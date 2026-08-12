@@ -1,6 +1,12 @@
 # SoftAE — Soft-matter Autonomous Experimentation
+Osuji lab, Department of Chemical and Biomolecular Engineering, University of Pennsylvania 
 
-Next-generation platform for autonomous (self-driving) materials science experiments, with automated/combinatorial modalities as a manual exploratory fallback.
+Next-generation benchtop platform for autonomous (self-driving) soft materials science experiments, with automated/combinatorial modalities as a manual exploratory fallback.
+
+Current SoftAE functionality integrates stage motion, liquid dispensing, environmental control (T/RH%), polarized optical microscopy, and conductivity measurements to afford high-throughput soft material formulation and inspection. High-throughput methods are in turn extended to autonomous experimentation via in-loop implementation of algorithms such as Bayesian optimization and Gaussian process-informed parameter phase space exploration.
+
+Core system functionality is accessible through a central graphical interface and is operable with various degrees of autonomy.
+The design intent is to be transparent in an instructive and functional manner. The codebase addresses many facets of a fully functional self-driving laboratory: orchestration, data analysis, algorithmic machinery, safety, reproducibility, telemetry, and data provenance.
 
 ## Quick Start
 
