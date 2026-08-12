@@ -1,6 +1,6 @@
 # Master guiding document for developing softae-next (Soft Matter Autonomous Experimentation system in the Osuji Lab)
 
-I am in the process of building & upgrading an autonomous experimentation system (softae-next) described in README.md and index.md under ".\docs". 
+We are in the process of building & upgrading an autonomous experimentation system (softae-next) described in README.md and index.md under ".\docs". 
 This is a master guiding document for researchers and AI agents to read for rapid, general context evaluation.
 
 Absolute path to project home directory:
