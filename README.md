@@ -3,8 +3,8 @@ Authored by:
 Pavel Shapturenka,
 Christopher W. Johnson,
 Yvonne Zagzag,
-Minki Lee
-*In collaboration and with assistance from frontier agentic large-language models*
+Minki Lee,
+ *In collaboration and with assistance from frontier agentic large-language models.*
 
 **Osuji lab**, Department of Chemical and Biomolecular Engineering, University of Pennsylvania
 
