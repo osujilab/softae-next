@@ -4,6 +4,7 @@ Pavel Shapturenka,
 Christopher W. Johnson,
 Yvonne Zagzag,
 Minki Lee
+
 **Osuji lab**, Department of Chemical and Biomolecular Engineering, University of Pennsylvania
 
 Next-generation benchtop platform for autonomous (self-driving) soft materials science experiments, with automated/combinatorial modalities as a manual exploratory fallback.
