@@ -8,6 +8,8 @@ Current SoftAE functionality integrates stage motion, liquid dispensing, environ
 Core system functionality is accessible through a central graphical interface and is operable with various degrees of autonomy.
 The design intent is to be transparent in an instructive and functional manner. The codebase addresses many facets of a fully functional self-driving laboratory: orchestration, data analysis, algorithmic machinery, safety, reproducibility, telemetry, and data provenance.
 
+![Project Screenshot](images/SoftAE_schema.png)
+
 ## Quick Start
 
 ```bash
