@@ -1,0 +1,49 @@
+name: ht_measure_only
+description: Representative HT 'ht_measure_only' recipe (2-channel snapshot). Exported
+  from the HT Experiment generator; EIS script paths are placeholders. Edit tasks/bindings
+  in the Process Configuration tab.
+variables:
+  vol_master:
+  - - 12.0
+    - 8.0
+    - 20.0
+  - - 12.0
+    - 8.0
+    - 20.0
+  eis_preset: Extended
+  selected_channels:
+  - 0
+  - 1
+  channel_numbers:
+  - 1
+  - 2
+setup:
+- name: measure_eis_ch1
+  instrument: pico1
+  method: sendscript_getdata
+  params:
+    mscrpath: scripts/eis_ch1.mscr
+    outdir: data/eis_output
+    chan: 1
+  timeout_s: 600.0
+  retry: 1
+  tags:
+    channel: '1'
+- name: measure_eis_ch2
+  instrument: pico1
+  method: sendscript_getdata
+  params:
+    mscrpath: scripts/eis_ch2.mscr
+    outdir: data/eis_output
+    chan: 2
+  timeout_s: 600.0
+  retry: 1
+  tags:
+    channel: '2'
+loop:
+  steps: []
+teardown: []
+metadata:
+  pcb: SoftAE_EIS_4Stripe
+  mode: measure_only
+  source: ht_experiment_export

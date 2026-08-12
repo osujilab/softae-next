@@ -1,0 +1,3 @@
+# Formulation
+
+::: softae.core.formulation

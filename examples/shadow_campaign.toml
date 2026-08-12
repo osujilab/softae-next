@@ -1,0 +1,121 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Shadow campaign — bench queue item 7 (docs/DEVELOPMENT_FRONTS.md)
+#
+#   "One shadow campaign with `engine = \"gated\"`, gates observing —
+#    unblocks E6 cutover"
+#
+# Run it with `[eis] engine = "gated"` and `[eis.gates] enabled = false` in
+# softae_config.toml.  The full procedure — pre-checks, the config flip, the
+# review, the revert — is docs/SHADOW_CAMPAIGN.md.  Read that first; this file
+# is only the campaign half.
+#
+#   softae-campaign check examples/shadow_campaign.toml
+#   softae-campaign run   examples/shadow_campaign.toml --head-up --yes \
+#       --project <project> 2>&1 | tee shadow_run.log
+#   softae-shadow review  shadow_run.log --project <project>
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY THIS SPEC IS VOLUME MODE, AND WHY THAT IS THE POINT
+#
+# A TOML spec cannot carry a `formulation` — `campaign_spec_io._UNSUPPORTED`
+# refuses it rather than load a spec that would run a different experiment from
+# the one the file describes.  So a file-driven campaign is always *volume
+# mode*, and `resolve_objective` therefore resolves the metric to **mean |Z|**.
+#
+# That is not a limitation here, it is the safety property.  mean |Z| is
+# computed from the raw sweep arrays by `_scalar_from_eis_raw` and never passes
+# through `analyze_spectrum`, so flipping `[eis] engine` **cannot steer the
+# search**.  The gated engine still runs on every spectrum — it decides the
+# auto-fit row written to `fit_results`, and it emits every gate verdict the
+# review exists to read — but an uncalibrated gate gets to be observed without
+# being given a vote on which formulations get explored.
+#
+# The gated σ is computed anyway on each measurement and logged as
+# `eis_objective_shadow` (σ observed, mean|Z| in use).  That is the
+# legacy-vs-gated comparison, for free, at no risk to the campaign.
+#
+# A composition-mode campaign under `engine = "gated"` behaves differently and
+# is NOT what this file is for: there the objective *is* the gated σ, and a
+# resolution-limited spectrum reports an upper bound, which
+# `_sigma_from_eis_raw` declines (`objective_declined_bound`) and the trial is
+# recorded as unmeasured.  `[eis.gates] enabled = false` does not prevent that —
+# the value-vs-bound decision is not behind that flag.  See §"What the flip
+# does and does not change" in docs/SHADOW_CAMPAIGN.md.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name      = "shadow_gated_observation"
+pcb_name  = "SoftAE_EIS_4Stripe"
+
+# Direction is DERIVED, never stated.  `objective = "maximize"` — which the
+# older Python examples carry — would be REFUSED here: this campaign resolves to
+# mean |Z|, which is minimised, and a contradiction spends the whole budget
+# hunting the worst material on the board while every step reports success.
+objective = "auto"
+
+optimizer   = "bayesian"
+acquisition = "ucb"
+kappa       = 2.0
+seed        = 42
+
+# Round width, not the electrode list: with `electrode_capacity` set, wells are
+# allocated sequentially from `electrode_start` and `channels` fixes how many
+# are cast per round.  q = 4 distinct suggestions per round (`batch = true`),
+# one per well, each scored against its own spectrum.
+channels           = [1, 2, 3, 4]
+batch              = true
+electrode_capacity = 32
+electrode_start    = 1
+
+# 16 wells = 16 real spectra over 4 rounds — half a board, on a board whose
+# wells are single-use.  Sized to be a reviewable sample rather than a
+# demonstration: the criterion the review has to satisfy is "a campaign's worth
+# of reviewed `eis_gate_would_reject` lines", and a 4-spectrum run cannot
+# support a judgement about a threshold.  Raise it to 32 to spend the whole
+# board; do not lower it.
+budget = 16
+
+# `vol_params` names, in pump order, which searched parameters ARE the per-pump
+# dispense volumes.  Composition setup carried over from
+# examples/autonomous_deposition_demo.py — the two-pump binary dropcast this rig
+# actually runs.
+#
+# EVERY top-level key must stay ABOVE the first `[table]` header: TOML assigns a
+# bare key to the most recently opened table, so `vol_params` written below
+# `[parameter_space.vol_p1]` silently becomes a *parameter attribute* and the
+# campaign loads with no volume parameters at all.  Nothing refuses it —
+# `parameter_space` is free-form by design.
+vol_params = ["vol_p0", "vol_p1"]
+pump_ids   = [0, 1]
+deadvols   = [10.0, 30.0]
+
+# Deposition is left at the rig's shipped defaults on purpose.  `two_phase` is
+# unset (→ `[dropcast] default_recipe`, today "legacy"), `disp_rate` unset,
+# `recipe_name` unset.  The shadow run has exactly ONE variable — which analysis
+# engine reads the spectra — and a cast that differed from the rig's normal one
+# would make every gate verdict a statement about the cast as well.
+
+# Per-pump 5–30 µL, so a well takes 10–60 µL against ~118.8 µL of void: no
+# overflow band is reachable from anywhere in this space.
+[parameter_space.vol_p0]
+type = "float"
+low  = 5.0
+high = 30.0
+
+[parameter_space.vol_p1]
+type = "float"
+low  = 5.0
+high = 30.0
+
+[measurement]
+modality = "eis"
+enabled  = true
+
+# `Extended` rather than the `Quick` default, and this is load-bearing.  Quick
+# bottoms out at 20 Hz; the gated engine's topology triad, Lin-KK truncation and
+# plateau-in-band checks all need low-frequency content to judge, so a Quick
+# sweep would produce a would-reject log dominated by "not enough band" rather
+# than by anything about the samples.  Extended reaches 1.2 Hz, which is exactly
+# `[eis.instrument] f_verified_lo_hz` — the lowest frequency this instrument has
+# been shown to hold at 1e4 Ω.  `Longest` (0.2 Hz) goes below it and would put
+# unverified points in front of gates that have never been calibrated.
+preset = "Extended"

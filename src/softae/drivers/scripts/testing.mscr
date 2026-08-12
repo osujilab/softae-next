@@ -1,0 +1,23 @@
+e
+set_gpio_cfg 0x3FFi 1
+set_gpio 0x11i
+var f
+var r
+var j
+set_pgstat_chan 0
+set_pgstat_mode 3
+set_autoranging ba 1p 1
+set_autoranging ab 1p 1
+cell_on
+set_gpio 0xffi
+wait 10m 
+meas_loop_eis f r j 10m 200000 1200m 45 0m
+ pck_start
+ pck_add f
+ pck_add r
+ pck_add j
+ pck_end
+endloop
+on_finished:
+cell_off
+

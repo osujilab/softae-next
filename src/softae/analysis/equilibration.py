@@ -1,0 +1,1228 @@
+"""σ(t) equilibration statistics — τ, t_tol, and the measured noise floor (P.22).
+
+The equilibration characterization run records EIS repeatedly at a held (T, RH,
+leg) and asks one question per channel: **how long does this sample take to stop
+changing?** Two statistics answer it, and they are both kept because they fail
+differently:
+
+============  ==================================================  ====================
+statistic     definition                                          fails when
+============  ==================================================  ====================
+``τ``         fit of σ(t) = σ_∞ + (σ₀ − σ_∞)·exp(−t/τ)            window < τ; two
+                                                                  relaxations; noise
+                                                                  ≫ Δσ
+``t_tol``     first *t* after which every later σ is within        the series never
+              ``tol_rel`` of σ_∞                                   settles → ``None``
+============  ==================================================  ====================
+
+τ is the physics and is comparable across samples and temperatures; **t_tol is
+the number the campaign will actually configure**, and it is model-free. A τ from
+a fit that converged on a bogus σ_∞ can be small with a small residual; t_tol
+cannot lie in that direction.
+
+Shape mirrors :mod:`softae.analysis.thermal` — a registry, a factory, and a
+model-agnostic entry point — so a caller stays model-agnostic and a new
+relaxation model is taught in one place.
+
+**It refuses rather than emitting a bogus τ.** Every refusal sets
+``fit_success=False`` and populates ``refusal``; none of them raise. That is the
+posture P.11/P.12/P.20 established: an absent number beats a plausible wrong one,
+because a plausible wrong τ becomes a conditioning hold duration and then a
+campaign's worth of off-equilibrium spectra.
+
+``s_noise`` is measured **in the same run** (:func:`noise_floor`), so the noise
+refusal threshold is not a constant somebody typed.
+
+τ from R₁ — a free check on the whole cell-constant path
+--------------------------------------------------------
+τ is a relaxation *time*, and ``σ = K/R₁`` with ``K`` constant during a hold. So a
+τ fitted to the R₁ channel **must equal** the τ fitted to σ: the cell constant
+cancels exactly. Computing both therefore costs one extra fit and buys a check on
+every link between the circuit fit and the reported conductivity — a per-point
+``K`` that is not actually constant (geometry resolved differently on different
+rounds), a σ derived from the wrong resistance, a thickness that moved mid-series.
+**A material disagreement means something is wrong in the cell-constant path**,
+and that is the entire reason to keep it.
+
+*One implementation note, because the identity is not free-form:* the diagnostic
+fits the **conductance** ``1/R₁``, not ``R₁``. ``1/R₁ = σ/K`` is σ times a
+constant, and an exponential's τ is invariant under a scaling of amplitude — so
+τ(1/R₁) ≡ τ(σ) exactly, which is the property the check depends on. Fitting
+``R₁`` itself would not have it: if σ(t) is a single exponential then
+``R₁(t) = K/σ(t)`` is *not*, and the two τ would differ by an amount that grows
+with the relaxation amplitude, turning the diagnostic into a source of false
+alarms. See :func:`r1_conductance`.
+
+σ stays the primary observable throughout. The diagnostic never sets
+``fit_success``, never fills ``tau_s``, and refuses under exactly the same
+discipline — an R₁ that is NULL because a circuit fit failed must not silently
+stand in for a missing σ.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Sequence
+
+import numpy as np
+import structlog
+
+from softae.analysis.conditions import (
+    TEMPERATURE_UNAVAILABLE,
+    combine_temperature_sources,
+    resolve_temperature_C,
+)
+from softae.errors import AnalysisError
+
+logger = structlog.get_logger(__name__)
+
+#: Default relative tolerance for "settled" — 2 % of σ_∞.
+DEFAULT_TOL_REL = 0.02
+#: Rounds at the tail of a series that define the settled block.
+DEFAULT_N_SETTLE = 5
+#: Three free parameters (σ₀, σ_∞, τ); four points fit any τ.
+#:
+#: **The acquisition side imports this**, and must: ``settle_floor_rounds`` in
+#: :mod:`softae.workflows.equilibration` folds it into the fewest rounds any
+#: setpoint may run, and ``EquilibrationConfig.validate`` refuses a
+#: ``rounds_per_setpoint`` ceiling below it. That coupling is what stops the run
+#: emitting a series this module will then refuse — the failure it closed was a
+#: 660 s round period, where every hold floor bought fewer than five rounds. So
+#: this is one authority, not a number two modules happen to agree on: raising it
+#: lengthens the run, and lowering it shortens it, automatically.
+MIN_POINTS_FOR_TAU = 5
+#: |σ₀ − σ_∞| must exceed this many noise sigmas for a relaxation to exist.
+NOISE_REFUSAL_FACTOR = 3.0
+#: A τ longer than half the observation window is an extrapolation, not a fit.
+MIN_WINDOWS_PER_TAU = 2.0
+#: Symmetric relative difference above which τ(σ) and τ(R₁) *disagree*. They should
+#: agree to fit noise, since the cell constant cancels exactly; 5 % is loose enough
+#: that ordinary scatter in two fits of the same data does not trip it, and tight
+#: enough that a K which is not constant across the series does.
+R1_AGREEMENT_TOL_REL = 0.05
+
+REFUSAL_TOO_FEW_POINTS = "too_few_points"
+REFUSAL_WINDOW_SHORTER_THAN_TAU = "window_shorter_than_tau"
+REFUSAL_NOISE_DOMINATED = "noise_dominated"
+REFUSAL_NON_MONOTONIC = "non_monotonic"
+REFUSAL_UNCONVERGED = "unconverged"
+REFUSAL_SIGMA_UNAVAILABLE = "sigma_unavailable"
+#: Not a failure: the ``"none"`` model is asked for the model-free numbers only.
+REFUSAL_NO_MODEL = "no_model_requested"
+#: The R₁ **diagnostic** has nothing to fit. Spelled separately from
+#: ``sigma_unavailable`` so a reader can never mistake "the diagnostic was
+#: unavailable" for "the observable was unavailable" — R₁ is NULL whenever a
+#: circuit fit failed, and it must not stand in for σ.
+REFUSAL_R1_UNAVAILABLE = "r1_unavailable"
+
+
+@dataclass
+class EquilibrationResult:
+    """One channel's equilibration statistics at one (leg, setpoint).
+
+    ``tau_s`` is ``NaN`` unless ``fit_success``. ``t_tol_s`` and
+    ``noise_floor_rel`` are independent of the fit and are populated whenever the
+    data supports them — a refused τ does not cost the campaign its hold time.
+    """
+
+    model: str = "exponential"
+    channel: int = 0
+    run_id: str = ""
+    leg: str = ""
+    setpoint_index: int = -1
+    times_s: list[float] = field(default_factory=list)
+    sigmas: list[float] = field(default_factory=list)
+    tau_s: float = float("nan")
+    tau_stderr_s: float = float("nan")
+    sigma_0: float = float("nan")
+    sigma_inf: float = float("nan")
+    sigma_settled: float = float("nan")
+    t_tol_s: float | None = None
+    tol_rel: float = DEFAULT_TOL_REL
+    n_settle: int = DEFAULT_N_SETTLE
+    noise_floor_rel: float | None = None
+    #: Measurement noise **plus** residual short-term drift. The two cannot be
+    #: separated without a repeat taken with zero time between them, which is not
+    #: physically available — so this is an UPPER BOUND on pure measurement noise.
+    noise_floor_is_upper_bound: bool = True
+    r_squared: float = float("nan")
+    n_points: int = 0
+    #: The temperature this series was held at, and — inseparably — which
+    #: thermometer read it. They travel together because the rig has two, and a
+    #: temperature reported without its source is the defect this pair closed:
+    #: the air probe read up to 42 °C below the stage at the same setpoint. See
+    #: :mod:`softae.analysis.conditions`.
+    temperature_C: float = float("nan")
+    temperature_source: str = TEMPERATURE_UNAVAILABLE
+    fit_success: bool = False
+    refusal: str = ""
+    error_msg: str = ""
+    #: τ from the R₁ channel — a **diagnostic beside** ``tau_s``, never a
+    #: replacement for it. See the module docstring: the cell constant cancels, so
+    #: these two must agree, and their disagreement is the finding.
+    tau_r1_s: float = float("nan")
+    tau_r1_stderr_s: float = float("nan")
+    r1_fit_success: bool = False
+    r1_refusal: str = ""
+    #: ``|τ_σ − τ_R₁| / mean(τ_σ, τ_R₁)``; ``None`` unless *both* fits succeeded.
+    tau_agreement_rel: float | None = None
+    #: ``True`` when the two τ agree inside :data:`R1_AGREEMENT_TOL_REL`, ``False``
+    #: when they do not, ``None`` when the comparison could not be made. The third
+    #: state is load-bearing: "not checked" is not "checked and fine".
+    r1_diagnostic_ok: bool | None = None
+
+    def describe(self) -> str:
+        """One line an operator can read at the bench."""
+        head = (f"ch{self.channel} {self.leg or '?'}/S{self.setpoint_index}"
+                f" {self.describe_temperature()}")
+        tau = (f"tau={self.tau_s:.0f}s" if self.fit_success
+               else f"tau=REFUSED({self.refusal or 'unknown'})")
+        ttol = "t_tol=never" if self.t_tol_s is None else f"t_tol={self.t_tol_s:.0f}s"
+        nf = ("noise=?" if self.noise_floor_rel is None
+              else f"noise<={self.noise_floor_rel * 100:.2f}%")
+        return (f"{head}: {tau}  {ttol}  {nf}  n={self.n_points}"
+                f"  {self.describe_r1()}")
+
+    def describe_temperature(self) -> str:
+        """The hold temperature **with** its thermometer — never the number alone.
+
+        An operator reading ``T=43C`` cannot tell a stage at 43 °C from a stage at
+        85 °C whose air probe read 43. The source label is what makes the number
+        actionable, so it is not optional formatting.
+        """
+        if not np.isfinite(self.temperature_C):
+            return f"T=?[{self.temperature_source}]"
+        return f"T={self.temperature_C:.1f}C[{self.temperature_source}]"
+
+    def describe_r1(self) -> str:
+        """The R₁ cross-check, said in the one place it can be acted on."""
+        if not self.r1_fit_success:
+            return f"tau(R1)=REFUSED({self.r1_refusal or 'not attempted'})"
+        agree = self.tau_agreement_rel
+        if agree is None:
+            return f"tau(R1)={self.tau_r1_s:.0f}s (no sigma tau to compare)"
+        flag = "" if self.r1_diagnostic_ok else "  ** CELL-CONSTANT PATH SUSPECT **"
+        return f"tau(R1)={self.tau_r1_s:.0f}s (d={agree * 100:.2f}%){flag}"
+
+
+# ── Model-free primitives ────────────────────────────────────────────────────
+
+def settled_mean(sigmas: Sequence[float], *, n_settle: int = DEFAULT_N_SETTLE) -> float:
+    """Mean of the last *n_settle* finite σ values (σ_∞, model-free)."""
+    finite = [float(s) for s in sigmas if np.isfinite(s)]
+    if not finite:
+        return float("nan")
+    tail = finite[-max(1, int(n_settle)):]
+    return float(np.mean(tail))
+
+
+def noise_floor(
+    sigmas: Sequence[float], *, n_settle: int = DEFAULT_N_SETTLE
+) -> float | None:
+    """Relative scatter of the settled tail — an **upper bound** on σ noise.
+
+    A conditioning tolerance below this can never be satisfied, which is why the
+    run reports it as a first-class output rather than leaving it implicit. It is
+    measurement noise *plus* whatever residual drift is left at the tail; the
+    caller must label it as a bound, not as the noise itself.
+    """
+    finite = [float(s) for s in sigmas if np.isfinite(s)]
+    tail = finite[-max(2, int(n_settle)):]
+    if len(tail) < 2:
+        return None
+    mean = float(np.mean(tail))
+    if not np.isfinite(mean) or mean == 0.0:
+        return None
+    return float(np.std(tail, ddof=1) / abs(mean))
+
+
+def settling_time(
+    times_s: Sequence[float],
+    sigmas: Sequence[float],
+    *,
+    tol_rel: float = DEFAULT_TOL_REL,
+    n_settle: int = DEFAULT_N_SETTLE,
+) -> float | None:
+    """First *t* after which **every** later σ is within *tol_rel* of σ_∞.
+
+    ``None`` when the series never settles inside the observation window — an
+    honest answer, and the one the campaign needs, because it says the hold was
+    not long enough rather than inventing a time that was never demonstrated.
+
+    The settled block must contain at least *n_settle* points: a "settled" run of
+    two points at the end of a still-drifting series is scatter, not evidence.
+    """
+    t = np.asarray(times_s, dtype=float)
+    s = np.asarray(sigmas, dtype=float)
+    if t.size != s.size or t.size == 0:
+        return None
+    ok = np.isfinite(t) & np.isfinite(s)
+    t, s = t[ok], s[ok]
+    if t.size < 2:
+        return None
+
+    target = settled_mean(s, n_settle=n_settle)
+    if not np.isfinite(target) or target == 0.0:
+        return None
+    band = abs(target) * float(tol_rel)
+    need = max(2, int(n_settle))
+
+    within = np.abs(s - target) <= band
+    for i in range(t.size - need + 1):
+        if bool(np.all(within[i:])):
+            return float(t[i])
+    return None
+
+
+def endorse_tolerance(
+    tol_rel: float, noise_floor_rel: float | None
+) -> tuple[bool, str]:
+    """Can a proposed conditioning tolerance be met at all? (``report``'s refusal)
+
+    A tolerance below the measured noise floor can never be satisfied, so a hold
+    time derived from it would be a number with no achievable meaning. Refused
+    rather than printed with a caveat.
+    """
+    if noise_floor_rel is None:
+        return False, ("no noise floor measured for this channel — cannot say "
+                       "whether the tolerance is achievable")
+    if float(tol_rel) <= 0:
+        return False, "a tolerance of zero or less can never be satisfied"
+    if float(tol_rel) < float(noise_floor_rel):
+        return False, (
+            f"tol_rel {tol_rel * 100:.2f}% is BELOW the measured noise floor "
+            f"{noise_floor_rel * 100:.2f}% — no hold length can satisfy it"
+        )
+    return True, (f"tol_rel {tol_rel * 100:.2f}% is above the {noise_floor_rel * 100:.2f}% "
+                  f"noise floor and is achievable")
+
+
+def _sign_changes(diffs: np.ndarray, *, threshold: float) -> int:
+    """Sign changes in a smoothed first difference, ignoring sub-noise steps."""
+    if diffs.size < 2:
+        return 0
+    kernel = np.ones(3) / 3.0
+    smooth = np.convolve(diffs, kernel, mode="valid") if diffs.size >= 3 else diffs
+    signs = np.sign(smooth[np.abs(smooth) > threshold])
+    if signs.size < 2:
+        return 0
+    return int(np.count_nonzero(np.diff(signs) != 0))
+
+
+# ── Fitters ──────────────────────────────────────────────────────────────────
+
+class _BaseEquilibrationFitter:
+    """Shared plumbing: the model-free numbers every model reports."""
+
+    model = "base"
+
+    def _seed(
+        self,
+        times_s: Sequence[float],
+        sigmas: Sequence[float],
+        *,
+        channel: int,
+        run_id: str,
+        leg: str,
+        setpoint_index: int,
+        tol_rel: float,
+        n_settle: int,
+    ) -> EquilibrationResult:
+        t_tol = settling_time(times_s, sigmas, tol_rel=tol_rel, n_settle=n_settle)
+        return EquilibrationResult(
+            model=self.model,
+            channel=channel,
+            run_id=run_id,
+            leg=leg,
+            setpoint_index=setpoint_index,
+            times_s=[float(v) for v in times_s],
+            sigmas=[float(v) for v in sigmas],
+            sigma_settled=settled_mean(sigmas, n_settle=n_settle),
+            t_tol_s=t_tol,
+            tol_rel=float(tol_rel),
+            n_settle=int(n_settle),
+            noise_floor_rel=noise_floor(sigmas, n_settle=n_settle),
+            n_points=int(len(list(sigmas))),
+        )
+
+
+class ToleranceOnlyFitter(_BaseEquilibrationFitter):
+    """``"none"`` — t_tol and the settled mean, with **no fit attempted**.
+
+    A deliberate registry member rather than a placeholder: a run that wants the
+    model-free number should be able to ask for it without a fitter pretending to
+    have found a τ. ``fit_success`` is False and ``refusal`` says why, so the
+    absence of τ is recorded as a choice rather than read as a failure.
+    """
+
+    model = "none"
+
+    def fit(
+        self,
+        times_s: Sequence[float],
+        sigmas: Sequence[float],
+        *,
+        channel: int = 0,
+        run_id: str = "",
+        leg: str = "",
+        setpoint_index: int = -1,
+        tol_rel: float = DEFAULT_TOL_REL,
+        n_settle: int = DEFAULT_N_SETTLE,
+    ) -> EquilibrationResult:
+        result = self._seed(times_s, sigmas, channel=channel, run_id=run_id, leg=leg,
+                            setpoint_index=setpoint_index, tol_rel=tol_rel,
+                            n_settle=n_settle)
+        result.refusal = REFUSAL_NO_MODEL
+        result.error_msg = "model 'none': t_tol only, no relaxation fitted"
+        return result
+
+
+class ExponentialRelaxationFitter(_BaseEquilibrationFitter):
+    """``"exponential"`` — σ(t) = σ_∞ + (σ₀ − σ_∞)·exp(−t/τ).
+
+    **The scaling matters.** ``curve_fit``'s default step is unit-scaled and τ
+    lives in the 10²–10⁴ s range, so an unscaled fit wanders and then reports
+    convergence — the same class of defect as the E0/E1 ``x_scale`` bug. Time is
+    therefore rescaled by a seed taken from the model-free ``t_tol`` and the fit
+    is done in units of that seed, then converted back.
+    """
+
+    model = "exponential"
+
+    def fit(
+        self,
+        times_s: Sequence[float],
+        sigmas: Sequence[float],
+        *,
+        channel: int = 0,
+        run_id: str = "",
+        leg: str = "",
+        setpoint_index: int = -1,
+        tol_rel: float = DEFAULT_TOL_REL,
+        n_settle: int = DEFAULT_N_SETTLE,
+    ) -> EquilibrationResult:
+        result = self._seed(times_s, sigmas, channel=channel, run_id=run_id, leg=leg,
+                            setpoint_index=setpoint_index, tol_rel=tol_rel,
+                            n_settle=n_settle)
+        t = np.asarray(times_s, dtype=float)
+        s = np.asarray(sigmas, dtype=float)
+
+        # Order is deliberate: input validity, then "is there a relaxation at
+        # all", then the fit. Each refusal below fires only when the ones above
+        # it have already passed, so the reported reason is the first true one.
+        if t.size != s.size or t.size == 0 or not np.all(np.isfinite(s)) \
+                or not np.all(np.isfinite(t)):
+            return _refuse(result, REFUSAL_SIGMA_UNAVAILABLE,
+                           "a sigma is NULL or non-finite; P.20 stores NULL when the "
+                           "geometry is absent, and a NaN must not become a point")
+        if t.size < MIN_POINTS_FOR_TAU:
+            return _refuse(result, REFUSAL_TOO_FEW_POINTS,
+                           f"{t.size} points; three free parameters need "
+                           f"≥ {MIN_POINTS_FOR_TAU}")
+
+        sigma_inf_hat = result.sigma_settled
+        sigma_0_hat = float(s[0])
+        result.sigma_0, result.sigma_inf = sigma_0_hat, sigma_inf_hat
+        tail = s[-max(2, int(n_settle)):]
+        s_noise = float(np.std(tail, ddof=1)) if tail.size >= 2 else 0.0
+        amplitude = abs(sigma_0_hat - sigma_inf_hat)
+
+        if amplitude < NOISE_REFUSAL_FACTOR * s_noise:
+            return _refuse(result, REFUSAL_NOISE_DOMINATED,
+                           f"|sigma_0 - sigma_inf| = {amplitude:.3g} is below "
+                           f"{NOISE_REFUSAL_FACTOR:g}x the {s_noise:.3g} tail noise; "
+                           f"the series is already settled, tau is not zero")
+        if _sign_changes(np.diff(s), threshold=s_noise) > 1:
+            return _refuse(result, REFUSAL_NON_MONOTONIC,
+                           "more than one sign change in the smoothed first "
+                           "difference; a one-relaxation model cannot describe two")
+
+        t_span = float(t[-1] - t[0])
+        # 2 % of an exponential is reached at ~3.9 tau, so t_tol/3.9 is the right
+        # order for the seed; the span/4 fallback covers a series that never met
+        # the tolerance at all.
+        seed = (result.t_tol_s / 3.9) if result.t_tol_s else (t_span / 4.0)
+        seed = float(seed) if np.isfinite(seed) and seed > 0 else max(t_span, 1.0) / 4.0
+
+        def _model(x: np.ndarray, s_inf: float, s_zero: float, tau_scaled: float):
+            return s_inf + (s_zero - s_inf) * np.exp(-x / tau_scaled)
+
+        try:
+            from scipy.optimize import curve_fit
+
+            popt, pcov = curve_fit(
+                _model, (t - t[0]) / seed, s,
+                p0=(sigma_inf_hat, sigma_0_hat, 1.0),
+                bounds=([-np.inf, -np.inf, 1e-6], [np.inf, np.inf, np.inf]),
+                maxfev=20000,
+            )
+        except Exception as exc:
+            return _refuse(result, REFUSAL_UNCONVERGED, f"curve_fit failed: {exc}")
+
+        if not np.all(np.isfinite(pcov)):
+            return _refuse(result, REFUSAL_UNCONVERGED,
+                           "non-finite covariance; the parameters are not determined")
+
+        tau = float(popt[2]) * seed
+        result.sigma_inf = float(popt[0])
+        result.sigma_0 = float(popt[1])
+        result.tau_s = tau
+        result.tau_stderr_s = float(np.sqrt(pcov[2][2])) * seed
+
+        if not np.isfinite(tau) or tau <= 0:
+            return _refuse(result, REFUSAL_UNCONVERGED, f"non-physical tau {tau:.3g} s")
+        if t_span < MIN_WINDOWS_PER_TAU * tau:
+            return _refuse(result, REFUSAL_WINDOW_SHORTER_THAN_TAU,
+                           f"window {t_span:.0f}s < {MIN_WINDOWS_PER_TAU:g}x the fitted "
+                           f"tau {tau:.0f}s; that is an extrapolation, not a fit")
+
+        pred = _model((t - t[0]) / seed, *popt)
+        ss_res = float(np.sum((s - pred) ** 2))
+        ss_tot = float(np.sum((s - float(np.mean(s))) ** 2))
+        result.r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        result.fit_success = True
+        return result
+
+
+def _refuse(result: EquilibrationResult, refusal: str, why: str) -> EquilibrationResult:
+    """Record a refusal on *result* — never raise, never emit a number."""
+    result.fit_success = False
+    result.tau_s = float("nan")
+    result.tau_stderr_s = float("nan")
+    result.refusal = refusal
+    result.error_msg = why
+    logger.info("equilibration_fit_refused", channel=result.channel, leg=result.leg,
+                setpoint_index=result.setpoint_index, refusal=refusal, detail=why)
+    return result
+
+
+#: Registry mapping model name → fitter class (mirrors ``THERMAL_MODELS``).
+EQUILIBRATION_MODELS: dict[str, type] = {
+    "exponential": ExponentialRelaxationFitter,
+    "none": ToleranceOnlyFitter,
+}
+
+
+def make_equilibration_fitter(model: str):
+    """Return a fitter instance for *model* (``"exponential"`` or ``"none"``)."""
+    try:
+        return EQUILIBRATION_MODELS[model]()
+    except KeyError:
+        raise AnalysisError(
+            f"unknown equilibration model '{model}'; "
+            f"available: {sorted(EQUILIBRATION_MODELS)}"
+        ) from None
+
+
+def r1_conductance(r1_ohms: Sequence[Any]) -> list[float]:
+    """``1/R₁`` — the quantity σ is proportional to, with the same τ.
+
+    ``σ = K/R₁``, so ``1/R₁`` is σ divided by the cell constant. Scaling an
+    exponential's amplitude leaves its τ untouched, which is what makes
+    τ(1/R₁) ≡ τ(σ) an *exact* identity rather than an approximation, and therefore
+    what makes a disagreement diagnostic rather than expected.
+
+    A NULL, non-finite or non-positive R₁ becomes ``NaN`` on purpose: the fitter's
+    own refusal is the correct outcome, and dropping the point would shorten the
+    series behind the caller's back.
+    """
+    out: list[float] = []
+    for value in r1_ohms:
+        try:
+            r = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            out.append(float("nan"))
+            continue
+        out.append(1.0 / r if np.isfinite(r) and r > 0 else float("nan"))
+    return out
+
+
+def _matched_to(values: Sequence[float], reference: Sequence[float]) -> list[float]:
+    """Rescale *values* to the magnitude of *reference*. τ is unaffected; noise is.
+
+    ``curve_fit``'s convergence criteria are partly absolute, so a series living
+    at 10⁻⁶ and the same series at 10⁻⁴ stop at slightly different optima — the two
+    τ then differ by ~10⁻⁴ *relative* for purely numerical reasons. That is small,
+    but this diagnostic exists to say whether a difference is real, and a floor of
+    numerical disagreement is exactly what it must not have.
+
+    A single multiplicative constant cannot change an exponential's τ, so this
+    **cannot** hide a genuine disagreement: a cell constant that drifts across the
+    series still changes the shape, and shape is all τ sees.
+    """
+    scale = _matching_scale(values, reference)
+    return [float(v) * scale for v in values]
+
+
+def _matching_scale(values: Sequence[float], reference: Sequence[float]) -> float:
+    ref = np.abs(np.asarray(list(reference), dtype=float))
+    own = np.abs(np.asarray(list(values), dtype=float))
+    if ref.size != own.size or ref.size == 0:
+        return 1.0
+    ref_mean, own_mean = float(np.mean(ref)), float(np.mean(own))
+    if not (np.isfinite(ref_mean) and np.isfinite(own_mean)) or own_mean == 0.0 \
+            or ref_mean == 0.0:
+        return 1.0
+    return ref_mean / own_mean
+
+
+def add_r1_diagnostic(
+    result: EquilibrationResult,
+    times_s: Sequence[float],
+    r1_ohms: Sequence[Any],
+    *,
+    tol_rel: float = DEFAULT_TOL_REL,
+    n_settle: int = DEFAULT_N_SETTLE,
+) -> EquilibrationResult:
+    """Fit τ on the R₁ channel and record it **beside** the σ-based τ.
+
+    Mutates and returns *result*. It touches only the ``r1_*`` fields: σ remains
+    the primary observable and a refused σ fit is not rescued by a successful R₁
+    one. The reverse also holds — an R₁ that is NULL for even one round refuses
+    with :data:`REFUSAL_R1_UNAVAILABLE` rather than fitting a shortened series,
+    because R₁ goes NULL precisely when a circuit fit failed and that point's σ is
+    suspect too.
+    """
+    conductance = r1_conductance(r1_ohms)
+    if not conductance or not all(np.isfinite(g) for g in conductance):
+        result.r1_refusal = REFUSAL_R1_UNAVAILABLE
+        result.tau_r1_s = float("nan")
+        result.r1_fit_success = False
+        result.r1_diagnostic_ok = None
+        return result
+    conductance = _matched_to(conductance, result.sigmas)
+
+    fitted = ExponentialRelaxationFitter().fit(
+        times_s, conductance, channel=result.channel, run_id=result.run_id,
+        leg=result.leg, setpoint_index=result.setpoint_index, tol_rel=tol_rel,
+        n_settle=n_settle)
+    result.r1_fit_success = fitted.fit_success
+    result.r1_refusal = fitted.refusal
+    result.tau_r1_s = fitted.tau_s
+    result.tau_r1_stderr_s = fitted.tau_stderr_s
+    result.tau_agreement_rel = tau_agreement(result.tau_s, fitted.tau_s) \
+        if (result.fit_success and fitted.fit_success) else None
+    result.r1_diagnostic_ok = (
+        None if result.tau_agreement_rel is None
+        else bool(result.tau_agreement_rel <= R1_AGREEMENT_TOL_REL))
+    if result.r1_diagnostic_ok is False:
+        logger.warning(
+            "equilibration_r1_tau_disagrees", channel=result.channel,
+            leg=result.leg, setpoint_index=result.setpoint_index,
+            tau_sigma_s=result.tau_s, tau_r1_s=result.tau_r1_s,
+            relative_difference=result.tau_agreement_rel,
+            detail="sigma = K/R1 with K constant, so these must agree; a material "
+                   "difference means the cell-constant path is wrong",
+        )
+    return result
+
+
+def tau_agreement(tau_sigma_s: float, tau_r1_s: float) -> float | None:
+    """Symmetric relative difference between two τ, or ``None`` if either is unusable.
+
+    Symmetric rather than "relative to σ" so the number does not depend on which
+    of two equally-good fits is called the reference.
+    """
+    try:
+        a, b = float(tau_sigma_s), float(tau_r1_s)
+    except (TypeError, ValueError):
+        return None
+    if not (np.isfinite(a) and np.isfinite(b)):
+        return None
+    mean = (abs(a) + abs(b)) / 2.0
+    return None if mean == 0.0 else float(abs(a - b) / mean)
+
+
+def fit_equilibration(
+    model: str,
+    times_s: Sequence[float],
+    sigmas: Sequence[float],
+    *,
+    channel: int = 0,
+    run_id: str = "",
+    leg: str = "",
+    setpoint_index: int = -1,
+    tol_rel: float = DEFAULT_TOL_REL,
+    n_settle: int = DEFAULT_N_SETTLE,
+) -> EquilibrationResult:
+    """Fit one σ(t) series with the selected relaxation *model*.
+
+    Never raises for data reasons: an unfittable series comes back with
+    ``fit_success=False`` and a populated ``refusal``. Only an unknown *model*
+    raises, because that is a caller bug rather than a measurement outcome.
+    """
+    return make_equilibration_fitter(model).fit(
+        times_s, sigmas, channel=channel, run_id=run_id, leg=leg,
+        setpoint_index=setpoint_index, tol_rel=tol_rel, n_settle=n_settle,
+    )
+
+
+# ── Reading a recorded run back ──────────────────────────────────────────────
+
+#: Columns the σ(t) reconstruction needs. No schema change: every one of these is
+#: already written by ``analysis.eis.router`` on an ordinary EIS shot.
+#:
+#: ``f.R1`` rides along for the τ cross-check. It is already in the row the join
+#: reads, so carrying it costs one column and buys the cell-constant diagnostic.
+#:
+#: ``c.stage_temp_pv_C`` is here because ``c.chamber_air_C`` is the humidity
+#: sensor's chamber-air reading, not the sample's. This query selected the air
+#: probe alone until 2026-08-11, when the columns were still named ``temp_pv_C`` /
+#: ``temp_sp_C`` and read like an SP/PV pair off one instrument; see
+#: :mod:`softae.analysis.conditions` for what that cost. Both are read and
+#: :func:`~softae.analysis.conditions.resolve_temperature_C`
+#: decides between them, so the choice is made in one place for the whole system.
+_SERIES_SQL = """
+SELECT m.measurement_id, m.channel, m.timestamp, m.eis_file_path,
+       f.sigma_S_per_cm, f.R1, c.stage_temp_sp_C, c.stage_temp_pv_C, c.chamber_air_C,
+       c.rh_sp_pct, c.rh_pv_pct
+FROM measurements m
+LEFT JOIN fit_results f ON f.measurement_id = m.measurement_id
+LEFT JOIN conditions  c ON c.measurement_id = m.measurement_id
+WHERE m.run_id = ?
+ORDER BY m.timestamp, m.measurement_id
+"""
+
+
+def load_sigma_series(store: Any, run_id: str, sidecar: dict[str, Any]) -> dict[
+        tuple[int, str, int, str], list[dict[str, Any]]]:
+    """Reconstruct σ(t) per coordinate by joining measurements × fits × conditions.
+
+    The **coordinate** is the one thing the database cannot supply — ``router``
+    reads a fixed list of tags and drops the rest — so it comes from the sidecar
+    this run wrote, keyed on the step name. The link is
+    ``measurements.eis_file_path``, whose stem the router derives from the step
+    name (``<step>_ch<N>.txt`` for any name that is not the Arrhenius sweep's).
+
+    Returns ``{(channel, leg, setpoint_index, kind): [point, …]}`` ordered by
+    ``t_since_hold_s``. Points whose σ is NULL are **kept with ``sigma=None``**,
+    so the fitter can refuse them rather than silently seeing a shorter series.
+
+    Each point carries ``temperature_C`` **and** ``temperature_source``, never one
+    without the other. The two raw reads survive beside them under names that say
+    which instrument they came from — ``stage_temp_pv_C`` and ``chamber_air_C`` —
+    because the RH physics still needs the humidity sensor's own air temperature
+    even though it is the wrong number for the sample.
+    """
+    by_stem: dict[str, dict[str, Any]] = {
+        f"{p['step_name']}_ch{int(p['channel'])}": p
+        for p in (sidecar.get("points") or [])
+    }
+    out: dict[tuple[int, str, int, str], list[dict[str, Any]]] = {}
+    for row in store._conn.execute(_SERIES_SQL, (run_id,)).fetchall():
+        (mid, channel, timestamp, path, sigma, r1,
+         t_sp, stage_pv, air_pv, rh_sp, rh_pv) = row
+        stem = str(path or "").replace("\\", "/").rsplit("/", 1)[-1]
+        if stem.endswith(".txt"):
+            stem = stem[:-4]
+        point = by_stem.get(stem)
+        if point is None:
+            continue
+        key = (int(channel), str(point["leg"]), int(point["setpoint_index"]),
+               str(point.get("kind", "series")))
+        temperature_C, temperature_source = resolve_temperature_C(
+            stage_pv_C=stage_pv, stage_sp_C=t_sp, chamber_air_C=air_pv)
+        out.setdefault(key, []).append({
+            "measurement_id": int(mid),
+            "t_since_hold_s": float(point["t_since_hold_s"]),
+            "round_index": int(point["round_index"]),
+            "sigma": None if sigma is None else float(sigma),
+            "R1": None if r1 is None else float(r1),
+            "timestamp": timestamp,
+            "temperature_C": temperature_C,
+            "temperature_source": temperature_source,
+            "temp_sp_C": t_sp,
+            "stage_temp_pv_C": stage_pv,
+            # Named for the instrument, matching the column since the 2026-08-11 rename.
+            # The RH physics needs the humidity sensor's own air temperature; it is
+            # simply not the sample's.
+            "chamber_air_C": air_pv,
+            "rh_sp_pct": rh_sp, "rh_pv_pct": rh_pv,
+        })
+    for points in out.values():
+        points.sort(key=lambda p: p["t_since_hold_s"])
+    return out
+
+
+def series_temperature(points: Sequence[dict[str, Any]]) -> tuple[float, str]:
+    """The temperature a held series sat at, and which thermometer says so.
+
+    Median rather than mean: a setpoint's first round is taken while the stage is
+    still arriving, and one approach transient must not drag the number that labels
+    the whole hold. Points that resolved to no thermometer are skipped — they carry
+    no temperature to average — and a series whose rounds resolved to *different*
+    instruments comes back labelled ``mixed`` rather than adopting the first one's
+    label. See :func:`~softae.analysis.conditions.combine_temperature_sources`.
+    """
+    usable = [p for p in points
+              if str(p.get("temperature_source", TEMPERATURE_UNAVAILABLE))
+              != TEMPERATURE_UNAVAILABLE
+              and np.isfinite(float(p.get("temperature_C", float("nan"))))]
+    if not usable:
+        return float("nan"), TEMPERATURE_UNAVAILABLE
+    source = combine_temperature_sources(p["temperature_source"] for p in usable)
+    return float(np.median([float(p["temperature_C"]) for p in usable])), source
+
+
+def fit_run(
+    series: dict[tuple[int, str, int, str], list[dict[str, Any]]],
+    *,
+    model: str = "exponential",
+    run_id: str = "",
+    tol_rel: float = DEFAULT_TOL_REL,
+    n_settle: int = DEFAULT_N_SETTLE,
+    kind: str = "series",
+) -> list[EquilibrationResult]:
+    """Fit every ``kind`` coordinate in a loaded run, sorted for stable output.
+
+    A NULL σ is passed through as ``NaN`` on purpose: the fitter's
+    ``sigma_unavailable`` refusal is the correct outcome, and dropping the point
+    here would hide a geometry gap behind a shorter but apparently clean series.
+
+    Every series also gets the R₁ cross-check (:func:`add_r1_diagnostic`), which
+    is why it is not opt-in: a consistency check nobody remembers to ask for is
+    one that never runs.
+
+    Each result also carries the hold temperature **and its source**
+    (:func:`series_temperature`), so no consumer downstream has to guess which of
+    the rig's two thermometers produced the number it is about to put in a 1/T.
+    """
+    results: list[EquilibrationResult] = []
+    for key in sorted(series, key=lambda k: (k[1], k[2], k[0], k[3])):
+        channel, leg, sp_idx, point_kind = key
+        if kind and point_kind != kind:
+            continue
+        points = series[key]
+        times = [p["t_since_hold_s"] for p in points]
+        sigmas = [float("nan") if p["sigma"] is None else p["sigma"] for p in points]
+        result = fit_equilibration(
+            model, times, sigmas, channel=channel, run_id=run_id, leg=leg,
+            setpoint_index=sp_idx, tol_rel=tol_rel, n_settle=n_settle,
+        )
+        result.temperature_C, result.temperature_source = series_temperature(points)
+        results.append(add_r1_diagnostic(
+            result, times, [p.get("R1") for p in points],
+            tol_rel=tol_rel, n_settle=n_settle))
+    return results
+
+
+# ── Session drift, at zero instrument cost ───────────────────────────────────
+
+def session_drift(
+    results: Sequence[EquilibrationResult], *, tol_rel: float = DEFAULT_TOL_REL,
+) -> list[dict[str, Any]]:
+    """First settled block of the up leg vs last settled block of the down leg.
+
+    Both are at the same nominal condition — the up leg starts where the down leg
+    ends — so their disagreement is **session drift**: the sample, the cell or the
+    instrument moving over the nine hours between them. It is the same reasoning
+    that put ``DRIFT_REPEAT_ROLE`` in the commissioning path, and it doubles as
+    question 3's retrace evidence at the reference point.
+
+    It costs **no instrument time**. The spec originally bought this with two
+    ``Longest`` rounds per setpoint; those acquired points below the fixture's
+    ~9 Hz phase-reliable floor and have been retired. The blocks compared here are
+    the ordinary settled tails that the σ(t) series already produces.
+
+    The yardstick is the run's **own measured noise floor**, not a typed constant:
+    a drift smaller than the scatter of the settled block is not evidence of
+    anything. ``significant`` is ``None`` when no noise floor could be measured —
+    "not checked" is not "checked and fine".
+    """
+    by_key = {(r.leg, r.setpoint_index, r.channel): r for r in results}
+    down_indices = [sp for (leg, sp, _ch) in by_key if leg == "down"]
+    if not down_indices:
+        return []
+    last_down = max(down_indices)
+
+    rows: list[dict[str, Any]] = []
+    for channel in sorted({ch for (_leg, _sp, ch) in by_key}):
+        start = by_key.get(("up", 0, channel))
+        end = by_key.get(("down", last_down, channel))
+        if start is None or end is None:
+            continue
+        s0, s1 = start.sigma_settled, end.sigma_settled
+        mean = (abs(s0) + abs(s1)) / 2.0 if np.isfinite(s0) and np.isfinite(s1) else 0.0
+        drift = float(abs(s0 - s1) / mean) if mean > 0 else None
+        floors = [f for f in (start.noise_floor_rel, end.noise_floor_rel)
+                  if f is not None]
+        floor = max(floors) if floors else None
+        rows.append({
+            "channel": channel,
+            "start": {"leg": "up", "setpoint_index": 0,
+                      "sigma_settled": _finite_or_none(s0)},
+            "end": {"leg": "down", "setpoint_index": last_down,
+                    "sigma_settled": _finite_or_none(s1)},
+            "drift_rel": drift,
+            "noise_floor_rel": floor,
+            "tol_rel": float(tol_rel),
+            "significant": (None if drift is None or floor is None
+                            else bool(drift > max(floor, float(tol_rel)))),
+        })
+    return rows
+
+
+def _finite_or_none(value: float) -> float | None:
+    return float(value) if np.isfinite(value) else None
+
+
+# ── The adaptive settle criterion — the run's own stopping rule ──────────────
+#
+# The 2026-08-11 production run held every setpoint for a fixed 15 rounds. The
+# evidence says that is right once and wrong seven times: the σ swing at the
+# first setpoint was 1600–2800 %, at the second 57–1370 %, and at the third and
+# fourth 0.5–8.5 % and 0.8–3.1 % — flat to within the noise. Seven of the eight
+# setpoints were over-held, at 45 minutes each.
+#
+# So `rounds_per_setpoint` becomes a CEILING and the series stops when σ stops
+# moving. Everything below is pure: it takes a window of fits and returns a
+# verdict, with no clock, no store and no chamber, because the one decision that
+# must never be got wrong here is *which channels count as evidence* and that is
+# not a decision worth needing a rig to test.
+#
+# **The criterion is on σ only, never on the environment PV.** The chamber
+# demonstrably cannot reach 15 %RH at 65 or 85 °C — 4 of 16 approaches in the
+# production run hit the 30-minute timeout without reaching tolerance — so a rule
+# that waited for RH-in-band would never fire at precisely the setpoints where
+# the hold length matters most, and the run would degenerate to the ceiling
+# everywhere. σ is what the campaign configures a hold time from; σ is what is
+# graded. Do not "fix" this by adding a PV gate.
+
+#: The setpoint stopped because σ stopped moving.
+SETTLE_SETTLED = "settled"
+#: The setpoint ran out of rounds. The criterion *was* evaluable and said no.
+SETTLE_CEILING = "ceiling"
+#: The setpoint ran out of rounds and the criterion was **never evaluable** —
+#: too few channels ever carried usable evidence. Spelled apart from
+#: :data:`SETTLE_CEILING` because "σ was still moving" and "nothing here could
+#: tell us whether σ was moving" are different findings and only one of them is
+#: about the sample.
+SETTLE_NOT_EVALUABLE = "not_evaluable"
+#: The criterion was switched off; the setpoint ran exactly to the ceiling.
+SETTLE_DISABLED = "disabled"
+
+#: Must exceed the run's measured noise floor (median 5.98 % over 96 series) or
+#: the criterion can never be met. 10 % clears it with room for the 22 of 96
+#: series that scattered above 20 % to still fail honestly rather than silently.
+DEFAULT_SETTLE_TOL_REL = 0.10
+#: Consecutive rounds that must all sit inside the tolerance. Two rounds is a
+#: coincidence at this noise level; three is a claim.
+DEFAULT_SETTLE_N_ROUNDS = 3
+#: Below this many participating channels the window is not evidence, and the
+#: setpoint runs to its ceiling instead of "settling" on one channel's opinion.
+DEFAULT_SETTLE_MIN_CHANNELS = 3
+#: ~3 τ at the session's first setpoint (τ = 425–575 s measured, films drying
+#: from ambient to 15 %RH). The first setpoint carries essentially the whole
+#: transient, so it gets its own floor.
+DEFAULT_MIN_HOLD_FIRST_S = 1500.0
+#: Every later setpoint: the films are already dry and the swing is single-digit
+#: percent by 65 °C, but the chamber still has to re-establish RH.
+DEFAULT_MIN_HOLD_S = 600.0
+
+#: How close to the circuit model's own R₁ lower bound counts as *railed*. The
+#: bounded least-squares path lands on the bound to within its own step size
+#: rather than exactly on it, so an equality test would miss most railed fits.
+RAILED_R1_TOL_REL = 1e-3
+
+#: Why a channel was left out of a settle window.
+EXCLUDED_ABSENT = "absent"
+EXCLUDED_SIGMA_NULL = "sigma_null"
+EXCLUDED_RAILED = "railed_R1"
+EXCLUDED_ZERO_MEAN = "zero_mean"
+
+
+@dataclass(frozen=True)
+class RoundFit:
+    """One channel's fit from one round — the two numbers the criterion reads.
+
+    ``sigma`` is ``None`` whenever the circuit fit produced no conductivity, and
+    ``r1_ohms`` is carried beside it because a *successful* fit that railed at the
+    model's R₁ bound reports a σ that is a bound artefact, not a measurement.
+    """
+
+    channel: int
+    sigma: float | None = None
+    r1_ohms: float | None = None
+
+
+@dataclass
+class SettleCheck:
+    """The verdict on one window of rounds.
+
+    ``evaluable`` and ``settled`` are separate on purpose. A window that could not
+    be judged is not a window that said "no": the first must run to the ceiling
+    and say why, the second is an ordinary not-yet.
+    """
+
+    evaluable: bool
+    settled: bool
+    participating: list[int] = field(default_factory=list)
+    excluded: dict[int, str] = field(default_factory=dict)
+    max_deviation_rel: float | None = None
+    n_rounds: int = 0
+    reason: str = ""
+
+
+def r1_lower_bound_ohms(circuit_model: str) -> float | None:
+    """The R₁ lower bound *this* circuit model fits against, or ``None``.
+
+    Read off :data:`~softae.analysis.circuit_fitting.CIRCUIT_MODELS` rather than
+    written down here, because a bound restated in a second place is a bound that
+    will disagree with the fitter after the first edit. ``z_indices`` already
+    names which parameter is R₁ (``[R0_index, R1_index]``), so the bound is
+    ``bounds[0][z_indices[1]]`` and nothing about the parameter ordering is
+    assumed twice.
+
+    ``None`` for a model that declares no bounds — then no fit can be *railed*
+    and the participation rule falls back to σ alone, which it says so in the
+    exclusion reasons rather than pretending it checked.
+    """
+    try:
+        from softae.analysis.circuit_fitting import CIRCUIT_MODELS
+
+        spec = CIRCUIT_MODELS[str(circuit_model)]
+        lower, _upper = spec["bounds"]
+        bound = float(lower[spec["z_indices"][1]])
+    except (ImportError, KeyError, TypeError, IndexError, ValueError):
+        return None
+    return bound if np.isfinite(bound) and bound > 0 else None
+
+
+def is_railed(r1_ohms: Any, bound_ohms: float | None) -> bool:
+    """Did this fit come to rest on the model's R₁ floor rather than on the data?
+
+    325 of 1440 fits in the production run (23 %) sat at R₁ = 100 Ω, the
+    ``simpleSalt`` lower bound, and every one of them reported ``success = 1``
+    with σ = 0.5 S/cm. A railed channel therefore returns *the same number every
+    round*, and a constant is trivially "settled" — which is exactly how a board
+    with four dead channels would declare equilibrium on round three and
+    under-condition the whole run.
+    """
+    if bound_ohms is None or r1_ohms is None:
+        return False
+    try:
+        r1 = float(r1_ohms)
+    except (TypeError, ValueError):
+        return False
+    if not np.isfinite(r1):
+        return False
+    return r1 <= float(bound_ohms) * (1.0 + RAILED_R1_TOL_REL)
+
+
+def _window_series(window: Sequence[Sequence[RoundFit]]) -> dict[int, list[RoundFit]]:
+    """Channel → its fit in each round, with a placeholder for the rounds it missed."""
+    channels = sorted({int(fit.channel) for rounds in window for fit in rounds})
+    out: dict[int, list[RoundFit]] = {ch: [] for ch in channels}
+    for rounds in window:
+        by_channel = {int(fit.channel): fit for fit in rounds}
+        for channel in channels:
+            out[channel].append(by_channel.get(channel, RoundFit(channel=channel)))
+    return out
+
+
+def _exclusion(fits: Sequence[RoundFit], bound_ohms: float | None) -> str:
+    """Why this channel cannot carry the window, or ``""`` if it can.
+
+    Order matters: a channel absent from a round is reported as absent rather
+    than as a NULL σ, because those send an operator to different places (a step
+    that never completed vs. a fit that failed).
+    """
+    for fit in fits:
+        if fit.sigma is None and fit.r1_ohms is None:
+            return EXCLUDED_ABSENT
+        if fit.sigma is None or not np.isfinite(float(fit.sigma)):
+            return EXCLUDED_SIGMA_NULL
+        if is_railed(fit.r1_ohms, bound_ohms):
+            return EXCLUDED_RAILED
+    mean = float(np.mean([float(fit.sigma) for fit in fits]))  # type: ignore[arg-type]
+    if not np.isfinite(mean) or mean == 0.0:
+        return EXCLUDED_ZERO_MEAN
+    return ""
+
+
+def settle_check(
+    window: Sequence[Sequence[RoundFit]],
+    *,
+    tol_rel: float = DEFAULT_SETTLE_TOL_REL,
+    min_channels: int = DEFAULT_SETTLE_MIN_CHANNELS,
+    r1_bound_ohms: float | None = None,
+) -> SettleCheck:
+    """Has σ stopped moving across *window*? Pure, and it never guesses.
+
+    Settled means: for every **participating** channel, every σ in the window
+    lies within *tol_rel* of that channel's mean over the window.
+
+    Participation excludes any channel that is absent from a round, has a NULL or
+    non-finite σ in a round, or whose R₁ sits on the model's bound in a round.
+    Those three are all the same failure wearing different clothes — a series
+    that is constant because nothing measured it — and the whole reason this
+    function exists is that a constant passes a stability test perfectly.
+
+    Fewer than *min_channels* participants is **not** a "no": it is
+    ``evaluable=False``, and the caller must run to its ceiling rather than treat
+    an absence of evidence as evidence of settling.
+    """
+    rounds = [list(r) for r in window]
+    if not rounds:
+        return SettleCheck(evaluable=False, settled=False, reason="no rounds yet")
+
+    by_channel = _window_series(rounds)
+    excluded = {ch: why for ch, fits in by_channel.items()
+                if (why := _exclusion(fits, r1_bound_ohms))}
+    participating = sorted(ch for ch in by_channel if ch not in excluded)
+    needed = max(1, int(min_channels))
+    if len(participating) < needed:
+        return SettleCheck(
+            evaluable=False, settled=False, participating=participating,
+            excluded=excluded, n_rounds=len(rounds),
+            reason=(f"{len(participating)} participating channel(s) < {needed} "
+                    f"required; the criterion cannot be evaluated"))
+
+    worst = 0.0
+    for channel in participating:
+        sigmas = [float(fit.sigma) for fit in by_channel[channel]]  # type: ignore[arg-type]
+        mean = float(np.mean(sigmas))
+        worst = max(worst, max(abs(s - mean) for s in sigmas) / abs(mean))
+    settled = bool(worst <= float(tol_rel))
+    verb = "within" if settled else "outside"
+    return SettleCheck(
+        evaluable=True, settled=settled, participating=participating,
+        excluded=excluded, max_deviation_rel=worst, n_rounds=len(rounds),
+        reason=(f"{len(rounds)} rounds, {len(participating)} channel(s): worst "
+                f"deviation {worst * 100:.2f}% is {verb} {float(tol_rel) * 100:.2f}%"))
+
+
+def window_noise_floor(
+    window: Sequence[Sequence[RoundFit]], participating: Sequence[int],
+) -> float | None:
+    """Median relative scatter of the participating channels over *window*.
+
+    The same quantity :func:`noise_floor` measures, taken over the window the
+    criterion is actually judging rather than over a settled tail chosen later.
+    Median across channels so one noisy channel does not decide whether the whole
+    setpoint's tolerance was achievable.
+    """
+    by_channel = _window_series([list(r) for r in window])
+    floors = []
+    for channel in participating:
+        fits = by_channel.get(int(channel)) or []
+        sigmas = [fit.sigma for fit in fits if fit.sigma is not None]
+        floor = noise_floor(sigmas, n_settle=len(sigmas))
+        if floor is not None:
+            floors.append(floor)
+    return float(np.median(floors)) if floors else None
+
+
+class SettleTracker:
+    """Accumulates a setpoint's rounds and answers "may this setpoint stop?".
+
+    Deliberately holds no clock and no store: the caller owns the floor and the
+    ceiling, because those are time and this is evidence. Testable end-to-end by
+    feeding it lists of :class:`RoundFit`.
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        tol_rel: float = DEFAULT_SETTLE_TOL_REL,
+        n_rounds: int = DEFAULT_SETTLE_N_ROUNDS,
+        min_channels: int = DEFAULT_SETTLE_MIN_CHANNELS,
+        r1_bound_ohms: float | None = None,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.tol_rel = float(tol_rel)
+        self.n_rounds = max(2, int(n_rounds))
+        self.min_channels = max(1, int(min_channels))
+        self.r1_bound_ohms = r1_bound_ohms
+        self.rounds: list[list[RoundFit]] = []
+        self.last: SettleCheck | None = None
+        #: Was the criterion ever evaluable at this setpoint? The difference
+        #: between CEILING and NOT_EVALUABLE, and it must survive a later window
+        #: that happened to lose a channel.
+        self.ever_evaluable = False
+
+    def observe(self, fits: Sequence[RoundFit]) -> SettleCheck | None:
+        """Record one round; return the verdict on the trailing window, if any."""
+        self.rounds.append(list(fits))
+        self.last = None
+        if not self.enabled or len(self.rounds) < self.n_rounds:
+            return None
+        self.last = settle_check(
+            self.rounds[-self.n_rounds:], tol_rel=self.tol_rel,
+            min_channels=self.min_channels, r1_bound_ohms=self.r1_bound_ohms)
+        self.ever_evaluable = self.ever_evaluable or self.last.evaluable
+        return self.last
+
+    @property
+    def settled(self) -> bool:
+        return bool(self.enabled and self.last is not None and self.last.settled)
+
+    @property
+    def participating(self) -> list[int]:
+        return list(self.last.participating) if self.last is not None else []
+
+    def outcome(self, *, stopped_early: bool) -> str:
+        """:data:`SETTLE_SETTLED` / ``CEILING`` / ``NOT_EVALUABLE`` / ``DISABLED``."""
+        if not self.enabled:
+            return SETTLE_DISABLED
+        if stopped_early:
+            return SETTLE_SETTLED
+        return SETTLE_CEILING if self.ever_evaluable else SETTLE_NOT_EVALUABLE
+
+    def endorsement(self) -> tuple[bool | None, str, float | None]:
+        """Could the configured tolerance be met **at all**, on this run's own noise?
+
+        One rule, :func:`endorse_tolerance`, applied to the noise floor this
+        setpoint measured. A tolerance below the floor cannot be satisfied by any
+        number of rounds, so the honest thing is to say it once and let the
+        ceiling do its job rather than to widen the tolerance behind the operator.
+
+        ``(None, …)`` when there is nothing to judge — never ``True``.
+        """
+        if not self.enabled or self.last is None or not self.last.participating:
+            return None, "not evaluated: no participating channels", None
+        floor = window_noise_floor(self.rounds[-self.n_rounds:],
+                                   self.last.participating)
+        ok, why = endorse_tolerance(self.tol_rel, floor)
+        return ok, why, floor
+
+
+#: This round's fits, keyed the way :func:`load_sigma_series` keys the whole run —
+#: on the stem of ``measurements.eis_file_path``, which the router derives from
+#: the step name. Restricted to the run, because a step name repeats across runs.
+_ROUND_FITS_SQL = """
+SELECT m.channel, m.eis_file_path, f.sigma_S_per_cm, f.R1
+FROM measurements m
+LEFT JOIN fit_results f ON f.measurement_id = m.measurement_id
+WHERE m.run_id = ?
+ORDER BY m.measurement_id
+"""
+
+
+def load_round_fits(
+    store: Any, run_id: str, step_names: dict[int, str],
+) -> list[RoundFit]:
+    """σ and R₁ for one round, read back mid-run so the series can decide to stop.
+
+    Returns **one entry per requested channel**, always. A channel whose step did
+    not complete, or whose fit produced no row, comes back as an all-``None``
+    :class:`RoundFit` rather than being dropped — a shorter list would read to
+    :func:`settle_check` as a smaller board rather than as missing evidence.
+    """
+    wanted = {f"{name}_ch{int(channel)}": int(channel)
+              for channel, name in step_names.items()}
+    found: dict[int, RoundFit] = {}
+    for channel, path, sigma, r1 in store._conn.execute(
+            _ROUND_FITS_SQL, (str(run_id),)).fetchall():
+        stem = str(path or "").replace("\\", "/").rsplit("/", 1)[-1]
+        if stem.endswith(".txt"):
+            stem = stem[:-4]
+        if stem not in wanted:
+            continue
+        found[int(channel)] = RoundFit(
+            channel=int(channel),
+            sigma=None if sigma is None else float(sigma),
+            r1_ohms=None if r1 is None else float(r1))
+    return [found.get(int(ch), RoundFit(channel=int(ch)))
+            for ch in sorted(step_names)]

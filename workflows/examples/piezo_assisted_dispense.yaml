@@ -1,0 +1,66 @@
+# Piezo-assisted dispense example
+#
+# Demonstrates optional piezo profile apply plus channel A on/off around
+# each liquid-handling dispense step.
+#
+# Run in mock mode:
+#   softae-run workflows/examples/piezo_assisted_dispense.yaml --mock -v
+
+name: piezo_assisted_dispense
+description: >
+  Apply piezo profile, toggle channel A around per-channel dispenses,
+  and return piezo to standby.
+
+variables:
+  channels: [1, 2, 3]
+  dispense_rate: 75
+  dispense_vol: 21
+  reservoir_mL: 1000
+  piezo_frequency_hz: 800
+  piezo_on_s: 1.200
+  piezo_rest_s: 2.400
+
+metadata:
+  example: true
+  feature: piezo_liquid_event
+
+setup:
+  - name: piezo_apply_profile
+    instrument: piezo
+    method: apply_profile
+    params:
+      frequency_hz: "$piezo_frequency_hz"
+      on_s: "$piezo_on_s"
+      rest_s: "$piezo_rest_s"
+
+loop:
+  iterate_over: channels
+  steps:
+    - name: piezo_on
+      instrument: piezo
+      method: set_channel
+      params:
+        channel: A
+        enabled: true
+
+    - name: dispense_liquid
+      instrument: syringe
+      method: single_pump
+      params:
+        res_vol: "$reservoir_mL"
+        ID: 0
+        rate: "$dispense_rate"
+        dispense_vol: "$dispense_vol"
+
+    - name: piezo_off
+      instrument: piezo
+      method: set_channel
+      params:
+        channel: A
+        enabled: false
+
+teardown:
+  - name: piezo_standby
+    instrument: piezo
+    method: standby
+    params: {}

@@ -1,0 +1,68 @@
+# Single Drop and Measure — deposit one formulation and run EIS
+#
+# A minimal workflow for quick manual experiments: flush, deposit a
+# single drop on one channel, run an EIS measurement, then cool down.
+
+name: single_drop_and_measure
+description: >
+  Deposit a single formulation drop on one PCB channel, run an EIS
+  measurement, and return the stage to a safe temperature.
+
+variables:
+  pump_id: 0
+  dispense_rate: 75
+  dispense_vol: 21
+  eis_preset: Quick
+  channel: 0
+  stage_temp: 25
+
+setup:
+  - name: set_temperature
+    instrument: temp_controller
+    method: write_sp
+    params:
+      val: "$stage_temp"
+      print_flag: 0
+
+  - name: wait_for_temp
+    instrument: temp_controller
+    method: wait
+    params:
+      target: "$stage_temp"
+      tolerance: 0.5
+    timeout_s: 120
+
+  - name: startup_flush
+    instrument: syringe
+    method: single_pump
+    params:
+      pump_ID: "$pump_id"
+      rate: 200
+      dispense_vol: 80
+
+  - name: deposit
+    instrument: syringe
+    method: single_pump
+    params:
+      pump_ID: "$pump_id"
+      rate: "$dispense_rate"
+      dispense_vol: "$dispense_vol"
+    timeout_s: 60
+
+  - name: measure_eis
+    instrument: pico1
+    method: sendscript_getdata
+    params:
+      script_path: scripts/eis_quick.mscr
+      output_path: data/eis_output
+      verbosity: 1
+    timeout_s: 300
+    retry: 1
+
+teardown:
+  - name: cool_stage
+    instrument: temp_controller
+    method: write_sp
+    params:
+      val: 10
+      print_flag: 0

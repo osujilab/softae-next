@@ -1,0 +1,69 @@
+site_name: SoftAE Documentation
+site_description: Soft-matter Autonomous Experimentation Platform
+repo_url: https://github.com/osujilab/softae-next
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: blue
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: blue
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - search.suggest
+    - content.code.copy
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            show_source: true
+            show_root_heading: true
+            members_order: source
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - toc:
+      permalink: true
+
+# Nav is limited to the version-controlled documentation surface:
+# USER_GUIDE.md, architecture.md and api/. Working documents (roadmaps,
+# progress logs, specs) stay local and are excluded via .gitignore.
+nav:
+  - User Guide: USER_GUIDE.md
+  - API Reference:
+    - Core:
+      - Formulation: api/core/formulation.md
+      - Deposition: api/core/deposition.md
+    - Server:
+      - Manager: api/server/manager.md
+      - Base Instrument: api/server/base_instrument.md
+    - Workflows:
+      - Model: api/workflows/workflow_model.md
+      - Parser: api/workflows/workflow_parser.md
+      - Executor: api/workflows/workflow_executor.md
+    - Analysis:
+      - EIS Data: api/analysis/eis_data.md
+      - Circuit Fitting: api/analysis/circuit_fitting.md
+    - Errors: api/errors.md
+  - Development:
+    - Architecture: architecture.md

@@ -1,0 +1,56 @@
+# NOTE: git has no trailing comments. A '#' only starts a comment at the
+# start of a line, so every comment here sits on its own line.
+
+# ─── Virtual environment ──────────────────────────────────────────────
+.venv/
+
+# ─── Python caches & tooling state ────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+
+# ─── Build artifacts ──────────────────────────────────────────────────
+*.egg-info/
+dist/
+build/
+*.so
+*.dll
+# mkdocs build output (`mkdocs build`)
+site/
+
+# ─── Per-machine editor / agent state ─────────────────────────────────
+# Local settings and agent memory; not portable between machines.
+.claude/
+.vscode/
+# assumes sibling folders (../educational_modules, ...) no clone reproduces
+softae-next.code-workspace
+
+# ─── Experimental data & run output ───────────────────────────────────
+# Real experimental results, instrument logs and plot dumps. These are
+# lab records, not source; they live in the DataStore, not in git.
+# catalogs (tasks.toml, recipes.toml) + chemicals/solutions CSVs
+data/
+# real experimental results DB at repo root
+softae_results.db
+# workflow run logs (*.jsonl)
+logs/
+# ms_plot_*.txt and other run dumps
+output/
+# data exports; no CSV outside data/ exists today
+*.csv
+
+# ─── Documentation: private by default ────────────────────────────────
+# Everything under docs/ is ignored, then the public surface is
+# re-included explicitly. New docs are therefore private unless someone
+# deliberately adds a negation below.
+#
+# This deliberately covers the live multi-session coordination transcript
+# `docs/SubAgent docs/SESSION_MAIL.md` and `docs/SubAgent docs/TASKS.md`,
+# which must NEVER be committed, along with all working specs, roadmaps
+# and progress logs.
+docs/*
+!docs/api/
+!docs/USER_GUIDE.md
+!docs/architecture.md

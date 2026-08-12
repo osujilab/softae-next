@@ -1,0 +1,779 @@
+# SoftAE default configuration
+# Copy this file and adjust values for your lab setup.
+
+[paths]
+thorlabs_dll = 'C:\Program Files\Thorlabs\Scientific Imaging\Scientific Camera Support\Scientific Camera Interfaces\SDK\Python Toolkit\dlls\64_lib'
+palmsens_sdk = ''
+data_root    = './data'
+
+# --- Project-scoped data directory ---
+[data]
+project_dir   = "~/softae_data"   # expands ~; overridable per-project
+db_filename   = "softae.db"       # SQLite file inside project_dir/db/
+auto_save_eis = true              # auto-save EIS data to project data dir
+
+[instruments.stage]
+driver   = "stage"
+port     = "ASRL7::INSTR"
+baud     = 921_600
+velocity = 10.0           # mm/s default
+x_min    = -100.0         # mm travel limit
+x_max    = 100.0
+y_min    = -50.0
+y_max    = 50.0
+# --- Comms / timeout tuning (ESP301 manual §3.1–3.2) ---
+visa_timeout_ms   = 8000      # PyVISA read timeout; was unset (~2000 default)
+write_termination = "\r"      # ESP301 commands terminate with CR (ASCII 13)
+read_termination  = "\r"      # robust for CR- or CRLF-terminated replies
+flow_control      = "none"    # set "rts_cts" for true RS-232C hardware handshake
+query_delay       = 0.0       # seconds between write and read on a query
+
+[instruments.syringe]
+driver       = "syringe"
+port         = "ASRL4::INSTR"
+baud         = 115_200
+diameter     = 14.4            # mm syringe inner diameter
+head_channel = "Dev1/port0/line0:7"
+max_rate     = 2120.0          # µL/min
+min_rate     = 0.05            # µL/min
+parallel_syringes = 2
+parallel_syringes_pump0 = 2
+parallel_syringes_pump1 = 1
+parallel_syringes_pump2 = 2
+
+[instruments.temp_controller]
+driver   = "temp_controller"
+port     = "com6"
+baud     = 115_200
+address  = 1
+reg_sp   = 0               # Novus setpoint register
+reg_pv   = 1               # Novus process-variable register
+max_temp = 200.0            # °C safety ceiling
+min_temp = 5.0              # °C safety floor
+
+[instruments.pico1]
+driver   = "espico"
+name     = "Pico1"
+port     = "COM9"  # auto-detect via PalmSens SDK
+
+[instruments.pico2]
+driver   = "espico"
+name     = "Pico2"
+port     = "COM5"
+
+[instruments.camera]
+driver   = "camera"
+exposure = 0.045           # seconds
+
+# ── DAC-switched loads (Adafruit MCP4728, I²C via MCP2221) ──────────────────
+# Each [instruments.<key>] with driver = "dac_switch" maps to one MCP4728
+# channel.  Add more sections here for future channel-B/C/D loads.
+# The "lamp" key is a convenience alias — the factory accepts both "lamp"
+# and "dac_switch" as driver values.
+
+[instruments.lamp]
+driver   = "dac_switch"
+channel  = "A"             # MCP4728 channel A–D
+address  = "0x60"          # MCP4728 I²C address (default)
+v_psu    = 5.0             # supply / full-scale voltage
+on_volt  = 0.0             # active-low relay: 0 V = ON
+off_volt = 5.0             # relay passive at full scale (5 V = OFF)
+
+[instruments.keithley]
+driver   = "keithley"
+address  = "USB0::0x05E6::0x6510::04614885::INSTR"
+nplc     = 1.0
+
+[instruments.ht_sensor]
+driver                 = "ht_sensor"
+env_var                = "BLINKA_MCP2221"  # must be set to "1"
+read_retries           = 3      # per-call retry attempts on transient I2C errors
+read_retry_delay_s     = 0.05   # seconds between retries
+reset_on_unrecoverable = true   # issue soft-reset on "Unrecoverable" errors
+
+[instruments.rh_controller]
+driver      = "rh_controller"
+trinket_port = "COM11"
+trinket_baud = 115_200
+pid_kp   = 0.007
+pid_ki   = 0.0015
+pid_kd   = 0.05
+max_consecutive_failures = 5   # sensor soft-reset threshold
+max_stale_s              = 30.0  # seconds before held last-good reading becomes NaN
+
+[instruments.piezo]
+driver  = "piezo"
+port    = "COM16"
+baud    = 115200
+enabled = true
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+# Set level to "DEBUG" to see all driver messages, "WARNING" to suppress info.
+[logging]
+level = "INFO"
+
+
+# --- USB Webcam ---
+# Set enabled = false if no USB webcam is attached.  On Windows, OpenCV's
+# CAP_DSHOW backend blocks 500 ms–3 s probing the device even when absent;
+# disabling avoids this startup delay.
+
+[webcam]
+enabled = true
+
+# --- Web visualizer ---
+
+[web]
+port = 8052   # Dash server port; change if 8050 is already in use
+
+[piezo]
+enabled = true
+channel      = "A"
+frequency_hz = 500
+sweep_on_s   = 2.0
+sweep_rest_s = 3.0
+
+[piezo.liquid_events]
+enabled = true
+settings_source = "liquid_event_profile"
+channel_a = true
+frequency_hz = 525
+sweep_on_s = 2.0
+sweep_rest_s = 3.0
+
+# --- PCB electrode configurations ---
+# spacing_mm = [step_x, step_y] is the centre-to-centre distance between
+# adjacent electrodes.  Electrode 1 is at the upper-left (most positive X, Y);
+# labels advance row-wise with X decreasing across a row and Y decreasing
+# across rows.
+
+# Board selected by default on GUI open and for headless campaigns. Its
+# electrode count also seeds the Live BO board-exchange capacity.
+default_pcb = "SoftAE_EIS_4Stripe"
+
+# The AUTHORITATIVE area a cast film covers on one electrode (P7.2) — the
+# denominator of every thickness number. Resolved most-specific-first:
+#
+#   1. deposit_area_mm2  — an explicit area, for a wetted region that is neither
+#                          the well nor the electrode rectangle (a hydrophobic
+#                          mask, or an observed spread that does not fill it).
+#   2. well_diameter_mm  — the circular well that confines the cast. THIS IS THE
+#                          NORMAL ONE: it is what a drop actually covers.
+#   3. electrode_L_cm x electrode_w_cm x 100 — a weak fallback, kept only so a
+#                          board declaring nothing behaves as it always has.
+#
+# Tier 3 deserves suspicion. Those two keys are the electrode GAP and the stripe
+# LENGTH (see [eis.cell]) — conduction geometry, not a wetted footprint — so
+# their product is the inter-electrode rectangle and has no reason to equal the
+# area a drop covers. On the 4-stripe board that is 4.0 mm2 against the well's
+# 18.7 mm2: a factor of 4.7 in every thickness derived from it. Measure the well
+# and declare `well_diameter_mm` on any board you cast to.
+#
+# Thickness is unavailable, never guessed, if a board declares none of the three.
+[pcb.SoftAE_IDE_EIS]
+channels        = 16
+grid            = [4, 4]
+spacing_mm      = [15, 15]     # 15 mm between adjacent electrodes
+electrode_L_cm  = 0.2
+electrode_w_cm  = 0.2
+well_capacity_uL = 50          # per-electrode max eluted volume (elution budget)
+cast_confinement = "sessile"   # NO WELLS on this board — cast as free droplets on
+                               # a flat surface. The wetted area is then set by
+                               # volume and contact angle, which is an OBSERVATION,
+                               # not a geometry: nothing on the board predicts it.
+                               # So thickness is UNAVAILABLE here until someone
+                               # measures a footprint and sets deposit_area_mm2
+                               # below. The old gap x stripe fallback (4.0 mm2)
+                               # described the space between two stripes and had no
+                               # relationship to where a droplet actually sat.
+# deposit_area_mm2 =           # set from a MEASURED droplet footprint to re-enable
+                               # thickness on this board. Note it is volume-
+                               # dependent, so one number is only valid over the
+                               # narrow range of dispense volumes it was measured at.
+
+[pcb.SoftAE_EIS_4Stripe]
+channels        = 32
+grid            = [8, 4]
+spacing_mm      = [10, 10]     # 10 mm between adjacent electrodes
+electrode_L_cm  = 0.2
+electrode_w_cm  = 0.2
+cast_confinement = "well"      # wells are built up and glued ABOVE the board, so
+                               # their depth is not a board property — it is the
+                               # wall stack, measured on-site.
+well_diameter_mm = 4.88        # measured -> 18.7038 mm2 of deposit area (pi d^2/4).
+well_depth_mm    = 6.35        # measured -> 118.769 uL VOID volume (area x depth).
+
+# Bead height the brim may carry ABOVE a full well, in mm. PTFE walls pin the
+# contact line at the sharp brim edge, so the apparent angle grows past the
+# material's intrinsic ~110 deg and fluid stands proud of the rim instead of
+# spilling. That head is real capacity; treating it as overflow needlessly
+# narrows which formulations this board can take.
+#
+# Three bands follow from it (core/geometry.classify_fill):
+#   <= void            -> fits
+#   void .. permitted  -> ABOVE BRIM, warn — castable, but the well itself is full
+#   > permitted        -> STOP
+#
+# Bead volumes for this well (r = 2.44 mm), V = pi h (3 r^2 + h^2) / 6:
+#   h = 0.25 mm ->   2.35 uL  (total 121.1,  +2.0 %)
+#   h = 0.50 mm ->   4.74 uL  (total 123.5,  +4.0 %)
+#   h = 1.00 mm ->   9.88 uL  (total 128.6,  +8.3 %)
+#   h = 1.50 mm ->  15.79 uL  (total 134.6, +13.3 %)
+#   h = 2.44 mm ->  30.42 uL  (total 149.2, +25.6 %)  <- HEMISPHERE, the geometric
+#                                                        ceiling. A real bead depins
+#                                                        and spills well before it;
+#                                                        it is a bound, not a target.
+#
+# Default is 0.0 — the brim is the limit, i.e. exactly what this board did before
+# the key existed. Raise it deliberately, and remember it also has to survive stage
+# motion and the dispenser's approach, neither of which this number knows about.
+permitted_overfill_mm = 0.0
+
+# well_capacity_uL             # DERIVED: void + the permitted bead. It was
+                               # hand-typed as 120, which OVERDECLARED the void by
+                               # 1.23 uL (1.04 %) — an overflow guard permitting
+                               # more than the walls hold. Set this key explicitly
+                               # only to impose a deliberate working margin; it
+                               # still wins when present.
+                               #
+                               # The two measurements also cross-check the area:
+                               # back-solving depth from the old 120 uL gives
+                               # 6.416 mm against the measured 6.35 (1 % apart),
+                               # whereas the retired 4.0 mm2 rectangle would have
+                               # required a 30 mm deep well.
+
+# --- Deposition twin (core/deposition.py) ---
+
+# Fraction of the carrier assumed to evaporate after a cast. 100 % is the
+# deliberate default: it makes DRY thickness deterministic without a per-solvent
+# volatility model, which is what lets a dry-basis ThicknessTarget reduce exactly
+# to a deposited-volume target. Lower it only alongside a real solvent model —
+# a half-modelled evaporation is worse than a stated assumption.
+[deposition]
+evaporation_pct = 100.0
+
+# Fallback bead height above the brim (mm) for boards that declare none of their
+# own. 0.0 keeps the brim as the limit. A board's own `permitted_overfill_mm`
+# always wins, because how much a bead can stand proud is a property of the wall
+# material — which is per-board, not per-rig.
+permitted_overfill_mm = 0.0
+
+# --- EIS measurement presets ---
+
+[eis_presets.Standard]
+npts   = 35
+f_hi   = 200_000
+f_lo_mHz = 4_000
+mv_ac  = 10
+
+[eis_presets.Quick]
+npts   = 25
+f_hi   = 200_000
+f_lo_mHz = 20_000
+mv_ac  = 10
+
+[eis_presets.Extended]
+npts   = 45
+f_hi   = 200_000
+f_lo_mHz = 1_200
+mv_ac  = 10
+
+[eis_presets.Longest]
+npts   = 35
+f_hi   = 200_000
+f_lo_mHz = 200
+mv_ac  = 10
+
+# --- Channel-to-Pico routing ---
+
+[channel_routing]
+pico1_range = [1, 16]     # 1-based channel numbers routed to pico1
+pico2_range = [17, 32]    # 1-based channel numbers routed to pico2
+
+# --- Safety limits ---
+
+[safety]
+# Rig-wide temperature-setpoint limits. Combined with the per-instrument
+# `max_temp`/`min_temp` under [instruments.temp_controller] by taking the NARROWER
+# window — highest floor, lowest ceiling — so either source can tighten the limit
+# and neither can loosen it. A controller rated to 150 C stays capped at 150 even
+# with the 200 below.
+#
+# Until 2026-08-05 nothing read this pair, and because it held values identical to
+# the instrument's the disconnection had no visible symptom: lowering temp_max_C
+# read as capping the heater and did nothing. It now bites.
+temp_max_C     = 200.0
+temp_min_C     = 5.0
+pump_rate_max  = 2120.0     # µL/min for 14.4 mm syringe
+pump_rate_min  = 0.05
+# Stock interlock (core/reservoir.py).  Soft warn raises an alert and keeps
+# running; hard stop refuses the dispense, because running a syringe dry drives
+# the plunger into its mechanical stop.  Levels themselves are declared by the
+# operator via Refill — never from single_pump's res_vol, which is only the
+# syringe volume declared to the pump firmware.
+reservoir_soft_warn_uL = 1000.0
+reservoir_hard_stop_uL = 250.0
+
+# Stage travel limits and the per-step ceiling (core/dropcast.py,
+# workflows/workflow_executor.py). These lived under [quality] until 2026-08-04,
+# where nothing read them — `safety()` is the single parse point, so the code
+# defaults applied instead. The values below are those same defaults, so moving
+# them here changes no behaviour; it makes editing them work.
+# Ceiling for a step that declares no `timeout_s` of its own. A step with no
+# timeout runs forever, which an unattended campaign cannot absorb: it is
+# indistinguishable from a hung instrument and no gate fires. Steps that
+# legitimately run for hours already declare their own (the anneal hold does),
+# so this only reaches steps nobody bounded. Set 0 for unbounded.
+step_timeout_s = 900
+stage_x_min_mm = -100.0
+stage_x_max_mm = 100.0
+stage_y_min_mm = -50.0
+stage_y_max_mm = 50.0
+
+# Anneal hold watchdog (drivers/contracts.monitored_hold). Soft-material anneals
+# run for hours; an unwatched hold turns a drifting or dead heater into a
+# wrongly-annealed sample that is then measured and recorded as valid. Deviation
+# beyond the warn band is reported; beyond the fault band *continuously* for the
+# grace period aborts the hold (a momentary excursion resets the timer).
+# Operator-measured 2026-07-31: normal PV ripple is within 1 C. Bands set from
+# that rather than from the original engineering guess (3/10 C), where a heater
+# 9 C off target would never have faulted. 2 C warn = twice normal ripple;
+# 5 C fault = five times it, still far outside anything a healthy hold produces.
+#
+# These keys sat under [purge] until 2026-08-04, where `anneal_watchdog_config`
+# never saw them — so the effective bands were still the rejected 3/10 C guess.
+# Moving them here is what finally applies the measured tuning.
+anneal_deviation_warn_C  = 2.0
+anneal_deviation_fault_C = 5.0
+anneal_deviation_grace_s = 120.0
+anneal_poll_interval_s   = 30.0
+
+# --- Anti-clog purge (core/purge.py) ---
+
+# A syringe line carrying a particulate stock has a check valve that clogs when
+# the stock sits stagnant — observable on a ~10-minute timescale. Being mid-run
+# is not protection: a campaign can go many trials without drawing meaningfully
+# from that stock.
+#
+# `interval_s` is a FLOOR, not a deadline: during a run the purge is queued to
+# the next safe boundary (an anneal/measure interim, or alongside a precondition
+# flush) rather than interrupting a cast.
+#
+# `particulate_pumps` marks which lines carry particulates and therefore get the
+# larger volume. All channels purge together so the lines that are not purging
+# do not become the new stagnation site.
+[purge]
+# `enabled` = the schedule is live and its consumption counts toward the stock
+# and waste runway. `actuate` = fluid actually moves.
+#
+# These are separate on purpose, and `actuate` ships OFF. Purging is the only
+# mechanism in the system that moves hardware with nobody asking it to, so it
+# stays inert until someone turns it on at the bench. With enabled = true and
+# actuate = false, the schedule runs and logs each due purge as a dry run while
+# the projection still bills the consumption — so the runway is not flattered by
+# the fact that nothing is dispensing yet.
+enabled           = true
+actuate           = false
+interval_s        = 900.0    # 15 min
+particulate_uL    = 20.0     # per purge, on a particulate line
+other_uL          = 10.0     # per purge, on every other line
+# Operator-confirmed 2026-08-02: pump 1 carries the particulate stock.
+#
+# This matters more than it looks. `precondition_flush` pushes a fixed 30 µL
+# rinsing-agent plug from `plug_ids` (default 0 and 2) on every channel, so
+# those two lines are credited as "moved" regardless of what the optimizer
+# suggested. Pump 1 is NOT in `plug_ids`, so it moves only when its own
+# component is non-zero — which is exactly why a BO trial that zeroes the
+# particulate component leaves this line stagnating and needing a purge.
+#
+# If `plug_ids` is ever retuned, re-check this: a particulate line that is also
+# a plug line would be credited every flush and would essentially never come due.
+particulate_pumps = [1]
+pumps             = [0, 1, 2]
+
+# Waste container (core/consumables.py). Leave `waste_capacity_uL` unset to
+# track the level without enforcing it — undeclared is *unknown*, never full.
+# Once anti-clog purging (P8) is running this fills on a schedule rather than
+# per-trial, which makes it a wall-clock limit on unattended time.
+# waste_capacity_uL  = 50000.0
+waste_warn_fraction = 0.8
+
+# --- Optimizer proposal selection (T1.3; reachable since T3.1) ---
+#
+# Both knobs existed on BayesianOptimizer and nothing carried a value to them —
+# the constructor defaults were the only settings that could ever apply. These
+# keys are the SITE default; a campaign spec's field of the same name overrides
+# it per campaign, and `build_optimizer` is the one place either is read.
+#
+# Defaults preserve today's behaviour exactly: a strict argmax that draws
+# nothing from the RNG, so resume behaviour is unchanged while both are off.
+[optimizer]
+# Relative tolerance on the acquisition argmax. 0.0 = strict argmax, bit-for-bit
+# as before. Above 0, the proposal is drawn uniformly (from the optimizer's own
+# checkpointed RNG, so it stays resume-safe) among all candidates within `rtol`
+# of the best — this guards flat/degenerate acquisition surfaces, where a strict
+# argmax just returns whichever index numpy happened to see first.
+decision_rtol = 0.0
+# Normalized-space exclusion radius around already-measured points. Commented
+# out = off, which is the shipped behaviour. When set, candidates closer than
+# this to any measured point are excluded from the argmax, preventing
+# near-duplicate re-requests. If EVERY candidate is excluded the unexcluded
+# argmax is used and a warning logged, rather than failing the campaign.
+# exclusion_radius = 0.05
+
+# --- Failure-informed feasibility (T3.1) ---
+#
+# A second, CLASSIFICATION surrogate fit on pass/fail labels, which softens the
+# acquisition while the regression GP continues to see only real measurements.
+# Nothing about the NULL-objective discipline changes: `unmeasured` is still not
+# `infeasible`, and the infeasible class stays a strict subset of the NULL rows.
+#
+# `enabled = false` is the shipped state and the feature NEVER turns itself on,
+# not even after N failures — same posture as [quality] enabled and [purge]
+# actuate. Off means no classifier is constructed, no label is read, and the
+# proposal stream is bit-identical to a build without this feature.
+[feasibility]
+enabled = false
+# "fwa" (acquisition x p_feas) is the only implemented strategy. "fia" is
+# DEFERRED behind a named trigger (>= 100 labelled trials under one parameter
+# space) and "fca" is REJECTED — softae scores a random candidate pool and takes
+# an argmax, so there is no constrained acquisition optimizer to hand a
+# constraint to. Naming either raises rather than silently running "fwa": a
+# deferred strategy must not be a synonym for the one that shipped.
+strategy = "fwa"
+# Cap the reward side of p_feas so a confidently-safe point earns no bonus over
+# a merely-probably-safe one, and the weight acts purely as a penalty. The
+# clamp's VALUE is never set here — it is derived as 0.05^(1/min_infeasible), so
+# the threshold for acting tracks the evidence the campaign actually has
+# (3 -> 0.368, 5 -> 0.549, which recovers ATLAS's hardcoded 0.5 as a special case).
+min_filter = true
+# Minimum labels of each class before the classifier is allowed to move
+# anything. Below either floor, p_feas is 1.0 everywhere and scores are
+# untouched — a 2-point classifier is noise dressed as knowledge.
+#
+# TUNABLE UPWARD ONLY. A campaign entering a known-hostile region may demand
+# more evidence; nothing may lower these. Below 3 the derived clamp exceeds 0.63
+# and the weight would start penalising points the classifier considers MORE
+# likely feasible than not, so a value under 3 is refused with an error naming
+# the floor — the mechanism would otherwise invert its own meaning.
+min_infeasible = 3
+min_feasible = 3
+
+# --- Measurement quality gate (P4) ---
+
+# Decides whether a measurement is trustworthy enough to steer the optimizer.
+# A rejected measurement is reported as *unmeasured* — the well is still
+# recorded as cast, but nothing is told to the optimizer, reusing the same path
+# a missing measurement already takes.
+#
+# `enabled = false` runs every check and logs what it *would* have rejected
+# without acting on it — use that to observe the gate against real data before
+# giving it authority over a campaign.
+[quality]
+enabled          = false
+min_r_squared    = 0.95    # below this, the fit does not describe the data
+max_residual_pct = 15.0    # RMS residual ceiling (%)
+min_points       = 8       # too few points to support a 5-parameter fit
+min_abs_z        = 1e-3    # |Z| at/below this = shorted or dead channel
+# Note this ceiling answers "is this an open circuit?" and is deliberately NOT
+# the same number as [eis.instrument] z_max_ohm ("is this reproducible?") or
+# z_phi_ohm ("is the phase here trustworthy?"). Three questions, three numbers.
+max_abs_z        = 1e12    # |Z| at/above this = open circuit
+
+# --- EIS analysis engine (E0; docs/EIS_GATE_FRAMEWORK.md) ---
+#
+# Two engines run side by side. "legacy" is what the rig has always done: fit
+# R0-CPE0-p(R1,C0), take R1, divide. "gated" adds admission gates, a per-sample
+# cell constant, and upper bounds where the measurement is resolution-limited.
+#
+# `engine` and `gates.enabled` are deliberately separate, the same two-flag
+# design [purge] uses: engine = "gated" with gates.enabled = false runs every
+# check and logs every verdict while removing nothing. Observe the would-reject
+# log across a campaign before giving these thresholds authority over data —
+# that is the P4 lesson, applied to a strictly larger gate.
+[eis]
+engine = "legacy"          # "legacy" | "gated"
+
+# What a campaign optimises against. Separate from `engine` on purpose, but NOT
+# in the way this comment used to claim. It said the sigma extractor "forces the
+# gated physics internally"; that was retired by T2.6b (2026-08-09), which made
+# the campaign objective call `analyze_spectrum` with the engine left unset like
+# every other fit site. So today: `engine` chooses WHICH PHYSICS computes sigma —
+# for the objective, the analysis tab and the auto-route alike, one sigma
+# everywhere, resolved in `analyze_spectrum` alone — and `objective` chooses
+# WHICH METRIC a campaign is scored on. Two keys, one sigma.
+#
+# The two campaign MODES want different objectives, and neither is a degraded
+# version of the other:
+#
+#   composition mode  the spec carries a formulation, so the twin knows what was
+#                     cast and can predict a thickness -> CONDUCTIVITY, maximised.
+#   volume mode       the spec explores raw pump volumes. Exploration is easier and
+#                     feasibility is native (a volume limit is just a bound), with
+#                     composition resolved post hoc. Without stock identity there is
+#                     no elution and hence no dry thickness, so sigma is impossible
+#                     rather than missing -> MEAN |Z|, minimised.
+#
+#   "auto"       follow the mode (default).
+#   "sigma"      force conductivity; a campaign that cannot deliver it is refused.
+#   "mean_abs_z" force impedance.
+#
+# A pinned value is never silently swapped: the two are optimised in OPPOSITE
+# directions, so switching one for the other would invert the search. For the same
+# reason CampaignSpec.objective defaults to "auto" and the direction is derived —
+# maximise conductivity, minimise impedance, same goal expressed two ways.
+objective = "auto"         # "auto" | "sigma" | "mean_abs_z"
+
+[eis.gates]
+enabled             = false
+# Every threshold below is an engineering default from the specification, chosen
+# without reference to this rig's spectra. None is calibrated yet.
+tand_slope_max      = -0.3   # d log tanδ/d log f; positive => series parasitic
+cap_flatness_max    = 0.15   # |d log C_app/d log f| before "dispersive"
+kk_resid_pct        = 1.0    # Lin-KK residual ceiling (E4)
+kk_c                = 0.85   # mu-criterion target for ladder order (Schoenleber)
+kk_max_M            = 50     # runtime bound; the mu criterion normally stops first
+# Largest fraction of the band the low-f K-K truncation may remove before the
+# spectrum is REJECTED instead of cut. The ladder fit is global, so a drift in the
+# few lowest-frequency points shifts the whole fit and makes almost every point
+# "fail" - measured: perturbing 5 of 41 points drove 40 past a 1% residual.
+# Unbounded truncation would delete the spectrum while reporting it had tidied a
+# tail. Section 3.6 licenses cutting only because R_bulk does not live at low f;
+# once the failing run reaches that far up the band, that premise is gone.
+kk_max_truncate_frac = 0.5
+plateau_tol_pct     = 10.0   # how close Re Z must sit to the plateau median
+min_fit_pts         = 8      # below this a spectrum cannot support a fit
+max_rel_se          = 0.10   # parameter relative standard error (E1)
+rho_degenerate      = -0.95  # below this, report R_series+R_bulk, not the split
+bound_tol           = 1e-3   # fractional distance to a bound counted as pegged
+plateau_min_decades = 0.5    # narrower than this and R_bulk is extrapolated
+tand_headroom_mult  = 3.0    # tanδ must exceed this × the phase floor for a value
+blank_over_frac     = 0.25   # open blank unusable above this fraction over range
+blank_flip_frac     = 0.30   # ...or this density of Im sign flips
+blank_repro_pct     = 5.0    # blank repeatability tolerance (E2)
+
+# --- Geometry series (E5, framework 5.6 / R13) ---
+#
+# The internal validation of the geometry-series route: sigma comes from the SLOPE of
+# Re(Y) against thickness, and a genuine DC-like ionic conductance gives a slope that
+# does not move with frequency (1.4). Residual dielectric loss scales ~ omega, so a
+# contaminated slope drifts -- and it drifts while fitting a perfectly straight line at
+# every individual frequency. Per-frequency R^2 is no defence at all here; the
+# frequency axis is the only thing that separates conduction from loss.
+#
+# When either test trips, fit_geometry_series REFUSES sigma (returns NaN) rather than
+# reporting it with a flag. The raw median is kept alongside so the refusal can be
+# inspected and, if warranted, overridden by loosening these.
+geom_sigma_spread_tol   = 0.25  # max fractional spread in sigma across frequencies
+geom_slope_exponent_tol = 0.15  # max |d ln m / d ln f|; loss trends toward 1, sigma 0
+
+# --- Fixture correction (E3) -------------------------------------------------
+#
+# How much of the measured impedance belongs to the mux, ribbon and trace rather
+# than to the cell. Applies on the GATED engine only.
+#
+# mode = "auto" resolves from the calibration's capability ladder: "none" until a
+# short blank exists for this fixture, "series" the moment one does. Nobody has to
+# remember to switch it on after commissioning, and — more to the point — nobody
+# can forget to switch it back off after swapping a board, because a hardware_hash
+# mismatch already drops the constants before they reach here.
+#
+# SERIES ONLY, ON PURPOSE. Open/short/load ("OSL") is not implemented. Overhaul F6
+# recorded it corrupting every spectrum on this fixture: mean error 32 %, with one
+# channel reading 1.26 MOhm against a true ~840 Ohm. The open blank is still worth
+# measuring, because an UNUSABLE open is the positive evidence that shunt
+# admittance is negligible — which is exactly when short-only series correction is
+# exact. The open selects the fallback; it is not applied. `auto` therefore never
+# resolves to OSL even when the artifacts would license it, and says so in the log.
+[eis.fixture]
+mode                = "auto"     # "auto" | "none" | "series"
+fixture_id          = "mux16"    # which calibration/eis/<id>.toml to apply
+load_tolerance_pct  = 5.0        # end-to-end load-blank error before distrust (R9)
+
+# Measured envelope of THIS instrument, from reference components with the
+# reference electrode correctly connected (EIS_SUITE_OVERHAUL_new.md §2, §3.7).
+#
+# RETRACTED: earlier drafts carried z_phi_ohm = 5e7, a "phase-reliable ceiling"
+# ~20x below the magnitude ceiling. It was an artifact of a FLOATING REFERENCE
+# ELECTRODE. With RE connected, a 9.9 kOhm standard gave 45/45 valid points from
+# 1.2 Hz to 200 kHz, zero negative Re Z, max |phase| 79.9 deg. There is no
+# evidence for such a ceiling and nothing gates on one any more.
+#
+# Consequence that reverses earlier guidance: sigma_min ~ K*eps*omega*C_cell
+# scales WITH frequency, so LOW frequency is strongly favoured — roughly
+# 1e-9 S/cm at 1 Hz against 1e-7 S/cm at 100 Hz for a 1.5 nF cell.
+#
+# CAVEAT: phase noise was measured on a RESISTIVE load at 1e4 Ohm. Films sit at
+# 1e6-1e8 Ohm and are capacitive. Outside phase_noise_valid_decades of
+# phase_noise_at_ohm, a bound is reported as *provisional* rather than qualified.
+# A genuine low-loss capacitor (C0G/NP0, tan d < 1e-3) and high-value resistors
+# are still outstanding; the E2 calibration module supersedes this block.
+[eis.instrument]
+f_min_hz           = 0.016
+f_max_hz           = 200_000
+f_verified_lo_hz   = 1.2      # no degradation observed down to here at 1e4 Ohm
+z_min_ohm          = 10
+z_max_ohm          = 1e9      # upper decades NOT yet verified
+phase_noise_deg    = 0.149    # measured, 9.9 kOhm resistive -> tan d floor 0.0026
+phase_noise_at_ohm = 9.9e3    # the impedance it was measured at
+phase_noise_valid_decades = 1.0   # how far it may be trusted either side
+phase_noise_load   = "resistive"
+magnitude_accuracy_pct = 0.32 # measured, flat across 5 decades of f
+# Fixture stray capacitance, measured TWO-ELECTRODE (RE tied to CE) on the
+# multichannel fixture.
+#
+# THIS IS A BOARD MEDIAN, NOT A CHANNEL. Seven tied open blanks (ch17-23, 2026-08-06)
+# give 10.2, 14.6, 24.7, 18.5, 23.3, 14.5, 18.8 pF -- a 2.4x spread across channels
+# with nominally identical stripes, and repeatable to 1% per channel (ch17 read
+# 10.20 pF on the board sweep and 10.30 pF standalone). The spread is therefore REAL
+# per-channel variation, plausibly the manually applied metal-loaded epoxy sitting
+# ~2 mm from each stripe. Median 18.5 pF is used here.
+#
+# The previous value, 10.6 pF, was ch17 -- the LOWEST of the seven. As the fallback
+# used when no calibration exists, the most optimistic channel is the wrong choice:
+# it understates Z_phi and so over-reports how many sigma values are values rather
+# than bounds. Prefer a per-channel CalibrationSet over this scalar wherever one
+# exists; that is what C_stray_F is a per-channel mapping for.
+#
+# Cable-dominated, NOT mux-dominated: the single-channel test board (ch25), carrying
+# roughly twice the cable run, measures 53.6 pF on the same basis. Use the
+# multichannel value here -- it is the path samples are actually measured through.
+#
+# Before this, 5.85 pF was recorded, which was a three-electrode figure. Every
+# three-electrode value for a two-terminal load is a floating-divider artifact
+# (overhaul F17): the same ch17 blank reads 246 pF that way, alpha = 23.8.
+stray_C_instrument_F = 18.5e-12   # multichannel fixture, 2-electrode, board median
+c_cell_F           = 1.0e-9   # board/cell shunt C — NOT the instrument path
+phase_noise_measured = true
+magnitude_window_measured = false
+measured_at        = "2026-08-05"
+
+# Largest excitation amplitude shown NOT to saturate the current range (overhaul
+# 3.8). At 100 mV two channels returned bitwise-identical |Z| at two frequencies,
+# 13 low-f points collapsed onto 8-9 discrete values, and the |Z| ratio deviated up
+# to 2.3x across 6-30 kHz — peaking at the impedance MINIMUM, where current is
+# largest. Deviation peaking at peak current is current-range saturation, not
+# interfacial nonlinearity, so the remedy is a HIGHER CURRENT RANGE, not less
+# voltage. The deployed MethodSCRIPT runs 15 mV, safely under this.
+max_amplitude_mV   = 25.0
+
+# Cell geometry. L_gap and L_stripe are the same two numbers [pcb.*] calls
+# electrode_L_cm and electrode_w_cm, named for what they physically are: the
+# electrode gap and the stripe length, for lateral conduction across the gap.
+# K = L_gap / ((t - h) * L_stripe), so at h = 0 this is arithmetically identical
+# to the legacy sigma = L/(R*t*w) and no stored number moves.
+#
+# dead_height_um ships at 0. EIS_SUITE_OVERHAUL §9.1 puts h near 48 um, but that
+# came from three thickness levels perfectly confounded with channel and with
+# 1.3-2.1x replicate scatter — trusted to no better than ±20 um. The parameter
+# exists and a geometry series can fit it (E5); it is not applied until one does.
+[eis.cell]
+geometry         = "coplanar"
+blocking         = true
+L_gap_cm         = 0.2
+L_stripe_cm      = 0.2
+dead_height_um   = 0.0
+thickness_max_cm = 0.05    # 500 um; above this a "thickness" is a placeholder
+
+# Electrode sensing configuration (framework 1.1 / overhaul R20, F16).
+#
+# Three-electrode sensing measures only part of the current path: with WE and CE
+# identical stripes and RE exactly mid-gap, mirror antisymmetry gives
+#     Z_3-electrode = 1/2 * Z_2-electrode
+# exactly, at every frequency. The full-gap K therefore over-reports sigma by that
+# factor, so sigma = K_geom / (k_config_factor * R).
+#
+# The rig is wired THREE-ELECTRODE permanently (operator decision, 2026-08-05: kept
+# for the other electrochemical techniques that need it or fit it better). That is a
+# wiring fact and is recorded as one.
+#
+# Recording the configuration does NOT arm the correction. The factor rests on stripe
+# symmetry and RE centring, and the only direct measurement on this rig (overhaul 3.8,
+# same two films back to back) gives Z_2el/Z_3el = 1.28x and 1.46x -- not the 2.00 the
+# symmetry predicts. Neither value is noise, so k_config_verified stays false and
+# k_config_factor stays 1.0, which changes no number.
+#
+# To arm it: measure stripe symmetry and RE centring on the board, then either set
+#     k_config_verified = true          # -> uses 2.0, the symmetry value
+# or pin the measured ratio directly:
+#     k_config_factor   = 1.37          # explicit override wins over both
+#
+# Until then absolute sigma reports as "scale unqualified". RELATIVE trends are
+# unaffected either way, the factor being a constant across a series -- so campaigns
+# ranking formulations are valid now.
+electrode_configuration = "3-electrode"  # "3-electrode" | "2-electrode" | "unverified"
+k_config_verified       = false          # true => apply the configuration's factor
+# k_config_factor       = 2.0            # explicit override (wins over the above)
+
+# Setting k_config_verified = true is NECESSARY BUT NOT SUFFICIENT (overhaul R26).
+#
+# There is deliberately no re_contact_verified key here, and the omission is the point.
+# The symmetry derivation above assumes the RE senses a real potential in a CONDUCTING
+# MEDIUM. That holds only where the cast film makes an ionic path to the reference
+# stripe. Where it does not -- blanks, reference components, dry or dewetted films --
+# the RE floats onto a capacitive divider whose ratio depends on the load: overhaul
+# 3.10 measures alpha from 2.2 to 23.8, and NOT reproducible even at fixed load
+# (9.85 and 4.96 for the same 1 nF part). There is then no factor to apply at all.
+#
+# Contact is therefore a property of each SAMPLE, not of the board, and a key here
+# would assert it for every sample cast -- including exactly the population where it
+# fails. It is passed per measurement instead:
+#     cell_constant_for_sample(..., re_contact_verified=True,
+#                              re_connection="bridged_by_sample")
+# Unsupplied means not verified, which demotes k_config_factor to 1.0 on a
+# three-electrode board. Fail-closed costs a known 2x; fail-open costs an unknown one.
+
+# --- Liquid handling correction (optional) ---
+
+[liquid_handling]
+enabled = false
+beta = 0.3
+eta_ref_mpas = 1.0
+alpha_growth_per_run = 0.0
+
+[liquid_handling.pump_line]
+0 = 0
+1 = 1
+
+[liquid_handling.line.0]
+cracking_kpa_per_valve = 8.0
+compliance_uL_per_kpa = 0.55
+alpha_base = 0.2
+viscosity_mpas = 1.0
+
+[liquid_handling.line.1]
+cracking_kpa_per_valve = 8.0
+compliance_uL_per_kpa = 0.55
+alpha_base = 0.2
+viscosity_mpas = 1.0
+
+[liquid_handling.line.2]
+alpha_base = 0.2
+viscosity_mpas = 1.0
+cracking_kpa_per_valve = 8.0
+compliance_uL_per_kpa = 0.55
+
+[stage_calibration]
+home_x = 0.0
+home_y = 0.0
+dep1_x = 43.5
+dep1_y = 50.0
+flush_x = -50.0
+flush_y = 50.0
+wick_x = -50.0
+wick_y = -25.0
+
+# Two-phase cast (precondition flush -> deposition) defaults for the HT/AE tabs.
+# Per-pump rates are split proportionally to per-pump volume so all components
+# extrude for the same duration. Positions / plug settings / dwell live on the
+# catalog methods (startup_flush_full, precondition_flush, single_drop_simul) so
+# Process Studio remains the place to iterate on elution accuracy.
+
+[dropcast]
+dispense_rate_uL_min   = 200.0     # total deposition flow rate (split per pump)
+line_flush_rate_uL_min = 1500.0     # total flush flow rate (start + precondition)
+flush_factor           = 2.0       # precondition preload = deposition vol x factor
+settle_factor          = 2.0       # deposition settle wait = duration x factor
+settle_base_s          = 30.0       # fixed floor added to the derived settle wait
+start_flush_uL         = [200.0, 100.0, 100.0]   # per-pump start-flush volumes
+default_recipe = "two_phase"

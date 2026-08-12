@@ -1,0 +1,98 @@
+# Standard EIS Sweep — multi-channel salt concentration screen
+#
+# Iterates over a matrix of formulation volumes, depositing each on a PCB
+# channel and running an EIS measurement.  The number of loop iterations
+# is inferred from the length of `vol_master`.
+
+name: standard_eis_sweep
+description: >
+  32-channel salt concentration screen with EIS.  Setup flushes the lines,
+  then for each channel: precondition → deposit → measure.  Teardown cools
+  the stage and runs a final flush.
+
+variables:
+  # Per-channel volumes: [pump_A, pump_B, total_vol]
+  vol_master:
+    - [0,    0,    21]
+    - [0,    0.62, 21]
+    - [0,    1.24, 21]
+    - [0,    1.86, 21]
+    - [0,    2.48, 21]
+    - [0,    3.10, 21]
+    - [0,    3.72, 21]
+    - [0,    4.34, 21]
+    - [0.62, 0,    21]
+    - [0.62, 0.62, 21]
+    - [0.62, 1.24, 21]
+    - [0.62, 1.86, 21]
+    - [0.62, 2.48, 21]
+    - [0.62, 3.10, 21]
+    - [0.62, 3.72, 21]
+    - [0.62, 4.34, 21]
+  eis_preset: Extended
+  circuit_model: simpleSalt
+  flush_rate: 200
+  flush_vol: 100
+  stage_temp: 30
+
+setup:
+  - name: set_temperature
+    instrument: temp_controller
+    method: write_sp
+    params:
+      val: "$stage_temp"
+      print_flag: 0
+
+  - name: startup_flush
+    instrument: syringe
+    method: single_pump
+    params:
+      pump_ID: 0
+      rate: "$flush_rate"
+      dispense_vol: "$flush_vol"
+
+loop:
+  iterate_over: vol_master
+  steps:
+    - name: precondition
+      instrument: syringe
+      method: single_pump
+      params:
+        pump_ID: 0
+        rate: 150
+        dispense_vol: 50
+
+    - name: deposit
+      instrument: syringe
+      method: single_pump
+      params:
+        pump_ID: 0
+        rate: 75
+        dispense_vol: 21
+      timeout_s: 120
+
+    - name: measure_eis
+      instrument: pico1
+      method: sendscript_getdata
+      params:
+        script_path: scripts/eis_extended.mscr
+        output_path: data/eis_output
+        verbosity: 1
+      timeout_s: 600
+      retry: 1
+
+teardown:
+  - name: final_flush
+    instrument: syringe
+    method: single_pump
+    params:
+      pump_ID: 0
+      rate: "$flush_rate"
+      dispense_vol: "$flush_vol"
+
+  - name: cool_stage
+    instrument: temp_controller
+    method: write_sp
+    params:
+      val: 10
+      print_flag: 0

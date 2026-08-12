@@ -1,0 +1,139 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "softae"
+version = "0.1.0"
+description = "SoftAE — Soft-matter Autonomous Experimentation platform"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    { name = "Osuji Lab" },
+]
+
+dependencies = [
+    # --- Core instrument libraries ---
+    "pyvisa",
+    "pyvisa-py",          # pure-Python VISA backend (fallback if NI-VISA unavailable)
+    "minimalmodbus",
+    "pyserial",
+    "nidaqmx",            # NI-DAQ device control (syringe head)
+
+    # --- Async ---
+    "nest-asyncio",
+    "qasync",
+
+    # --- Analysis / math ---
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "scipy",
+    "impedance",          # EIS circuit fitting
+    "scikit-learn",       # GaussianProcessRegressor — the DEFAULT BO surrogate
+                          # backend (optimizers/surrogates.py), not an extra
+    "xarray",             # MeasurementResult payload format (modality-agnostic)
+    "h5netcdf",           # netCDF/HDF5 backend for xarray payload files
+    "h5py",               # h5netcdf's own backend — NOT a hard dependency of it,
+                          # so payload writes raise ImportError without this line
+
+    # --- UI ---
+    "PySide6>=6.6",
+    "opencv-python",
+
+    # --- Configuration ---
+    "tomli-w",            # TOML writing (tomllib for reading is stdlib 3.11+)
+
+    # --- Workflow definitions ---
+    "pyyaml",             # YAML workflow file parsing
+
+    # --- Logging ---
+    "structlog",
+
+    # --- PID control ---
+    "simple-pid",
+
+    # --- Progress bars ---
+    "tqdm",
+]
+
+[project.optional-dependencies]
+# Hardware-specific packages that require physical devices or proprietary SDKs.
+# Install with: pip install -e ".[hardware]"
+hardware = [
+    "nidaqmx",
+    "pythonnet",
+    "hidapi",
+    "adafruit-blinka",
+    "adafruit-circuitpython-sht31d",
+    "adafruit-circuitpython-mcp4728",   # quad-DAC lamp control
+    # "thorlabs-tsi-sdk",   # installed manually from ThorLabs SDK
+    # "palmsens",            # installed from PalmSens wheel
+]
+
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-qt",
+    "pyvisa-sim",         # VISA instrument simulation for tests
+    "ruff",               # linting
+]
+
+docs = [
+    "mkdocs>=1.5",
+    "mkdocs-material>=9",
+    "mkdocstrings[python]>=0.24",
+]
+
+web = [
+    "dash>=2.16",
+    "plotly>=5.20",
+    "dash-bootstrap-components>=1.6",
+]
+
+# Optional surrogate backends for the simulated BO campaign suite
+# (softae.campaigns).  The default 'sklearn' backend needs no extras.
+bo-botorch = [
+    "botorch",
+    "torch",
+]
+bo-gpytorch = [
+    "gpytorch",
+    "torch",
+]
+bo-gpcam = [
+    "gpcam",
+]
+
+[project.scripts]
+softae-gui = "softae.gui.__main__:main"
+softae-run = "softae.workflows.__main__:main"
+softae-web = "softae.web.__main__:main"
+softae-deposition = "softae.gui.deposition_app:main"
+softae-method = "softae.tools.method:main"
+softae-campaign = "softae.tools.campaign:main"
+softae-commission = "softae.tools.commission:main"
+softae-shadow = "softae.tools.shadow_review:main"
+softae-thickness = "softae.tools.thickness:main"
+softae-equilibration = "softae.tools.equilibration:main"
+
+[project.entry-points."gui_scripts"]
+softae = "softae.gui.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/softae"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]

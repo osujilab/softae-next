@@ -1,0 +1,49 @@
+# Temperature-Stepped EIS Sweep — Arrhenius Analysis
+#
+# Measures EIS at multiple temperatures, fits the impedance data, and
+# extracts the activation energy Eₐ via linearised Arrhenius regression:
+#
+#   σ = A · exp(−Eₐ / (k_B · T))
+#
+# This YAML is processed by ArrheniusSweep.from_yaml(); it is NOT a
+# generic workflow — metadata.experiment_type must be "arrhenius_sweep".
+
+name: temp_eis_sweep
+description: >
+  Temperature-stepped EIS sweep with per-channel Arrhenius fitting.
+  Steps the stage from T_start to T_stop in T_step increments, waits
+  for equilibration, then measures EIS on all listed channels. After
+  the sweep completes, fits ln(σ) vs 1/T for each channel to extract
+  the activation energy Eₐ.
+
+metadata:
+  experiment_type: arrhenius_sweep
+
+variables:
+  # ── Channel selection ──────────────────────────────────────────────
+  channels: [1, 2]              # EIS channels to measure (1–8)
+
+  # ── Temperature profile (step mode) ────────────────────────────────
+  # The stage is stepped from T_start to T_stop in T_step increments.
+  # To override with an explicit list, set 'temperatures' instead:
+  #   temperatures: [25, 35, 45, 55, 65, 75]
+  T_start: 25.0                 # °C
+  T_stop:  75.0                 # °C (inclusive)
+  T_step:  10.0                 # °C per step
+
+  # ── Equilibration ──────────────────────────────────────────────────
+  dwell_s: 60.0                 # Hold time after stabilisation (seconds)
+  temp_tolerance: 0.5           # |PV − SP| threshold (°C)
+  wait_timeout_s: 1800.0        # Maximum wait per setpoint (seconds)
+
+  # ── EIS fitting ────────────────────────────────────────────────────
+  eis_model: simpleSalt         # Circuit model key (see CIRCUIT_MODELS)
+
+  # ── Electrode geometry (required for σ calculation) ────────────────
+  electrode_L_cm: 0.2           # Electrode separation (cm)
+  electrode_t_cm: 0.175         # Sample thickness (cm)
+  electrode_w_cm: 0.2           # Electrode width (cm)
+
+  # ── Instrument keys (optional, defaults shown) ─────────────────────
+  eis_instrument: pico1
+  temp_instrument: temp_controller

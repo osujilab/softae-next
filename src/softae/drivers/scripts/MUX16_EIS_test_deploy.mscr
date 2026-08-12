@@ -1,0 +1,33 @@
+e
+set_gpio_cfg 0x3FFi 1
+# Change the hexadecimal code below to select channel (0x+binary(RE/CE)binary(WE))
+set_gpio 0xFFi
+var f
+var r
+var j
+set_pgstat_chan 0
+# Set mode to high speed
+set_pgstat_mode 3
+# Enable all supported ranges for current autoranging
+set_autoranging ba 1p 1
+# Enable all supported ranges for potential autoranging
+set_autoranging ab 1p 1
+# Turn cell on
+cell_on
+# loop i <= 0xFFi
+#   set_gpio i
+#   wait 50m
+    # Call the EIS loop with 15 mV amplitude, f_start = 200 kHz, f_end = 20 Hz, nrOfPoints = 41, 0 mV DC
+     meas_loop_eis f r j 15m 200k 20 41 0m
+        # Add the returned variables to the data package
+        pck_start
+        pck_add f
+        pck_add r
+        pck_add j
+        pck_end
+     endloop
+#   add_var i 0x11i
+# endloop
+on_finished:
+cell_off
+

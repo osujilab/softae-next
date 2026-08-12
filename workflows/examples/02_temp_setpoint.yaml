@@ -1,0 +1,32 @@
+# Example 2: Temperature set + read
+# Tests: temp_controller write_sp, get_pv, wait
+# Run:  softae-run workflows/examples/02_temp_setpoint.yaml --mock --verbose
+
+name: "temp_setpoint_test"
+description: "Set temperature to 40C, read PV, then cool back to 25C"
+
+variables:
+  target_temp: 40.0
+  cool_temp: 25.0
+
+setup:
+  - name: "set_temperature"
+    instrument: "temp_controller"
+    method: "write_sp"
+    params:
+      T_SP: "$target_temp"
+      print_flag: 0
+
+  - name: "read_pv"
+    instrument: "temp_controller"
+    method: "get_pv"
+    params:
+      n_avg: 1
+
+teardown:
+  - name: "cool_down"
+    instrument: "temp_controller"
+    method: "write_sp"
+    params:
+      T_SP: "$cool_temp"
+      print_flag: 0

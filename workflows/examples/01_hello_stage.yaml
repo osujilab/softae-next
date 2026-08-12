@@ -1,0 +1,40 @@
+# Example 1: Simple stage move
+# Tests: stage connection, move_to, live_position
+# Run:  softae-run workflows/examples/01_hello_stage.yaml --mock --verbose
+
+name: "hello_stage"
+description: "Move the stage to a few positions and read back coordinates"
+
+variables: {}
+
+setup:
+  - name: "init_stage"
+    instrument: "stage"
+    method: "stage_init"
+    params: {}
+
+  - name: "move_to_origin"
+    instrument: "stage"
+    method: "move_to"
+    params:
+      x: 0.0
+      y: 0.0
+
+  - name: "read_position_1"
+    instrument: "stage"
+    method: "live_position"
+    params:
+      print_flag: 0
+
+teardown:
+  - name: "move_home"
+    instrument: "stage"
+    method: "move_to"
+    params:
+      x: 0.0
+      y: 0.0
+
+  - name: "close_stage"
+    instrument: "stage"
+    method: "stage_end"
+    params: {}

@@ -1,0 +1,79 @@
+name: ht_formulate_only
+description: Representative HT 'ht_formulate_only' recipe (2-channel snapshot). Exported
+  from the HT Experiment generator; EIS script paths are placeholders. Edit tasks/bindings
+  in the Process Configuration tab.
+variables:
+  vol_master:
+  - - 12.0
+    - 8.0
+    - 20.0
+  - - 12.0
+    - 8.0
+    - 20.0
+  eis_preset: Extended
+  selected_channels:
+  - 0
+  - 1
+  channel_numbers:
+  - 1
+  - 2
+setup:
+- name: startup_flush
+  instrument: syringe
+  method: single_pump
+  params:
+    res_vol: 1000
+    ID: 0
+    rate: 200
+    dispense_vol: 80.0
+- name: deposit_p0_ch1
+  instrument: syringe
+  method: single_pump
+  params:
+    res_vol: 1000
+    ID: 0
+    rate: 75.0
+    dispense_vol: 12.0
+  timeout_s: 120.0
+- name: deposit_p1_ch1
+  instrument: syringe
+  method: single_pump
+  params:
+    res_vol: 1000
+    ID: 1
+    rate: 75.0
+    dispense_vol: 8.0
+  timeout_s: 120.0
+- name: deposit_p0_ch2
+  instrument: syringe
+  method: single_pump
+  params:
+    res_vol: 1000
+    ID: 0
+    rate: 75.0
+    dispense_vol: 12.0
+  timeout_s: 120.0
+- name: deposit_p1_ch2
+  instrument: syringe
+  method: single_pump
+  params:
+    res_vol: 1000
+    ID: 1
+    rate: 75.0
+    dispense_vol: 8.0
+  timeout_s: 120.0
+loop:
+  steps: []
+teardown:
+- name: final_flush
+  instrument: syringe
+  method: single_pump
+  params:
+    res_vol: 1000
+    ID: 0
+    rate: 200
+    dispense_vol: 80.0
+metadata:
+  pcb: SoftAE_EIS_4Stripe
+  mode: formulate
+  source: ht_experiment_export

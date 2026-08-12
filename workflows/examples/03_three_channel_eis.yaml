@@ -1,0 +1,64 @@
+# Example 3: Multi-instrument workflow with loop
+# Tests: stage + syringe + EIS across 3 channels
+# Run:  softae-run workflows/examples/03_three_channel_eis.yaml --mock --verbose
+
+name: "three_channel_eis"
+description: "Deposit on 3 channels and run EIS on each"
+
+variables:
+  channels: [1, 2, 3]
+  dispense_vol: 5.0
+  dispense_rate: 50.0
+  flush_vol: 100.0
+  flush_rate: 200.0
+  eis_script: "scripts/example_eis.mscr"
+
+setup:
+  - name: "init_stage"
+    instrument: "stage"
+    method: "stage_init"
+    params: {}
+
+  - name: "startup_flush"
+    instrument: "syringe"
+    method: "single_pump"
+    params:
+      res_vol: 1000.0
+      ID: 0
+      rate: "$flush_rate"
+      dispense_vol: "$flush_vol"
+
+loop:
+  iterate_over: "channels"
+  steps:
+    - name: "deposit"
+      instrument: "syringe"
+      method: "single_pump"
+      params:
+        res_vol: 1000.0
+        ID: 0
+        rate: "$dispense_rate"
+        dispense_vol: "$dispense_vol"
+
+    - name: "run_eis"
+      instrument: "pico1"
+      method: "sendscript_getdata"
+      params:
+        mscrpath: "$eis_script"
+        outdir: "./eis_output"
+        chan: 1
+
+teardown:
+  - name: "final_flush"
+    instrument: "syringe"
+    method: "single_pump"
+    params:
+      res_vol: 1000.0
+      ID: 0
+      rate: "$flush_rate"
+      dispense_vol: "$flush_vol"
+
+  - name: "close_stage"
+    instrument: "stage"
+    method: "stage_end"
+    params: {}

@@ -1,0 +1,3 @@
+# Error Hierarchy
+
+::: softae.errors

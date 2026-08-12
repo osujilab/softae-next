@@ -1,0 +1,38 @@
+name: process_20260710_164354
+description: Process recipe
+setup:
+- name: move_to_flush
+  instrument: stage
+  method: move_to
+  params:
+    x: -50
+    y: 50
+  timeout_s: 300.0
+- name: head_descend
+  instrument: syringe
+  method: head_descend
+  timeout_s: 300.0
+- name: head_retract
+  instrument: syringe
+  method: head_retract
+  timeout_s: 300.0
+- name: move_to_wick
+  instrument: stage
+  method: move_to
+  params:
+    x: -50
+    y: -25
+  timeout_s: 300.0
+- name: head_descend_2
+  instrument: syringe
+  method: head_descend
+  timeout_s: 300.0
+- name: head_retract_2
+  instrument: syringe
+  method: head_retract
+  timeout_s: 300.0
+loop:
+  steps: []
+teardown: []
+metadata:
+  source: process_config

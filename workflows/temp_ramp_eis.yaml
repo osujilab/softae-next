@@ -1,0 +1,81 @@
+# Temperature Ramp EIS — measure EIS at multiple temperatures
+#
+# Ramps the heating stage through a series of setpoints and runs EIS at
+# each temperature.  Useful for studying conductivity vs. temperature or
+# phase-transition behaviour.
+
+name: temp_ramp_eis
+description: >
+  Linear temperature ramp with EIS measurements at each setpoint.
+  The 'temperatures' list defines the ramp profile;
+  each EIS measurement is taken after the stage stabilises.
+
+variables:
+  temperatures: [25, 30, 35, 40, 45, 50, 55, 60]
+  temp_tolerance: 0.5
+  eis_preset: Extended
+  pump_id: 0
+  flush_vol: 80
+  flush_rate: 200
+
+setup:
+  - name: startup_flush
+    instrument: syringe
+    method: single_pump
+    params:
+      pump_ID: "$pump_id"
+      rate: "$flush_rate"
+      dispense_vol: "$flush_vol"
+
+  - name: deposit
+    instrument: syringe
+    method: single_pump
+    params:
+      pump_ID: "$pump_id"
+      rate: 75
+      dispense_vol: 21
+    timeout_s: 60
+
+loop:
+  iterate_over: temperatures
+  steps:
+    - name: set_temperature
+      instrument: temp_controller
+      method: write_sp
+      params:
+        val: 0       # Overridden per-iteration by the executor (future: per-iter variable binding)
+        print_flag: 0
+
+    - name: wait_for_temp
+      instrument: temp_controller
+      method: wait
+      params:
+        target: 0    # Same note as above
+        tolerance: "$temp_tolerance"
+      timeout_s: 180
+
+    - name: measure_eis
+      instrument: pico1
+      method: sendscript_getdata
+      params:
+        script_path: scripts/eis_extended.mscr
+        output_path: data/eis_output
+        verbosity: 1
+      timeout_s: 600
+      retry: 1
+
+teardown:
+  - name: cool_stage
+    instrument: temp_controller
+    method: write_sp
+    params:
+      val: 10
+      print_flag: 0
+
+  - name: final_flush
+    instrument: syringe
+    method: single_pump
+    params:
+      pump_ID: "$pump_id"
+      rate: "$flush_rate"
+      dispense_vol: "$flush_vol"
