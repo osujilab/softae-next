@@ -378,10 +378,14 @@ class _DataStoreSelectionDialog(QDialog):
 
         self._table = QTableWidget()
         # ☑, Timestamp, Run, Channel, Workflow, then the five environmental
-        # SP/PVs captured at measurement time, then the EIS file path.
+        # SP/PVs captured at measurement time plus the resolved temperature and
+        # the thermometer it came from, then the EIS file path. The resolved
+        # pair is shown NEXT TO its sources rather than instead of them: the
+        # operator's question "why is this row 85 °C" is answered by seeing all
+        # three reads and the label side by side.
         self._env_headers = [
             "Stage SP (°C)", "Chamber PV (°C)", "Stage PV (°C)",
-            "RH SP (%)", "RH PV (%)",
+            "RH SP (%)", "RH PV (%)", "T resolved (°C)", "T source",
         ]
         headers = (
             ["☑", "Timestamp", "Run", "Channel", "Workflow"]
@@ -477,14 +481,20 @@ class _DataStoreSelectionDialog(QDialog):
             env = self._env_for(row_data.get("measurement_id"))
             for offset, key in enumerate(
                 # Order matches `self._env_headers` exactly: Stage SP, Chamber
-                # PV (the air probe), Stage PV, RH SP, RH PV. A key that stops
-                # matching the schema does not raise here — `env.get` returns
-                # None and the column renders blank under a correct-looking
-                # header — so the two tuples move together or not at all.
+                # PV (the air probe), Stage PV, RH SP, RH PV, then the resolved
+                # temperature and its source (schema epoch 4 — read off the row,
+                # not re-derived here). A key that stops matching the schema does
+                # not raise here — `env.get` returns None and the column renders
+                # blank under a correct-looking header — so the two tuples move
+                # together or not at all.
                 ("stage_temp_sp_C", "chamber_air_C", "stage_temp_pv_C",
-                 "rh_sp_pct", "rh_pv_pct")
+                 "rh_sp_pct", "rh_pv_pct", "temperature_C", "temperature_source")
             ):
-                self._table.setItem(row, 5 + offset, QTableWidgetItem(_fmt_env(env.get(key))))
+                value = env.get(key)
+                # One TEXT column among the numbers: show the label as written
+                # rather than letting the numeric formatter turn it into '—'.
+                text = (value or "—") if isinstance(value, str) else _fmt_env(value)
+                self._table.setItem(row, 5 + offset, QTableWidgetItem(text))
             self._table.setItem(
                 row, self._eis_file_col,
                 QTableWidgetItem(str(row_data.get("eis_file_path") or "")),

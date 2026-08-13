@@ -26,6 +26,7 @@ from typing import Any
 import numpy as np
 import structlog
 
+from softae.analysis.eis.arc import annotate_arc_closure
 from softae.analysis.eis.geometry import CellConstant
 from softae.analysis.eis.policy import build_context, reduce_gates
 from softae.analysis.eis.report import (
@@ -132,6 +133,51 @@ def _resolve_reported_resistance(
     return cov.value(b), cov.se(b), "split_bulk", rho
 
 
+def _demote_if_railed(fit: Any) -> str:
+    """Strip the measurement claim off a fit that railed. Returns why, or ``""``.
+
+    A fit whose ``R_bulk`` came to rest on a box constraint reports the *bound*,
+    not the sample, and it does so with the same ``success`` flag as a genuine
+    measurement — so every consumer that reads only ``success`` (the optimiser,
+    the settle criterion, the analysis tab, ``fit_results.sigma_S_per_cm``) takes
+    a constant that is a property of ``CIRCUIT_MODELS`` for an observation.
+
+    Three things change, and each closes one of those routes:
+
+    ``success = False``
+        The single flag most consumers branch on. A *distinct* quality state was
+        the alternative and was rejected: it would leave ``success = 1`` on the
+        row, so every reader that does not yet know about the new state keeps
+        believing the number. Demoting an unidentified parameter to "not a fit"
+        is also simply what it is — the optimiser reported where the wall was.
+    ``error_msg``
+        Names the bound and its value, so a railed row is distinguishable from a
+        fit that failed to converge without re-deriving anything.
+    ``R1 = NaN``
+        σ follows from R₁ everywhere it is computed, including inside
+        ``DataStore.record_fit``, which derives it from ``fit_result.R1`` and
+        cannot see this reason. A NaN R₁ fails that guard, so no conductivity is
+        stored — the ``resolve_thickness_cm`` posture: absence, not an invented
+        value. The railed value itself survives in ``parameters_json``, which is
+        where a diagnostic belongs.
+
+    ``parameters``, ``z_fit`` and ``quality`` are deliberately untouched: the
+    residuals against a railed model are real, and are the evidence for the
+    demotion rather than a casualty of it.
+    """
+    from softae.analysis.eis.models import railed_measurand
+
+    reason = railed_measurand(fit)
+    if not reason:
+        return ""
+
+    fit.success = False
+    fit.error_msg = f"railed fit: {reason} — parameter unidentified, no conductivity"
+    fit.R1 = float("nan")
+    logger.info("eis_fit_railed", model=getattr(fit, "model_name", "?"), reason=reason)
+    return reason
+
+
 def _sigma_from_R(
     R_ohm: float,
     cell: CellConstant | None,
@@ -145,6 +191,14 @@ def _sigma_from_R(
     R_basis: str = "split_bulk",
     rho: float = float("nan"),
 ) -> SigmaReport:
+    # A non-finite resistance is not a small conductivity, it is no conductivity:
+    # `cell.sigma(nan)` would return a NaN wearing `mode="value"`, which reads as a
+    # measurement to anything that branches on the mode before checking the number.
+    if not (R_ohm == R_ohm):
+        return SigmaReport(mode="unavailable", R_reported_ohm=float("nan"),
+                           R_reported_se_ohm=R_se, R_basis=R_basis, rho=rho,
+                           model_free_R_ohm=model_free_R,
+                           phase_headroom=phase_headroom)
     if cell is None:
         return SigmaReport(mode="unavailable", R_reported_ohm=float(R_ohm),
                            R_reported_se_ohm=R_se, R_basis=R_basis, rho=rho,
@@ -201,8 +255,17 @@ def _legacy_report(
     from softae.analysis.quality import grade_fit
 
     fit = fit_circuit(eis_result, model_name)
+    # The one behaviour change on this path, and it only ever fires on a fit that
+    # was already reporting the model's bound rather than the sample. A converged
+    # fit takes the identical route it always has.
+    railed = _demote_if_railed(fit)
+    arc = annotate_arc_closure(fit, eis_result)
     quality = grade_fit(getattr(fit, "quality", {}) or {},
                         success=bool(fit.success))
+    if railed:
+        quality.issues.append(railed)
+    if not arc.closed:
+        quality.issues.append(arc.detail)
 
     sigma = SigmaReport(mode="unavailable", R_reported_ohm=float(fit.R1),
                         R_basis="split_bulk")
@@ -361,6 +424,13 @@ def analyze_spectrum(
         fit = fit_circuit(surviving, model_name)
     if not fit.success:
         fit = fit_circuit(surviving, model_name)
+    # After the fallback, never before it: demoting a railed fit clears
+    # ``success``, and the line above reads that flag as "try the other fitter".
+    railed = _demote_if_railed(fit)
+    # Judged on ``surviving`` — the corrected, truncated points R₁ actually came
+    # from. Judging the raw sweep would credit the fit with a low-frequency point
+    # a gate had already removed.
+    arc = annotate_arc_closure(fit, surviving)
 
     f_ok, Z_ok = _physics_complex(surviving)
     mode, provisional, headroom = decide_report_mode(
@@ -394,6 +464,10 @@ def analyze_spectrum(
         report_mode=mode, enabled=gate_cfg.enabled,
     )
     quality.issues.extend(fit_report.issues)
+    if railed:
+        quality.issues.append(railed)
+    if not arc.closed:
+        quality.issues.append(arc.detail)
     quality.metrics.update(fit_report.metrics)
     # A correction that drove points non-physical is a data-quality fact, so it travels
     # with the verdict rather than living only in the log where nothing reads it.

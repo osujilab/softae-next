@@ -83,13 +83,22 @@ DEFAULT_N_SETTLE = 5
 #: Three free parameters (σ₀, σ_∞, τ); four points fit any τ.
 #:
 #: **The acquisition side imports this**, and must: ``settle_floor_rounds`` in
-#: :mod:`softae.workflows.equilibration` folds it into the fewest rounds any
+#: :mod:`softae.workflows.equilibration` folds it into the fewest rounds a
 #: setpoint may run, and ``EquilibrationConfig.validate`` refuses a
 #: ``rounds_per_setpoint`` ceiling below it. That coupling is what stops the run
 #: emitting a series this module will then refuse — the failure it closed was a
 #: 660 s round period, where every hold floor bought fewer than five rounds. So
 #: this is one authority, not a number two modules happen to agree on: raising it
 #: lengthens the run, and lowering it shortens it, automatically.
+#:
+#: It is folded in **only where a τ is wanted**, which is not everywhere. The
+#: films dry once, at the start: the 2026-08-11 run measured a per-setpoint σ
+#: swing of 1600–2800 % at S0 and 57–1370 % at S1, then 0.5–8.5 % and 0.8–3.1 %
+#: at S2/S3 against a 5.98 % noise floor. Past the first setpoint or two there is
+#: no relaxation left to fit, so ``EquilibrationConfig.tau_setpoints`` bounds how
+#: far into the run this floor applies. Beyond it the acquisition side can stop
+#: at the settle/time floor alone — and the series it emits there is one this
+#: module will refuse for τ, **on purpose**, because no τ was being bought.
 MIN_POINTS_FOR_TAU = 5
 #: |σ₀ − σ_∞| must exceed this many noise sigmas for a relaxation to exist.
 NOISE_REFUSAL_FACTOR = 3.0
@@ -742,6 +751,73 @@ def load_sigma_series(store: Any, run_id: str, sidecar: dict[str, Any]) -> dict[
     for points in out.values():
         points.sort(key=lambda p: p["t_since_hold_s"])
     return out
+
+
+#: Every stored spectrum of a run, keyed the way :func:`load_sigma_series` keys it.
+_ARC_SQL = """
+SELECT m.channel, m.eis_file_path, m.payload_path
+FROM measurements m
+WHERE m.run_id = ?
+ORDER BY m.measurement_id
+"""
+
+
+def _payload_arc(project_dir: Any, payload_path: str) -> Any:
+    """One payload's arc-closure state, or ``UNKNOWN`` when it cannot be read."""
+    from pathlib import Path
+
+    import xarray as xr
+
+    from softae.analysis.eis.arc import UNKNOWN, ArcClosure, arc_closure
+    from softae.analysis.eis_data import FREQ_DIM
+
+    path = Path(payload_path)
+    if not path.is_absolute():
+        path = Path(project_dir) / path
+    try:
+        with xr.open_dataset(path, engine="h5netcdf") as ds:
+            return arc_closure(ds[FREQ_DIM].values, ds["z_imag_neg"].values,
+                               ds["phase"].values if "phase" in ds else None)
+    except (OSError, KeyError, ValueError):
+        return ArcClosure(UNKNOWN, reason="payload unreadable")
+
+
+def arc_closure_rates(store: Any, run_id: str,
+                      sidecar: dict[str, Any]) -> dict[str, Any]:
+    """How often the semicircle closed in band, per setpoint block and per channel.
+
+    Read from the stored payloads rather than from ``fit_results``: the check
+    post-dates every row already on disk, and the spectrum is the evidence in
+    either case. Coordinates come from the sidecar exactly as
+    :func:`load_sigma_series` takes them, so these blocks are the blocks the rest
+    of the report names.
+
+    Returns ``{"n", "n_open", "n_unknown", "by_block", "by_channel"}``; the two
+    maps hold ``[open, total]``.
+    """
+    from softae.analysis.eis.arc import OPEN, UNKNOWN
+
+    by_stem = {f"{p['step_name']}_ch{int(p['channel'])}": p
+               for p in (sidecar.get("points") or [])}
+    blocks: dict[tuple[str, int], list[int]] = {}
+    channels: dict[int, list[int]] = {}
+    total = n_open = n_unknown = 0
+    for channel, path, payload in store._conn.execute(_ARC_SQL, (run_id,)).fetchall():
+        stem = str(path or "").replace("\\", "/").rsplit("/", 1)[-1]
+        point = by_stem.get(stem[:-4] if stem.endswith(".txt") else stem)
+        if point is None or not payload:
+            continue
+        arc = _payload_arc(store.project_dir, payload)
+        total += 1
+        n_open += arc.state == OPEN
+        n_unknown += arc.state == UNKNOWN
+        key = (str(point["leg"]), int(point["setpoint_index"]))
+        for tally in (blocks.setdefault(key, [0, 0]),
+                      channels.setdefault(int(channel), [0, 0])):
+            tally[0] += arc.state == OPEN
+            tally[1] += 1
+    return {"n": total, "n_open": n_open, "n_unknown": n_unknown,
+            "by_block": blocks, "by_channel": channels}
 
 
 def series_temperature(points: Sequence[dict[str, Any]]) -> tuple[float, str]:

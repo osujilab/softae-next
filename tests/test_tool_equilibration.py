@@ -42,6 +42,11 @@ from softae.tools.equilibration import (
     reconciled_eta_s,
 )
 from softae.workflows.equilibration import (
+    DEFAULT_APPROACH_TIMEOUT_S,
+    DEFAULT_DOWN_APPROACH_TIMEOUT_S,
+    DEFAULT_RH_SETPOINT_PCT,
+    DEFAULT_TAU_SETPOINTS,
+    DEFAULT_TOLERANCE_C,
     ENV_OK,
     ENV_SKIPPED,
     EV_AMBIENT_RESTORED,
@@ -54,6 +59,7 @@ from softae.workflows.equilibration import (
     VERDICT_UNMET,
     EquilibrationConfig,
     ProgressEvent,
+    project_duration,
 )
 
 
@@ -100,8 +106,29 @@ class TestArgumentSurface:
         assert config.channels == list(range(1, 17))
         assert config.temperatures_C == [27.5, 45.0, 65.0, 85.0]
         assert config.legs == ("up", "down")
-        assert config.rh_setpoint_pct == pytest.approx(15.0)
+        # 20 %RH, not 15: the flush basin holds water inside the heated
+        # enclosure, so warming the chamber humidifies it and 15 is below what
+        # the enclosure can deliver hot (measured PV 16.9-20.4 at 65 C, 19.5-23.2
+        # at 85 C on 2026-08-11). Not a controls fault and not re-tunable.
+        assert config.rh_setpoint_pct == pytest.approx(20.0)
+        assert config.rh_setpoint_pct == pytest.approx(DEFAULT_RH_SETPOINT_PCT)
         assert config.rounds_per_setpoint == 15
+
+    def test_the_shipped_chamber_defaults_are_the_ones_the_bench_ruled(self):
+        config = build_config(_args("plan"))
+        # 2.0 C, not 0.5: at 0.5 a 0.6 C dip graded a whole setpoint "hold not
+        # met" on a chamber that wanders a few tenths.
+        assert config.tolerance_C == pytest.approx(2.0) == DEFAULT_TOLERANCE_C
+        # And it still sits strictly inside the excursion warning, which sits
+        # strictly inside the runaway guard. Ordering these wrongly would either
+        # warn on every in-band sample or abort before warning once.
+        assert config.tolerance_C < config.warn_C < config.fault_C
+        # Cooling is passive; the descending allowance is the longer one.
+        assert config.approach_timeout_s == pytest.approx(DEFAULT_APPROACH_TIMEOUT_S)
+        assert config.down_approach_timeout_s == pytest.approx(
+            DEFAULT_DOWN_APPROACH_TIMEOUT_S)
+        assert config.down_approach_timeout_s > config.approach_timeout_s
+        assert config.tau_setpoints == DEFAULT_TAU_SETPOINTS == 2
 
     def test_an_unknown_relaxation_model_is_rejected_by_the_parser_itself(self):
         with pytest.raises(SystemExit):
@@ -408,41 +435,64 @@ class TestPlan:
         assert _cmd_plan(_args("plan")) == EXIT_OK
         out = capsys.readouterr().out
         assert "typical" in out and "worst case" in out
-        # Every figure is now a RANGE. `--rounds` is a ceiling, so a single
-        # number would be a promise the run cannot keep in either direction: the
-        # floor is MIN_POINTS_FOR_TAU = 5 rounds per setpoint at BOTH floors --
-        # at the 660 s period the time floors buy only 3 rounds at the first
-        # setpoint and 1 after, so the fitter's minimum is what binds -- and the
-        # ceiling is 15.
+        # Every figure is a RANGE. `--rounds` is a ceiling, so a single number
+        # would be a promise the run cannot keep in either direction: the floor
+        # is every setpoint settling at its earliest and the ceiling is none of
+        # them settling at all.
         #
-        # The absolute values moved with the round-period default, which is now
-        # derived from the OTHER defaults: 16 channels x 40.7 s/channel measured
-        # on 'Standard' = 660 s, against a 120 s default that no preset could
-        # honour at 16 channels.
-        assert "1.17-3.00 h" in out and "1.92-3.75 h" in out      # per setpoint
-        assert "9.33-24.00 h" in out and "15.33-30.00 h" in out   # whole run
+        # Read off the projection rather than written as literals. The hours here
+        # rest on `estimate_eis_duration`, which lives in core/preflight.py and is
+        # recalibrated from time to time (it ran ~10x low until 2026-08); pinning
+        # a number would make this test a hostage to that constant instead of a
+        # statement about what `plan` prints.
+        projection = project_duration(build_config(_args("plan")))
+        assert (f"{projection.per_setpoint_typical_floor_s / 3600:.2f}-"
+                f"{projection.per_setpoint_typical_s / 3600:.2f} h") in out
+        assert (f"{projection.typical_floor_s / 3600:.2f}-"
+                f"{projection.typical_s / 3600:.2f} h") in out
+        assert (f"{projection.worst_floor_s / 3600:.2f}-"
+                f"{projection.worst_case_s / 3600:.2f} h") in out
+        assert projection.typical_floor_s < projection.typical_s
         assert "anchor" not in out.lower()
 
-    def test_plan_prints_the_effective_minimum_rounds_for_both_floors(
+    def test_plan_prints_the_effective_minimum_rounds_for_every_regime(
             self, project, capsys):
-        # The two floors differ -- only one setpoint in a run gets
-        # `min_hold_first_s` -- so both are printed rather than their minimum,
-        # and the printed figure is the EFFECTIVE one. The time floors alone buy
-        # ceil(1500/660) = 3 and ceil(600/660) = 1 rounds at the shipped period;
-        # printing those would understate the fast end by the very amount that
-        # makes the run analysable.
+        # Three floors now, not two, and they are printed rather than their
+        # minimum: the run's first setpoint has `min_hold_first_s`, the rest of
+        # the --tau-setpoints window has the fitter's MIN_POINTS_FOR_TAU, and
+        # everything after has neither. An operator reading a 3-round setpoint
+        # beside a 5-round one must be able to see which regime each was in.
         assert _cmd_plan(_args("plan")) == EXIT_OK
         out = capsys.readouterr().out
 
-        assert f"effective minimum {MIN_POINTS_FOR_TAU} rounds at the first " \
-               f"setpoint, {MIN_POINTS_FOR_TAU} after" in out
-        assert f"No setpoint may stop under {MIN_POINTS_FOR_TAU} rounds" in out
+        # 8, not MIN_POINTS_FOR_TAU: at the 200 s period the shipped preset now
+        # allows, the 1500 s first-setpoint hold floor buys ceil(1500/200) = 8
+        # rounds and OVERTAKES the fit minimum. That is the point of the faster
+        # preset -- the first setpoint carries essentially the whole transient,
+        # and it now gets 8 sigma points instead of the 5 the fitter demands as a
+        # bare minimum.
+        assert "effective minimum 8 rounds at setpoint 1 of the run" in out
+        assert f"The first 2 setpoint(s) may not stop under " \
+               f"{MIN_POINTS_FOR_TAU} rounds" in out
         assert "MIN_POINTS_FOR_TAU" in out
-        # And the range agrees with it, in both places a range is printed.
-        assert f"a setpoint runs {MIN_POINTS_FOR_TAU}-15 rounds" in out
-        assert f"{MIN_POINTS_FOR_TAU} rounds at the first, " \
-               f"{MIN_POINTS_FOR_TAU} after, of 15" in out
-        assert "9.33-24.00 h" in out
+        # Past the window the floor is --settle-n-rounds alone: ceil(600/200) = 3
+        # rounds of time floor, and the detection window is also 3.
+        assert "3 after that" in out
+        assert "a setpoint runs 3-15 rounds" in out
+        assert "8/5/3/3/3/3/3/3 rounds in run order, of 15" in out
+
+    def test_plan_states_which_setpoints_the_tau_floor_applies_to(
+            self, project, capsys):
+        # `--tau-setpoints 0` removes it everywhere, and the plan must say so
+        # rather than quietly printing a shorter floor: a run that guarantees no
+        # tau anywhere is a legitimate thing to ask for and a terrible thing to
+        # get by accident.
+        assert _cmd_plan(_args("plan", "--tau-setpoints", "0")) == EXIT_OK
+        out = capsys.readouterr().out
+
+        assert "--tau-setpoints 0" in out
+        assert "applies NOWHERE" in out
+        assert "a setpoint runs 3-15 rounds" in out
 
     def test_plan_warns_that_a_missing_geometry_means_every_sigma_is_null(
             self, project, capsys):
@@ -542,41 +592,68 @@ class TestPlan:
         assert "channels:     1-16" not in out
         assert "(12)" in out
 
-    def test_plan_cautions_when_the_period_cannot_contain_a_real_round(
+    def test_plan_cautions_when_the_period_fits_the_model_but_not_the_models_error(
             self, project, capsys):
-        # The model covers the frequency sweep only; the per-channel overhead it
-        # omits is what makes a 120 s period too short for 16 channels. That was
-        # once the DEFAULT period -- it no longer is, so the caution has to be
-        # provoked by typing the old value rather than by typing nothing.
-        _cmd_plan(_args("plan", "--round-period-s", "120"))
+        # The regime the caution exists for, and the only one: 16 channels on
+        # 'Standard' model ~604 s, so a 620 s period DOES contain the modelled
+        # round -- but not the ~8 % the model may be under it by, and the bench
+        # number for that preset is 651 s. `plan` must not let 620 read as safe.
+        _cmd_plan(_args("plan", "--preset", "Standard", "--round-period-s", "620"))
         out = capsys.readouterr().out
-        assert "FREQUENCY SWEEP ONLY" in out
-        assert "s/channel for that overhead" in out
+        assert "FITTED to three presets" in out
+        assert "s/channel of margin" in out
         assert "CAUTION" in out
         assert "--round-period-s" in out
+        # Not the harder statement -- the round does fit the model.
+        assert "UNACHIEVABLE" not in out
+
+    def test_a_round_that_does_not_fit_at_all_is_not_also_hedged_about(
+            self, project, capsys):
+        # 604 s of modelled round against a 120 s period. Two verdicts of
+        # different strength on one question ("may not fit" directly above
+        # "UNACHIEVABLE") teaches the reader that neither is meant literally, so
+        # the margin caution stands down once the round plainly does not fit.
+        _cmd_plan(_args("plan", "--preset", "Standard", "--round-period-s", "120"))
+        out = capsys.readouterr().out
+        assert "UNACHIEVABLE" in out
+        assert "CAUTION" not in out
+        assert "Minimum feasible --round-period-s 610" in out
 
     def test_the_default_round_period_contains_a_real_round_at_the_default_channels(
             self, project, capsys):
         # The defect this default closes: --round-period-s was 120 s while
         # --channels defaulted to all 16, which costs ~168 s even on the fastest
-        # preset and 651 s on the default one. Someone accepting every default
-        # got a run that could not honour its own sampling interval.
-        from softae.tools.equilibration import (
-            DEFAULT_ROUND_PERIOD_S,
-            MEASURED_PER_CHANNEL_S_STANDARD,
+        # preset. Someone accepting every default got a run that could not honour
+        # its own sampling interval.
+        from softae.core.preflight import EIS_MEASURED_S_PER_CHANNEL
+        from softae.tools.equilibration import DEFAULT_ROUND_PERIOD_S
+        from softae.workflows.equilibration import (
+            ROUND_BUFFER_S,
+            EquilibrationConfig,
+            round_cost_s,
         )
-        from softae.workflows.equilibration import EquilibrationConfig, round_cost_s
 
-        config = EquilibrationConfig()          # 16 ch, 'Standard'
+        config = EquilibrationConfig()
         assert config.round_period_s == DEFAULT_ROUND_PERIOD_S
-        measured = round_cost_s(
-            config, measured_per_channel_s=MEASURED_PER_CHANNEL_S_STANDARD)
-        assert measured <= config.round_period_s
+        measured = round_cost_s(config, measured_per_channel_s=(
+            EIS_MEASURED_S_PER_CHANNEL[config.eis_preset]))
+        assert measured <= config.round_period_s - ROUND_BUFFER_S
 
         _cmd_plan(_args("plan"))
         out = capsys.readouterr().out
-        assert "CAUTION" not in out
+        # SILENT on both counts, and that is the property being pinned: `plan` is
+        # the screen an operator reads before committing a night, and a tool that
+        # cautions on its own shipped configuration teaches them to ignore it.
+        #
+        # It briefly did caution here, because the period was derived from the
+        # measurement alone (16 x 40.7 s -> 660 s) and left 8.8 s of slack, less
+        # than the sweep model's own ~8 % error. The period is now the measured
+        # round plus a stated buffer, which clears that error at the shipped
+        # preset. The threshold that fires the caution is derived from the model's
+        # calibration rather than being the flat 10 s/channel it was when the
+        # model ran ~10x low -- see `model_underestimate_frac`.
         assert "UNACHIEVABLE" not in out
+        assert "CAUTION" not in out
 
     def test_plan_does_not_caution_when_the_period_is_generous(self, project, capsys):
         _cmd_plan(_args("plan", "--channels", "1-4", "--round-period-s", "600"))
@@ -591,13 +668,19 @@ class TestPlan:
 
 
 class TestPlanningFromAMeasuredCost:
-    """The model is ~10x low, so a plan resting on it told the operator a 240 s
-    period was fine when a real round was 488 s. ``--measured-per-channel-s`` is
-    how a bench number gets into the projection; the modelled path must stop
-    reading like a prediction."""
+    """``--measured-per-channel-s`` is how a bench number gets into the projection,
+    and the modelled path must not read like a prediction beside it.
 
-    #: The operator's real run: 12 channels, 240 s period, 40.7 s/channel measured.
-    OPERATOR = ("plan", "--channels", "1-3,8-16", "--round-period-s", "240")
+    Written when the model was ~10x low and a plan resting on it told the operator
+    a 240 s period was fine for a round that really took 488 s. The model has since
+    been refitted and is ~8 % out, so what these tests now pin is that the two
+    paths stay distinguishable and stay labelled -- not that the gap is large."""
+
+    #: The operator's real run: 12 channels, 240 s period, 'Standard' at the
+    #: 40.7 s/channel it measured. ``--preset`` is now typed rather than defaulted:
+    #: the default is 'Quick', and 40.7 s/channel is a 'Standard' number.
+    OPERATOR = ("plan", "--channels", "1-3,8-16", "--round-period-s", "240",
+                "--preset", "Standard")
 
     def test_a_measured_per_channel_cost_changes_the_projected_total_duration(
             self, project, capsys):
@@ -608,9 +691,13 @@ class TestPlanningFromAMeasuredCost:
         out = capsys.readouterr().out
         measured = _whole_run_h(out)
 
-        # 15 rounds x 518 s per setpoint against 15 x 240 s: not a rounding
-        # difference, a different night.
-        assert measured > modelled + 5.0
+        # 15 rounds x 518 s against 15 x 483 s: still a different night, but a
+        # much smaller difference than when this was written. The modelled round
+        # was ~47 s then and is ~453 s now, because the sweep model was
+        # recalibrated against the bench; what is left is the ~3 s/channel of
+        # mux/upload/retrieval the model still does not carry, not an order of
+        # magnitude. An hour is well past a rounding difference at this scale.
+        assert measured > modelled + 1.0
         assert "MEASURED" in out
         assert "40.7s/channel" in out
 
@@ -654,8 +741,14 @@ class TestPlanningFromAMeasuredCost:
         out = capsys.readouterr().out
 
         assert "basis: MODELLED" in out
-        assert "a FLOOR, not a prediction" in out
-        assert "SEVERAL TIMES higher" in out
+        # No longer "a FLOOR" and no longer "SEVERAL TIMES higher": both were true
+        # of a model that ran ~10x low and are false of one refitted to the bench.
+        # What must survive is the label and the size of the doubt -- a modelled
+        # figure is never printed bare, and the note quotes the model's own fitted
+        # error rather than leaving the reader to guess at it.
+        assert "fitted to three" in out
+        assert "UNDER a real round" in out
+        assert "8%" in out
         assert "--measured-per-channel-s 40.7" in out   # the flag that fixes it
 
     def test_a_measured_plan_drops_the_modelled_caveats_rather_than_stacking_them(
@@ -663,7 +756,7 @@ class TestPlanningFromAMeasuredCost:
         _cmd_plan(_args(*self.OPERATOR, "--measured-per-channel-s", "40.7"))
         out = capsys.readouterr().out
         assert "basis: MODELLED" not in out
-        assert "FREQUENCY SWEEP ONLY" not in out
+        assert "NOTE: the model is FITTED" not in out
 
     def test_the_measured_cost_also_reaches_the_thermal_confirmation_prompt(
             self, capsys):
@@ -679,9 +772,18 @@ class TestPlanningFromAMeasuredCost:
         # Floor-to-worst, not typical-to-worst: `--rounds` is a ceiling, so the
         # low end of what the operator is committing to on this screen is every
         # setpoint settling at its earliest, not a typical approach time.
-        assert "4.8-16.0" in modelled
-        assert "4.8-16.0" not in measured
-        assert "7.8-25.3" in measured
+        #
+        # Both spans come from `project_duration` rather than being written out:
+        # the modelled one rests on core/preflight.py's sweep calibration, and a
+        # literal here would break every time that is re-fitted while saying
+        # nothing about the banner.
+        modelled_span = _span_h(project_duration(config))
+        measured_span = _span_h(project_duration(
+            config, measured_series_round_s=40.7 * len(config.channels)))
+        assert modelled_span != measured_span
+        assert modelled_span in modelled
+        assert modelled_span not in measured
+        assert measured_span in measured
 
     def test_a_nonpositive_measurement_falls_back_to_the_model_rather_than_exiting(
             self, project, capsys):
@@ -703,6 +805,12 @@ def _whole_run_h(out: str) -> float:
         if "WHOLE RUN" in line:
             return float(line.split()[2].split("-")[-1])
     raise AssertionError("no WHOLE RUN row in the printed design")
+
+
+def _span_h(projection) -> str:
+    """The floor-to-worst hours ``confirm_thermal`` commits the operator to."""
+    return (f"{projection.typical_floor_s / 3600:.1f}-"
+            f"{projection.worst_case_s / 3600:.1f}")
 
 
 class TestChannelSpecFormatting:
@@ -999,17 +1107,18 @@ class TestETA:
     def test_a_measured_round_cost_reprojects_the_eta_and_keeps_the_model_visible(self):
         # The gap between projected and actual IS the finding, so the modelled
         # figure stays on the line rather than being silently replaced.
-        # The measured round has to OVERRUN the configured period for the
-        # reprojection to lengthen the run, so the period is stated rather than
-        # defaulted: the shipped default is now 660 s and a 170 s round fits
-        # inside it comfortably.
+        # A cycle is the period or the round cost, whichever is longer, so the
+        # measured round has to overrun BOTH for the reprojection to lengthen the
+        # run. 16 channels of `Standard` now model ~603 s (recalibrated against
+        # the bench), so 170 s no longer overruns anything -- it is *shorter*
+        # than the model. 700 s is a round that genuinely overruns.
         tty = _Sink(tty=True)
         renderer = _renderer(stream=tty,
                              config=EquilibrationConfig(round_period_s=120.0))
         modelled_total = renderer.projected_total_s
 
         renderer(_event(kind=EV_ROUND_FINISHED, round_kind="series",
-                        round_duration_s=170.0, per_channel_s=10.6))
+                        round_duration_s=700.0, per_channel_s=43.75))
 
         assert renderer.measured_total_s is not None
         assert renderer.measured_total_s > modelled_total
@@ -1313,10 +1422,86 @@ class TestPlanArtifact:
         design = load_plan(_write_plan_file(tmp_path / "plan.toml",
                                             "--channels", "1-4", *GEOMETRY))
 
+        from softae.workflows.equilibration import DEFAULT_EIS_PRESET
+
         assert design["model"] == "simpleSalt"
         assert design["thickness_method"] == "target"
-        assert design["preset"] == "Standard"
+        # 'Quick', and read from the constant rather than spelled: the value is
+        # what the plan artifact must not lose, and pinning the spelling here
+        # would make this a test of the default instead of a test of the file.
+        assert design["preset"] == DEFAULT_EIS_PRESET == "Quick"
         assert design["rounds"] == 15
+        # The RH setpoint among them: 20, and it is in the file rather than left
+        # to whatever the `run` process happens to default to.
+        assert design["rh"] == pytest.approx(20.0)
+
+    def test_every_newly_exposed_chamber_flag_reaches_the_config_and_the_plan(
+            self, project, tmp_path):
+        # None of these was settable without editing source, and the operator hit
+        # the approach timeout on a real run with no flag to extend it. Each is
+        # given a value distinct from its default so a flag silently dropped on
+        # the floor cannot pass by coincidence.
+        from softae.tools.equilibration import load_plan
+
+        typed = ("--tolerance-c", "1.25", "--rh-tolerance-pct", "3.5",
+                 "--warn-c", "4.5", "--fault-c", "12.0", "--grace-s", "90",
+                 "--approach-timeout-s", "2400", "--down-approach-timeout-s", "7200",
+                 "--rh-approach-timeout-s", "3000", "--tau-setpoints", "3")
+        expected = {"tolerance_C": 1.25, "rh_tolerance_pct": 3.5, "warn_C": 4.5,
+                    "fault_C": 12.0, "grace_s": 90.0, "approach_timeout_s": 2400.0,
+                    "down_approach_timeout_s": 7200.0,
+                    "rh_approach_timeout_s": 3000.0}
+
+        args = _args("plan", "--channels", "1-4", *GEOMETRY, *typed)
+        config = build_config(args)
+        for field, value in expected.items():
+            assert getattr(config, field) == pytest.approx(value), field
+        assert config.tau_setpoints == 3
+
+        design = load_plan(_write_plan_file(tmp_path / "plan.toml",
+                                            "--channels", "1-4", *GEOMETRY, *typed))
+        for field, value in expected.items():
+            assert design[field] == pytest.approx(value), field
+        assert design["tau_setpoints"] == 3
+
+    def test_the_chamber_flags_survive_the_round_trip_into_the_run(
+            self, project, tmp_path):
+        # A plan that records a tolerance the run does not read would be worse
+        # than not recording it: the file would state a design nobody executed.
+        from softae.tools.equilibration import _seat_plan
+
+        typed = ("--tolerance-c", "1.25", "--down-approach-timeout-s", "7200",
+                 "--tau-setpoints", "3")
+        path = _write_plan_file(tmp_path / "plan.toml", "--channels", "1-4",
+                                *GEOMETRY, *typed)
+
+        executed = _args("run", "--from-plan", str(path))
+        assert _seat_plan(executed) == []
+        config = build_config(executed)
+
+        assert config.tolerance_C == pytest.approx(1.25)
+        assert config.down_approach_timeout_s == pytest.approx(7200.0)
+        assert config.tau_setpoints == 3
+
+    def test_a_plan_from_the_previous_schema_is_refused_rather_than_defaulted(
+            self, project, tmp_path, monkeypatch, capsys):
+        # A `/2` plan was written when tolerance_C was 0.5, --rh was 15 and the
+        # descending leg had the ascending leg's allowance. Reading one here with
+        # the new keys defaulted would silently change what "held" means on a file
+        # that states neither value.
+        path = _write_plan_file(tmp_path / "plan.toml", "--channels", "1-4",
+                                *GEOMETRY)
+        _corrupt_plan(path, f'schema = "{PLAN_SCHEMA}"',
+                      'schema = "equilibration-plan/2"')
+        _offline_run(monkeypatch)
+        capsys.readouterr()
+
+        assert _cmd_run(_args("run", "--from-plan", str(path),
+                              "--execute")) == EXIT_FAILED
+        err = capsys.readouterr().err
+        assert "equilibration-plan/2" in err
+        assert PLAN_SCHEMA in err
+        assert "does NOT fall back to the built-in defaults" in err
 
     def test_a_saved_plan_names_its_writer_and_stamps_a_timestamp(
             self, project, tmp_path):
@@ -1325,11 +1510,12 @@ class TestPlanArtifact:
         path = _write_plan_file(tmp_path / "plan.toml", "--channels", "1-4", *GEOMETRY)
         data = tomllib.loads(Path(path).read_text(encoding="utf-8"))
 
-        # `/2` since the settle criterion landed: the six settle_*/min_hold_*
-        # keys joined [design], and a `/1` plan is refused rather than read with
-        # them defaulted -- it was written when `rounds` meant "exactly this
-        # many", and it says nothing about a criterion that can now stop at 3.
-        assert data["schema"] == PLAN_SCHEMA == "equilibration-plan/2"
+        # `/3` since the chamber joined [design]: tau_setpoints and the eight
+        # bands and allowances. A `/2` plan is refused rather than read with them
+        # defaulted -- it was written when tolerance_C was 0.5, --rh was 15 and
+        # the descending leg had the ascending leg's 1800 s allowance, so
+        # executing one here would silently change what "held" means.
+        assert data["schema"] == PLAN_SCHEMA == "equilibration-plan/3"
         # Never `__name__`, which is "__main__" under `python -m` and names
         # nothing a reader could open.
         assert data["written_by"] == "softae.tools.equilibration"

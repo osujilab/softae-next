@@ -73,8 +73,12 @@ $Design = @(
     # board casts sessile (no wells), so nothing on it predicts a footprint.
     '--thickness-method', 'target'
 
-    # Plan from the bench figure rather than preflight's model, which is ~10x low
-    # (EIS_CYCLES_PER_POINT = 3.0 against a fitted ~29).
+    # Plan from the bench figure rather than the model. That model WAS ~10x low
+    # (EIS_CYCLES_PER_POINT = 3.0) and has since been recalibrated against these
+    # same three measured presets -- it now sits within ~8%, over-counting Quick
+    # rather than under-counting it. Passing the measured anchor is therefore no
+    # longer a correction, it is a statement of provenance: the plan says which
+    # numbers came off this rig and which came out of a fit.
     '--measured-per-channel-s', '10.47'
 
     # ---- How long each setpoint is held --------------------------------------
@@ -97,12 +101,46 @@ $Design = @(
     '--settle-min-channels', '3'
 
     # 1500 s ~ 3 tau at the first setpoint (tau = 425-575 s measured, films
-    # drying from ambient to 15 %RH). Every later setpoint gets 600 s: the films
-    # are dry, but the chamber still has to re-establish RH -- and it cannot
-    # reach 15 %RH at 65 or 85 C at all, which is why the criterion is on SIGMA
+    # drying from ambient to the RH setpoint). Every later setpoint gets 600 s:
+    # the films are dry, but the chamber still has to re-establish RH -- and how
+    # close it gets is a RESULT, which is why the stopping criterion is on SIGMA
     # and not on the RH process value.
     '--min-hold-first-s', '1500'
     '--min-hold-s', '600'
+
+    # tau is only wanted where a transient exists. Measured per-setpoint sigma
+    # swing on the up leg: 1600-2800% at S0, 57-1370% at S1, then 0.5-8.5% at S2
+    # and 0.8-3.1% at S3, against a 5.98% noise floor. The films dry ONCE and
+    # stay dry, so past S1 the 5-round fit minimum buys a tau fitted to noise.
+    # Two setpoints of the RUN, not of each leg: the down leg re-visits
+    # temperatures the films have already seen.
+    '--tau-setpoints', '2'
+
+    # ---- The chamber ---------------------------------------------------------
+    # 20 %RH, NOT 15. This is not a controls fault and re-tuning will not fix it:
+    # the flush basin holds water INSIDE the heated enclosure, so warming the
+    # chamber humidifies it with surplus moisture. Commanded 15 on 2026-08-11 and
+    # measured a PV of 16.9-20.4 at 65 C and 19.5-23.2 at 85 C -- 15 is below what
+    # this enclosure can deliver hot, so asking for it grades every hot setpoint
+    # unmet for a plumbing reason. Do not "optimise" this back down without first
+    # taking the water out of the enclosure.
+    '--rh', '20'
+
+    # 2.0 C, NOT 0.5. At 0.5 a 0.6 C dip (PV 64.4 against 65.0) graded the whole
+    # down/S1 window "hold not met" on a chamber that wanders a few tenths --
+    # an unmet verdict that is not a failure, on a run where an unmet verdict is
+    # a primary result. Still well inside the 3.0 C excursion warning.
+    '--tolerance-c', '2.0'
+
+    # Cooling is passive and asymptotic, and 1800 s is not enough coming down:
+    # measured down-leg approaches were 0.5 min at 85 C, 12.0 at 65, 22.5 at 45
+    # and 30.0 at 27.5 -- where it hit the 1800 s timeout WITHOUT reaching
+    # tolerance, so 15 rounds labelled 27.5 C spanned a 5 C ramp (34.1 C at the
+    # first round, 29.0 C at the last). 5400 s = that 1800 s plus ~60 min; at the
+    # measured end-of-series rate of ~5 C per 44 min, 34.1 -> 27.5 C needs ~58.
+    # The UP leg keeps 1800 s: the heater is driving there and it was ample.
+    '--approach-timeout-s', '1800'
+    '--down-approach-timeout-s', '5400'
 )
 
 & $python @cli 'plan' @Design '--save' $Plan

@@ -34,9 +34,56 @@ logger = structlog.get_logger(__name__)
 
 #: Periods measured per frequency point in an EIS sweep. The low-frequency end
 #: dominates the sweep time; this is the multiplier on 1/f for each point.
-EIS_CYCLES_PER_POINT = 3.0
-#: Floor on per-point time, covering instrument overhead at high frequency.
-EIS_MIN_POINT_S = 0.05
+#:
+#: **Measured on this rig, not assumed.** The previous pair (3.0 cycles, 0.05 s)
+#: was a guess and ran ~10x low — ``Standard`` projected 3.9 s/channel against a
+#: bench-measured 40.85 s, which is how a 15 h run came to be planned at 9 h. The
+#: three anchors these constants are fitted to, each a timestamp delta from a
+#: production run and reproducible to ±0.1 s over four months:
+#:
+#: ========  ====  =======  =================
+#: preset    npts  f_lo     measured s/channel
+#: ========  ====  =======  =================
+#: Quick       25  20 Hz    10.47
+#: Standard    35  4 Hz     40.85
+#: Extended    45  1.2 Hz   115.2
+#: ========  ====  =======  =================
+#:
+#: ``Longest`` (35 pts, 0.2 Hz) is **not** an anchor — it has never been timed on
+#: this rig. The model predicts ~503 s/channel for it; that is extrapolation and
+#: is labelled as such wherever it surfaces.
+#:
+#: Two constants cannot fit three points exactly. These are the minimax-relative
+#: solution: every anchor is reproduced to within 7.8 %, and no reweighting of the
+#: three does better than 7.7 % with this functional form. The residual is a limit
+#: of the ``max(floor, cycles/f)`` shape, not of the measurements.
+EIS_CYCLES_PER_POINT = 33.2
+#: Floor on per-point time, covering instrument overhead at high frequency. The
+#: knee sits at ``33.2 / 0.342 ≈ 97 Hz``, so the floor — not the sweep — sets the
+#: cost of 24 of ``Standard``'s 35 points. Anything that shortens a sweep by
+#: raising ``f_lo`` therefore saturates quickly.
+EIS_MIN_POINT_S = 0.342
+
+#: The presets whose per-channel cost was actually timed on this rig, and what
+#: they cost. Kept as data so a projection can say which of its numbers rest on a
+#: measurement and which are the model speaking beyond its anchors — ``Longest``
+#: is the live case, and a duration quoted for it with the same confidence as
+#: ``Standard`` is how the 10x error stayed invisible for four months.
+EIS_MEASURED_S_PER_CHANNEL: dict[str, float] = {
+    "Quick": 10.47,
+    "Standard": 40.85,
+    "Extended": 115.2,
+}
+
+
+def eis_duration_basis(preset: str | None) -> str:
+    """``"measured"`` for a timed preset, ``"extrapolated"`` for anything else.
+
+    A one-word provenance tag, not a confidence score: the model reproduces its
+    three anchors to 7.8 %, and says nothing at all about how it behaves outside
+    them. ``Longest`` reaches 0.2 Hz, a factor of six below the lowest anchor.
+    """
+    return "measured" if preset in EIS_MEASURED_S_PER_CHANNEL else "extrapolated"
 
 
 @dataclass
@@ -80,11 +127,17 @@ def _extrusion_s(vols, rates) -> float:
 
 
 def estimate_eis_duration(eis_params: Any = None) -> float:
-    """Estimated sweep time from the EIS parameters.
+    """Estimated sweep time from the EIS parameters, in seconds per channel.
 
-    The low-frequency end dominates: a point at 0.1 Hz costs ~30 s while one at
+    The low-frequency end dominates: a point at 0.2 Hz costs ~165 s while one at
     100 kHz is instrument-limited. Points are assumed log-spaced between
-    ``f_hi`` and ``f_lo``, each costing ``EIS_CYCLES_PER_POINT`` periods.
+    ``f_hi`` and ``f_lo``, each costing ``EIS_CYCLES_PER_POINT`` periods or
+    ``EIS_MIN_POINT_S``, whichever is longer.
+
+    Calibrated against three measured presets (see :data:`EIS_CYCLES_PER_POINT`)
+    and reproducing all three within 7.8 %. Any *other* preset — ``Longest``
+    included — is an extrapolation from those three, and callers that surface a
+    projection for one should say so.
     """
     if eis_params is None:
         from softae.core.eis_scripts import EISParams
@@ -417,12 +470,23 @@ def project_campaign(
             warnings=[f"Could not build a representative trial: {exc}"],
         )
 
-    eis = EISParams.from_preset(
-        getattr(spec, "eis_preset", None),
-        **(getattr(spec, "eis_overrides", None) or {}),
-    )
+    preset = getattr(spec, "eis_preset", None)
+    overrides = getattr(spec, "eis_overrides", None) or {}
+    eis = EISParams.from_preset(preset, **overrides)
     est = estimate_workflow_duration(wf, eis_params=eis)
     draw = per_iteration_draw(wf)
+
+    # An operator reading "at most 14 h" has no way to tell a projection anchored
+    # on a stopwatch from one the model invented past its last anchor, and the two
+    # deserve different amounts of trust. Overrides count as leaving the anchors:
+    # a Standard preset with f_lo pushed to 0.2 Hz is not the Standard that was timed.
+    if overrides or eis_duration_basis(preset) != "measured":
+        warnings.append(
+            f"EIS duration for preset '{preset or 'default'}' is EXTRAPOLATED — "
+            f"the sweep model is calibrated only against "
+            f"{', '.join(sorted(EIS_MEASURED_S_PER_CHANNEL))}, and this is not one "
+            f"of them."
+        )
 
     if not est.is_complete:
         warnings.append(

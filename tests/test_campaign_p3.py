@@ -133,8 +133,13 @@ def store(tmp_path):
 def _seed_store_run(store) -> str:
     """Populate a run with two channels × two replicate measurements + fits.
 
-    Seeds the tables directly (the adapter only reads table contents); the
-    high-level ``record_*`` helpers require full EISResult/FitResult objects.
+    ``measurements`` and ``fit_results`` are seeded directly — their ``record_*``
+    helpers require full EISResult/FitResult objects — but conditions go through
+    :meth:`DataStore.record_conditions`, because since schema epoch 4 that writer
+    is where a row's temperature is resolved. A raw INSERT here would produce
+    rows no production writer can produce, and the fixture would then be testing
+    the adapter's fallback path in every test that uses it. One test below does
+    exactly that, deliberately and alone.
     """
     run_id = store.start_run("ht", campaign="dev")
     conn = store._conn
@@ -148,15 +153,8 @@ def _seed_store_run(store) -> str:
                 (run_id, ch, ts, 10),
             )
             mid = cur.lastrowid
-            conn.execute(
-                "INSERT INTO conditions (measurement_id, run_id, stage, timestamp, "
-                # Raw INSERT into a LIVE, already-migrated store: the new column
-                # names are the only ones that exist here. (That this fixture is
-                # coupled to the schema at all is what `record_conditions` exists
-                # to absorb.)
-                "chamber_air_C, rh_pv_pct) VALUES (?, ?, ?, ?, ?, ?)",
-                (mid, run_id, "measurement", ts, 35.0, 30.0),
-            )
+            store.record_conditions(
+                mid, "measurement", chamber_air_C=35.0, rh_pv_pct=30.0)
             conn.execute(
                 "INSERT INTO fit_results (measurement_id, run_id, model_name, R0, R1, "
                 "sigma_S_per_cm, success, fitted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -247,6 +245,57 @@ def test_datastore_adapter_no_thermometer_at_all_is_nan_not_a_number(store):
     row = DataStoreAdapter(store, run_id).to_tidy().iloc[0]
     assert math.isnan(row["temp_C"])
     assert row["temp_source"] == "unavailable"
+
+
+def test_datastore_adapter_reads_the_stored_resolution_not_its_own(store):
+    """Epoch 4: the adapter consumes the row's answer instead of re-deriving it.
+
+    Pinned by writing a stored pair the *source* columns cannot produce. If the
+    adapter still resolved from the raw reads it would return 42.8/chamber_air;
+    reading the stored column, it returns what the row says. No production
+    writer creates this disagreement — that is why it makes a clean probe.
+    """
+    run_id = _seed_one_measurement(store, chamber_air_C=42.8)
+    store._conn.execute(
+        "UPDATE conditions SET temperature_C = 85.0, temperature_source = 'stage_pv' "
+        "WHERE run_id = ?", (run_id,)
+    )
+    store._conn.commit()
+
+    row = DataStoreAdapter(store, run_id).to_tidy().iloc[0]
+    assert row["temp_C"] == pytest.approx(85.0)
+    assert row["temp_source"] == "stage_pv"
+
+
+def test_datastore_adapter_falls_back_to_the_resolver_when_the_row_has_no_source(store):
+    """A row with no stored label — raw INSERT, or a pre-epoch-4 binary.
+
+    The fallback is the same authority the writer would have used, so the answer
+    must be identical to the stored-column path's: stage PV over the air probe.
+    """
+    run_id = store.start_run("stale_writer", campaign="dev")
+    conn = store._conn
+    ts = "2026-01-01T00:00:00"
+    cur = conn.execute(
+        "INSERT INTO measurements (run_id, channel, timestamp, npts) VALUES (?, 1, ?, 10)",
+        (run_id, ts),
+    )
+    mid = cur.lastrowid
+    conn.execute(
+        "INSERT INTO fit_results (measurement_id, run_id, model_name, R0, R1, "
+        "sigma_S_per_cm, success, fitted_at) VALUES (?, ?, 'simpleSalt', 10.0, 1e5, 1e-5, 1, ?)",
+        (mid, run_id, ts),
+    )
+    conn.execute(
+        "INSERT INTO conditions (measurement_id, run_id, stage, timestamp, "
+        "stage_temp_pv_C, chamber_air_C) VALUES (?, ?, 'measurement', ?, 85.0, 42.8)",
+        (mid, run_id, ts),
+    )
+    conn.commit()
+
+    row = DataStoreAdapter(store, run_id).to_tidy().iloc[0]
+    assert row["temp_C"] == pytest.approx(85.0)
+    assert row["temp_source"] == "stage_pv"
 
 
 # ── Pareto utilities ────────────────────────────────────────────────────────

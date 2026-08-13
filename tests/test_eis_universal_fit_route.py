@@ -405,7 +405,10 @@ def test_the_temperature_sweep_sigma_is_bit_comparable_to_the_legacy_value_withi
     sweep = object.__new__(ArrheniusSweep)
     sweep.config = SimpleNamespace(electrode_geometry=geom, eis_model="simpleSalt")
 
-    for R1 in (1.0, 333.0, 1234.5, 5.0e4, 9.87e5):
+    # Every value stays above the `simpleSalt` R₁ lower bound of 100 Ω. Below it a
+    # fit is *railed* and the engine now withholds σ entirely, which is a different
+    # test's subject: this one is about association order, and needs σ to exist.
+    for R1 in (150.0, 333.0, 1234.5, 5.0e4, 9.87e5):
         monkeypatch.setattr("softae.analysis.circuit_fitting.fit_circuit",
                             lambda eis, model_name, _R=R1: _fit(R1=_R))
         with pytest.warns(DeprecationWarning):

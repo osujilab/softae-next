@@ -27,6 +27,7 @@ from typing import Any
 import numpy as np
 import structlog
 
+from softae.analysis.conditions import resolve_temperature_C
 from softae.analysis.eis.calibration import MEASUREMENT_ROLES
 from softae.analysis.eis.geometry import THICKNESS_METHODS, CellConstant
 from softae.analysis.eis_data import EISResult
@@ -72,6 +73,21 @@ SCHEMA_EPOCHS: tuple[tuple[int, str, str], ...] = (
      "changed. That is what the kind column is for. Pre-rename readers that "
      "took temp_pv_C for 'the temperature' were reading air up to 42 C below "
      "the stage; see softae.analysis.conditions"),
+    (4, "schema",
+     "2026-08-12 conditions gains temperature_C + temperature_source: the "
+     "answer resolve_temperature_C() would give for a row, computed once at "
+     "record time and stored, instead of re-derived by every consumer (and "
+     "restated as a COALESCE inside query_measurements(temp_range=...)). "
+     "softae.analysis.conditions called this end state 'data-epoch-grade' - "
+     "that phrase measures how significant the change is, not what kind it is. "
+     "The kind column asks only whether stored numbers changed meaning, and "
+     "none did: every source column keeps its value, and the new columns are a "
+     "deterministic function of columns already in the same row. So: 'schema'. "
+     "Backfilled across all historical rows, unlike the deliberately "
+     "NULL-for-historical columns of T2.6 / T3.1b - see "
+     "_migrate_conditions_resolved_temperature for why a derivation differs "
+     "from a fact the past failed to record. temperature_source is never NULL "
+     "after this epoch; 'unavailable' means no thermometer spoke"),
 )
 
 # ---------------------------------------------------------------------------
@@ -129,17 +145,28 @@ CREATE TABLE IF NOT EXISTS conditions (
     stage_temp_pv_C     REAL,
     rh_sp_pct           REAL,
     rh_pv_pct           REAL,
+    -- The temperature this row means, and which thermometer said so: what
+    -- `softae.analysis.conditions.resolve_temperature_C` returns for the three
+    -- columns above, written once at record time (schema epoch 4). NULL
+    -- `temperature_C` means no thermometer spoke; `temperature_source` is then
+    -- 'unavailable' and is never NULL on a row any writer since epoch 4 wrote.
+    temperature_C       REAL,
+    temperature_source  TEXT,
     notes               TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_conditions_measurement_id ON conditions(measurement_id);
 CREATE INDEX IF NOT EXISTS idx_conditions_run_id         ON conditions(run_id);
 CREATE INDEX IF NOT EXISTS idx_conditions_stage          ON conditions(stage);
--- The temperature index is NOT declared here. This script runs before the
+-- NO temperature index is declared here — neither on the source columns nor on
+-- the derived `temperature_C` this DDL does declare. This script runs before the
 -- migrations, so on a legacy database `conditions` still carries whichever
--- temperature columns it was created with, and indexing a column this DDL has
--- not been able to add yet fails the whole open. `_migrate_conditions_temp_names`
--- creates `idx_conditions_stage_temp_pv` once the column names are settled.
+-- columns it was created with (the CREATE above is a no-op there), and indexing
+-- a column this DDL has not been able to add yet fails the whole open.
+-- `_migrate_conditions_temp_names` creates `idx_conditions_stage_temp_pv` once
+-- the column names are settled; `_migrate_conditions_resolved_temperature`
+-- creates `idx_conditions_temperature_C` once the derived column exists
+-- everywhere. Migrations own every conditions temperature index, on both paths.
 
 CREATE TABLE IF NOT EXISTS fit_results (
     fit_id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -488,6 +515,10 @@ class DataStore:
         # Must follow the line above: it can only rename a table that already has
         # all three columns, and it owns the temperature index for every database.
         self._migrate_conditions_temp_names()
+        # ...and only then derive the resolved temperature from them: this one
+        # reads all three source columns by their settled names, so it cannot run
+        # before the rename above has given them those names.
+        self._migrate_conditions_resolved_temperature()
         self._migrate_formulation_thickness()
         # Migrate existing databases: record the area a thickness was divided by.
         self._migrate_formulation_area()
@@ -831,18 +862,33 @@ class DataStore:
 
         Only the first two are a pair. Nothing sets ``chamber_air_C``; it is air
         in the enclosure and ran up to 42 °C below the stage on run
-        ``20260811T023757Z``. Consumers choosing between them must go through
-        :func:`softae.analysis.conditions.resolve_temperature_C`.
+        ``20260811T023757Z``.
+
+        **The choice between them is made here, once** (schema epoch 4). Every
+        row also stores what
+        :func:`softae.analysis.conditions.resolve_temperature_C` says about it:
+        ``temperature_C`` — the sample's temperature, ``NULL`` when no
+        thermometer spoke — and ``temperature_source``, one of
+        :data:`~softae.analysis.conditions.TEMPERATURE_SOURCES` or
+        ``'unavailable'``, never ``NULL``. Consumers read those two columns
+        rather than re-deriving the precedence; the resolver remains the only
+        place the precedence is written down.
 
         Returns the new ``condition_id``.
         """
         run_id = self._run_id_for_measurement(measurement_id)
+        temperature_C, temperature_source = resolve_temperature_C(
+            stage_pv_C=stage_temp_pv_C,
+            stage_sp_C=stage_temp_sp_C,
+            chamber_air_C=chamber_air_C,
+        )
         cur = self._conn.execute(
             """INSERT INTO conditions
                (measurement_id, run_id, stage, timestamp,
                 stage_temp_sp_C, chamber_air_C, stage_temp_pv_C,
+                temperature_C, temperature_source,
                 rh_sp_pct, rh_pv_pct, notes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 measurement_id,
                 run_id,
@@ -851,6 +897,10 @@ class DataStore:
                 stage_temp_sp_C,
                 chamber_air_C,
                 stage_temp_pv_C,
+                # NaN never reaches the REAL column: 'no thermometer spoke' is
+                # NULL + 'unavailable', one state with one spelling.
+                _f_or_none(temperature_C),
+                temperature_source,
                 rh_sp_pct,
                 rh_pv_pct,
                 notes,
@@ -1546,20 +1596,19 @@ class DataStore:
             )
             clauses.append("c.stage = ?")
             params.append(condition_stage)
-            # MIRROR — read the paragraph on ``TEMPERATURE_SOURCES`` in
-            # :mod:`softae.analysis.conditions` before touching this line. That
-            # tuple is the single authority for which thermometer a temperature
-            # comes from, and SQL cannot call it: the filter has to choose a
-            # column before any row reaches Python. So the precedence
-            # (stage PV → stage setpoint → chamber air) is restated here as a
-            # COALESCE, and the two must be changed together. It is a disclosed
-            # debt, not a pattern; the resolver's own note records the same
-            # obligation from its end, and names the derived-column end state
-            # that would retire both.
-            clauses.append(
-                "COALESCE(c.stage_temp_pv_C, c.stage_temp_sp_C, c.chamber_air_C) "
-                "BETWEEN ? AND ?"
-            )
+            # The mirror of the source precedence that used to sit here — a
+            # COALESCE restating `TEMPERATURE_SOURCES` because SQL cannot call
+            # the resolver — is RETIRED as of schema epoch 4. `temperature_C`
+            # *is* the resolver's answer, written at record time, so this filter
+            # names one column and holds no copy of the precedence. Rows where
+            # no thermometer spoke are NULL and drop out of the range, which is
+            # correct: they have no temperature to be in range of.
+            #
+            # Accepted edge: a row written by a stale pre-epoch-4 process against
+            # an already-migrated database lands with NULL and is invisible here
+            # until the next open re-resolves it (the backfill targets exactly
+            # those rows) — a single-machine, single-upgrade window.
+            clauses.append("c.temperature_C BETWEEN ? AND ?")
             params.extend(temp_range)
         else:
             base = (
@@ -1951,8 +2000,15 @@ class DataStore:
         # third copy of the source precedence in the schema — after the resolver
         # and the SQL — and a copy inside an index definition is the one nobody
         # greps. `conditions` holds ~1.4k rows per characterization run; the scan
-        # is not the problem here. The plain column index stays because ad-hoc
-        # and analysis queries do select on the stage PV directly.
+        # is not the problem here.
+        #
+        # Epoch 4 settled that differently, and better: the precedence is applied
+        # once at record time and the filter now names `temperature_C`, which
+        # `_migrate_conditions_resolved_temperature` indexes. This index no
+        # longer serves that query — it stays because ad-hoc and analysis
+        # queries do select on the stage PV directly, which is a different
+        # question ("what did the stage read") from the one the filter asks
+        # ("what temperature was this sample at").
         indexes = {
             row[0]
             for row in self._conn.execute(
@@ -1972,6 +2028,86 @@ class DataStore:
             )
         if pending or reindex:
             self._conn.commit()
+
+    def _migrate_conditions_resolved_temperature(self) -> None:
+        """Add ``temperature_C`` / ``temperature_source`` to ``conditions`` (epoch 4).
+
+        These are :func:`~softae.analysis.conditions.resolve_temperature_C`'s
+        answer for a row, stored. The resolver stays the only authority for the
+        precedence; what changes is that the answer is computed once, at record
+        time, instead of being re-derived by every consumer — and, worse,
+        restated as a ``COALESCE`` inside ``query_measurements(temp_range=…)``
+        because SQL cannot call Python. That mirror is what this migration
+        retires.
+
+        **This is the first backfilling migration in this codebase, and the
+        divergence is deliberate.** :meth:`_migrate_formulation_sample_uuid` and
+        :meth:`_migrate_doe_outcome` both chose NULL-for-historical, and were
+        right to: a sample uuid and a trial outcome are *facts the past failed to
+        record*, and no amount of inspection recovers them — inventing values
+        would fabricate exactly the fact the column exists to state honestly.
+        A resolved temperature is not that. It is a deterministic function of
+        three columns **already present in the same row**, so backfilling asserts
+        nothing the row did not already say; it only spells the answer out. A
+        NULL here would be the strictly worse choice, because it would mean every
+        historical row silently drops out of temperature filtering.
+
+        **SQL ``CASE`` was assessed and rejected**, on the same ground
+        :meth:`_migrate_conditions_temp_names` rejected an index over the
+        ``COALESCE`` expression: it would put a third copy of the source
+        precedence into the schema — after the resolver and the query — and this
+        one would additionally have to re-implement the resolver's *validity*
+        rules (non-finite, at-or-below absolute zero) in SQL, where they would
+        drift unnoticed. The rows go through the real function instead. There are
+        a few thousand of them per database; a one-time Python pass is not the
+        expensive part of an open.
+
+        The backfill targets ``temperature_source IS NULL``, which is every row
+        immediately after the ``ALTER``, nothing on a settled database, and
+        exactly the right set after an open interrupted between the ``ALTER`` and
+        the ``UPDATE``.
+        """
+        cols = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(conditions)"
+            ).fetchall()
+        }
+        added = False
+        for column, decl in (("temperature_C", "REAL"),
+                             ("temperature_source", "TEXT")):
+            if column not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE conditions ADD COLUMN {column} {decl}"
+                )
+                added = True
+        if added:
+            self._conn.commit()
+
+        stale = self._conn.execute(
+            "SELECT condition_id, stage_temp_pv_C, stage_temp_sp_C, chamber_air_C "
+            "FROM conditions WHERE temperature_source IS NULL"
+        ).fetchall()
+        if stale:
+            resolved = []
+            for condition_id, stage_pv, stage_sp, air in stale:
+                celsius, source = resolve_temperature_C(
+                    stage_pv_C=stage_pv, stage_sp_C=stage_sp, chamber_air_C=air
+                )
+                resolved.append((_f_or_none(celsius), source, condition_id))
+            self._conn.executemany(
+                "UPDATE conditions SET temperature_C = ?, temperature_source = ? "
+                "WHERE condition_id = ?",
+                resolved,
+            )
+            self._conn.commit()
+            logger.info("conditions_temperature_backfilled", rows=len(resolved))
+
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conditions_temperature_C "
+            "ON conditions(temperature_C)"
+        )
+        self._conn.commit()
 
     def _migrate_measurement_role(self) -> None:
         """Add ``role`` and ``fixture_id`` to ``measurements`` (E2 calibration).

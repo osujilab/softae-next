@@ -80,6 +80,7 @@ from softae.analysis.equilibration import (
     EQUILIBRATION_MODELS,
     MIN_POINTS_FOR_TAU,
     R1_AGREEMENT_TOL_REL,
+    arc_closure_rates,
     endorse_tolerance,
     fit_run,
     load_sigma_series,
@@ -93,6 +94,19 @@ from softae.core.channel_spec import (
 from softae.core.hardware_safety import ARM_ENV_VAR, HardwareNotArmedError
 from softae.tools import use_utf8_console
 from softae.workflows.equilibration import (
+    DEFAULT_APPROACH_TIMEOUT_S,
+    DEFAULT_DOWN_APPROACH_TIMEOUT_S,
+    DEFAULT_EIS_PRESET,
+    DEFAULT_FAULT_C,
+    DEFAULT_GRACE_S,
+    DEFAULT_N_CHANNELS,
+    DEFAULT_RH_APPROACH_TIMEOUT_S,
+    DEFAULT_RH_SETPOINT_PCT,
+    DEFAULT_RH_TOLERANCE_PCT,
+    DEFAULT_ROUND_PERIOD_S,
+    DEFAULT_TAU_SETPOINTS,
+    DEFAULT_TOLERANCE_C,
+    DEFAULT_WARN_C,
     ENV_ABSENT,
     ENV_SKIPPED,
     EV_AMBIENT_RESTORED,
@@ -106,6 +120,7 @@ from softae.workflows.equilibration import (
     EV_SETPOINT_FINISHED,
     EV_SETPOINT_STARTED,
     EV_SETTLE_VERDICT,
+    ROUND_BUFFER_S,
     VERDICT_ABORTED,
     VERDICT_MET,
     VERDICT_UNMET,
@@ -115,6 +130,7 @@ from softae.workflows.equilibration import (
     inter_round_gap_s,
     load_sidecar,
     minimum_feasible_period_s,
+    model_underestimate_frac,
     project_duration,
     round_cost_s,
     round_headroom_s_per_channel,
@@ -150,47 +166,34 @@ STATUS_WIDTH = 78
 #: see a controller drift, sparse enough that a 15 h log stays readable.
 DEFAULT_MILESTONE_INTERVAL_S = 300.0
 
-#: Below this much per-channel headroom, ``plan`` cautions that the configured
-#: round period is unlikely to contain a real round. It is a **warning threshold**,
-#: not an overhead model: the mux switch, the script upload, the data retrieval and
-#: the file write are per-channel costs ``estimate_eis_duration`` does not carry,
-#: and bench observation puts them at ~9-10 s each (a measured ~10-12 s/channel
-#: against a 1.4 s/channel model for ``Quick``). No rig's number is written into
-#: the projection — the run measures its own and records it; this threshold only
-#: decides whether a caution is printed.
-OVERHEAD_HEADROOM_WARN_S = 10.0
-
 #: What one channel of a ``Standard`` round **actually** cost on this rig, measured
 #: over 12 channels: 40.7 s, and essentially constant channel to channel (40.687 /
-#: 40.719 / 40.718 / 40.703 s on four consecutive channels). The model says ~3.9 s,
-#: so it is roughly **ten times low** — it covers the frequency sweep and nothing
-#: else, and the entire 40.7 s sits between the script send and the data return.
-#: Post-acquisition work (routing, fitting, the payload write) all lands inside the
-#: same log second and is not a factor.
+#: 40.719 / 40.718 / 40.703 s on four consecutive channels). Preflight's own
+#: ``Standard`` anchor, taken separately, is 40.85 s — the two agree to 0.4 %.
 #:
-#: Quoted in ``--help`` and in the modelled-basis note so an operator has a real
-#: number to plan from, rather than having to discover the gap the way this run
-#: did — by finding round 4 starting at elapsed 2166 s against an intended 240 s
-#: period. It is **not** used as a default: it belongs to one rig and one preset,
-#: and a silently applied constant would be wrong the moment either changed.
+#: This number is why the sweep model is trustworthy today. It used to model
+#: ~3.9 s/channel here, roughly **ten times low**, and a plan resting on it told
+#: an operator 240 s for a round that took 2166 s. ``estimate_eis_duration`` was
+#: refitted against this and two other timed presets in 2026-08 and now says
+#: ~37.7 s/channel — within 8.2 % of the bench. The measured-vs-modelled machinery
+#: throughout this module dates from the era of the gap and is kept because a model
+#: that was wrong once can be wrong again, not because it is currently wrong.
+#:
+#: Quoted in ``--help`` and in the modelled-basis note so an operator has a
+#: stopwatch number beside the model's. Still **not** used as a default: it belongs
+#: to one rig and one preset, and a silently applied constant would be wrong the
+#: moment either changed.
 MEASURED_PER_CHANNEL_S_STANDARD = 40.7
 
-#: The default σ(t) sampling interval, **derived from the other defaults rather
-#: than chosen**. ``--channels`` defaults to all 16 and ``--preset`` to
-#: ``Standard``, which is 16 × :data:`MEASURED_PER_CHANNEL_S_STANDARD` = 651.2 s of
-#: round; the previous 120 s default could not contain that on any preset (16
-#: channels costs ~168 s even on ``Quick``, measured at ~10.5 s/channel), so an
-#: operator accepting every default got a run that could not honour its own period
-#: and a σ(t) the fitter reads as evenly spaced when it is not.
-#:
-#: Rounded up to a whole ten by the same rule :func:`minimum_feasible_period_s`
-#: uses, so the number is one an operator can retype. It is deliberately a
-#: *feasible* default rather than a *good* one: a 660 s interval resolves τ no
-#: shorter than ~22 min, and the measured τ at the first setpoint is ~500 s — so
-#: a run that cares about the transient must take fewer channels or a faster
-#: preset, and this default makes that trade visible in ``plan`` instead of
-#: burying it in an overrun.
-DEFAULT_ROUND_PERIOD_S = math.ceil(16 * MEASURED_PER_CHANNEL_S_STANDARD / 10.0) * 10.0
+# The modelled-basis caution below is sized by
+# `model_underestimate_frac`, imported from the workflow rather than restated here.
+# It replaced a flat `OVERHEAD_HEADROOM_WARN_S = 10.0` s/channel, which reserved
+# room for a fixed per-channel overhead the model was believed not to carry, back
+# when the model ran ~10x low. Since the 2026-08 recalibration the residual is a
+# two-sided ~8 % fit error that *scales with the sweep*, and a flat 10 s/channel
+# would demand 89 % of `Quick`'s entire per-channel cost as reserve against 8 % of
+# `Extended`'s -- cautioning on rounds that comfortably fit and going quiet on ones
+# that do not.
 
 #: What an unreadable, stale or NaN value looks like. Never ``0.0``, never the
 #: last good number: ``AsyncRHController`` deliberately turns a held reading into
@@ -606,9 +609,35 @@ def build_config(args) -> EquilibrationConfig:
                                     DEFAULT_SETTLE_MIN_CHANNELS),
         min_hold_first_s=getattr(args, "min_hold_first_s", DEFAULT_MIN_HOLD_FIRST_S),
         min_hold_s=getattr(args, "min_hold_s", DEFAULT_MIN_HOLD_S),
+        tau_setpoints=getattr(args, "tau_setpoints", DEFAULT_TAU_SETPOINTS),
+        **_chamber_settings(args),
     )
     config.validate()
     return config
+
+
+#: The chamber bands and allowances, by ``EquilibrationConfig`` field name — which
+#: is also the ``argparse`` dest and the plan-file key, so the flag an operator
+#: types, the value the plan records and the field the run reads are one name from
+#: end to end. Paired with the module default so a hand-built namespace (the GUI,
+#: a test, a caller predating these flags) still produces the shipped chamber
+#: rather than an ``AttributeError`` at the top of a command that heats things.
+CHAMBER_SETTINGS = (
+    ("tolerance_C", DEFAULT_TOLERANCE_C),
+    ("rh_tolerance_pct", DEFAULT_RH_TOLERANCE_PCT),
+    ("warn_C", DEFAULT_WARN_C),
+    ("fault_C", DEFAULT_FAULT_C),
+    ("grace_s", DEFAULT_GRACE_S),
+    ("approach_timeout_s", DEFAULT_APPROACH_TIMEOUT_S),
+    ("down_approach_timeout_s", DEFAULT_DOWN_APPROACH_TIMEOUT_S),
+    ("rh_approach_timeout_s", DEFAULT_RH_APPROACH_TIMEOUT_S),
+)
+
+
+def _chamber_settings(args) -> dict[str, float]:
+    """The eight chamber values off the namespace, defaulted from one table."""
+    return {name: float(getattr(args, name, default))
+            for name, default in CHAMBER_SETTINGS}
 
 
 # ── The plan as an executable artifact ───────────────────────────────────────
@@ -630,7 +659,14 @@ def build_config(args) -> EquilibrationConfig:
 #: written when ``rounds`` meant "run exactly this many" would otherwise execute
 #: under a criterion that can stop the setpoint at three, and the file would say
 #: nothing about it.
-PLAN_SCHEMA = "equilibration-plan/2"
+#:
+#: ``/3`` added ``tau_setpoints`` and the eight chamber bands and allowances
+#: (:data:`CHAMBER_SETTINGS`). Same rule, and it bites harder: a ``/2`` plan was
+#: written when ``tolerance_C`` was 0.5, ``rh`` was 15 and the descending leg had
+#: the ascending leg's 1800 s allowance. Executing one here with those defaulted
+#: would silently change what "held" means and how long the chamber is given to
+#: get there, on a file that states neither. Re-save the design.
+PLAN_SCHEMA = "equilibration-plan/3"
 
 #: Every design flag :func:`build_config` reads, by its ``argparse`` dest. A key
 #: absent from a saved plan is a value that reverts to its default on ``run``, so
@@ -644,9 +680,15 @@ PLAN_SCHEMA = "equilibration-plan/2"
 PLAN_DESIGN_KEYS = (
     "channels", "temperatures", "legs", "rh", "rounds", "round_period_s",
     "settle", "settle_tol_rel", "settle_n_rounds", "settle_min_channels",
-    "min_hold_first_s", "min_hold_s",
+    "min_hold_first_s", "min_hold_s", "tau_setpoints",
     "preset", "model", "measured_per_channel_s",
     "electrode_l_cm", "electrode_t_cm", "electrode_w_cm", "thickness_method",
+    # The chamber. In the plan for the same reason the settle criterion is: what
+    # counts as "held", and how long the chamber is given to get there, is as much
+    # a part of the experiment as which temperatures it visits — and a verdict
+    # graded against a tolerance that reverted between `plan` and `run` is the
+    # 2026-08-10 defect in a field where it would never be noticed.
+    *(name for name, _default in CHAMBER_SETTINGS),
 )
 
 #: The design keys that legitimately have no value — the geometry, which may be
@@ -909,15 +951,16 @@ def _print_design(config: EquilibrationConfig, *,
 def _print_settle(config: EquilibrationConfig, projection: Any) -> None:
     """State that ``--rounds`` is a ceiling, and what the floors really buy.
 
-    Both floors are printed, not their minimum. They differ — only one setpoint
-    in the run gets ``min_hold_first_s`` — and the number an operator needs when
-    reading a short setpoint later is the one that applied to *that* setpoint.
+    Every floor is printed, not their minimum. They differ — only one setpoint in
+    the run gets ``min_hold_first_s``, and only the first ``tau_setpoints`` carry
+    the fit minimum — and the number an operator needs when reading a short
+    setpoint later is the one that applied to *that* setpoint.
 
     The effective figure is what the run enforces, which is not the time floor
-    divided by the period: :data:`MIN_POINTS_FOR_TAU` is folded in, and at the
-    shipped 660 s period it is the term that binds at **every** setpoint. Printing
-    only the time floors would understate the fast end of the budget by exactly
-    the amount that makes the run analysable.
+    divided by the period: :data:`MIN_POINTS_FOR_TAU` is folded in wherever a τ is
+    wanted, and at the shipped 660 s period it is the term that binds there.
+    Printing only the time floors would understate the fast end of the budget by
+    exactly the amount that makes the transient analysable.
     """
     if not config.settle_enabled:
         print("  settle:       OFF -- every setpoint runs exactly "
@@ -928,19 +971,57 @@ def _print_settle(config: EquilibrationConfig, projection: Any) -> None:
           f"channel(s)")
     print(f"                floors {config.min_hold_first_s:g}s at the FIRST setpoint "
           f"of the run, {config.min_hold_s:g}s after")
-    print(f"                effective minimum {projection.min_rounds_first} rounds at "
-          f"the first setpoint, {projection.min_rounds_later} after")
-    print(f"                so a setpoint runs "
-          f"{min(projection.min_rounds_first, projection.min_rounds_later)}-"
+    _print_floor_regimes(config, projection)
+    print(f"                so a setpoint runs {projection.min_rounds}-"
           f"{config.rounds_per_setpoint} rounds -- --rounds is a CEILING, not a count.")
-    print(f"                No setpoint may stop under {MIN_POINTS_FOR_TAU} rounds: "
-          f"that is the offline")
-    print("                fitter's own MIN_POINTS_FOR_TAU (sigma(t) has three free")
-    print("                parameters), so a shorter series would be acquired and then")
-    print("                REFUSED for tau -- the one number this run exists to get.")
+    _print_tau_window(config)
     print("                A channel with NULL sigma, or an R1 railed on the circuit")
     print("                model's bound, does not count towards the criterion: a")
     print("                railed fit is constant, and a constant is always 'settled'.")
+
+
+def _tau_window(config: EquilibrationConfig) -> int:
+    """Setpoints of this run that carry the fit minimum, clamped to the run."""
+    return max(0, min(int(config.tau_setpoints), int(config.n_setpoints)))
+
+
+def _print_floor_regimes(config: EquilibrationConfig, projection: Any) -> None:
+    """The effective minimum in **every** regime, and where the boundaries are.
+
+    Two numbers were enough while :data:`MIN_POINTS_FOR_TAU` applied everywhere.
+    It no longer does, so an operator reading a 3-round setpoint next to a
+    5-round one has to be able to see that the difference is the τ window and not
+    a configuration change.
+    """
+    n_tau = _tau_window(config)
+    print(f"                effective minimum {projection.min_rounds_first} rounds at "
+          f"setpoint 1 of the run,")
+    # The middle regime — inside the τ window but past the first setpoint — is
+    # printed only when it is a regime: it does not exist for a window of one, and
+    # it is not a separate number when it agrees with what follows it.
+    if n_tau <= 1 or projection.min_rounds_tau == projection.min_rounds_later:
+        print(f"                {projection.min_rounds_later} after")
+        return
+    span = "setpoint 2" if n_tau == 2 else f"setpoints 2-{n_tau}"
+    print(f"                {projection.min_rounds_tau} at {span}, "
+          f"{projection.min_rounds_later} after that")
+
+
+def _print_tau_window(config: EquilibrationConfig) -> None:
+    """Why the first setpoints are floored harder than the rest — and where to move it."""
+    n_tau = _tau_window(config)
+    if n_tau <= 0:
+        print(f"                --tau-setpoints 0: the {MIN_POINTS_FOR_TAU}-round fit "
+              f"minimum applies NOWHERE, so")
+        print("                no setpoint in this run is guaranteed to yield a tau.")
+        return
+    print(f"                The first {n_tau} setpoint(s) may not stop under "
+          f"{MIN_POINTS_FOR_TAU} rounds: that is")
+    print("                the offline fitter's own MIN_POINTS_FOR_TAU (sigma(t) has")
+    print("                three free parameters), so a shorter series would be")
+    print("                acquired and then REFUSED for tau. Past them the films are")
+    print("                dry and there is no relaxation left to fit, so the floor is")
+    print("                --settle-n-rounds and the hold floor alone (--tau-setpoints).")
 
 
 def _print_projection(projection: Any) -> None:
@@ -962,7 +1043,7 @@ def _print_projection(projection: Any) -> None:
 
     # Only the σ series shortens: the approaches are the chamber's to spend and
     # the criterion has no opinion about them.
-    series_floor = projection.min_rounds_later * projection.series_round_s
+    series_floor = projection.min_rounds * projection.series_round_s
     print("  Projected duration          typical            worst case")
     for key in ("temperature_approach", "rh_approach", "sigma_series"):
         typical, worst = (projection.breakdown_typical[key],
@@ -976,15 +1057,35 @@ def _print_projection(projection: Any) -> None:
     _row("WHOLE RUN",
          [(projection.typical_floor_s, projection.typical_s),
           (projection.worst_floor_s, projection.worst_case_s)], "h")
+    _print_approach_allowances(projection)
     if projection.adaptive:
         print("    (a RANGE, not an estimate: the floor is every setpoint settling at")
-        print(f"     its earliest -- {projection.min_rounds_first} rounds at the first, "
-              f"{projection.min_rounds_later} after, of "
-              f"{projection.rounds_per_setpoint} -- and the")
+        print(f"     its earliest -- {'/'.join(str(f) for f in projection.floor_rounds)}"
+              f" rounds in run order, of {projection.rounds_per_setpoint} -- and the")
         print("     ceiling is none of them settling at all. Both ends are achievable.)")
     print("    (worst case uses the TIMEOUTS, not an assumed ramp rate, so it is an")
     print("     upper bound rather than a guess. Holds are computed from this config:")
     print("     estimate_workflow_duration projects every temperature wait as 0.0 s.)")
+
+
+def _print_approach_allowances(projection: Any) -> None:
+    """The two temperature allowances, whenever they are not the same number.
+
+    The ``temperature_approach`` row above is the per-setpoint **mean** across the
+    legs, which is the right term in a total and the wrong number to quote at an
+    operator deciding whether to extend one. Cooling is passive: the descending
+    allowance is the one that ran out on 2026-08-11.
+    """
+    up = projection.temp_approach_timeout_up_s
+    down = projection.temp_approach_timeout_down_s
+    if abs(up - down) < 1.0:
+        return
+    print("    (the temperature_approach row is the per-setpoint MEAN of two "
+          "allowances:")
+    print(f"     {up / 60:.0f} min going UP, {down / 60:.0f} min coming DOWN "
+          f"(--down-approach-timeout-s).")
+    print("     Cooling is passive and asymptotic; the ascending allowance timed out")
+    print("     mid-descent on 2026-08-11 and 15 rounds spanned a 5 C ramp.)")
 
 
 def _print_round_cost(config: EquilibrationConfig, cost: float, *,
@@ -996,21 +1097,24 @@ def _print_round_cost(config: EquilibrationConfig, cost: float, *,
           f"({cost / max(1, len(config.channels)):.1f}s/channel)")
     if measured:
         return
-    print("    NOTE: the model covers the FREQUENCY SWEEP ONLY. Mux switching,")
-    print("    script upload, data retrieval and the file write are per-channel")
-    print("    costs it does not carry, and they are roughly fixed rather than")
-    print("    proportional to the sweep -- so a real round is LONGER, and a faster")
-    print("    preset does not shrink the difference. This run measures its own")
-    print("    round cost and records it in the sidecar.")
+    print("    NOTE: the model is FITTED to three presets timed on this rig and")
+    print(f"    reproduces them within ~{model_underestimate_frac():.0%}. That is a fit "
+          f"residual, not a")
+    print("    bound: it says nothing about a preset that was never timed, and it")
+    print("    does not carry mux switching, script upload, data retrieval or the")
+    print("    file write. This run measures its own round cost and records it in")
+    print("    the sidecar, so the next plan need not rest on the model at all.")
 
 
 def _print_basis(config: EquilibrationConfig, cost: float, *,
                  measured: bool) -> None:
-    """Never let a modelled duration be read as a prediction.
+    """Never let a modelled duration be read as a measurement.
 
-    The model is not merely approximate here, it is out by roughly an order of
-    magnitude, and the whole point of this note is that the operator sees that
-    before committing a night rather than after.
+    The two are close now — the model was refitted to the bench in 2026-08 and is
+    ~8 % out on ``Standard`` where it was ~10x out before — so this note no longer
+    exists to warn of a chasm. It exists because a night is being committed on the
+    strength of a number, and the operator is entitled to know whether that number
+    came from a stopwatch or from an extrapolation.
     """
     per_channel = cost / max(1, len(config.channels))
     if measured:
@@ -1018,13 +1122,16 @@ def _print_basis(config: EquilibrationConfig, cost: float, *,
               f"line. The")
         print("     model is not used anywhere above.)")
         return
-    print(f"    (basis: MODELLED {per_channel:.1f}s/channel -- a FLOOR, not a "
-          f"prediction. Bench")
-    print(f"     measurement puts a real round SEVERAL TIMES higher: "
-          f"{MEASURED_PER_CHANNEL_S_STANDARD:g}s/channel was")
-    print("     measured on 'Standard' over 12 channels, ~10x this. Re-plan with")
-    print(f"     --measured-per-channel-s {MEASURED_PER_CHANNEL_S_STANDARD:g} for a "
-          f"duration that reflects the bench.)")
+    frac = model_underestimate_frac()
+    print(f"    (basis: MODELLED {per_channel:.1f}s/channel, from a sweep model "
+          f"fitted to three")
+    print(f"     presets timed on this rig. It runs up to {frac:.0%} UNDER a real "
+          f"round on those:")
+    print(f"     'Standard' measured {MEASURED_PER_CHANNEL_S_STANDARD:g}s/channel over "
+          f"12 channels. Treat it as")
+    print(f"     +/-{frac:.0%}, not as a prediction; --measured-per-channel-s "
+          f"{MEASURED_PER_CHANNEL_S_STANDARD:g} plans")
+    print("     from that stopwatch instead.)")
 
 
 def _print_period_caution(config: EquilibrationConfig, cost: float, *,
@@ -1038,12 +1145,11 @@ def _print_period_caution(config: EquilibrationConfig, cost: float, *,
 
     Three statements, and they answer different questions. The remainder line is
     the same arithmetic on either basis, but it means different things: against a
-    modelled cost it is *headroom for the overhead the model omits*, and against a
-    measured one the overhead is already inside the number, so what is left is
-    simply slack. The CAUTION is modelled-only for that reason — it warns about an
-    omission that a measurement does not have. The feasibility block is
-    unconditional: at this channel count and this per-channel cost, either the
-    period contains a round or it does not.
+    measured cost what is left is simply slack, and against a modelled one it is
+    slack that still has to absorb the model's own error. The CAUTION is
+    modelled-only for that reason — a stopwatch has no fit residual to allow for.
+    The feasibility block is unconditional: at this channel count and this
+    per-channel cost, either the period contains a round or it does not.
     """
     headroom = round_headroom_s_per_channel(config, cost if measured else None)
     if measured:
@@ -1051,22 +1157,39 @@ def _print_period_caution(config: EquilibrationConfig, cost: float, *,
               f"{cost:.0f}s leaves {headroom:+.1f}s/channel of slack.")
     else:
         print(f"    Configured period {config.round_period_s:.0f}s vs modelled "
-              f"{cost:.0f}s leaves {headroom:.1f}s/channel for that overhead.")
+              f"{cost:.0f}s leaves {headroom:.1f}s/channel of margin.")
         _print_headroom_caution(config, cost, headroom)
     _print_feasibility(config, cost, measured=measured)
 
 
 def _print_headroom_caution(config: EquilibrationConfig, modelled: float,
                             headroom: float) -> None:
-    """The modelled-basis warning: too little room left for what the model omits."""
-    if headroom >= OVERHEAD_HEADROOM_WARN_S:
+    """The modelled-basis warning: the period fits the model but not the model's error.
+
+    Sized as a *fraction* of the modelled cost rather than a flat per-channel
+    reserve — see :func:`model_underestimate_frac` for why the flat one had to go.
+    The question asked is exactly: if this preset behaves like the worst-fitted of
+    the three timed ones, does the round still fit? A "no" here is not a prediction
+    of overrun; it is a refusal to promise there will not be one.
+
+    Silent once the round does not fit *at all*: :func:`_print_feasibility` then
+    says so outright, and hedging that a round "may not fit" immediately above
+    "UNACHIEVABLE" reads as two verdicts of different strength on one question.
+    """
+    frac = model_underestimate_frac()
+    needed = modelled * (1.0 + frac)
+    if modelled >= float(config.round_period_s):
         return
-    needed = modelled + OVERHEAD_HEADROOM_WARN_S * len(config.channels)
-    print(f"    ! CAUTION: under {OVERHEAD_HEADROOM_WARN_S:.0f}s/channel of headroom. "
-          f"Rounds will very likely")
-    print("      overrun --round-period-s, and the run will NOT shorten them or")
-    print("      adjust the period -- the period is the sampling interval of")
-    print(f"      sigma(t). Consider --round-period-s {needed:.0f} or fewer channels.")
+    if frac <= 0.0 or headroom * len(config.channels) >= needed - modelled:
+        return
+    print(f"    ! CAUTION: {headroom:.1f}s/channel of margin, and the sweep model "
+          f"runs up to")
+    print(f"      {frac:.0%} under a real round on the presets it was fitted to -- so "
+          f"a round")
+    print("      MAY NOT FIT, and the run will NOT shorten one or adjust the period:")
+    print("      the period is the sampling interval of sigma(t).")
+    print(f"      --round-period-s {math.ceil(needed / 10.0) * 10.0:.0f} covers that "
+          f"error; fewer channels is the other lever.")
 
 
 def _print_feasibility(config: EquilibrationConfig, cost: float, *,
@@ -1084,7 +1207,7 @@ def _print_feasibility(config: EquilibrationConfig, cost: float, *,
     minimum = minimum_feasible_period_s(cost)
     interval = cost + inter_round_gap_s(config, cost)
     qualifier = ("MEASURED" if measured
-                 else "MODELLED, so the real shortfall is several times worse")
+                 else f"MODELLED, and up to {model_underestimate_frac():.0%} low")
     print(f"    ! UNACHIEVABLE: one round costs {cost:.0f}s at "
           f"{len(config.channels)} channel(s)")
     print(f"      ({per_channel:.1f}s/channel, {qualifier}) but --round-period-s is "
@@ -1563,16 +1686,17 @@ def _print_teardown(runner: EquilibrationRun) -> None:
 def _print_measured_cost(runner: EquilibrationRun) -> None:
     """What a round really cost, beside what the model said it would.
 
-    This is the number that corrects ``estimate_eis_duration`` for everything
-    downstream, so it is printed rather than left in the sidecar for someone to
-    find.
+    This is the number ``estimate_eis_duration`` is answerable to — it is what the
+    2026-08 recalibration was fitted against — so it is printed rather than left in
+    the sidecar for someone to find. Every run adds an anchor, and a run whose
+    ratio drifts from 1 is the earliest warning the model has gone stale again.
     """
     summary = runner.measured_cost_summary()
     rows = [(kind, summary[kind]) for kind in ("series",) if kind in summary]
     if not rows:
         return
-    print("  Measured round cost (wall clock, includes per-channel overhead the")
-    print("  model does not carry):")
+    print("  Measured round cost (wall clock, includes the per-channel mux switch,")
+    print("  upload, retrieval and file write the sweep model does not carry):")
     for kind, row in rows:
         ratio = row["ratio_measured_over_modelled"]
         print(f"    {kind:<7s} {row['measured_round_s']:7.1f}s "
@@ -1712,6 +1836,7 @@ def _cmd_report(args) -> int:
         print("  an UPPER BOUND on pure measurement noise. Separating them needs a")
         print("  repeat with zero time between, which is not physically available.")
         _print_thickness(sidecar)
+        _print_arc_closure(arc_closure_rates(store, args.run, sidecar))
         _print_r1_diagnostic(stats)
         _print_session_drift(drift or [])
 
@@ -1761,6 +1886,40 @@ def _print_thickness(sidecar: dict[str, Any]) -> None:
         print("  A TARGET, not a measurement: every sigma above is divided by a")
         print("  hand-computed number. fit_results.thickness_method is NULL for this")
         print("  run, so this sidecar is the only record that says so.")
+
+
+def _print_arc_closure(summary: dict[str, Any]) -> None:
+    """How much of each block's σ rests on an extrapolated R₁.
+
+    A spectrum whose ``−Z″`` has not peaked by the lowest swept frequency gives R₁
+    by extrapolating off the high-frequency side. The number is still usable, so
+    nothing above excludes it — but a block where most spectra are in that state
+    has a σ, and a σ scatter, set partly by the circuit model, and the operator's
+    two decisions here are whether to trust that block's noise floor and whether
+    the cold end needs a slower preset.
+    """
+    n = summary["n"]
+    print()
+    if not n:
+        print("  Arc closure: NOT AVAILABLE (no stored payloads for this run).")
+        return
+    n_open = summary["n_open"]
+    print(f"  Arc closure: {n_open} of {n} spectra ({n_open / n * 100:.0f}%) did not "
+          f"close inside the")
+    print("  swept window; their R1 is extrapolated off the high-frequency side.")
+    if summary["n_unknown"]:
+        print(f"    {summary['n_unknown']} could not be judged (non-finite or too "
+              f"short a sweep).")
+    blocks = summary["by_block"]
+    if blocks:
+        print("    by block:  " + "  ".join(
+            f"{leg}/S{sp} {o / t * 100:.0f}%"
+            for (leg, sp), (o, t) in sorted(blocks.items(),
+                                            key=lambda kv: (kv[0][0] != "up", kv[0][1]))))
+    worst = sorted(summary["by_channel"].items(), key=lambda kv: -kv[1][0])[:4]
+    if worst and worst[0][1][0]:
+        print("    worst channels:  " + "  ".join(
+            f"ch{ch} {o}/{t}" for ch, (o, t) in worst))
 
 
 def _print_r1_diagnostic(stats: list[dict[str, Any]]) -> None:
@@ -1842,52 +2001,78 @@ def _add_design_args(parser: argparse.ArgumentParser, *,
     **not** ``argparse``'s ``required=True``, which exits 2 with a message that
     explains none of that — ``build_config`` raises and ``_cmd_run`` prints the
     reason and the flag.
+
+    Split across three ``--help`` groups because the surface is large and the
+    three answer different questions — *what is measured*, *when a setpoint may
+    stop*, and *what the chamber must do* — and an operator reaching for a
+    timeout should not have to read the geometry flags to find it. The grouping
+    is cosmetic only: every flag below lands in the saved plan exactly as before,
+    and :data:`PLAN_DESIGN_KEYS` is what decides that, not the group.
     """
-    parser.add_argument("--channels", default=None if required_channels else "1-16",
+    design = parser.add_argument_group(
+        "the experiment", "what is measured, where, and at what cost")
+    design.add_argument("--channels", default=None if required_channels else "1-16",
                         help='e.g. "1-16" or "2,4,5-10"'
                              + (" -- REQUIRED here; never inherited from 'plan'"
                                 if required_channels else ""))
-    parser.add_argument("--temperatures", default="27.5,45,65,85",
+    design.add_argument("--temperatures", default="27.5,45,65,85",
                         help="setpoints for the UP leg; the down leg retraces them")
-    parser.add_argument("--legs", default="up,down")
-    parser.add_argument("--rh", type=float, default=15.0, help="%%RH setpoint")
-    parser.add_argument("--rounds", type=int, default=15,
+    design.add_argument("--legs", default="up,down")
+    design.add_argument("--rh", type=float, default=DEFAULT_RH_SETPOINT_PCT,
+                        help=f"%%RH setpoint, re-established at EVERY temperature "
+                             f"(default {DEFAULT_RH_SETPOINT_PCT:g}). NOT 15: the "
+                             f"flush basin holds water inside the heated enclosure, "
+                             f"so warming the chamber humidifies it with surplus "
+                             f"moisture. Commanded 15 on 2026-08-11 and measured a PV "
+                             f"of 16.9-20.4 at 65 C and 19.5-23.2 at 85 C -- 15 is "
+                             f"below what this enclosure can deliver hot, and asking "
+                             f"for it grades every hot setpoint unmet for a reason "
+                             f"that is plumbing, not control.")
+    design.add_argument("--rounds", type=int, default=15,
                         help=f"the CEILING on sigma(t) rounds per setpoint -- NOT a "
                              f"fixed count. A setpoint stops as soon as sigma has "
-                             f"settled (see --settle-tol-rel), the hold floor has "
-                             f"elapsed AND at least {MIN_POINTS_FOR_TAU} rounds have "
-                             f"run; it runs this many only when it has not. That last "
-                             f"floor is the offline fitter's own MIN_POINTS_FOR_TAU, "
-                             f"imported rather than retyped: sigma(t) has three free "
-                             f"parameters, so a shorter series is REFUSED for tau, and "
-                             f"the run must not be able to acquire a setpoint it "
-                             f"cannot analyse. A ceiling below "
+                             f"settled (see --settle-tol-rel) and the hold floor has "
+                             f"elapsed; it runs this many only when it has not. Inside "
+                             f"the --tau-setpoints window it must also have run "
+                             f"{MIN_POINTS_FOR_TAU} rounds -- the offline fitter's own "
+                             f"MIN_POINTS_FOR_TAU, imported rather than retyped: "
+                             f"sigma(t) has three free parameters, so a shorter series "
+                             f"is REFUSED for tau, and the run must not be able to "
+                             f"acquire a setpoint it cannot analyse. A ceiling below "
                              f"{MIN_POINTS_FOR_TAU} is refused outright -- no setpoint "
                              f"in such a run could ever yield a tau.")
     _add_settle_args(parser)
-    parser.add_argument("--round-period-s", dest="round_period_s", type=float,
+    design.add_argument("--round-period-s", dest="round_period_s", type=float,
                         default=DEFAULT_ROUND_PERIOD_S,
-                        help=f"sigma(t) sampling interval. Default "
-                             f"{DEFAULT_ROUND_PERIOD_S:g}s is DERIVED, not chosen: "
-                             f"16 channels (the --channels default) x "
-                             f"{MEASURED_PER_CHANNEL_S_STANDARD:g}s/channel measured "
-                             f"on 'Standard' (the --preset default) = "
-                             f"{16 * MEASURED_PER_CHANNEL_S_STANDARD:.0f}s, rounded up "
-                             f"to a typable ten. Shorten it by taking fewer channels "
-                             f"or a faster preset -- the cost is PER CHANNEL, and a "
-                             f"period a round does not fit inside is not honoured, it "
-                             f"is simply exceeded.")
-    parser.add_argument("--preset", default="Standard", help="EIS preset for the series")
+                        help=f"sigma(t) sampling interval, and the thing that sets "
+                             f"the shortest resolvable tau (~2x this). Default "
+                             f"{DEFAULT_ROUND_PERIOD_S:g}s is two terms kept apart: "
+                             f"{DEFAULT_N_CHANNELS} channels (the --channels default) "
+                             f"x the MEASURED per-channel cost of "
+                             f"'{DEFAULT_EIS_PRESET}' (the --preset default), which is "
+                             f"derived, plus a CHOSEN {ROUND_BUFFER_S:g}s per-round "
+                             f"buffer for executor and mscr overhead, rounded up to a "
+                             f"typable ten. Shorten it by taking fewer channels or a "
+                             f"faster preset -- the cost is PER CHANNEL, and a period "
+                             f"a round does not fit inside is not honoured, it is "
+                             f"simply exceeded.")
+    design.add_argument("--preset", default=DEFAULT_EIS_PRESET,
+                        help=f"EIS preset for the series. Default "
+                             f"'{DEFAULT_EIS_PRESET}': at 'Standard' an all-channel "
+                             f"round costs 654s, forcing a sampling interval whose "
+                             f"tau floor (~22 min) is coarser than the ~8.3 min tau "
+                             f"this run exists to measure.")
     # No default. The measured number belongs to one rig and one preset, and a
     # constant applied silently would be wrong the moment either changed -- while
     # still reading, to the next operator, like a prediction.
-    parser.add_argument("--measured-per-channel-s", dest="measured_per_channel_s",
+    design.add_argument("--measured-per-channel-s", dest="measured_per_channel_s",
                         type=float, default=None,
                         help="plan from a MEASURED per-channel round cost instead of "
-                             "the model, which covers the frequency sweep only. This "
-                             f"rig measured {MEASURED_PER_CHANNEL_S_STANDARD:g} "
-                             "s/channel on 'Standard' over 12 channels, against ~3.9 "
-                             "s/channel modelled -- about 10x. Overrides the modelled "
+                             "the model. The model is fitted to three presets timed "
+                             "on this rig and runs up to ~8%% under them; it says "
+                             "nothing about a preset that was never timed. This rig "
+                             f"measured {MEASURED_PER_CHANNEL_S_STANDARD:g} s/channel "
+                             "on 'Standard' over 12 channels. Overrides the modelled "
                              "cost in the round cost, the inter-round gap, the "
                              "headroom, the sampling interval and the total duration.")
     # `--model` meant the EIS CIRCUIT model here and the RELAXATION model on
@@ -1896,23 +2081,102 @@ def _add_design_args(parser: argparse.ArgumentParser, *,
     # obviously. Each name is now unambiguous and each help text names the other,
     # with `--model` kept as a working alias on both so no saved script breaks.
     # `dest` stays `model`, so plan files written before the rename still load.
-    parser.add_argument("--circuit-model", "--model", dest="model",
+    design.add_argument("--circuit-model", "--model", dest="model",
                         default="simpleSalt",
                         help="EIS CIRCUIT model fitted to each spectrum (e.g. "
                              "simpleSalt). Not the relaxation model: that is "
                              "--relaxation-model on 'fit'/'report'. '--model' is a "
                              "deprecated alias for this flag here.")
-    parser.add_argument("--electrode-l-cm", dest="electrode_l_cm", type=float)
-    parser.add_argument("--electrode-t-cm", dest="electrode_t_cm", type=float)
-    parser.add_argument("--electrode-w-cm", dest="electrode_w_cm", type=float)
-    parser.add_argument("--thickness-method", dest="thickness_method",
+    design.add_argument("--electrode-l-cm", dest="electrode_l_cm", type=float)
+    design.add_argument("--electrode-t-cm", dest="electrode_t_cm", type=float)
+    design.add_argument("--electrode-w-cm", dest="electrode_w_cm", type=float)
+    design.add_argument("--thickness-method", dest="thickness_method",
                         default="target", choices=list(THICKNESS_METHODS),
                         help="how --electrode-t-cm was obtained. Default 'target': "
                              "a hand-computed digital-twin number, NOT a measurement. "
                              "Recorded in the run sidecar because "
                              "fit_results.thickness_method stays NULL for this run.")
+    _add_chamber_args(parser)
     parser.add_argument("--project", help="project directory (default: [data] project_dir)")
     parser.add_argument("--mock", action="store_true")
+
+
+def _add_chamber_args(parser: argparse.ArgumentParser) -> None:
+    """The bands and allowances — **what counts as held, and how long it may take**.
+
+    Not settable without editing source until now, and the omission cost a real
+    run: the operator hit ``approach_timeout_s`` at the last down-leg setpoint on
+    2026-08-11 and had no flag to extend it, so fifteen rounds labelled 27.5 °C
+    were taken while the stage fell from 34.1 to 29.0 °C. On the **shared** design
+    surface for the same reason the settle criterion is: these decide the verdict
+    that is this run's primary result, and one that reverted between ``plan`` and
+    ``run`` would change what a recorded ``hold_met`` means with nothing on disk
+    saying so.
+    """
+    group = parser.add_argument_group(
+        "the chamber", "what counts as HELD, and how long the chamber is given "
+                       "to get there. Every one of these lands in the saved plan")
+    group.add_argument("--tolerance-c", dest="tolerance_C", type=float,
+                       default=DEFAULT_TOLERANCE_C,
+                       help=f"half-width of the temperature band that decides "
+                            f"'held' (default {DEFAULT_TOLERANCE_C:g} C). NOT 0.5: at "
+                            f"0.5 a 0.6 C dip (PV 64.4 against 65.0) graded a whole "
+                            f"setpoint 'hold not met' on a chamber that wanders a few "
+                            f"tenths, and an unmet verdict that is not a failure "
+                            f"teaches an operator to ignore unmet verdicts. Sits "
+                            f"inside --warn-c ({DEFAULT_WARN_C:g}), so an excursion is "
+                            f"still warned before the band is anywhere near --fault-c.")
+    group.add_argument("--rh-tolerance-pct", dest="rh_tolerance_pct", type=float,
+                       default=DEFAULT_RH_TOLERANCE_PCT,
+                       help=f"the same band on humidity (default "
+                            f"{DEFAULT_RH_TOLERANCE_PCT:g} %%RH). Whether the rig can "
+                            f"hold the setpoint hot is a PRIMARY RESULT of this run, "
+                            f"so widening this to make verdicts look better answers "
+                            f"the question it was asked to measure.")
+    group.add_argument("--warn-c", dest="warn_C", type=float, default=DEFAULT_WARN_C,
+                       help=f"deviation that logs an excursion (default "
+                            f"{DEFAULT_WARN_C:g} C). Counted, never fatal, and it must "
+                            f"stay above --tolerance-c or every out-of-band sample "
+                            f"warns and the count says nothing.")
+    group.add_argument("--fault-c", dest="fault_C", type=float, default=DEFAULT_FAULT_C,
+                       help=f"the RUNAWAY guard (default {DEFAULT_FAULT_C:g} C). A "
+                            f"sustained PV above target+this for --grace-s aborts the "
+                            f"run and restores ambient. Not a tolerance: failing to "
+                            f"REACH a setpoint is recorded and continues, overshooting "
+                            f"one is a hazard and stops.")
+    group.add_argument("--grace-s", dest="grace_s", type=float, default=DEFAULT_GRACE_S,
+                       help=f"how long an overshoot must be sustained before it is a "
+                            f"runaway rather than a transient (default "
+                            f"{DEFAULT_GRACE_S:g}s).")
+    group.add_argument("--approach-timeout-s", dest="approach_timeout_s", type=float,
+                       default=DEFAULT_APPROACH_TIMEOUT_S,
+                       help=f"how long temperature may take to reach band on the UP "
+                            f"leg, where the heater is driving (default "
+                            f"{DEFAULT_APPROACH_TIMEOUT_S:g}s). Timing out is not an "
+                            f"abort: the run measures from wherever the PV got to and "
+                            f"records the approach as not reached.")
+    group.add_argument("--down-approach-timeout-s", dest="down_approach_timeout_s",
+                       type=float, default=DEFAULT_DOWN_APPROACH_TIMEOUT_S,
+                       help=f"the same allowance on the DOWN leg, where nothing is "
+                            f"driving (default {DEFAULT_DOWN_APPROACH_TIMEOUT_S:g}s). "
+                            f"Cooling is passive and asymptotic: measured down-leg "
+                            f"approaches were 0.5 min at 85 C, 12.0 at 65, 22.5 at 45 "
+                            f"and 30.0 at 27.5 -- where it hit the "
+                            f"{DEFAULT_APPROACH_TIMEOUT_S:g}s timeout WITHOUT reaching "
+                            f"tolerance, so 15 rounds labelled 27.5 C spanned a 5 C "
+                            f"ramp (34.1 C at the first, 29.0 C at the last). The "
+                            f"default is that {DEFAULT_APPROACH_TIMEOUT_S:g}s plus "
+                            f"~60 min: at the measured end-of-series rate of ~5 C per "
+                            f"44 min, 34.1 C -> 27.5 C needs ~58 min more. A separate "
+                            f"timeout rather than a factor, so the number you are "
+                            f"extending is visible.")
+    group.add_argument("--rh-approach-timeout-s", dest="rh_approach_timeout_s",
+                       type=float, default=DEFAULT_RH_APPROACH_TIMEOUT_S,
+                       help=f"how long humidity may take to reach band, at EVERY "
+                            f"temperature (default "
+                            f"{DEFAULT_RH_APPROACH_TIMEOUT_S:g}s). Not the 120 s "
+                            f"AsyncRHController.wait default: holding one %%RH from "
+                            f"27.5 to 85 C moves the absolute water content ~9.6x.")
 
 
 def _add_settle_args(parser: argparse.ArgumentParser) -> None:
@@ -1928,58 +2192,79 @@ def _add_settle_args(parser: argparse.ArgumentParser) -> None:
     be written into a plan file and retyped from it: ``design_flags`` renders
     every resolved value as a flag an operator could paste back.
     """
-    parser.add_argument("--settle", dest="settle", choices=("on", "off"),
-                        default="on",
-                        help="stop a setpoint once sigma has settled instead of "
-                             "always running --rounds. 'off' restores the old "
-                             "fixed-count behaviour exactly.")
-    parser.add_argument("--settle-tol-rel", dest="settle_tol_rel", type=float,
-                        default=DEFAULT_SETTLE_TOL_REL,
-                        help=f"relative half-width of the settle band (default "
-                             f"{DEFAULT_SETTLE_TOL_REL:g}). MUST exceed the run's own "
-                             f"noise floor -- 5.98%% median was measured over 96 "
-                             f"series, with 22 of them above 20%% -- or no hold "
-                             f"length can satisfy it and every setpoint runs to its "
-                             f"ceiling. The run says so per setpoint when it happens.")
-    parser.add_argument("--settle-n-rounds", dest="settle_n_rounds", type=int,
-                        default=DEFAULT_SETTLE_N_ROUNDS,
-                        help=f"consecutive rounds that must all sit inside the band "
-                             f"(default {DEFAULT_SETTLE_N_ROUNDS}). A DETECTION "
-                             f"WINDOW, and a different question from how many points "
-                             f"a tau needs: setting it below {MIN_POINTS_FOR_TAU} "
-                             f"narrows the window exactly as asked and is NOT "
-                             f"rewritten, but the setpoint still cannot stop before "
-                             f"{MIN_POINTS_FOR_TAU} rounds, because the fitter refuses "
-                             f"a shorter series.")
-    parser.add_argument("--settle-min-channels", dest="settle_min_channels", type=int,
-                        default=DEFAULT_SETTLE_MIN_CHANNELS,
-                        help=f"fewest channels that must carry usable evidence for "
-                             f"the criterion to be evaluated at all (default "
-                             f"{DEFAULT_SETTLE_MIN_CHANNELS}). A channel whose sigma "
-                             f"is NULL, or whose R1 railed on the circuit model's "
-                             f"lower bound, does NOT count -- a railed fit returns "
-                             f"the same number every round and a constant is "
-                             f"trivially 'settled'. Below this the setpoint runs to "
-                             f"its ceiling and records 'not_evaluable'.")
-    parser.add_argument("--min-hold-first-s", dest="min_hold_first_s", type=float,
-                        default=DEFAULT_MIN_HOLD_FIRST_S,
-                        help=f"floor on the hold at the FIRST setpoint of the run "
-                             f"(default {DEFAULT_MIN_HOLD_FIRST_S:g}s ~ 3 tau, with "
-                             f"tau = 425-575s measured while the films dry from "
-                             f"ambient to 15 %%RH). The whole transient is here. A "
-                             f"TIME floor: the rounds it buys is "
-                             f"ceil(it / --round-period-s), and the effective minimum "
-                             f"is that against {MIN_POINTS_FOR_TAU} rounds and "
-                             f"--settle-n-rounds, whichever is largest.")
-    parser.add_argument("--min-hold-s", dest="min_hold_s", type=float,
-                        default=DEFAULT_MIN_HOLD_S,
-                        help=f"floor on every later setpoint (default "
-                             f"{DEFAULT_MIN_HOLD_S:g}s). The films are already dry, "
-                             f"but the chamber still has to re-establish RH. At the "
-                             f"default {DEFAULT_ROUND_PERIOD_S:g}s period this buys "
-                             f"only one round, so {MIN_POINTS_FOR_TAU} -- the fitter's "
-                             f"minimum -- is what actually binds; 'plan' prints the "
-                             f"effective figure for both floors.")
+    group = parser.add_argument_group(
+        "the settle criterion", "when a setpoint is allowed to stop short of "
+                                "--rounds, and the floors under that")
+    group.add_argument("--settle", dest="settle", choices=("on", "off"),
+                       default="on",
+                       help="stop a setpoint once sigma has settled instead of "
+                            "always running --rounds. 'off' restores the old "
+                            "fixed-count behaviour exactly.")
+    group.add_argument("--settle-tol-rel", dest="settle_tol_rel", type=float,
+                       default=DEFAULT_SETTLE_TOL_REL,
+                       help=f"relative half-width of the settle band (default "
+                            f"{DEFAULT_SETTLE_TOL_REL:g}). MUST exceed the run's own "
+                            f"noise floor -- 5.98%% median was measured over 96 "
+                            f"series, with 22 of them above 20%% -- or no hold "
+                            f"length can satisfy it and every setpoint runs to its "
+                            f"ceiling. The run says so per setpoint when it happens.")
+    group.add_argument("--settle-n-rounds", dest="settle_n_rounds", type=int,
+                       default=DEFAULT_SETTLE_N_ROUNDS,
+                       help=f"consecutive rounds that must all sit inside the band "
+                            f"(default {DEFAULT_SETTLE_N_ROUNDS}). A DETECTION "
+                            f"WINDOW, and a different question from how many points "
+                            f"a tau needs: setting it below {MIN_POINTS_FOR_TAU} "
+                            f"narrows the window exactly as asked and is NOT "
+                            f"rewritten. Inside the --tau-setpoints window the "
+                            f"setpoint still cannot stop before {MIN_POINTS_FOR_TAU} "
+                            f"rounds, because the fitter refuses a shorter series.")
+    group.add_argument("--settle-min-channels", dest="settle_min_channels", type=int,
+                       default=DEFAULT_SETTLE_MIN_CHANNELS,
+                       help=f"fewest channels that must carry usable evidence for "
+                            f"the criterion to be evaluated at all (default "
+                            f"{DEFAULT_SETTLE_MIN_CHANNELS}). A channel whose sigma "
+                            f"is NULL, or whose R1 railed on the circuit model's "
+                            f"lower bound, does NOT count -- a railed fit returns "
+                            f"the same number every round and a constant is "
+                            f"trivially 'settled'. Below this the setpoint runs to "
+                            f"its ceiling and records 'not_evaluable'.")
+    group.add_argument("--min-hold-first-s", dest="min_hold_first_s", type=float,
+                       default=DEFAULT_MIN_HOLD_FIRST_S,
+                       help=f"floor on the hold at the FIRST setpoint of the run "
+                            f"(default {DEFAULT_MIN_HOLD_FIRST_S:g}s ~ 3 tau, with "
+                            f"tau = 425-575s measured while the films dry from "
+                            f"ambient down to the RH setpoint). The whole transient "
+                            f"is here. A TIME floor: the rounds it buys is "
+                            f"ceil(it / --round-period-s), and the effective minimum "
+                            f"is that against {MIN_POINTS_FOR_TAU} rounds and "
+                            f"--settle-n-rounds, whichever is largest.")
+    group.add_argument("--min-hold-s", dest="min_hold_s", type=float,
+                       default=DEFAULT_MIN_HOLD_S,
+                       help=f"floor on every later setpoint (default "
+                            f"{DEFAULT_MIN_HOLD_S:g}s). The films are already dry, "
+                            f"but the chamber still has to re-establish RH. A TIME "
+                            f"floor like the one above: at the default "
+                            f"{DEFAULT_ROUND_PERIOD_S:g}s period it buys "
+                            f"ceil({DEFAULT_MIN_HOLD_S:g}/{DEFAULT_ROUND_PERIOD_S:g}) "
+                            f"rounds, so inside the --tau-setpoints window "
+                            f"{MIN_POINTS_FOR_TAU} -- the fitter's minimum -- is what "
+                            f"actually binds and outside it --settle-n-rounds does; "
+                            f"'plan' prints the effective figure for every regime.")
+    group.add_argument("--tau-setpoints", dest="tau_setpoints", type=int,
+                       default=DEFAULT_TAU_SETPOINTS,
+                       help=f"how many setpoints OF THE RUN (not of each leg) carry "
+                            f"the {MIN_POINTS_FOR_TAU}-round floor that guarantees a "
+                            f"fittable tau (default {DEFAULT_TAU_SETPOINTS}). The "
+                            f"films dry ONCE, at the start, and stay dry: measured "
+                            f"per-setpoint sigma swing on the up leg was 1600-2800%% "
+                            f"at S0 and 57-1370%% at S1, then 0.5-8.5%% at S2 and "
+                            f"0.8-3.1%% at S3, against a 5.98%% noise floor. Past S1 "
+                            f"there is no relaxation left to fit, so forcing "
+                            f"{MIN_POINTS_FOR_TAU} rounds there buys a tau nobody can "
+                            f"use. Beyond the Nth setpoint the floor is "
+                            f"max(--settle-n-rounds, ceil(hold floor / period)) "
+                            f"alone. 0 removes it everywhere; a value at or above the "
+                            f"setpoint count restores it everywhere.")
 
 
 def _add_analysis_args(parser: argparse.ArgumentParser) -> None:

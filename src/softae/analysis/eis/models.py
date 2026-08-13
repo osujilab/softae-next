@@ -89,6 +89,50 @@ def roles_for(model_name: str) -> dict[str, str]:
     return dict(LEGACY_ROLE_MAP.get(model_name, {}))
 
 
+def railed_measurand(fit: Any) -> str:
+    """Why this fit's measurand is not a measurement, or ``""`` when it is.
+
+    σ is ``K/R_bulk``, so ``R_bulk`` is the measurand and a ``R_bulk`` that came to
+    rest on the optimiser's box constraint is not one. 335 of the 1440 fits in run
+    ``20260811T023757Z_equilibration_characterization`` (23.3 %) sat on the
+    ``simpleSalt`` R₁ floor of 100 Ω and reported ``success = 1`` with
+    σ = 0.5 S/cm — roughly seawater, from a dry polymer film. The population is
+    unambiguous: 335 rows inside ``[100.000, 100.030]`` Ω and then nothing at all
+    until 226.9 Ω, so the tolerance below has an order of magnitude of room.
+
+    The bound is never written down here. It is read from whichever registry
+    actually fitted the spectrum:
+
+    * the **gated** path carries the bounds it fitted against on
+      :class:`~softae.analysis.eis.fitter.FitCovariance`, whose
+      :meth:`~softae.analysis.eis.fitter.FitCovariance.pegged` already names every
+      parameter resting on one;
+    * the **legacy** path declares them in
+      :data:`~softae.analysis.circuit_fitting.CIRCUIT_MODELS`, read through
+      :func:`~softae.analysis.equilibration.r1_lower_bound_ohms` — the one
+      existing spelling of "``bounds[0][z_indices[1]]``", reused rather than
+      restated so a bound edited in the registry moves both readers at once.
+
+    Detection is *near*, not *at*, the bound (``RAILED_R1_TOL_REL``): bounded
+    least squares stops within its own step size of a constraint, so an equality
+    test would miss most railed fits.
+    """
+    from softae.analysis.equilibration import is_railed, r1_lower_bound_ohms
+
+    model_name = str(getattr(fit, "model_name", "") or "")
+    cov = getattr(fit, "covariance", None)
+    if cov is not None:
+        bulk = roles_for(model_name).get("R_bulk", "R1")
+        if bulk in cov.pegged():
+            return f"{bulk} rests on a fitted bound"
+        return ""
+
+    bound = r1_lower_bound_ohms(model_name)
+    if not is_railed(getattr(fit, "R1", None), bound):
+        return ""
+    return f"R1 rests on the '{model_name}' lower bound of {bound:g} ohm"
+
+
 def parameter_names(circuit: str, constants: dict[str, Any] | None = None) -> tuple[str, ...]:
     """Fitted parameter names in vector order, e.g. ``("R0","CPE0_0","CPE0_1","R1","C0")``.
 

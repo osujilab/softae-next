@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import structlog
 
+from softae.analysis.eis.arc import arc_provenance
 from softae.analysis.eis.engine import analyze_spectrum
 from softae.analysis.eis.geometry import CellConstant, cell_from_legacy_terms
 from softae.analysis.eis_data import EISResult
@@ -451,6 +452,10 @@ class EISResultRouter:
                         L_cm=step.params.get("electrode_L_cm"),
                         t_cm=step.params.get("electrode_t_cm"),
                         w_cm=step.params.get("electrode_w_cm"),
+                        # Not the real report — see `arc_provenance`. It carries the
+                        # arc-closure record and nothing else, so P.18 still holds
+                        # and every other stored column is what it was.
+                        report=arc_provenance(report.fit),
                     )
                     logger.info(
                         "eis_fit_autorouted",

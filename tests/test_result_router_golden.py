@@ -231,11 +231,23 @@ async def test_golden_eis_routing_rows_and_files(connected_manager, data_store):
             "stage_temp_pv_C": FINITE,
             "rh_sp_pct": FINITE,
             "rh_pv_pct": FINITE,
+            # Schema epoch 4: `record_conditions` resolves the sample's
+            # temperature at write time. The fixture supplies a stage PV, so the
+            # best source wins — pinned as a literal because a *source* that
+            # drifted to the air probe is the failure this whole module exists
+            # to catch, and a sentinel would hide it.
+            "temperature_C": FINITE,
+            "temperature_source": "stage_pv",
             "notes": "",
         }
         for i in range(2)
     ]
     assert conds == expected_conditions
+
+    # The derived column is not merely present and finite — it is *the stage PV*.
+    for cond in conds:
+        assert cond["temperature_C"] == cond["stage_temp_pv_C"]
+        assert cond["temperature_C"] != cond["chamber_air_C"]
 
     # ── Auto-fit: routed only for the step that declared circuit_model ───
     fits = data_store.query_fits(run_id=run_id)

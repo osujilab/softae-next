@@ -63,26 +63,46 @@ of evidence as settling all live in
 fits and want no rig to test. ``settle_enabled = False`` restores the old
 fixed-count behaviour exactly.
 
-The acquisition floor is **coupled to the fit minimum**
---------------------------------------------------------
+The acquisition floor is **coupled to the fit minimum, where a τ is wanted**
+-----------------------------------------------------------------------------
 A criterion that can stop a setpoint after three rounds can produce a series the
 offline τ fitter refuses: :data:`~softae.analysis.equilibration.MIN_POINTS_FOR_TAU`
-is 5, because σ(t) = σ_∞ + (σ₀ − σ_∞)·exp(−t/τ) has three free parameters. At the
-shipped ``round_period_s`` of 660 s **every** floor bought fewer than five rounds
-— ``ceil(1500/660) = 3`` at the first setpoint and ``ceil(600/660) = 1`` after —
-so a run could have stopped every setpoint short of the fit minimum and produced
-no τ at all, which is the entire purpose of the run.
+is 5, because σ(t) = σ_∞ + (σ₀ − σ_∞)·exp(−t/τ) has three free parameters. How
+many rounds a *time* floor buys depends entirely on the sampling interval: at the
+660 s ``round_period_s`` that a ``Standard`` default once forced, **every** floor
+bought fewer than five — ``ceil(1500/660) = 3`` at the first setpoint and
+``ceil(600/660) = 1`` after — so a run could have stopped every setpoint short of
+the fit minimum and produced no τ at all, which is the entire purpose of the run.
+The interval is 200 s now and the first setpoint's floor alone buys 8, but that is
+arithmetic working out rather than a guarantee, which is why the coupling below
+stands.
 
-So the fewest rounds any setpoint may run is
+So the fewest rounds a setpoint may run is
 
     ``max(settle_n_rounds, MIN_POINTS_FOR_TAU, ceil(min_hold_s / round_period_s))``
 
-and that is a **self-consistency property, not a tunable**: the acquisition side
-must not be able to emit a series the analysis side will refuse. The constant is
-*imported* from :mod:`softae.analysis.equilibration` rather than restated, so the
-two cannot drift, and a ``rounds_per_setpoint`` below it is refused outright by
+for the **first** ``tau_setpoints`` setpoints of the run, and
+
+    ``max(settle_n_rounds, ceil(min_hold_s / round_period_s))``
+
+after them. Where it applies it is a **self-consistency property, not a
+tunable**: the acquisition side must not be able to emit a series the analysis
+side will refuse. The constant is *imported* from
+:mod:`softae.analysis.equilibration` rather than restated, so the two cannot
+drift, and a ``rounds_per_setpoint`` below it is refused outright by
 :meth:`EquilibrationConfig.validate` — a ceiling under the fit minimum is a design
-in which no setpoint can ever yield a τ.
+in which none of those setpoints can ever yield a τ. That refusal is conditional
+on ``tau_setpoints > 0``: with the window closed there is no τ to preserve, and a
+settle-only sweep is a legitimate thing to ask for.
+
+**Where it applies is the operator's call, and it is narrow.** The films dry once,
+at the start of the session, and stay dry: measured per-setpoint σ swing on the up
+leg of the 2026-08-11 run was 1600–2800 % at S0, 57–1370 % at S1, then 0.5–8.5 %
+at S2 and 0.8–3.1 % at S3, against a 5.98 % noise floor. Past S1 there is no
+relaxation left to fit, so forcing five rounds there spends instrument time buying
+a τ that would be fitted to noise and that nobody can use. ``tau_setpoints``
+defaults to 2 for that reason; ``0`` removes the floor everywhere and a value at
+or above :attr:`EquilibrationConfig.n_setpoints` restores it everywhere.
 
 Never calls ``wait()``
 ----------------------
@@ -117,6 +137,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -160,6 +181,173 @@ GEOMETRY_TERMS = ("L_cm", "t_cm", "w_cm")
 #: Fraction of a timeout a typical approach actually takes. A stated guess used
 #: only for the *typical* projection column; the worst case uses the timeouts.
 TYPICAL_APPROACH_FRACTION = 0.25
+
+# ── Chamber defaults, named once ─────────────────────────────────────────────
+#
+# Declared here rather than inline in the dataclass because the CLI now exposes
+# every one of them and quotes the default in its own ``--help``. Two spellings
+# of a default is how a plan file comes to disagree with the run it describes.
+
+#: %RH held at every temperature. **20, not 15, and not a controls fault.** The
+#: flush basin holds water *inside* the heated enclosure, so warming the chamber
+#: humidifies it with surplus moisture: the 2026-08-11 run commanded 15 %RH and
+#: measured a PV of 16.9–20.4 at 65 °C and 19.5–23.2 at 85 °C. 15 % is below what
+#: this enclosure can deliver hot, and commanding it produces an unmet setpoint at
+#: every hot condition — a graded failure that is an artefact of the basin, not a
+#: measurement of the rig. **Do not "optimise" this back down** without first
+#: taking the water out of the enclosure.
+DEFAULT_RH_SETPOINT_PCT = 20.0
+#: Band that decides whether temperature was *held*. **2.0 °C, not 0.5.** At 0.5 a
+#: 0.6 °C dip (PV 64.4 against a 65.0 setpoint) graded the whole down-leg S1 as
+#: "hold not met" on a chamber that wanders a few tenths — an unmet verdict that
+#: is not a failure, on a run where an unmet verdict is a primary result and has
+#: to mean something. It stays well inside :data:`DEFAULT_WARN_C` (3.0) and far
+#: inside :data:`DEFAULT_FAULT_C` (10.0), so the excursion warning and the runaway
+#: guard both still fire strictly before and after this band, in that order.
+DEFAULT_TOLERANCE_C = 2.0
+DEFAULT_RH_TOLERANCE_PCT = 2.0
+#: Allowance for driving temperature into band on the **ascending** leg, where the
+#: heater is doing the work.
+DEFAULT_APPROACH_TIMEOUT_S = 1800.0
+#: The same allowance on the **descending** leg, where nothing is doing the work.
+#: Cooling here is passive and asymptotic, and 1800 s is not enough: measured
+#: down-leg approach times were 0.5 min at 85 °C, 12.0 at 65, 22.5 at 45 and 30.0
+#: at 27.5 — where it hit the timeout **without reaching tolerance**. The stage was
+#: still at 34.1 °C when measurement began and had only fallen to 29.0 °C by the
+#: end of the 44-minute series, so those 15 rounds span a 5 °C ramp while labelled
+#: 27.5 °C.
+#:
+#: 5400 s = the 1800 s already spent plus ~60 min. At the measured end-of-series
+#: rate (~5 °C per 44 min) falling from 34.1 °C to 27.5 °C needs ~58 min, and to
+#: the edge of the 2.0 °C band ~40 min. A separate timeout rather than a multiplier
+#: on the ascending one: an operator who has to extend it needs to see the number
+#: it is being extended from.
+DEFAULT_DOWN_APPROACH_TIMEOUT_S = 5400.0
+DEFAULT_RH_APPROACH_TIMEOUT_S = 1800.0
+DEFAULT_WARN_C = 3.0
+DEFAULT_FAULT_C = 10.0
+DEFAULT_GRACE_S = 120.0
+#: How many setpoints **of the run** the :data:`MIN_POINTS_FOR_TAU` round floor
+#: applies to. See the module docstring: the films dry once, so a τ exists to be
+#: fitted at the first setpoint or two and nowhere after.
+DEFAULT_TAU_SETPOINTS = 2
+
+#: Channels a default run measures — 1-16, and the count the sampling interval
+#: below is derived at. Named because the derivation needs it and a second
+#: spelling of "16" is how a derived default stops matching what it describes.
+DEFAULT_N_CHANNELS = 16
+
+#: EIS preset for the σ(t) series. **Quick, and this is what makes the shipped
+#: defaults able to measure their own subject.**
+#:
+#: The sampling interval sets the shortest resolvable τ at roughly twice itself,
+#: and the interval is floored by what an all-channel round costs. At ``Standard``
+#: (40.85 s/channel measured) 16 channels cost 654 s, forcing a ≥660 s interval and
+#: a τ floor of ~22 min — against a τ of ~500 s (8.3 min) measured at the first
+#: setpoint. The stock configuration was sampling ~2.6x too coarsely to see the
+#: transient this tool exists to characterise; it was a *feasible* default that
+#: could not answer the question.
+#:
+#: ``Quick`` costs 10.47 s/channel measured, which is a 200 s interval and a ~6.7
+#: min τ floor — under the measured τ, so the relaxation is resolved. It is also
+#: what the operator's own production runs and ``scripts/equilibration_run.ps1``
+#: already use, so this aligns the default with practice rather than inventing one.
+#:
+#: The counter-argument is arc closure: 33 % of the 1440 spectra in run
+#: ``20260811T023757Z`` showed an unclosed arc at ``Quick`` (peak of -Z'' at the
+#: lowest measured frequency), and ``Standard``'s 4 Hz floor would close some of
+#: them. It does not justify a 4x cost on **every** round: ``Standard`` does not
+#: close them at the cold end either, where ch1 sits at 6.5e7 Ω. The right answer
+#: is to detect and report an unclosed arc, not to buy a slower sweep everywhere
+#: in the hope of avoiding one.
+DEFAULT_EIS_PRESET = "Quick"
+
+
+@lru_cache(maxsize=1)
+def model_underestimate_frac() -> float:
+    """How far the sweep model may fall *under* a real round, as a fraction of itself.
+
+    Read off the model's own calibration rather than chosen.
+    ``estimate_eis_duration`` is fitted to three presets timed on this rig
+    (:data:`~softae.core.preflight.EIS_MEASURED_S_PER_CHANNEL`) and reproduces each
+    within ~8 %; on the one it under-counts — ``Standard``, ~37.7 s/channel modelled
+    against 40.85 s measured — it is 8.2 % low.
+
+    Computed here instead of written down so a re-fit of those constants moves
+    everything sized against them. The threshold this replaced was a literal, and
+    it outlived the model it was sized against by exactly one recalibration.
+
+    Zero if the anchors are unavailable or the model never under-counts them; every
+    caller then degrades to trusting the model as-is, which is the honest response
+    to having no measurement of its error.
+    """
+    from softae.core.eis_scripts import EISParams
+    from softae.core.preflight import EIS_MEASURED_S_PER_CHANNEL, estimate_eis_duration
+
+    worst = 0.0
+    for preset, measured in EIS_MEASURED_S_PER_CHANNEL.items():
+        modelled = estimate_eis_duration(EISParams.from_preset(preset))
+        if modelled > 0:
+            worst = max(worst, float(measured) / modelled - 1.0)
+    return worst
+
+
+#: Per-round buffer added on top of the measured channel cost. **Chosen, not
+#: derived, and deliberately kept as its own term** so the next person can see
+#: which half of the default is measurement and which is judgement.
+#:
+#: It is *not* a statistical bound and must not be presented as one: the measured
+#: per-channel spread across the anchors is ~±0.1 s, so ±1.6 s over 16 channels,
+#: and 30 s is well above that. It is headroom for the per-round work no anchor
+#: covers — executor construction, the mscr rebuild, DAG setup — plus operating
+#: margin for a run nobody is watching.
+ROUND_BUFFER_S = 30.0
+
+
+def default_round_period_s(preset: str = DEFAULT_EIS_PRESET,
+                           n_channels: int = DEFAULT_N_CHANNELS) -> float:
+    """The shipped σ(t) sampling interval: a measured round plus a chosen buffer.
+
+    Two terms, kept apart on purpose::
+
+        n_channels × EIS_MEASURED_S_PER_CHANNEL[preset]   DERIVED  167.5 s
+        + ROUND_BUFFER_S                                  CHOSEN    30.0 s
+        rounded up to a typable ten                                200.0 s
+
+    Rounded by the same rule :func:`minimum_feasible_period_s` uses, because a
+    default an operator cannot retype from memory is a default they will type
+    wrongly. 200 rather than 198 for that reason alone.
+
+    Two properties worth checking against, neither of which drove the number:
+
+    * The modelled round at ``Quick``/16 is ~180.5 s, and its worst case under
+      :func:`model_underestimate_frac` is ~195.4 s — under 200, so an operator's
+      first ``plan`` neither refuses the shipped defaults nor cautions on them. A
+      period derived from the measurement alone (170 s) would have done both, the
+      model over-counting ``Quick`` by 7.8 %.
+    * 200 s resolves τ no shorter than ~6.7 min, against the ~500 s (8.3 min) τ
+      measured at the first setpoint. The interval this replaced was 660 s — a
+      ~22 min τ floor, ~2.6x too coarse to see the transient the run exists to
+      characterise.
+
+    Falls back to the model alone for a preset with no anchor, buffer included: an
+    untimed preset gets a period that is honest about resting on an extrapolation
+    rather than one that silently reads as measured.
+    """
+    from softae.core.eis_scripts import EISParams
+    from softae.core.preflight import EIS_MEASURED_S_PER_CHANNEL, estimate_eis_duration
+
+    n = max(1, int(n_channels))
+    per_channel = EIS_MEASURED_S_PER_CHANNEL.get(preset)
+    if per_channel is None:
+        per_channel = (estimate_eis_duration(EISParams.from_preset(preset))
+                       * (1.0 + model_underestimate_frac()))
+    return math.ceil((float(per_channel) * n + ROUND_BUFFER_S) / 10.0) * 10.0
+
+
+#: σ(t) sampling interval for a run that types nothing. See
+#: :func:`default_round_period_s` — 200 s at the shipped preset and channel count.
+DEFAULT_ROUND_PERIOD_S = default_round_period_s()
 
 _ABORT_UNREADABLE = "unreadable_pv"
 _ABORT_OVERSHOOT = "sustained_overshoot"
@@ -252,9 +440,9 @@ class ProgressEvent:
     round_kind: str = ""
     channel: int = 0
     #: Wall-clock the round actually took, and that divided by the channel count.
-    #: ``estimate_eis_duration`` models the frequency sweep only, so these are the
-    #: first numbers in the system that include mux switching, script upload, data
-    #: retrieval and the file write.
+    #: ``estimate_eis_duration`` models the frequency sweep, so these are the only
+    #: numbers in the system that include mux switching, script upload, data
+    #: retrieval and the file write as well.
     round_duration_s: float = float("nan")
     per_channel_s: float = float("nan")
     #: :data:`VERDICT_MET` / :data:`VERDICT_UNMET` / :data:`VERDICT_ABORTED`, or "".
@@ -322,7 +510,9 @@ class EquilibrationConfig:
     temperatures_C: list[float] = field(
         default_factory=lambda: [27.5, 45.0, 65.0, 85.0])
     legs: tuple[str, ...] = LEGS
-    rh_setpoint_pct: float = 15.0
+    #: See :data:`DEFAULT_RH_SETPOINT_PCT` — 20 %, because the flush basin
+    #: humidifies the enclosure as it warms and 15 % is unreachable hot.
+    rh_setpoint_pct: float = DEFAULT_RH_SETPOINT_PCT
     #: **A CEILING, not a count.** Every setpoint runs *at most* this many σ(t)
     #: rounds and stops earlier the moment σ has settled (see ``settle_*`` below
     #: and :class:`~softae.analysis.equilibration.SettleTracker`). This changed
@@ -331,15 +521,17 @@ class EquilibrationConfig:
     #: already flat to within the noise. Set ``settle_enabled = False`` to get the
     #: old fixed-count behaviour back exactly.
     #:
-    #: It is a ceiling **over** :data:`MIN_POINTS_FOR_TAU`, never under it: a run
-    #: whose ceiling is below the fit minimum can produce no τ anywhere, so
-    #: :meth:`validate` refuses it rather than executing a night that cannot be
-    #: analysed.
+    #: Wherever a τ is wanted it is a ceiling **over** :data:`MIN_POINTS_FOR_TAU`,
+    #: never under it: those setpoints could produce no τ at all, so
+    #: :meth:`validate` refuses rather than execute a night that cannot be
+    #: analysed. With ``tau_setpoints = 0`` there is no τ to preserve and the
+    #: ceiling may go as low as 1 — a settle-only sweep is a legitimate design.
     rounds_per_setpoint: int = 15
-    #: Budgeted wall-clock per σ(t) round, covering mux switching and file writes
-    #: that the EIS model does not carry. Sets the shortest resolvable τ
-    #: (≈ 2 × this).
-    round_period_s: float = 660.0
+    #: Budgeted wall-clock per σ(t) round: the modelled sweep, plus the mux
+    #: switching and file writes the model does not carry, plus room for the
+    #: model's own ~8 % residual. Sets the shortest resolvable τ (≈ 2 × this), which
+    #: is why :func:`default_round_period_s` is derived and not picked.
+    round_period_s: float = DEFAULT_ROUND_PERIOD_S
     #: Stop a setpoint when σ settles, instead of always running to the ceiling.
     settle_enabled: bool = True
     #: Relative half-width of the settle band. Must exceed the run's own measured
@@ -349,8 +541,9 @@ class EquilibrationConfig:
     #: Consecutive rounds that must all sit inside the band. A *detection window*,
     #: which is a different question from how many points a τ needs: configuring
     #: it below :data:`MIN_POINTS_FOR_TAU` narrows the window as asked and does
-    #: **not** widen it behind the operator — the round floor still guarantees
-    #: :data:`MIN_POINTS_FOR_TAU` rounds. See :func:`settle_floor_rounds`.
+    #: **not** widen it behind the operator — inside the :attr:`tau_setpoints`
+    #: window the round floor still guarantees :data:`MIN_POINTS_FOR_TAU` rounds,
+    #: and past it this is the floor. See :func:`settle_floor_rounds`.
     settle_n_rounds: int = DEFAULT_SETTLE_N_ROUNDS
     #: Fewest channels that must carry usable evidence for the criterion to be
     #: *evaluable at all*. Below it the setpoint runs to its ceiling and records
@@ -364,7 +557,13 @@ class EquilibrationConfig:
     #: Floor on every later setpoint, first of a leg or not. The films are already
     #: dry, but the chamber still has to re-establish RH at the new temperature.
     min_hold_s: float = DEFAULT_MIN_HOLD_S
-    eis_preset: str = "Standard"
+    #: How many setpoints **of the run** are held long enough to fit a τ, counted
+    #: from the run's first — not from each leg's. Inside that window the round
+    #: floor carries :data:`MIN_POINTS_FOR_TAU`; outside it the floor is the
+    #: settle window and the time floor alone. ``0`` disables the τ floor
+    #: everywhere; anything ≥ :attr:`n_setpoints` applies it everywhere.
+    tau_setpoints: int = DEFAULT_TAU_SETPOINTS
+    eis_preset: str = DEFAULT_EIS_PRESET
     eis_model: str = "simpleSalt"
     electrode_geometry: dict[str, float] | None = None
     #: How ``electrode_geometry["t_cm"]`` was obtained, in the analysis layer's own
@@ -374,15 +573,24 @@ class EquilibrationConfig:
     #: because the shipped case is a hand-computed digital-twin target, not a
     #: measurement — see :meth:`EquilibrationRun.thickness_provenance`.
     thickness_method: str = "target"
-    tolerance_C: float = 0.5
-    rh_tolerance_pct: float = 2.0
-    approach_timeout_s: float = 1800.0
-    #: **Not** the 120 s ``AsyncRHController.wait`` default: holding 15 %RH from
+    #: See :data:`DEFAULT_TOLERANCE_C` — 2.0 °C, wide enough that a chamber
+    #: wandering a few tenths is not graded as a failure to hold.
+    tolerance_C: float = DEFAULT_TOLERANCE_C
+    rh_tolerance_pct: float = DEFAULT_RH_TOLERANCE_PCT
+    #: Ascending leg only. The descending one has its own, because cooling here is
+    #: passive — see :attr:`down_approach_timeout_s` and
+    #: :meth:`temperature_approach_timeout_s`.
+    approach_timeout_s: float = DEFAULT_APPROACH_TIMEOUT_S
+    #: See :data:`DEFAULT_DOWN_APPROACH_TIMEOUT_S`. Applies to the temperature axis
+    #: on the ``"down"`` leg and to nothing else: the humidifier is actively driven
+    #: in both directions and is not what runs out of time here.
+    down_approach_timeout_s: float = DEFAULT_DOWN_APPROACH_TIMEOUT_S
+    #: **Not** the 120 s ``AsyncRHController.wait`` default: holding a low %RH from
     #: 27.5 → 85 °C moves the absolute water content by ~9.6×, so RH must be
     #: re-established at every temperature and 120 s would time out routinely.
-    rh_approach_timeout_s: float = 1800.0
-    warn_C: float = 3.0
-    fault_C: float = 10.0
+    rh_approach_timeout_s: float = DEFAULT_RH_APPROACH_TIMEOUT_S
+    warn_C: float = DEFAULT_WARN_C
+    fault_C: float = DEFAULT_FAULT_C
     rh_warn_pct: float = 5.0
     #: Wide **on purpose**, and it is not a slack tolerance — ``rh_tolerance_pct``
     #: is what decides ``met``. The fault band is only the runaway guard, and the
@@ -392,7 +600,7 @@ class EquilibrationConfig:
     #: into a crash. 50 puts the trip at 65 %RH, which is a humidifier running
     #: away rather than a rig that will not dry down.
     rh_fault_pct: float = 50.0
-    grace_s: float = 120.0
+    grace_s: float = DEFAULT_GRACE_S
     poll_interval_s: float = 30.0
     #: Floor on the interval between the *throttled* progress events — the
     #: approach ticks and the idle heartbeat. Milestones are never throttled.
@@ -411,15 +619,27 @@ class EquilibrationConfig:
         bad_legs = [leg for leg in self.legs if leg not in LEGS]
         if bad_legs or not self.legs:
             raise ValueError(f"legs must be drawn from {LEGS}; got {self.legs!r}")
-        if self.rounds_per_setpoint < MIN_POINTS_FOR_TAU:
+        if self.rounds_per_setpoint < 1:
+            raise ValueError(
+                f"rounds_per_setpoint {self.rounds_per_setpoint} would acquire "
+                f"nothing at any setpoint")
+        # Conditional on a tau being wanted. The guard refuses a ceiling too low
+        # for the fitter, and that is only an unsatisfiable design while the run
+        # is trying to fit something: `--tau-setpoints 0` says no setpoint carries
+        # the tau floor, and refusing `--tau-setpoints 0 --rounds 4` was refusing
+        # to preserve a tau nobody asked for. A settle-only sweep -- "how long
+        # does this chamber take to stop moving" -- is a legitimate design and
+        # `tau_setpoints` is how it is spelled.
+        if self.tau_setpoints > 0 and self.rounds_per_setpoint < MIN_POINTS_FOR_TAU:
             raise ValueError(
                 f"rounds_per_setpoint {self.rounds_per_setpoint} is below "
                 f"MIN_POINTS_FOR_TAU {MIN_POINTS_FOR_TAU}: sigma(t) = sigma_inf + "
                 f"(sigma_0 - sigma_inf)*exp(-t/tau) has three free parameters, so "
                 f"fit_equilibration refuses any series shorter than "
                 f"{MIN_POINTS_FOR_TAU} points. A CEILING below that is an "
-                f"unsatisfiable design -- no setpoint in the run could ever yield a "
-                f"tau, which is what the run exists to measure.")
+                f"unsatisfiable design while tau_setpoints is "
+                f"{self.tau_setpoints} -- none of those setpoints could ever yield "
+                f"a tau. Pass --tau-setpoints 0 if no tau is wanted anywhere.")
         self._validate_settle()
         if not 0.0 <= self.rh_setpoint_pct <= 100.0:
             raise ValueError(f"rh_setpoint_pct {self.rh_setpoint_pct} is not a %RH")
@@ -453,6 +673,11 @@ class EquilibrationConfig:
                 "is an absence of evidence, never a settled setpoint")
         if self.min_hold_first_s < 0 or self.min_hold_s < 0:
             raise ValueError("hold floors must be >= 0")
+        if self.tau_setpoints < 0:
+            raise ValueError(
+                "tau_setpoints must be >= 0; it counts setpoints of the run that "
+                "carry the MIN_POINTS_FOR_TAU round floor, and a negative count "
+                "states nothing. 0 is the way to remove the floor everywhere")
 
     def _validate_geometry(self) -> None:
         """``electrode_geometry`` is all three terms or nothing at all.
@@ -486,6 +711,23 @@ class EquilibrationConfig:
                 f"electrode_geometry has non-positive term(s) {', '.join(bad)}; "
                 f"that is a stated wrong value, not an absent one, and sigma "
                 f"divides by t and w")
+
+    def temperature_approach_timeout_s(self, leg: str) -> float:
+        """How long the temperature axis may take to reach band, on *leg*.
+
+        The two directions are not symmetric and one number cannot describe both.
+        Going up, the heater drives the stage and 1800 s is generous. Coming down
+        nothing drives it: the approach is passive and asymptotic, and the
+        2026-08-11 run hit the 1800 s timeout at the last down-leg setpoint
+        without ever reaching tolerance — so fifteen "isothermal" rounds were
+        taken across a 5 °C ramp.
+
+        A ``leg`` this run does not recognise takes the ascending allowance:
+        :meth:`validate` has already refused any such leg, so this is unreachable
+        rather than a policy.
+        """
+        return (float(self.down_approach_timeout_s) if leg == "down"
+                else float(self.approach_timeout_s))
 
     def leg_temperatures(self, leg: str) -> list[float]:
         """The setpoint order for *leg* — ``"down"`` retraces the up leg."""
@@ -1086,12 +1328,28 @@ class DurationProjection:
     #: Never collapsed into one figure: the *gap* between the two is the finding.
     basis: str = "modelled"
     series_round_s: float = 0.0
-    #: Fewest rounds the settle criterion can stop a setpoint after: the greatest
-    #: of ``settle_n_rounds``, :data:`MIN_POINTS_FOR_TAU` and what the hold floor
-    #: buys. Equal to the ceiling when the criterion is disabled, which collapses
-    #: every range below.
+    #: Fewest rounds the settle criterion can stop each setpoint after, in run
+    #: order. The **source of truth** for every floor below: the three named
+    #: figures are read off it and the floor totals are its sum, so a regime
+    #: nobody named cannot be silently dropped from the budget. Equal to the
+    #: ceiling throughout when the criterion is disabled, which collapses every
+    #: range below.
+    floor_rounds: tuple[int, ...] = ()
+    #: The run's first setpoint — the only one with ``min_hold_first_s``.
     min_rounds_first: int = 0
+    #: A later setpoint still inside the τ window (``tau_setpoints``). Equal to
+    #: :attr:`min_rounds_later` when the window does not extend past the first.
+    min_rounds_tau: int = 0
+    #: A setpoint past the τ window: ``settle_n_rounds`` and the time floor alone.
     min_rounds_later: int = 0
+    #: How far the τ floor reaches, echoed so a reader of the projection alone can
+    #: tell which of the three figures above applies where.
+    tau_setpoints: int = 0
+    #: The two temperature-approach allowances, kept apart. ``breakdown_worst``
+    #: carries their per-setpoint mean, which is the right term in the totals and
+    #: the wrong number to quote at an operator deciding whether to extend one.
+    temp_approach_timeout_up_s: float = 0.0
+    temp_approach_timeout_down_s: float = 0.0
     #: The same totals at the floor. ``*_floor_s <= *_s`` always. The per-setpoint
     #: pair uses ``min_rounds_later``: it describes a *typical* setpoint, and only
     #: one setpoint in the run is the first.
@@ -1103,15 +1361,18 @@ class DurationProjection:
     @property
     def adaptive(self) -> bool:
         """Is there a range at all, or did the criterion collapse it to a point?"""
-        return (self.min_rounds_first, self.min_rounds_later) != (
-            self.rounds_per_setpoint, self.rounds_per_setpoint)
+        return any(floor != self.rounds_per_setpoint for floor in self.floor_rounds)
+
+    @property
+    def min_rounds(self) -> int:
+        """The shortest a setpoint anywhere in this run may be."""
+        return min(self.floor_rounds) if self.floor_rounds else self.min_rounds_first
 
     def rounds_span(self) -> str:
         """``"15"`` or ``"3-15"`` — what a setpoint may cost, in rounds."""
         if not self.adaptive:
             return str(self.rounds_per_setpoint)
-        return (f"{min(self.min_rounds_first, self.min_rounds_later)}-"
-                f"{self.rounds_per_setpoint}")
+        return f"{self.min_rounds}-{self.rounds_per_setpoint}"
 
     def describe(self) -> str:
         if not self.adaptive:
@@ -1152,12 +1413,15 @@ def inter_round_gap_s(config: EquilibrationConfig,
     that have nothing measured yet (``plan``, the pre-run projection).
 
     Which cost is subtracted is the whole defect this argument exists to fix.
-    ``eis_round_cost_s`` models the **frequency sweep only** — it carries none of
-    the per-channel mux switch, script upload, data retrieval or file write — so
-    subtracting it produced a cycle of ``real_cost + (period - modelled_cost)``.
-    At 12 channels / 240 s / ``Quick`` that is a ~353 s cycle against a configured
-    240 s: σ(t) sampled at an interval nobody asked for, and the fitter reads the
-    series as evenly spaced at the *configured* period.
+    Subtracting the modelled cost produces a cycle of
+    ``real_cost + (period - modelled_cost)``, which overruns the period by exactly
+    however much the model is low. When the defect was found the model ran ~10x
+    low, so at 12 channels / 240 s / ``Quick`` the cycle was ~353 s against a
+    configured 240 s: σ(t) sampled at an interval nobody asked for, and the fitter
+    reading the series as evenly spaced at the *configured* period. The 2026-08
+    recalibration shrank that error to ~8 % but did not remove it, and it never
+    removes the unmodelled per-channel overhead, so the measured cost is still the
+    only correct thing to subtract.
 
     ``project_duration`` never had that bug — it computes a cycle as the period or
     the round cost, whichever is longer — so the executor was disagreeing with the
@@ -1185,11 +1449,13 @@ def round_cost_s(config: EquilibrationConfig, *,
     the *same* one. Mixing a modelled round into a measured projection is wrong in
     a way no single printed figure reveals.
 
-    ``eis_round_cost_s`` models the frequency sweep and nothing else, and bench
-    measurement puts a real round several times above it — 12 channels on
-    ``Standard`` measured 40.7 s/channel against ~3.9 s/channel modelled. So the
-    modelled figure is a **floor**, not a prediction, and a caller that has a
-    measured per-channel number should always pass it.
+    ``eis_round_cost_s`` models the frequency sweep, and it is fitted to three
+    presets timed on this rig rather than assumed — 12 channels on ``Standard``
+    measured 40.7 s/channel against ~37.7 s/channel modelled. It ran ~10x low until
+    2026-08, which is why this argument exists at all; it is now within ~8 %, so
+    the modelled figure is a usable estimate rather than a floor. A caller holding
+    a measured per-channel number should still pass it: no fit beats a stopwatch,
+    and the fit says nothing about a preset that was never timed.
     """
     if measured_per_channel_s is not None and float(measured_per_channel_s) > 0:
         return float(measured_per_channel_s) * len(config.channels)
@@ -1215,21 +1481,22 @@ def minimum_feasible_period_s(round_cost: float) -> float:
 
 def round_headroom_s_per_channel(config: EquilibrationConfig,
                                  measured_round_s: float | None = None) -> float:
-    """Seconds per channel the configured period leaves for **unmodelled** overhead.
+    """Seconds per channel the configured period leaves over the round cost.
 
-    ``estimate_eis_duration`` models the frequency sweep and nothing else. Every
-    real round also pays a per-channel cost for the mux switch, the script upload,
-    the data retrieval and the file write, and that cost is roughly *fixed* rather
-    than proportional to the sweep — so it does not shrink when a faster preset is
-    chosen, and a short ``round_period_s`` is exactly where it bites.
+    On the modelled cost this is the margin available to absorb two things: the
+    per-channel mux switch, script upload, data retrieval and file write that
+    ``estimate_eis_duration`` does not model, and the ~8 % residual of the fit
+    itself. Since the 2026-08 recalibration the second dominates and it is
+    *proportional* to the sweep, which is why the caution built on this number
+    (``softae.tools.equilibration.model_underestimate_frac``) is a fraction rather
+    than a flat per-channel reserve.
 
-    This says how much room the configuration has left for it. It is a *headroom*,
-    not an estimate of the overhead: no per-channel overhead constant lives in this
-    module, because that number belongs to one rig and would be wrong the moment it
-    was written down. The run measures its own — see
-    :meth:`EquilibrationRun.measured_cost_summary`.
+    It remains a *headroom*, not an estimate of the overhead: no per-channel
+    overhead constant lives in this module, because that number belongs to one rig
+    and would be wrong the moment it was written down. The run measures its own —
+    see :meth:`EquilibrationRun.measured_cost_summary`.
 
-    With *measured_round_s* the remainder is no longer headroom for anything: the
+    With *measured_round_s* the remainder is no longer margin for anything: the
     overhead is already inside the measurement, and what is left is idle time. The
     argument exists so a plan given a measured cost reports one consistent set of
     numbers rather than a measured duration beside a modelled headroom.
@@ -1240,37 +1507,62 @@ def round_headroom_s_per_channel(config: EquilibrationConfig,
     return (float(config.round_period_s) - cost) / channels
 
 
+def tau_floor_rounds(config: EquilibrationConfig, setpoint_ordinal: int) -> int:
+    """:data:`MIN_POINTS_FOR_TAU` where a τ is wanted, and ``1`` where it is not.
+
+    *setpoint_ordinal* counts setpoints of the **run**, not of the leg: the down
+    leg revisits temperatures the films have already dried at, so its first
+    setpoint is not a fresh transient and must not be treated as one.
+
+    Returning ``1`` rather than ``0`` outside the window keeps this a real floor
+    on rounds — a setpoint always runs at least once — so callers can take a plain
+    ``max`` over the three bounds without a special case for "no τ here".
+    """
+    if int(setpoint_ordinal) < int(config.tau_setpoints):
+        return MIN_POINTS_FOR_TAU
+    return 1
+
+
+def hold_floor_s(config: EquilibrationConfig, setpoint_ordinal: int) -> float:
+    """The time floor at this setpoint: the first of the run gets its own."""
+    return float(config.min_hold_first_s if int(setpoint_ordinal) == 0
+                 else config.min_hold_s)
+
+
 def settle_floor_rounds(config: EquilibrationConfig, series_round_s: float, *,
-                        first: bool) -> int:
+                        setpoint_ordinal: int) -> int:
     """Fewest rounds a setpoint can stop after, given the criterion and the floors.
 
-    **Three** things bound it from below and all three are hard: the criterion
-    needs ``settle_n_rounds`` rounds before it has a window at all; the hold floor
-    (``min_hold_first_s`` at the run's first setpoint, ``min_hold_s`` after) must
-    have elapsed; and the series must be long enough for the offline fitter to
-    accept it — :data:`MIN_POINTS_FOR_TAU`, imported rather than restated so the
-    acquisition side cannot drift away from the analysis side that will refuse its
-    output.
+    Three things bound it from below: the criterion needs ``settle_n_rounds``
+    rounds before it has a window at all; the hold floor (``min_hold_first_s`` at
+    the run's first setpoint, ``min_hold_s`` after) must have elapsed; and, **for
+    the first ``tau_setpoints`` setpoints only**, the series must be long enough
+    for the offline fitter to accept it — :data:`MIN_POINTS_FOR_TAU`, imported
+    rather than restated so the acquisition side cannot drift away from the
+    analysis side that will refuse its output.
 
-    That third bound is not a nicety. At the shipped ``round_period_s`` of 660 s
-    the time floors buy 3 rounds at the first setpoint and 1 after, so without it
-    *every* setpoint of a default run could stop below the fit minimum and the run
-    would end with no τ at all.
+    That third bound is not a nicety where it applies. At the shipped
+    ``round_period_s`` of 660 s the time floors buy 3 rounds at the first setpoint
+    and 1 after, so without it a run could stop the transient short of the fit
+    minimum and end with no τ at all. But it is confined to the setpoints that
+    have a transient to fit: see :func:`tau_floor_rounds` and the module docstring
+    for the measured swing that decides where that is.
 
     The ceiling bounds it from above, and :meth:`EquilibrationConfig.validate`
     guarantees the ceiling is itself at least :data:`MIN_POINTS_FOR_TAU`, so the
-    clamp can never reintroduce an unanalysable setpoint. With the criterion
-    disabled the answer is the ceiling, which is what makes every projected range
-    collapse to the old single number rather than needing a second code path.
+    clamp can never reintroduce an unanalysable setpoint inside the τ window. With
+    the criterion disabled the answer is the ceiling, which is what makes every
+    projected range collapse to the old single number rather than needing a second
+    code path.
     """
     ceiling = int(config.rounds_per_setpoint)
     if not config.settle_enabled:
         return ceiling
-    floor_s = config.min_hold_first_s if first else config.min_hold_s
-    by_time = (math.ceil(float(floor_s) / series_round_s)
-               if series_round_s > 0 else 1)
+    floor_s = hold_floor_s(config, setpoint_ordinal)
+    by_time = (math.ceil(floor_s / series_round_s) if series_round_s > 0 else 1)
     return max(1, min(ceiling, max(int(config.settle_n_rounds),
-                                   MIN_POINTS_FOR_TAU, int(by_time))))
+                                   tau_floor_rounds(config, setpoint_ordinal),
+                                   int(by_time))))
 
 
 def project_duration(
@@ -1284,9 +1576,10 @@ def project_duration(
     actually costs, that value is passed in and the projection is redone on it —
     but the modelled projection is never overwritten in place. The gap between the
     two is a finding about ``estimate_eis_duration``, not an error to correct
-    quietly: bench observation puts a real round several times above the model,
-    and everything downstream (``preflight.project_campaign`` included) inherits
-    that model.
+    quietly: everything downstream (``preflight.project_campaign`` included)
+    inherits that model, so a run whose measured round drifts from it is the first
+    place the drift can be seen. It once stood at ~10x and was refitted from the
+    bench; keeping both numbers is how the next such gap gets caught earlier.
     """
     series_cost = eis_round_cost_s(config, config.eis_preset)
     basis = "modelled"
@@ -1301,39 +1594,61 @@ def project_duration(
     # drop (one hour, over a shipped 8-setpoint x 15-round run).
     series_round_s = series_cost + inter_round_gap_s(config, series_cost)
     series_s = config.rounds_per_setpoint * series_round_s
+    n = config.n_setpoints
 
-    worst = {"temperature_approach": config.approach_timeout_s,
+    worst = {"temperature_approach": _mean_temp_approach_s(config),
              "rh_approach": config.rh_approach_timeout_s,
              "sigma_series": series_s}
-    typical = {"temperature_approach": config.approach_timeout_s
-               * TYPICAL_APPROACH_FRACTION,
-               "rh_approach": config.rh_approach_timeout_s * TYPICAL_APPROACH_FRACTION,
-               "sigma_series": series_s}
+    typical = {k: (v if k == "sigma_series" else v * TYPICAL_APPROACH_FRACTION)
+               for k, v in worst.items()}
     per_worst, per_typical = sum(worst.values()), sum(typical.values())
-    n = config.n_setpoints
 
     # The floor. Only the series shortens — the approaches are driven by the
     # chamber and the settle criterion has no opinion about them — so the fixed
-    # part is carried across unchanged and only `sigma_series` is replaced. The
-    # first setpoint is budgeted separately because it alone gets
-    # `min_hold_first_s`, and it is the setpoint that carries the transient.
-    min_first = settle_floor_rounds(config, series_round_s, first=True)
-    min_later = settle_floor_rounds(config, series_round_s, first=False)
+    # part is carried across unchanged and only `sigma_series` is replaced. Every
+    # setpoint is asked for its own floor rather than two being extrapolated: the
+    # first has `min_hold_first_s`, the next `tau_setpoints - 1` still carry the
+    # τ floor, and the rest carry neither.
+    floors = tuple(settle_floor_rounds(config, series_round_s, setpoint_ordinal=i)
+                   for i in range(n))
     fixed_worst = per_worst - series_s
     fixed_typical = per_typical - series_s
-    floor_series_total = (min_first + min_later * max(0, n - 1)) * series_round_s
+    # `min_rounds_later` describes the regime MOST setpoints are in, which is what
+    # the per-setpoint floor row should quote; the last setpoint is always in it.
+    later = floors[-1] if floors else 0
     return DurationProjection(
         n_setpoints=n, rounds_per_setpoint=config.rounds_per_setpoint,
         per_setpoint_worst_s=per_worst, per_setpoint_typical_s=per_typical,
         worst_case_s=per_worst * n, typical_s=per_typical * n,
         breakdown_worst=worst, breakdown_typical=typical, basis=basis,
         series_round_s=series_round_s,
-        min_rounds_first=min_first, min_rounds_later=min_later,
-        per_setpoint_typical_floor_s=fixed_typical + min_later * series_round_s,
-        per_setpoint_worst_floor_s=fixed_worst + min_later * series_round_s,
-        typical_floor_s=fixed_typical * n + floor_series_total,
-        worst_floor_s=fixed_worst * n + floor_series_total,
+        floor_rounds=floors,
+        min_rounds_first=floors[0] if floors else 0,
+        min_rounds_tau=floors[1] if len(floors) > 1 else (floors[0] if floors else 0),
+        min_rounds_later=later,
+        tau_setpoints=int(config.tau_setpoints),
+        temp_approach_timeout_up_s=config.temperature_approach_timeout_s("up"),
+        temp_approach_timeout_down_s=config.temperature_approach_timeout_s("down"),
+        per_setpoint_typical_floor_s=fixed_typical + later * series_round_s,
+        per_setpoint_worst_floor_s=fixed_worst + later * series_round_s,
+        typical_floor_s=fixed_typical * n + sum(floors) * series_round_s,
+        worst_floor_s=fixed_worst * n + sum(floors) * series_round_s,
     )
+
+
+def _mean_temp_approach_s(config: EquilibrationConfig) -> float:
+    """Per-setpoint temperature-approach allowance, averaged over the legs.
+
+    The two legs no longer share a timeout, so no single per-setpoint figure is
+    *the* allowance. The mean is the one that keeps the arithmetic honest —
+    ``per_setpoint * n_setpoints`` still equals the run total — and the two real
+    numbers are carried separately on the projection for anything that quotes an
+    allowance to an operator rather than summing it.
+    """
+    n = max(1, config.n_setpoints)
+    total = sum(config.temperature_approach_timeout_s(leg)
+                for leg in config.legs for _temp in config.temperatures_C)
+    return total / n
 
 
 # ── The run ──────────────────────────────────────────────────────────────────
@@ -1704,7 +2019,10 @@ class EquilibrationRun:
         t_approach = await self._approach(
             temp_ctl.get_pv, temperature_C, axis="temperature",
             instrument=cfg.temp_instrument, tolerance=cfg.tolerance_C,
-            timeout_s=cfg.approach_timeout_s, leg=leg, setpoint_index=sp_idx)
+            # Leg-dependent: coming down nothing drives the stage, and the
+            # ascending allowance timed out mid-descent on 2026-08-11.
+            timeout_s=cfg.temperature_approach_timeout_s(leg),
+            leg=leg, setpoint_index=sp_idx)
 
         rh_approach = None
         if rh_ctl is not None:
@@ -1715,13 +2033,15 @@ class EquilibrationRun:
                 timeout_s=cfg.rh_approach_timeout_s, leg=leg, setpoint_index=sp_idx)
 
         # `_setpoints_done` is still 0 here — it is incremented once this setpoint
-        # finishes — so this is the first setpoint of the *run*, not of the leg.
+        # finishes — so it is this setpoint's ordinal in the *run*, not in the leg.
         # The down leg's first setpoint is a re-visit of a temperature the films
-        # have already seen, and it gets no extra floor for that reason.
+        # have already seen, and it gets neither the extra time floor nor the τ
+        # floor for that reason.
+        ordinal = self._setpoints_done
         series = await self._run_series(
             leg, sp_idx, temperature_C, temp_ctl, rh_ctl,
-            floor_s=(cfg.min_hold_first_s if self._setpoints_done == 0
-                     else cfg.min_hold_s))
+            floor_s=hold_floor_s(cfg, ordinal),
+            min_rounds=tau_floor_rounds(cfg, ordinal))
 
         temp_verdict = HoldOutcome.merge(series.temp_holds)
         rh_verdict = HoldOutcome.merge(series.rh_holds)
@@ -1769,7 +2089,7 @@ class EquilibrationRun:
 
     async def _run_series(self, leg: str, sp_idx: int, temperature_C: float,
                           temp_ctl: Any, rh_ctl: Any, *,
-                          floor_s: float) -> "SeriesOutcome":
+                          floor_s: float, min_rounds: int) -> "SeriesOutcome":
         """The σ(t) series at one setpoint: rounds until it settles, or the ceiling.
 
         The ceiling is unconditional. Stopping *early* needs three things at once,
@@ -1779,11 +2099,13 @@ class EquilibrationRun:
         * the time floor has elapsed — a series that looks flat two rounds into a
           setpoint the chamber has not finished reaching is flat for the wrong
           reason;
-        * at least :data:`MIN_POINTS_FOR_TAU` rounds exist, because a shorter
-          series is one :func:`~softae.analysis.equilibration.fit_equilibration`
-          refuses outright. The run must not be able to acquire a setpoint it
-          cannot analyse, and at a 660 s period the time floor alone does not
-          prevent that at *any* setpoint, first or later.
+        * ``min_rounds`` rounds exist. Inside the τ window that is
+          :data:`MIN_POINTS_FOR_TAU`, because a shorter series is one
+          :func:`~softae.analysis.equilibration.fit_equilibration` refuses
+          outright and the run must not acquire a setpoint it cannot analyse; past
+          the window it is 1, because there is no τ left to protect and the fifth
+          round would re-measure a settled number. :func:`tau_floor_rounds` owns
+          which of the two this is — the loop is handed the answer, not the rule.
         """
         cfg = self.config
         hold_start = float(self._now())
@@ -1804,7 +2126,7 @@ class EquilibrationRun:
             tracker.observe(self._round_fits(leg, sp_idx, round_index))
             elapsed_s = float(self._now()) - hold_start
             if (tracker.settled and elapsed_s >= float(floor_s)
-                    and n_rounds >= MIN_POINTS_FOR_TAU):
+                    and n_rounds >= int(min_rounds)):
                 settled_early = True
                 break
             if round_index == cfg.rounds_per_setpoint - 1:
@@ -1834,9 +2156,10 @@ class EquilibrationRun:
         """The graded dead time between two rounds, so the round period is honoured."""
         cfg = self.config
         # The MEASURED round, not the modelled one: the period is honoured from
-        # this round's start, and the model under-counts a real round several-fold
-        # (see `inter_round_gap_s`). Passing the modelled cost here is what made
-        # every cycle overrun --round-period-s.
+        # this round's start, and the model under-counts a real round by whatever
+        # its fit residual and the unmodelled per-channel overhead come to (see
+        # `inter_round_gap_s`). Passing the modelled cost here is what made every
+        # cycle overrun --round-period-s.
         gap = inter_round_gap_s(cfg, measured_s)
         # The gap is split so BOTH axes are graded by the same primitive.
         # `monitored_hold` grades one target, and leaving either axis ungraded for
@@ -2070,7 +2393,8 @@ class EquilibrationRun:
             actual_cycle_s=round(cycle, 1), n_channels=len(self.config.channels),
             preset=self.config.eis_preset, suggested_round_period_s=suggested,
             detail="the sampling interval is an experimental parameter and is not "
-                   "auto-adjusted; the model covers the frequency sweep only",
+                   "auto-adjusted; the modelled cost beside it is a fitted sweep "
+                   "estimate, not a measurement",
         )
 
     def measured_round_cost_s(self, kind: str = KIND_SERIES) -> float | None:
@@ -2089,11 +2413,12 @@ class EquilibrationRun:
     def measured_cost_summary(self) -> dict[str, Any]:
         """The run's own answer to "what does a round actually cost?".
 
-        ``estimate_eis_duration`` models the frequency sweep and nothing else, and
-        every consumer of it — this projection, ``preflight.project_campaign``, the
-        campaign check — inherits that omission. This is the measurement that
-        corrects it, recorded beside the modelled figure rather than in place of
-        it so the size of the gap survives.
+        ``estimate_eis_duration`` models the frequency sweep, and every consumer of
+        it — this projection, ``preflight.project_campaign``, the campaign check —
+        inherits both its fit residual and the per-channel overhead it omits. This
+        is the measurement they are answerable to, recorded beside the modelled
+        figure rather than in place of it so the size of the gap survives. It read
+        ~10x once; the ratio below is what would show that happening again.
         """
         out: dict[str, Any] = {"rounds": list(self.round_costs),
                                "round_period_s": self.config.round_period_s,
@@ -2255,12 +2580,25 @@ class EquilibrationRun:
                 "settle_min_channels": cfg.settle_min_channels,
                 "min_hold_first_s": cfg.min_hold_first_s,
                 "min_hold_s": cfg.min_hold_s,
+                # How far the MIN_POINTS_FOR_TAU floor reached. Without it a short
+                # late setpoint in this run and a short late setpoint in a run
+                # that predates the window are indistinguishable on disk.
+                "tau_setpoints": cfg.tau_setpoints,
                 "round_period_s": cfg.round_period_s,
                 "eis_preset": cfg.eis_preset,
                 "eis_model": cfg.eis_model,
                 "electrode_geometry": cfg.electrode_geometry,
                 "tolerance_C": cfg.tolerance_C,
                 "rh_tolerance_pct": cfg.rh_tolerance_pct,
+                # The bands and allowances a verdict in this file was graded
+                # against. `hold_met` is meaningless without the tolerance that
+                # produced it, and both moved on 2026-08-12.
+                "warn_C": cfg.warn_C,
+                "fault_C": cfg.fault_C,
+                "grace_s": cfg.grace_s,
+                "approach_timeout_s": cfg.approach_timeout_s,
+                "down_approach_timeout_s": cfg.down_approach_timeout_s,
+                "rh_approach_timeout_s": cfg.rh_approach_timeout_s,
             },
             "thickness": self.thickness_provenance(),
             "projection": {"typical_s": projection.typical_s,
@@ -2268,7 +2606,9 @@ class EquilibrationRun:
                            "typical_floor_s": projection.typical_floor_s,
                            "worst_floor_s": projection.worst_floor_s,
                            "min_rounds_first": projection.min_rounds_first,
+                           "min_rounds_tau": projection.min_rounds_tau,
                            "min_rounds_later": projection.min_rounds_later,
+                           "floor_rounds": list(projection.floor_rounds),
                            "basis": projection.basis},
             "measured_cost": self.measured_cost_summary(),
             "points": list(self.points),

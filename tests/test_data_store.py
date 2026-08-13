@@ -315,6 +315,73 @@ class TestConditions:
             store.record_conditions(99999, "measurement")
 
 
+class TestConditionsResolvedTemperature:
+    """Schema epoch 4: the resolver's answer is written, not re-derived.
+
+    ``record_conditions`` is the only production writer, so these pin the whole
+    contract: every row leaves here with a source label, and the number attached
+    to it is the one :func:`resolve_temperature_C` chose.
+    """
+
+    def _record(self, store_with_run, **env) -> dict:
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        store.record_conditions(mid, "measurement", **env)
+        return store.query_conditions(measurement_id=mid)[0]
+
+    def test_record_conditions_resolves_the_stage_pv_first(
+            self, store_with_run) -> None:
+        row = self._record(
+            store_with_run,
+            stage_temp_pv_C=85.0, stage_temp_sp_C=84.0, chamber_air_C=42.8)
+        assert row["temperature_C"] == pytest.approx(85.0)
+        assert row["temperature_source"] == "stage_pv"
+
+    def test_record_conditions_falls_back_to_the_setpoint(
+            self, store_with_run) -> None:
+        row = self._record(
+            store_with_run, stage_temp_sp_C=65.0, chamber_air_C=36.6)
+        assert row["temperature_C"] == pytest.approx(65.0)
+        assert row["temperature_source"] == "stage_sp"
+
+    def test_record_conditions_falls_back_to_the_air_probe_and_says_so(
+            self, store_with_run) -> None:
+        row = self._record(store_with_run, chamber_air_C=29.1)
+        assert row["temperature_C"] == pytest.approx(29.1)
+        assert row["temperature_source"] == "chamber_air"
+
+    def test_record_conditions_with_no_thermometer_is_null_not_a_number(
+            self, store_with_run) -> None:
+        """NULL + ``'unavailable'``: one absence, spelled one way.
+
+        The number column is NULL rather than NaN so nothing that only checks
+        ``is None`` mistakes it for a reading; the source column is populated
+        rather than NULL so *recorded as absent* stays distinguishable from
+        *never recorded* — the FORMULATION_THICKNESS_METHODS convention.
+        """
+        row = self._record(store_with_run, rh_pv_pct=30.0)
+        assert row["temperature_C"] is None
+        assert row["temperature_source"] == "unavailable"
+
+    def test_record_conditions_rejects_an_impossible_reading_like_the_resolver(
+            self, store_with_run) -> None:
+        """Validity is the resolver's rule, and it is not re-implemented here."""
+        row = self._record(
+            store_with_run, stage_temp_pv_C=-300.0, stage_temp_sp_C=40.0)
+        assert row["temperature_C"] == pytest.approx(40.0)
+        assert row["temperature_source"] == "stage_sp"
+
+    def test_the_source_columns_are_untouched_by_the_derivation(
+            self, store_with_run) -> None:
+        """Derived, not replacing: the three reads still say what they read."""
+        row = self._record(
+            store_with_run,
+            stage_temp_pv_C=85.0, stage_temp_sp_C=84.0, chamber_air_C=42.8)
+        assert row["stage_temp_pv_C"] == pytest.approx(85.0)
+        assert row["stage_temp_sp_C"] == pytest.approx(84.0)
+        assert row["chamber_air_C"] == pytest.approx(42.8)
+
+
 # ---------------------------------------------------------------------------
 # Conditions-table temperature migrations
 #
@@ -364,6 +431,16 @@ def _conditions_columns(store: DataStore) -> set[str]:
     return {
         r[1]
         for r in store._conn.execute("PRAGMA table_info(conditions)").fetchall()
+    }
+
+
+def _conditions_indexes(store: DataStore) -> set[str]:
+    return {
+        r[0]
+        for r in store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' "
+            "AND tbl_name = 'conditions'"
+        ).fetchall()
     }
 
 
@@ -486,13 +563,7 @@ class TestConditionsTempRenameMigration:
         conn.close()
 
         with DataStore(project) as store:
-            indexes = {
-                r[0]
-                for r in store._conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'index' "
-                    "AND tbl_name = 'conditions'"
-                ).fetchall()
-            }
+            indexes = _conditions_indexes(store)
             assert "idx_conditions_temp_pv" not in indexes
             assert "idx_conditions_stage_temp_pv" in indexes
 
@@ -507,12 +578,174 @@ class TestConditionsTempRenameMigration:
         assert "chamber_air_C" in row[1]
 
 
+class TestConditionsResolvedTemperatureMigration:
+    """Schema epoch 4: derived temperature columns, and the first backfill.
+
+    These stack on the *oldest* reachable shape on purpose. The migration reads
+    all three source columns by their settled names, so it can only work if
+    ``_migrate_conditions_stage_temp`` (adds the stage PV) and
+    ``_migrate_conditions_temp_names`` (renames the other two) have already run
+    — ordering the assertions cannot see directly, but a wrong order produces a
+    row resolved from columns that did not exist yet.
+    """
+
+    #: One legacy row per branch of the resolver's precedence, in the oldest
+    #: shape — which has no stage-PV column at all, so 'stage_pv' is unreachable
+    #: here and is covered from the pre-rename shape below.
+    _OLDEST_ROWS = (
+        "INSERT INTO conditions (measurement_id, run_id, stage, timestamp,"
+        " temp_sp_C, temp_pv_C) VALUES"
+        " (1, 'old_run', 'measurement', '2026-01-01T00:00:00Z', 65.0, 36.6),"
+        " (2, 'old_run', 'measurement', '2026-01-01T00:01:00Z', NULL, 29.1),"
+        " (3, 'old_run', 'measurement', '2026-01-01T00:02:00Z', NULL, NULL)"
+    )
+
+    def _resolved(self, store: DataStore) -> dict[int, tuple]:
+        return {
+            r[0]: (r[1], r[2])
+            for r in store._conn.execute(
+                "SELECT measurement_id, temperature_C, temperature_source "
+                "FROM conditions ORDER BY measurement_id"
+            ).fetchall()
+        }
+
+    def test_legacy_db_gains_both_derived_columns(self, tmp_path: Path) -> None:
+        project = tmp_path / "derived"
+        _build_legacy_conditions_db(
+            project, _LEGACY_CONDITIONS_DDL_PRE_STAGE_PV, self._OLDEST_ROWS)
+
+        with DataStore(project) as store:
+            assert {"temperature_C", "temperature_source"} <= _conditions_columns(store)
+
+    def test_every_historical_row_is_backfilled_through_the_resolver(
+            self, tmp_path: Path) -> None:
+        """The first backfilling migration in this codebase — so, spot-checked.
+
+        A derived column left NULL for history would drop every pre-epoch row
+        out of temperature filtering, which is why this migration diverges from
+        the NULL-for-historical choice made for ``sample_uuid`` and ``outcome``:
+        those are facts the past failed to record, this is a function of the
+        row's own columns.
+        """
+        project = tmp_path / "backfill"
+        _build_legacy_conditions_db(
+            project, _LEGACY_CONDITIONS_DDL_PRE_STAGE_PV, self._OLDEST_ROWS)
+
+        with DataStore(project) as store:
+            rows = self._resolved(store)
+
+        assert rows[1][0] == pytest.approx(65.0)
+        assert rows[1][1] == "stage_sp"
+        assert rows[2][0] == pytest.approx(29.1)
+        assert rows[2][1] == "chamber_air"
+        # Nothing to resolve is a *result*: NULL number, populated label.
+        assert rows[3] == (None, "unavailable")
+
+    def test_backfill_prefers_the_stage_pv_where_the_row_has_one(
+            self, tmp_path: Path) -> None:
+        project = tmp_path / "backfill_pv"
+        _build_legacy_conditions_db(
+            project,
+            _LEGACY_CONDITIONS_DDL_PRE_RENAME,
+            "INSERT INTO conditions (measurement_id, run_id, stage, timestamp,"
+            " temp_sp_C, temp_pv_C, stage_temp_pv_C)"
+            " VALUES (1, 'old_run', 'measurement', '2026-01-01T00:00:00Z',"
+            " 85.0, 42.8, 84.6)",
+        )
+
+        with DataStore(project) as store:
+            assert self._resolved(store)[1] == (pytest.approx(84.6), "stage_pv")
+
+    def test_reopening_a_backfilled_db_changes_nothing(
+            self, tmp_path: Path) -> None:
+        project = tmp_path / "twice_derived"
+        _build_legacy_conditions_db(
+            project, _LEGACY_CONDITIONS_DDL_PRE_STAGE_PV, self._OLDEST_ROWS)
+
+        with DataStore(project) as store:
+            first = store.query_conditions()
+        with DataStore(project) as store:
+            assert store.query_conditions() == first
+
+    def test_a_row_left_unresolved_by_a_stale_writer_is_repaired_on_open(
+            self, tmp_path: Path) -> None:
+        """The backfill targets ``temperature_source IS NULL``, not 'first open'.
+
+        That set is every row after the ALTER, nothing on a settled database,
+        and exactly the right rows after an open interrupted mid-backfill or a
+        raw INSERT from a binary that predates the columns.
+        """
+        project = tmp_path / "stale_writer"
+        with DataStore(project) as store:
+            run_id = store.start_run("legacy_writer")
+            mid = store.record_measurement(run_id, _make_eis_result())
+            store._conn.execute(
+                "INSERT INTO conditions (measurement_id, run_id, stage, timestamp,"
+                " stage_temp_pv_C) VALUES (?, ?, 'measurement', ?, 77.0)",
+                (mid, run_id, "2026-01-01T00:00:00Z"),
+            )
+            store._conn.commit()
+            assert store.query_conditions(measurement_id=mid)[0][
+                "temperature_source"] is None
+
+        with DataStore(project) as store:
+            row = store.query_conditions(measurement_id=mid)[0]
+            assert row["temperature_C"] == pytest.approx(77.0)
+            assert row["temperature_source"] == "stage_pv"
+
+    def test_a_fresh_db_carries_the_derived_columns_and_the_index(
+            self, tmp_path: Path) -> None:
+        with DataStore(tmp_path / "fresh_derived") as store:
+            assert {"temperature_C", "temperature_source"} <= _conditions_columns(store)
+            assert "idx_conditions_temperature_C" in _conditions_indexes(store)
+
+    def test_the_derived_index_is_created_on_a_legacy_db_too(
+            self, tmp_path: Path) -> None:
+        """The filter's new target is indexed on every path, fresh or migrated.
+
+        The DDL cannot declare it — on a legacy database the CREATE TABLE is a
+        no-op and the column does not exist yet — so the migration owns it, the
+        same division ``idx_conditions_stage_temp_pv`` already follows.
+        """
+        project = tmp_path / "legacy_index"
+        _build_legacy_conditions_db(
+            project, _LEGACY_CONDITIONS_DDL_PRE_STAGE_PV, self._OLDEST_ROWS)
+
+        with DataStore(project) as store:
+            indexes = _conditions_indexes(store)
+            assert "idx_conditions_temperature_C" in indexes
+            # The stage-PV index survives: ad-hoc and analysis queries still
+            # select on the raw column directly.
+            assert "idx_conditions_stage_temp_pv" in indexes
+
+    def test_the_epoch_is_recorded_as_schema_not_data_epoch(
+            self, tmp_path: Path) -> None:
+        with DataStore(tmp_path / "epoch4") as store:
+            row = store._conn.execute(
+                "SELECT kind, note FROM schema_version WHERE version = 4"
+            ).fetchone()
+        assert row is not None
+        # 'data-epoch-grade' in the resolver's note measures significance; the
+        # kind column asks only whether stored numbers changed meaning.
+        assert row[0] == "schema"
+        assert "temperature_source" in row[1]
+
+
 # ---------------------------------------------------------------------------
 # Temperature-range query via conditions join
 # ---------------------------------------------------------------------------
 
 
 class TestTempRangeQuery:
+    """The filter names one column — ``conditions.temperature_C`` (epoch 4).
+
+    These scenarios are unchanged from when the filter restated the precedence
+    as a COALESCE; what changed is *where* the precedence is applied. It now
+    happens at ``record_conditions`` time, so these read as write-time-resolution
+    tests observed through the query — which is the point: a filter that can only
+    return the right row if the write resolved correctly is the stronger test.
+    """
+
     def test_temp_range_filter(self, store_with_run) -> None:
         store, run_id = store_with_run
         m1 = store.record_measurement(run_id, _make_eis_result(channel=1))
@@ -546,7 +779,7 @@ class TestTempRangeQuery:
 
     def test_temp_range_falls_back_to_the_setpoint_then_the_air(
             self, store_with_run) -> None:
-        """COALESCE mirrors `resolve_temperature_C`: stage PV → stage SP → air."""
+        """The stored column carries the resolver's fallbacks: SP, then air."""
         store, run_id = store_with_run
         m1 = store.record_measurement(run_id, _make_eis_result(channel=1))
         m2 = store.record_measurement(run_id, _make_eis_result(channel=2))
@@ -558,6 +791,18 @@ class TestTempRangeQuery:
                 store.query_measurements(temp_range=(64.0, 66.0))] == [1]
         assert [r["channel"] for r in
                 store.query_measurements(temp_range=(28.0, 30.0))] == [2]
+
+    def test_temp_range_excludes_rows_no_thermometer_spoke_for(
+            self, store_with_run) -> None:
+        """NULL is not 0 °C, and must not be swept into a range containing it."""
+        store, run_id = store_with_run
+        m1 = store.record_measurement(run_id, _make_eis_result(channel=1))
+        m2 = store.record_measurement(run_id, _make_eis_result(channel=2))
+        store.record_conditions(m1, "measurement", rh_pv_pct=30.0)
+        store.record_conditions(m2, "measurement", stage_temp_pv_C=25.0)
+
+        assert [r["channel"] for r in
+                store.query_measurements(temp_range=(-50.0, 50.0))] == [2]
 
     def test_temp_range_custom_stage(self, store_with_run) -> None:
         store, run_id = store_with_run

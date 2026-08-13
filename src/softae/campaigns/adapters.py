@@ -334,11 +334,23 @@ class DataStoreAdapter(DatasetAdapter):
             # chamber-air probe first and never read the stage PV at all — the
             # resolver's precedence exactly inverted, worth up to 42 °C on every
             # tidy row it emitted.
-            temp, temp_source = resolve_temperature_C(
-                stage_pv_C=cond.get("stage_temp_pv_C"),
-                stage_sp_C=cond.get("stage_temp_sp_C"),
-                chamber_air_C=cond.get("chamber_air_C"),
-            )
+            #
+            # Since schema epoch 4 the answer is already on the row, resolved at
+            # record time, so read it rather than re-deriving it. The fallback
+            # below is the SAME authority, not a second opinion: it calls the
+            # resolver the writer would have called, for rows no epoch-4 writer
+            # wrote — raw-INSERT test fixtures, or a row from a stale binary
+            # before the next open re-resolves it.
+            temp_source = cond.get("temperature_source")
+            if temp_source:
+                temp = cond.get("temperature_C")
+                temp = float("nan") if temp is None else float(temp)
+            else:
+                temp, temp_source = resolve_temperature_C(
+                    stage_pv_C=cond.get("stage_temp_pv_C"),
+                    stage_sp_C=cond.get("stage_temp_sp_C"),
+                    chamber_air_C=cond.get("chamber_air_C"),
+                )
             rh = cond.get("rh_pv_pct")
             if rh is None:
                 rh = cond.get("rh_sp_pct", float("nan"))

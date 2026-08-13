@@ -28,6 +28,7 @@ from softae.analysis.equilibration import (
     RoundFit,
 )
 from softae.workflows.equilibration import (
+    DEFAULT_TAU_SETPOINTS,
     ENV_OK,
     ENV_SKIPPED,
     EV_AMBIENT_RESTORED,
@@ -55,6 +56,7 @@ from softae.workflows.equilibration import (
     measurement_step_name,
     project_duration,
     round_headroom_s_per_channel,
+    settle_floor_rounds,
     watch_hold,
 )
 
@@ -226,6 +228,14 @@ class TestWatchedHold:
 
 # ── Naming: three collisions, one of them loud ───────────────────────────────
 
+#: An RH process value sitting exactly on the shipped setpoint. Read off the
+#: config rather than retyped, so that changing the setpoint — 15 → 20 %RH on
+#: 2026-08-12, because the flush basin humidifies the heated enclosure as it warms
+#: — does not silently turn every "the chamber is at condition" fixture in this
+#: file into an unmet hold and send the reader hunting for a regression.
+ON_RH = [EquilibrationConfig.rh_setpoint_pct]
+
+
 def _design_config(**kw) -> EquilibrationConfig:
     params = dict(channels=[1, 2], temperatures_C=[27.5, 45.0], rounds_per_setpoint=5,
                   electrode_geometry={"L_cm": 0.2, "t_cm": 0.0175, "w_cm": 0.2})
@@ -378,32 +388,72 @@ class TestProjection:
         assert projection.worst_case_s > 0
 
     def test_the_projected_worst_case_uses_the_timeouts_rather_than_an_assumed_ramp_rate(self):
-        base = _design_config(approach_timeout_s=1800.0, rh_approach_timeout_s=1800.0)
-        doubled = _design_config(approach_timeout_s=3600.0, rh_approach_timeout_s=3600.0)
+        # All THREE allowances are doubled: the temperature axis has one per leg
+        # since cooling stopped sharing the heater's budget.
+        base = _design_config(approach_timeout_s=1800.0, rh_approach_timeout_s=1800.0,
+                              down_approach_timeout_s=1800.0)
+        doubled = _design_config(approach_timeout_s=3600.0, rh_approach_timeout_s=3600.0,
+                                 down_approach_timeout_s=3600.0)
 
         delta = (project_duration(doubled).worst_case_s
                  - project_duration(base).worst_case_s)
         assert delta == pytest.approx(3600.0 * base.n_setpoints)
         assert project_duration(base).breakdown_worst["temperature_approach"] == 1800.0
 
+    def test_the_down_leg_approach_allowance_is_longer_and_is_used_on_the_down_leg_only(self):
+        # Cooling is passive: the ascending allowance timed out at the last
+        # down-leg setpoint on 2026-08-11 with the stage still 6.6 C high.
+        config = _design_config()
+        assert config.down_approach_timeout_s > config.approach_timeout_s
+        assert config.temperature_approach_timeout_s("up") == pytest.approx(
+            config.approach_timeout_s)
+        assert config.temperature_approach_timeout_s("down") == pytest.approx(
+            config.down_approach_timeout_s)
+
+        # And it is spent: the run total carries the down leg's allowance for the
+        # down leg's setpoints, not the up leg's for all of them.
+        up_only = _design_config(legs=("up",))
+        both = _design_config(legs=("up", "down"))
+        extra = (project_duration(both).worst_case_s
+                 - 2 * project_duration(up_only).worst_case_s)
+        assert extra == pytest.approx(
+            (config.down_approach_timeout_s - config.approach_timeout_s)
+            * len(config.temperatures_C))
+
+    def test_the_down_leg_allowance_is_a_separate_setting_not_a_hidden_multiplier(self):
+        # An operator who has to extend it must be able to see the number being
+        # extended, and to set the two directions independently.
+        stretched = _design_config(down_approach_timeout_s=9000.0)
+        assert stretched.approach_timeout_s == pytest.approx(1800.0)
+        assert stretched.temperature_approach_timeout_s("down") == pytest.approx(9000.0)
+
     def test_the_shipped_design_projects_the_overnight_run_the_spec_budgeted(self):
         config = EquilibrationConfig()          # 16 channels, 4 temps, 2 legs, 15 rounds
         projection = project_duration(config)
         assert projection.n_setpoints == 8
-        # The CEILING, which is what the old fixed-count projection was. It grew
-        # with the round-period default (120 s -> 660 s, derived from 16 channels
-        # x the measured 40.7 s/channel on 'Standard'), because the old default
-        # projected a night the rig could not actually run at that channel count.
-        assert projection.typical_s / 3600 == pytest.approx(24.0, abs=0.05)
-        assert projection.worst_case_s / 3600 == pytest.approx(30.0, abs=0.05)
-        # And the FLOOR, which the settle criterion makes reachable. At the 660 s
-        # default period the time floors buy only ceil(1500/660) = 3 rounds at the
-        # first setpoint and ceil(600/660) = 1 after, and settle_n_rounds is 3 --
-        # so MIN_POINTS_FOR_TAU is what binds at EVERY setpoint, first included.
-        assert (projection.min_rounds_first, projection.min_rounds_later) == (
-            MIN_POINTS_FOR_TAU, MIN_POINTS_FOR_TAU)
-        assert projection.typical_floor_s / 3600 == pytest.approx(9.3, abs=0.05)
-        assert projection.worst_floor_s / 3600 == pytest.approx(15.3, abs=0.05)
+        # The CEILING, which is what the old fixed-count projection was. It moved
+        # with the round-period default: 120 s -> 660 s when the period was
+        # derived from 'Standard', then 660 -> 200 s when the shipped preset
+        # became 'Quick'. The night got SHORTER because the sampling interval did,
+        # not because anything was cut: 15 rounds x 200 s is 50 min of series
+        # where 15 x 660 s was 2.75 h. The down leg's own approach allowance is
+        # still in here -- 4 setpoints at 5400 s against 4 at 1800 s.
+        assert projection.typical_s / 3600 == pytest.approx(10.02, abs=0.05)
+        assert projection.worst_case_s / 3600 == pytest.approx(19.02, abs=0.05)
+        # And the FLOOR, which the settle criterion makes reachable. Read off the
+        # three regimes rather than one number: at the 200 s period the 1500 s
+        # first-setpoint hold floor buys ceil(1500/200) = 8 rounds, which now
+        # EXCEEDS MIN_POINTS_FOR_TAU instead of falling under it -- the shortest
+        # legal first setpoint is 8 sigma points where it used to be 5. Setpoint 2
+        # is still inside the tau window with only ceil(600/200) = 3 rounds of
+        # time floor, so MIN_POINTS_FOR_TAU binds there; past the window the floor
+        # is settle_n_rounds alone.
+        assert projection.min_rounds_first == 8 > MIN_POINTS_FOR_TAU
+        assert projection.min_rounds_tau == MIN_POINTS_FOR_TAU
+        assert projection.min_rounds_later == config.settle_n_rounds == 3
+        assert projection.floor_rounds == (8, 5, 3, 3, 3, 3, 3, 3)
+        assert projection.typical_floor_s / 3600 == pytest.approx(4.81, abs=0.05)
+        assert projection.worst_floor_s / 3600 == pytest.approx(13.81, abs=0.05)
         assert projection.adaptive is True
         assert "anchor_rounds" not in projection.breakdown_typical
 
@@ -549,7 +599,7 @@ class TestRunLoop:
             self, tmp_path):
         # 40 C against a 45 C setpoint: inside the fault band, so monitored_hold
         # never raises -- but it is not held, and that is the primary result.
-        run, temp, _rh, _ex = _runner([40.0], [15.0], tmp_path)
+        run, temp, _rh, _ex = _runner([40.0], ON_RH, tmp_path)
         payload = await run.run()
 
         assert payload["setpoints"][0]["hold_met"] is False
@@ -585,11 +635,11 @@ class TestRunLoop:
 
     @pytest.mark.asyncio
     async def test_a_held_setpoint_records_met_and_writes_the_sidecar(self, tmp_path):
-        run, _temp, rh, _ex = _runner([45.0], [15.0], tmp_path)
+        run, _temp, rh, _ex = _runner([45.0], ON_RH, tmp_path)
         payload = await run.run()
 
         assert payload["setpoints"][0]["hold_met"] is True
-        assert rh.setpoint == pytest.approx(15.0) and rh.started
+        assert rh.setpoint == pytest.approx(ON_RH[0]) and rh.started
         path = Path(tmp_path) / "runs" / "RUN1" / "equilibration.json"
         assert path.exists()
         assert payload["schema"] == "equilibration/1"
@@ -598,7 +648,7 @@ class TestRunLoop:
     @pytest.mark.asyncio
     async def test_an_unreadable_pv_aborts_the_run_rather_than_being_recorded_as_an_unmet_setpoint(
             self, tmp_path):
-        run, _temp, _rh, _ex = _runner([None], [15.0], tmp_path)
+        run, _temp, _rh, _ex = _runner([None], ON_RH, tmp_path)
         with pytest.raises(EquilibrationAbort) as excinfo:
             await run.run()
         assert excinfo.value.kind == "unreadable_pv"
@@ -607,7 +657,7 @@ class TestRunLoop:
     @pytest.mark.asyncio
     async def test_a_sustained_overshoot_beyond_the_fault_band_aborts_and_restores_ambient(
             self, tmp_path):
-        run, temp, _rh, _ex = _runner([60.0], [15.0], tmp_path, fault_C=10.0)
+        run, temp, _rh, _ex = _runner([60.0], ON_RH, tmp_path, fault_C=10.0)
         with pytest.raises(EquilibrationAbort) as excinfo:
             await run.run()
 
@@ -619,7 +669,7 @@ class TestRunLoop:
 
     @pytest.mark.asyncio
     async def test_the_sidecar_carries_the_coordinate_the_database_cannot(self, tmp_path):
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path,
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path,
                                        temperatures_C=[27.5, 45.0], legs=("up", "down"),
                                        fault_C=50.0)
         payload = await run.run()
@@ -632,7 +682,7 @@ class TestRunLoop:
 
     @pytest.mark.asyncio
     async def test_both_axes_are_graded_by_the_same_watched_primitive(self, tmp_path):
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path)
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path)
         payload = await run.run()
 
         axes = {hold["axis"] for hold in payload["holds"]}
@@ -654,7 +704,7 @@ class TestInterruptSafeTeardown:
     @pytest.mark.asyncio
     async def test_run_keyboard_interrupt_restores_ambient_and_writes_the_sidecar(
             self, tmp_path):
-        run, temp, _rh, _ex = _runner([45.0], [15.0], tmp_path,
+        run, temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path,
                                       raises=KeyboardInterrupt())
         with pytest.raises(KeyboardInterrupt):
             await run.run()
@@ -670,7 +720,7 @@ class TestInterruptSafeTeardown:
         # A driver CommunicationError, a SafetyError or a plain bug: none is an
         # EquilibrationAbort, and all of them used to walk past the teardown.
         run, temp, _rh, _ex = _runner(
-            [45.0], [15.0], tmp_path,
+            [45.0], ON_RH, tmp_path,
             raises=RuntimeError("the potentiostat stopped answering"))
         with pytest.raises(RuntimeError, match="stopped answering"):
             await run.run()
@@ -689,7 +739,7 @@ class TestInterruptSafeTeardown:
         # Regression pin. The abort path predates this fix and its semantics --
         # `kind:` prefixed reason, ambient restored, sidecar on disk, exception
         # re-raised with its `kind` and `axis` -- must not have moved.
-        run, temp, _rh, _ex = _runner([60.0], [15.0], tmp_path, fault_C=10.0)
+        run, temp, _rh, _ex = _runner([60.0], ON_RH, tmp_path, fault_C=10.0)
         with pytest.raises(EquilibrationAbort) as excinfo:
             await run.run()
 
@@ -707,7 +757,7 @@ class TestInterruptSafeTeardown:
         # The restore runs in a context where a driver may ALREADY be broken --
         # often that is exactly why we are here. Its own failure must not become
         # the exception the operator is shown.
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path,
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path,
                                        raises=RuntimeError("the original fault"))
 
         async def _restore_explodes():
@@ -722,7 +772,7 @@ class TestInterruptSafeTeardown:
     @pytest.mark.asyncio
     async def test_run_sidecar_failure_does_not_mask_the_original_exception(
             self, tmp_path):
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path,
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path,
                                        raises=RuntimeError("the original fault"))
 
         def _write_explodes():
@@ -741,7 +791,7 @@ class TestInterruptSafeTeardown:
         # A silent restore attempt is indistinguishable from a successful one, and
         # the number the operator has to walk to the rig with is the setpoint the
         # chamber is still commanded to -- not the config's peak, and not ambient.
-        run, temp, _rh, _ex = _runner([85.0], [15.0], tmp_path,
+        run, temp, _rh, _ex = _runner([85.0], ON_RH, tmp_path,
                                       temperatures_C=[85.0], fault_C=50.0)
         events = _collect(run)
         accepted = temp.write_sp
@@ -771,7 +821,7 @@ class TestInterruptSafeTeardown:
     @pytest.mark.asyncio
     async def test_run_successful_restore_is_stated_rather_than_left_to_be_assumed(
             self, tmp_path):
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path)
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path)
         events = _collect(run)
         await run.run()
 
@@ -785,7 +835,7 @@ class TestInterruptSafeTeardown:
             self, tmp_path):
         # A power cut or a `kill -9` catches no handler at all, so the record of
         # setpoint 1 has to already be on disk while setpoint 2 is still running.
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path,
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path,
                                        temperatures_C=[40.0, 45.0], fault_C=50.0)
         path = Path(tmp_path) / "runs" / "RUN1" / "equilibration.json"
         on_disk: list = []
@@ -865,7 +915,7 @@ class TestProgressEvents:
     @pytest.mark.asyncio
     async def test_the_progress_events_fire_in_the_hierarchy_order_an_operator_reads(
             self, tmp_path):
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path)
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path)
         events = _collect(run)
         await run.run()
         kinds = [e.kind for e in events]
@@ -886,7 +936,7 @@ class TestProgressEvents:
     @pytest.mark.asyncio
     async def test_every_event_carries_the_whole_coordinate_so_a_dropped_one_costs_nothing(
             self, tmp_path):
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path)
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path)
         events = _collect(run)
         await run.run()
 
@@ -904,7 +954,7 @@ class TestProgressEvents:
             self, tmp_path):
         # The watched gap between rounds is where nothing changes and nothing
         # prints -- exactly where a silent console reads as a hung run.
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path,
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path,
                                        progress_interval_s=20.0)
         events = _collect(run)
         await run.run()
@@ -917,7 +967,7 @@ class TestProgressEvents:
     @pytest.mark.asyncio
     async def test_the_hold_verdict_reaches_the_operator_when_it_resolves(
             self, tmp_path):
-        run, _temp, _rh, _ex = _runner([40.0], [15.0], tmp_path)
+        run, _temp, _rh, _ex = _runner([40.0], ON_RH, tmp_path)
         events = _collect(run)
         await run.run()
 
@@ -931,7 +981,7 @@ class TestProgressEvents:
             self, tmp_path):
         # A formatting bug or a closed pipe is a cosmetic failure. Letting it
         # propagate would cost the night AND the data.
-        run, temp, _rh, _ex = _runner([45.0], [15.0], tmp_path)
+        run, temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path)
 
         def _explode(_event):
             raise RuntimeError("closed pipe")
@@ -964,7 +1014,7 @@ class TestProgressEvents:
             def flush(self):
                 pass
 
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path,
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path,
                                        progress_interval_s=20.0)
         renderer = ProgressRenderer(run.config, stream=_Sink(),
                                     milestone_interval_s=1.0)
@@ -979,7 +1029,7 @@ class TestProgressEvents:
 
     @pytest.mark.asyncio
     async def test_the_abort_path_still_announces_before_it_raises(self, tmp_path):
-        run, _temp, _rh, _ex = _runner([None], [15.0], tmp_path)
+        run, _temp, _rh, _ex = _runner([None], ON_RH, tmp_path)
         events = _collect(run)
         with pytest.raises(EquilibrationAbort):
             await run.run()
@@ -997,7 +1047,7 @@ class TestTelemetry:
         # The point of this is that nobody has to open the GUI on a running
         # headless job -- which would contend for the rig lock and the serial
         # ports of the very run being checked on.
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path,
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path,
                                        progress_interval_s=20.0)
         events = _collect(run)
         await run.run()
@@ -1007,8 +1057,8 @@ class TestTelemetry:
         env = with_env[-1].env
         assert env["stage_temp_sp_C"] == pytest.approx(45.0)
         assert env["stage_temp_pv_C"] == pytest.approx(45.0)
-        assert env["rh_sp_pct"] == pytest.approx(15.0)
-        assert env["rh_pv_pct"] == pytest.approx(15.0)
+        assert env["rh_sp_pct"] == pytest.approx(ON_RH[0])
+        assert env["rh_pv_pct"] == pytest.approx(ON_RH[0])
         assert all(e.wall_clock for e in with_env)
 
     @pytest.mark.asyncio
@@ -1017,7 +1067,7 @@ class TestTelemetry:
         # _FakeRH.get_T returns NaN, standing in for AsyncRHController's
         # max_stale_s behaviour. read_environment maps it to None, and None must
         # survive to the renderer as "unavailable".
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path,
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path,
                                        progress_interval_s=20.0)
         events = _collect(run)
         await run.run()
@@ -1031,7 +1081,7 @@ class TestTelemetry:
         # A missed monitor line is free. A telemetry read that WAITS delays the
         # next EIS shot, and the spacing of those shots is the sigma(t) series
         # this run exists to produce.
-        run, temp, rh, _ex = _runner([45.0], [15.0], tmp_path)
+        run, temp, rh, _ex = _runner([45.0], ON_RH, tmp_path)
         temp._lock = _HeldLock()
         before = temp.reads
 
@@ -1043,7 +1093,7 @@ class TestTelemetry:
         assert run.telemetry_skips == 1
 
     def test_telemetry_is_skipped_while_a_measurement_dag_owns_the_rig(self, tmp_path):
-        run, temp, _rh, _ex = _runner([45.0], [15.0], tmp_path)
+        run, temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path)
         run._measuring = True
         before = temp.reads
 
@@ -1054,7 +1104,7 @@ class TestTelemetry:
     async def test_telemetry_is_emitted_during_the_approach_not_only_at_boundaries(
             self, tmp_path):
         # The approach is up to 30 min per axis with nothing else to print.
-        run, _temp, _rh, _ex = _runner([30.0, 30.0, 30.0, 45.0], [15.0], tmp_path,
+        run, _temp, _rh, _ex = _runner([30.0, 30.0, 30.0, 45.0], ON_RH, tmp_path,
                                        progress_interval_s=10.0)
         events = _collect(run)
         await run.run()
@@ -1072,13 +1122,18 @@ class TestMeasuredRoundCost:
         # estimate_eis_duration models the frequency sweep only. This is the
         # first number in the system that includes the mux switch, the script
         # upload, the retrieval and the file write.
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path, per_step_s=11.0,
-                                       channels=[1, 2, 3, 4])
+        #
+        # `Quick` at 15 s/channel: the sweep model now says 11.3 s/channel
+        # (measured 10.47 on this rig), so 15 leaves a real ~4 s of unmodelled
+        # overhead. The old 10x-low model made almost any per-step cost exceed
+        # it, which is why this used to pass with the default `Standard`.
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path, per_step_s=15.0,
+                                       channels=[1, 2, 3, 4], eis_preset="Quick")
         payload = await run.run()
 
         cost = payload["measured_cost"]
-        assert cost["series"]["measured_round_s"] == pytest.approx(44.0)
-        assert cost["series"]["measured_per_channel_s"] == pytest.approx(11.0)
+        assert cost["series"]["measured_round_s"] == pytest.approx(60.0)
+        assert cost["series"]["measured_per_channel_s"] == pytest.approx(15.0)
         assert cost["series"]["measured_round_s"] > cost["series"]["modelled_round_s"]
         assert cost["series"]["ratio_measured_over_modelled"] > 1.0
         assert cost["series"]["unmodelled_per_channel_s"] > 0.0
@@ -1088,7 +1143,7 @@ class TestMeasuredRoundCost:
     @pytest.mark.asyncio
     async def test_a_round_that_overruns_the_period_is_announced_loudly_and_early(
             self, tmp_path):
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path, per_step_s=200.0,
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path, per_step_s=200.0,
                                        round_period_s=120.0)
         events = _collect(run)
         await run.run()
@@ -1105,7 +1160,7 @@ class TestMeasuredRoundCost:
         # round_period_s is an experimental parameter: it sets the shortest
         # resolvable tau and the fitter reads the series as evenly spaced.
         # Stretching it silently would make sigma(t) inhomogeneous invisibly.
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path, per_step_s=200.0,
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path, per_step_s=200.0,
                                        round_period_s=120.0)
         payload = await run.run()
 
@@ -1114,47 +1169,63 @@ class TestMeasuredRoundCost:
         assert payload["measured_cost"]["period_overrun_warned"] is True
 
     def test_a_measured_cost_reprojects_the_run_without_erasing_the_modelled_one(self):
-        # The measured round has to exceed the period for the reprojection to
-        # lengthen the run, so the period is stated: the shipped default is
-        # derived from the 16-channel measured cost and a 170 s round fits inside
-        # it with room to spare.
+        # The cycle is the period or the round cost, whichever is longer, so the
+        # measured round must exceed BOTH for the reprojection to lengthen the
+        # run. 16 channels of `Standard` model ~603 s, so 700 s is the smallest
+        # round that reprojects — with the old 10x-low model any round at all did,
+        # which is what let a measurement that was actually *shorter* than the
+        # model still read as a lengthening.
         config = EquilibrationConfig(round_period_s=120.0)
         modelled = project_duration(config)
-        measured = project_duration(config, measured_series_round_s=170.0)
+        measured = project_duration(config, measured_series_round_s=700.0)
 
         assert modelled.basis == "modelled" and measured.basis == "measured"
         assert measured.typical_s > modelled.typical_s
         assert project_duration(config).typical_s == pytest.approx(modelled.typical_s)
 
-    def test_the_headroom_says_what_the_period_leaves_for_unmodelled_overhead(self):
-        # 16 channels x Standard models ~62 s of sweep, and the model covers the
-        # frequency sweep ONLY -- the mux switch, the upload, the retrieval and
-        # the file write are what the remainder has to absorb.
-        from softae.workflows.equilibration import eis_round_cost_s
+    def test_the_headroom_says_what_the_period_leaves_over_the_modelled_round(self):
+        # Whatever the shipped preset and period are, the remainder over the
+        # MODELLED round has to cover two things: the mux switch, upload,
+        # retrieval and file write the sweep model does not carry, and the ~8 %
+        # residual of the model's own fit. Both terms are read from the config
+        # rather than written down, because both moved this month.
+        from softae.workflows.equilibration import (
+            eis_round_cost_s,
+            model_underestimate_frac,
+        )
 
-        config = EquilibrationConfig(round_period_s=120.0)
+        config = EquilibrationConfig()
         headroom = round_headroom_s_per_channel(config)
-        expected = (120.0 - eis_round_cost_s(config, "Standard")) / 16
+        modelled = eis_round_cost_s(config, config.eis_preset)
+        expected = (config.round_period_s - modelled) / len(config.channels)
 
         assert headroom == pytest.approx(expected)
-        assert 0.0 < headroom < 5.0, "a 120 s period leaves almost no headroom"
+        # The margin that decides `plan`'s caution: the shipped defaults must
+        # clear the model's own worst underestimate, or the tool cautions on the
+        # configuration it ships with.
+        assert headroom * len(config.channels) >= modelled * model_underestimate_frac()
 
     def test_the_default_round_period_holds_a_measured_round_at_the_default_channels(
             self):
-        # The regression the default now closes: 120 s against 16 channels could
-        # not contain a round on ANY preset (~168 s on the fastest, 651 s on the
-        # default one), so a run accepting every default could not honour its own
-        # sampling interval and sigma(t) was not evenly spaced as the fitter reads
-        # it. Headroom is now positive on the MEASURED cost, not merely on the
-        # model.
-        from softae.tools.equilibration import MEASURED_PER_CHANNEL_S_STANDARD
-        from softae.workflows.equilibration import round_cost_s
+        # The regression the default closes: 120 s against 16 channels could not
+        # contain a round on ANY preset, so a run accepting every default could
+        # not honour its own sampling interval and sigma(t) was not evenly spaced
+        # as the fitter reads it. Asserted against the MEASURED anchor for
+        # whatever preset ships, not against a preset named here -- the default
+        # moved from 'Standard' to 'Quick' and this invariant is about the pairing
+        # of period and preset, not about either one.
+        from softae.core.preflight import EIS_MEASURED_S_PER_CHANNEL
+        from softae.workflows.equilibration import ROUND_BUFFER_S, round_cost_s
 
-        config = EquilibrationConfig()          # 16 ch, 'Standard'
-        measured = round_cost_s(
-            config, measured_per_channel_s=MEASURED_PER_CHANNEL_S_STANDARD)
+        config = EquilibrationConfig()
+        anchor = EIS_MEASURED_S_PER_CHANNEL[config.eis_preset]
+        measured = round_cost_s(config, measured_per_channel_s=anchor)
+
         assert measured <= config.round_period_s
         assert round_headroom_s_per_channel(config, measured) >= 0.0
+        # And it fits by at least the chosen buffer, which is what that buffer is
+        # for: per-round executor and mscr work no per-channel anchor covers.
+        assert config.round_period_s - measured >= ROUND_BUFFER_S
 
 
 # ── The round period is honoured from the round's START ──────────────────────
@@ -1169,12 +1240,15 @@ def _operator_config(**kw):
 
 class TestRoundPeriodIsHonoured:
     def test_the_gap_uses_the_measured_round_rather_than_the_modelled_one(self):
-        # The defect: the model covers the frequency sweep only (~17 s for this
-        # config), so subtracting it left a 223 s gap after a 130 s round -- a
-        # 353 s cycle against a configured 240 s.
+        # The defect: subtracting the modelled cost left a 223 s gap after a
+        # 130 s round -- a 353 s cycle against a configured 240 s. The sweep
+        # model has since been corrected against the bench (12 ch of `Quick`
+        # models ~135 s, not ~17 s), which narrows the discrepancy without
+        # removing it: only the measured round can close it.
         config = _operator_config()
         assert inter_round_gap_s(config, 130.0) == pytest.approx(110.0)
-        assert inter_round_gap_s(config) > 220.0, "the modelled path is the old bug"
+        assert inter_round_gap_s(config) != pytest.approx(
+            inter_round_gap_s(config, 130.0)), "the two paths must not be the same"
 
     def test_the_gap_with_no_measurement_still_returns_the_modelled_value(self):
         # Pins the projection path: `plan` and `project_duration` have nothing
@@ -1210,7 +1284,7 @@ class TestRoundPeriodIsHonoured:
     async def test_the_run_loop_spaces_rounds_by_the_period_when_the_round_fits(
             self, tmp_path):
         # One channel at 130 s/step, so a round costs 130 s inside a 240 s period.
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path, per_step_s=130.0,
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path, per_step_s=130.0,
                                        round_period_s=240.0, poll_interval_s=10.0,
                                        rounds_per_setpoint=5)
         await run.run()
@@ -1223,7 +1297,7 @@ class TestRoundPeriodIsHonoured:
     @pytest.mark.asyncio
     async def test_the_run_loop_pays_the_poll_floor_and_warns_when_a_round_overruns(
             self, tmp_path):
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path, per_step_s=200.0,
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path, per_step_s=200.0,
                                        round_period_s=120.0, poll_interval_s=10.0,
                                        rounds_per_setpoint=5)
         events = _collect(run)
@@ -1247,7 +1321,7 @@ class TestRoundPeriodIsHonoured:
             self, tmp_path):
         # The floor exists for this: a zero gap would produce no watched window
         # at all, which is the fail-open behaviour this module replaced.
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path, per_step_s=200.0,
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path, per_step_s=200.0,
                                        round_period_s=120.0, poll_interval_s=10.0,
                                        rounds_per_setpoint=5)
         await run.run()
@@ -1286,18 +1360,22 @@ class TestMeasuredRoundCostBasis:
             eis_round_cost_s(config, "Standard"))
 
     def test_the_minimum_feasible_period_is_the_round_cost_rounded_up_to_ten(self):
-        # The operator's real numbers: 12 channels at 40.7 s/channel.
+        # The operator's real numbers: 12 channels at 40.7 s/channel. A pure
+        # function of the round cost -- no config term, which is the point.
         from softae.workflows.equilibration import minimum_feasible_period_s
 
-        config = _operator_config(eis_preset="Standard")
         assert minimum_feasible_period_s(488.4) == pytest.approx(490.0)
 
     def test_the_headroom_uses_the_measured_round_when_one_is_supplied(self):
         config = _operator_config(eis_preset="Standard")     # 12 ch, 240 s period
         # 240 - 488.4 over 12 channels: negative, which is the honest answer. The
-        # modelled headroom for the same config is positive and reassuring.
+        # model used to disagree with it in sign -- +18 s/channel of reassurance
+        # against a round that could not fit -- which is what the corrected sweep
+        # constants remove. Both now say the same thing, to within the overhead
+        # the model still does not carry.
         assert round_headroom_s_per_channel(config, 488.4) == pytest.approx(-20.7)
-        assert round_headroom_s_per_channel(config) > 0.0
+        assert round_headroom_s_per_channel(config) < 0.0
+        assert abs(round_headroom_s_per_channel(config) - (-20.7)) < 5.0
 
 
 # ── Thickness provenance ─────────────────────────────────────────────────────
@@ -1311,7 +1389,7 @@ class TestThicknessProvenance:
         # filled from a SpectrumReport and this run passes none. So the stored
         # sigma would carry a hand-computed target with nothing saying so.
         run, _temp, _rh, _ex = _runner(
-            [45.0], [15.0], tmp_path,
+            [45.0], ON_RH, tmp_path,
             electrode_geometry={"L_cm": 0.2, "t_cm": 0.02, "w_cm": 0.2})
         payload = await run.run()
 
@@ -1332,7 +1410,7 @@ class TestThicknessProvenance:
 
     @pytest.mark.asyncio
     async def test_no_geometry_means_no_thickness_claim_at_all(self, tmp_path):
-        run, _temp, _rh, _ex = _runner([45.0], [15.0], tmp_path,
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path,
                                        electrode_geometry=None)
         payload = await run.run()
         assert payload["thickness"] == {}
@@ -1438,7 +1516,7 @@ def _settle_runner(tmp_path, fit_reader, **cfg_kw):
     class _Store:
         project_dir = str(tmp_path)
 
-    run = EquilibrationRun(config, _FakeManager(_FakeTemp([45.0]), _FakeRH([15.0])),
+    run = EquilibrationRun(config, _FakeManager(_FakeTemp([45.0]), _FakeRH(ON_RH)),
                            data_store=_Store(), run_id="RUNSETTLE",
                            sleep=clock.sleep, now=clock.now,
                            executor_factory=_factory, fit_reader=fit_reader)
@@ -1625,12 +1703,15 @@ class TestTauFitMinimumIsTheRoundFloor:
     """The acquisition side must not be able to emit a series the analysis side
     refuses.
 
-    Measured against the shipped defaults, the earliest a setpoint could stop was
-    ``max(settle_n_rounds, ceil(min_hold/round_period))``, and at
-    ``DEFAULT_ROUND_PERIOD_S = 660`` that is 3 rounds at the first setpoint and 3
-    at every later one -- below :data:`MIN_POINTS_FOR_TAU` at *every* setpoint of
-    a default run. A run that stopped there produced spectra nobody could fit a
-    tau to, which is the one number the run exists to measure.
+    The earliest a setpoint can stop is
+    ``max(settle_n_rounds, ceil(min_hold/round_period))``, and how many rounds that
+    buys depends entirely on the sampling interval. At the 660 s period the
+    'Standard' default once forced, it was 3 rounds at the first setpoint and 3 at
+    every later one -- below :data:`MIN_POINTS_FOR_TAU` at *every* setpoint of a
+    default run, producing spectra nobody could fit a tau to. The period is 200 s
+    now and the first setpoint's time floor alone buys 8, but the coupling is what
+    guarantees it rather than the arithmetic happening to work out, which is why
+    these tests pin the 660 s case explicitly.
     """
 
     @pytest.mark.asyncio
@@ -1700,6 +1781,31 @@ class TestTauFitMinimumIsTheRoundFloor:
         assert "MIN_POINTS_FOR_TAU" in message
         EquilibrationConfig(rounds_per_setpoint=MIN_POINTS_FOR_TAU).validate()
 
+    def test_the_same_ceiling_is_allowed_once_no_setpoint_is_asked_for_a_tau(self):
+        # The guard above refuses a ceiling the fitter could never accept, and
+        # that is only unsatisfiable while something is being fitted.
+        # `--tau-setpoints 0` says no setpoint carries the tau floor, so refusing
+        # `--tau-setpoints 0 --rounds 4` was refusing to preserve a tau nobody
+        # asked for -- and a settle-only sweep ("how long does this chamber take
+        # to stop moving") is a legitimate design with no other spelling.
+        EquilibrationConfig(tau_setpoints=0,
+                            rounds_per_setpoint=MIN_POINTS_FOR_TAU - 1).validate()
+        # Still refused where a tau IS wanted, including at tau_setpoints = 1.
+        for wanted in (1, DEFAULT_TAU_SETPOINTS):
+            with pytest.raises(ValueError, match="MIN_POINTS_FOR_TAU"):
+                EquilibrationConfig(
+                    tau_setpoints=wanted,
+                    rounds_per_setpoint=MIN_POINTS_FOR_TAU - 1).validate()
+
+    def test_a_ceiling_of_zero_rounds_is_refused_however_the_tau_floor_is_set(self):
+        # Removing the tau floor removes a REASON to demand five rounds, not the
+        # floor of the thing itself: a setpoint that acquires nothing is not a
+        # shorter design, it is an empty one.
+        for tau_setpoints in (0, DEFAULT_TAU_SETPOINTS):
+            with pytest.raises(ValueError, match="acquire nothing"):
+                EquilibrationConfig(tau_setpoints=tau_setpoints,
+                                    rounds_per_setpoint=0).validate()
+
     @pytest.mark.asyncio
     async def test_a_settled_series_is_long_enough_for_the_real_fitter_to_accept(
             self, tmp_path):
@@ -1732,6 +1838,86 @@ class TestTauFitMinimumIsTheRoundFloor:
         one_round_shorter = fit_equilibration("exponential", times[:-1], sigmas[:-1],
                                               channel=1)
         assert one_round_shorter.refusal == REFUSAL_TOO_FEW_POINTS
+
+
+class TestTauFloorAppliesOnlyWhereTauIsWanted:
+    """The τ floor buys a fittable transient. Past the transient it buys nothing.
+
+    Measured per-setpoint σ swing on the up leg of the 2026-08-11 run: 1600–2800 %
+    at S0, 57–1370 % at S1, then 0.5–8.5 % at S2 and 0.8–3.1 % at S3, against a
+    5.98 % noise floor. The films dry once and stay dry, so from S2 on there is no
+    relaxation left to fit and five forced rounds are five re-measurements of a
+    settled number.
+    """
+
+    #: Eight setpoints of a run, as the shipped design has: four temperatures up
+    #: and the same four back down.
+    EIGHT = dict(temperatures_C=[27.5, 45.0, 65.0, 85.0], legs=("up", "down"))
+
+    def _floors(self, **cfg_kw) -> list[int]:
+        """The per-setpoint round floor, in run order, at a 100 s cycle."""
+        config = _design_config(rounds_per_setpoint=15, round_period_s=100.0,
+                                min_hold_first_s=0.0, min_hold_s=0.0, **cfg_kw)
+        return [settle_floor_rounds(config, 100.0, setpoint_ordinal=i)
+                for i in range(config.n_setpoints)]
+
+    def test_the_tau_floor_applies_at_setpoints_0_and_1_and_not_at_2_through_7(self):
+        floors = self._floors(**self.EIGHT)
+
+        assert floors[:2] == [MIN_POINTS_FOR_TAU, MIN_POINTS_FOR_TAU]
+        # And past the window it is the settle window and the time floor alone --
+        # the time floor is 0 here, so it is settle_n_rounds exactly.
+        assert floors[2:] == [3] * 6
+        assert floors[2:] == [_design_config().settle_n_rounds] * 6
+
+    def test_the_window_counts_setpoints_of_the_run_not_of_each_leg(self):
+        # The down leg's first setpoint revisits a temperature the films have
+        # already dried at, so it is not a fresh transient. Counted per leg, S4
+        # would get the floor back.
+        floors = self._floors(**self.EIGHT)
+        assert floors[4] == 3, "the down leg restarted the tau window"
+
+    def test_tau_setpoints_0_disables_the_tau_floor_everywhere(self):
+        assert self._floors(tau_setpoints=0, **self.EIGHT) == [3] * 8
+
+    def test_tau_setpoints_8_restores_the_tau_floor_everywhere(self):
+        # The regression pin for the behaviour that landed just before this
+        # change: with the window covering the whole run, every setpoint carries
+        # the fit minimum exactly as it did when the coupling was unconditional.
+        assert self._floors(tau_setpoints=8, **self.EIGHT) == [MIN_POINTS_FOR_TAU] * 8
+
+    def test_a_negative_tau_window_is_refused_rather_than_clamped(self):
+        with pytest.raises(ValueError) as excinfo:
+            _design_config(tau_setpoints=-1).validate()
+        assert "tau_setpoints" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_a_late_setpoint_stops_at_the_settle_window_rather_than_the_fit_minimum(
+            self, tmp_path):
+        # End to end, and the whole point of the change: sigma is flat from the
+        # first round at three setpoints. The first two are held to the fit
+        # minimum; the third stops as soon as the detection window is satisfied.
+        run = _settle_runner(
+            tmp_path, _fit_stream([_flat_round([1, 2, 3])]),
+            temperatures_C=[45.0, 65.0, 85.0], legs=("up",),
+            rounds_per_setpoint=15, tau_setpoints=2)
+        payload = await run.run()
+
+        rounds = [_setpoint(payload, i)["settle_rounds_run"] for i in range(3)]
+        assert rounds == [MIN_POINTS_FOR_TAU, MIN_POINTS_FOR_TAU,
+                          run.config.settle_n_rounds]
+
+    @pytest.mark.asyncio
+    async def test_the_window_reaches_the_sidecar_so_a_short_setpoint_is_readable(
+            self, tmp_path):
+        # A 3-round setpoint under this window and a 3-round setpoint in a run
+        # that predates it are otherwise indistinguishable on disk.
+        run = _settle_runner(tmp_path, _fit_stream([_flat_round([1, 2, 3])]),
+                             tau_setpoints=2)
+        payload = await run.run()
+
+        assert payload["config"]["tau_setpoints"] == 2
+        assert payload["projection"]["floor_rounds"] == [MIN_POINTS_FOR_TAU]
 
 
 class TestMscrIsolation:

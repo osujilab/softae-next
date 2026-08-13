@@ -109,6 +109,58 @@ class TestEISDuration:
         assert estimate_eis_duration(EISParams(npts=0)) == 0.0
 
 
+#: What one channel of each preset **actually** cost on this rig, from timestamp
+#: deltas in production runs and reproducible to ±0.1 s over four months. These
+#: are the only three anchors the sweep model has; ``Longest`` has never been
+#: timed and deliberately has no entry.
+MEASURED_S_PER_CHANNEL = {
+    "Quick":    (EISParams(f_hi=200_000, f_lo_mHz=20_000, npts=25), 10.47),
+    "Standard": (EISParams(f_hi=200_000, f_lo_mHz=4_000, npts=35), 40.85),
+    "Extended": (EISParams(f_hi=200_000, f_lo_mHz=1_200, npts=45), 115.2),
+}
+
+#: Two constants cannot fit three points exactly. 7.8 % is what the minimax
+#: solution achieves; no reweighting of the three does better than 7.7 % with the
+#: ``max(floor, cycles/f)`` form, so this tolerance is the model's limit and not
+#: slack left for a future edit to hide in.
+DURATION_TOL_REL = 0.10
+
+
+class TestEISDurationAgainstTheBench:
+    """The point of this class: turn "the model is roughly right" into "the model
+    is unchanged". It ran ~10x low for four months and nothing caught it, because
+    nothing compared it to a stopwatch."""
+
+    @pytest.mark.parametrize("preset", sorted(MEASURED_S_PER_CHANNEL))
+    def test_estimate_eis_duration_measured_preset_matches_the_bench(self, preset):
+        params, measured = MEASURED_S_PER_CHANNEL[preset]
+        assert estimate_eis_duration(params) == pytest.approx(
+            measured, rel=DURATION_TOL_REL)
+
+    @pytest.mark.parametrize("preset", sorted(MEASURED_S_PER_CHANNEL))
+    def test_estimate_eis_duration_old_constants_fail_the_bench(self, preset, monkeypatch):
+        # Proves the pin above has teeth. The pre-correction constants were 3.0
+        # cycles and a 0.05 s floor; if this test can pass with those, it is not
+        # measuring anything.
+        import softae.core.preflight as preflight
+
+        monkeypatch.setattr(preflight, "EIS_CYCLES_PER_POINT", 3.0)
+        monkeypatch.setattr(preflight, "EIS_MIN_POINT_S", 0.05)
+        params, measured = MEASURED_S_PER_CHANNEL[preset]
+        assert estimate_eis_duration(params) != pytest.approx(
+            measured, rel=DURATION_TOL_REL)
+
+    def test_eis_duration_basis_untimed_preset_is_extrapolated(self):
+        from softae.core.preflight import eis_duration_basis
+
+        assert eis_duration_basis("Standard") == "measured"
+        # `Longest` reaches 0.2 Hz, six times below the lowest anchor. The model
+        # predicts ~500 s/channel for it and that number must never be quoted
+        # with the same confidence as the three above.
+        assert eis_duration_basis("Longest") == "extrapolated"
+        assert eis_duration_basis(None) == "extrapolated"
+
+
 # ── Whole-workflow roll-up ───────────────────────────────────────────────────
 
 class TestWorkflowEstimate:

@@ -7,9 +7,12 @@ that constraint made mechanical rather than asserted in a comment.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
+from softae.analysis.circuit_fitting import fit_circuit
 from softae.analysis.eis.engine import analyze_spectrum
 from softae.analysis.eis.geometry import CellConstant
 from softae.analysis.eis.policy import reduce_gates
@@ -72,6 +75,116 @@ class TestLegacyEngineIsUntouched:
         report = analyze_spectrum(eis, cell=CELL, engine="legacy")
         assert report.engine == "legacy"
         assert report.gate_log == ()
+
+
+# ── A fit that railed on its own bound ───────────────────────────────────────
+
+class TestRailedFitsAreNotMeasurements:
+    """335 of 1440 fits in run ``20260811T023757Z_equilibration_characterization``
+    (23.3 %) came to rest on the ``simpleSalt`` R₁ floor of 100 Ω and stored
+    σ = 0.5 S/cm — roughly seawater, from a dry polymer film — with ``success = 1``.
+    A series-RC spectrum reproduces it exactly: the optimiser is asked for a bulk
+    arc that is not there, and reports where the wall was."""
+
+    def test_engine_railed_fit_does_not_report_success(self):
+        report = analyze_spectrum(as_eis_result(*pure_series_rc()),
+                                  cell=CELL, engine="legacy")
+        assert report.fit.success is False
+        assert "railed" in report.fit.error_msg
+        # The bound and its value are named on the row, so a railed fit is
+        # distinguishable from one that failed to converge without re-deriving it.
+        assert "100" in report.fit.error_msg
+
+    def test_engine_railed_fit_yields_no_sigma(self):
+        report = analyze_spectrum(as_eis_result(*pure_series_rc()),
+                                  cell=CELL, engine="legacy")
+        assert report.sigma.mode == "unavailable"
+        assert report.sigma.value != report.sigma.value       # NaN, not 0.5 S/cm
+        # σ follows from R₁ everywhere it is computed, including inside
+        # `record_fit`, which cannot see the demotion — so R₁ has to carry it.
+        assert report.fit.R1 != report.fit.R1
+
+    def test_engine_railed_fit_keeps_the_railed_value_as_a_diagnostic(self):
+        # Demoted, not erased: the parameter vector still says *where* it railed,
+        # and that is what `parameters_json` stores.
+        report = analyze_spectrum(as_eis_result(*pure_series_rc()),
+                                  cell=CELL, engine="legacy")
+        assert report.fit.parameters[3] == pytest.approx(100.0, rel=1e-3)
+        assert any("rests on" in issue for issue in report.quality.issues)
+
+    def test_engine_converged_fit_is_unaffected(self):
+        # The regression pin: 1381 of those 1440 fits were fine and must report
+        # exactly what they reported before.
+        eis = as_eis_result(*reference_spectrum())
+        report = analyze_spectrum(eis, cell=CELL, engine="legacy")
+        raw = fit_circuit(eis, "simpleSalt")
+
+        assert report.fit.success is True
+        assert report.fit.error_msg == ""
+        assert report.fit.R1 == pytest.approx(raw.R1)
+        assert report.fit.R0 == pytest.approx(raw.R0)
+        assert report.sigma.mode == "value"
+        assert report.sigma.value == pytest.approx(CELL.sigma(raw.R1))
+
+    def test_record_fit_railed_fit_stores_no_conductivity(self, tmp_path):
+        # End to end through the surface the campaign actually reads. `record_fit`
+        # derives σ from `fit_result.R1` and knows nothing about railing, so this
+        # is the assertion that the demotion reaches the database at all.
+        from softae.core.data_store import DataStore
+
+        store = DataStore(tmp_path / "project")
+        try:
+            run_id = store.start_run("railed")
+            eis = as_eis_result(*pure_series_rc())
+            measurement_id = store.record_measurement(run_id, eis)
+            fit = analyze_spectrum(eis, cell=CELL, engine="legacy").fit
+            fit_id = store.record_fit(measurement_id, fit,
+                                      L_cm=0.2, t_cm=0.015, w_cm=0.2)
+            row = dict(store._conn.execute(
+                "SELECT success, sigma_S_per_cm, R1, error_msg FROM fit_results "
+                "WHERE fit_id = ?", (fit_id,)).fetchone())
+        finally:
+            store.close()
+
+        assert row["success"] == 0
+        assert row["sigma_S_per_cm"] is None, "0.5 S/cm from a dry film"
+        assert row["R1"] is None
+        assert "railed" in row["error_msg"]
+
+
+class TestRailedDetectionReadsTheModelsBounds:
+    """The bound is never a literal here. It is read from the registry that fitted
+    the spectrum, so editing the registry moves what counts as railed."""
+
+    @staticmethod
+    def _fit(r1: float):
+        return SimpleNamespace(model_name="simpleSalt", R1=r1, covariance=None)
+
+    def test_railed_measurand_follows_the_registry_bound(self, monkeypatch):
+        from softae.analysis.circuit_fitting import CIRCUIT_MODELS
+        from softae.analysis.eis.models import railed_measurand
+
+        assert railed_measurand(self._fit(100.0))
+        assert not railed_measurand(self._fit(5.0e4))
+
+        # Drop the model's own R₁ floor to 1 Ω and 100 Ω stops being a rail — it
+        # is two decades clear of the constraint and therefore set by the data.
+        # Nothing in the detector had to be edited to follow it.
+        lower, upper = CIRCUIT_MODELS["simpleSalt"]["bounds"]
+        moved = list(lower)
+        moved[CIRCUIT_MODELS["simpleSalt"]["z_indices"][1]] = 1.0
+        monkeypatch.setitem(CIRCUIT_MODELS["simpleSalt"], "bounds", (moved, upper))
+
+        assert not railed_measurand(self._fit(100.0))
+        assert railed_measurand(self._fit(1.0))
+
+    def test_railed_measurand_unbounded_model_can_never_rail(self):
+        from softae.analysis.eis.models import railed_measurand
+
+        # `flexSalt` declares no bounds, so no fit of it rests on one. Reporting a
+        # rail there would be inventing a constraint the optimiser never had.
+        assert not railed_measurand(
+            SimpleNamespace(model_name="flexSalt", R1=100.0, covariance=None))
 
 
 class TestGatedEngine:
