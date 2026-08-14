@@ -501,15 +501,15 @@ def _arc_columns(fit_result: Any) -> dict[str, Any]:
     :class:`~softae.analysis.eis.report.SpectrumReport` carries ``run_gates``' log,
     and that log has **no** ``arc_closure`` entry:
     :func:`~softae.analysis.eis.arc.annotate_arc_closure` writes to the *fit*, and
-    only the ``arc_provenance`` shim ever copies the record into a ``gate_log``. A
-    report-scanning implementation would therefore work exactly as long as the shim
-    is in use and go quiet the day P.18 starts passing the real report — a column
-    that empties itself on an upgrade is worse than no column at all.
+    nothing copies the record into a ``gate_log`` — the shim that once did was
+    retired the moment these columns existed. A report-scanning implementation
+    would therefore find nothing to read — a column that empties itself is worse
+    than no column at all.
 
     Reading the fit also reaches further: ``annotate_arc_closure`` runs on every
     ``analyze_spectrum`` call on both engines, so ``fit.arc_closure`` is present for
-    every fit that came through analysis, including the ``report=None`` callers the
-    shim cannot reach.
+    every fit that came through analysis, including the ``report=None`` callers —
+    which, since the shim went, is all of them.
 
     All four are ``None`` when nothing annotated the fit, which is a different fact
     from ``'unknown'`` — see the DDL. The three REALs go through :func:`_f_or_none`,
@@ -1054,13 +1054,12 @@ class DataStore:
         extra = _fit_report_columns(report)
         # DELIBERATE DEVIATION from the report-only convention one line above: the
         # arc columns are sourced from the *fit*, because the arc record is not in
-        # any real report's gate log — only the `arc_provenance` shim ever puts it
-        # there. Scanning `report` would work until P.18 passes the genuine
-        # SpectrumReport and would then silently NULL these columns. See
-        # `_arc_columns`. `gate_log_json` is untouched by this and stays byte for
-        # byte what `_fit_report_columns` produced; the record living in both the
-        # JSON and the columns is an intentional one-release duplication, so
-        # pre-T7.7 rows and new ones stay readable by the same consumer.
+        # any real report's gate log — `annotate_arc_closure` writes it to the fit
+        # and nowhere else, so scanning `report` would silently NULL these columns.
+        # See `_arc_columns`. `gate_log_json` is untouched by this and stays byte
+        # for byte what `_fit_report_columns` produced; rows written since these
+        # columns landed carry the literal "[]" there, and the older rows that
+        # carried the record in the JSON are still read by `shadow_db`'s fallback.
         extra.update(_arc_columns(fit_result))
         # A bounded σ is not a value.  Storing it in ``sigma_S_per_cm`` would let any
         # reader that does not check ``sigma_is_bound`` treat a ceiling as a

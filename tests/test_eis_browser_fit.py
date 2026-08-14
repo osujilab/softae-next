@@ -247,12 +247,10 @@ def test_browser_fit_persists_the_arc_state_column(qapp, tmp_path, sample_eis,
     """A browser-saved row must be the same era of row as a router-written one.
 
     The entry's fit comes from `fit_entry` -> `analyze_spectrum` ->
-    `annotate_arc_closure`, so it carries `.arc_closure`; the columns are read off
-    the fit, and `report=arc_provenance(fit)` additionally lines the gate log up
-    with what the router writes.
+    `annotate_arc_closure`, so it carries `.arc_closure`, and the columns are read
+    off the fit — the same source the router's rows use, with no `report=` on
+    either call site.
     """
-    import json
-
     from softae.analysis.eis.arc import ArcClosure
     from softae.core.data_store import DataStore
     from softae.gui.tabs.tab_analysis import AnalysisTab
@@ -273,14 +271,15 @@ def test_browser_fit_persists_the_arc_state_column(qapp, tmp_path, sample_eis,
     assert latest["arc_state"] == "open"
     assert latest["arc_f_low_hz"] == pytest.approx(20.0)
     assert latest["arc_phase_low_deg"] == pytest.approx(-41.5)
-    # One era of rows, not two: the shim's JSON matches the router's.
-    assert json.loads(latest["gate_log_json"])[0]["gate"] == "arc_closure"
+    # One era of rows, not two: like a router-written row, this one carries the
+    # verdict in the columns and leaves the gate log its literal.
+    assert latest["gate_log_json"] == "[]"
 
 
 def test_browser_fit_persists_a_fit_without_an_annotation_without_raising(
         qapp, tmp_path, sample_eis, sample_fit):
-    # `arc_provenance` returns None for an unannotated object, so the call site is
-    # safe on whatever the browser hands over — a hand-built FitResult included.
+    # `_arc_columns` returns four NULLs for an unannotated object, so the call site
+    # is safe on whatever the browser hands over — a hand-built FitResult included.
     from softae.core.data_store import DataStore
     from softae.gui.tabs.tab_analysis import AnalysisTab
 

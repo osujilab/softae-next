@@ -47,7 +47,6 @@ from PySide6.QtWidgets import (
 from softae.analysis.arrhenius import ArrheniusFitter, ArrheniusResult
 from softae.analysis.thermal import make_fitter
 from softae.analysis.circuit_fitting import CIRCUIT_MODELS, FitResult
-from softae.analysis.eis.arc import arc_provenance
 from softae.analysis.eis.engine import analyze_spectrum
 from softae.analysis.eis_data import EISResult
 from softae.gui.eis_sigma import cell_sigma, gui_cell, report_sigma
@@ -627,12 +626,10 @@ class AnalysisTab(QWidget):
         Appends a new fit row (history-preserving) for the entry's measurement,
         recording the per-sample electrode geometry so σ is reproducible.
 
-        ``report=arc_provenance(fit)`` is belt-and-braces: the four ``arc_*``
-        columns populate from the fit regardless, so this only makes a
-        browser-saved row's ``gate_log_json`` match a router-written one's — one
-        era of rows rather than two. It returns ``None`` for any object without
-        an annotation, so the call is safe on whatever the browser hands over,
-        and it goes when the shim goes.
+        The four ``arc_*`` columns populate from *fit* alone — ``record_fit``
+        reads ``fit.arc_closure`` and never the report — so a browser-saved row
+        carries the arc verdict with no ``report=`` passed here. A fit the
+        browser hands over without an annotation simply lands as four NULLs.
         """
         if self._data_store is None:
             return
@@ -642,8 +639,7 @@ class AnalysisTab(QWidget):
             logger.debug("browser_fit_not_persisted", reason="no measurement_id/fit")
             return
         try:
-            self._data_store.record_fit(mid, fit, L_cm=L, t_cm=t, w_cm=w,
-                                        report=arc_provenance(fit))
+            self._data_store.record_fit(mid, fit, L_cm=L, t_cm=t, w_cm=w)
             logger.info("browser_fit_persisted", measurement_id=mid, model=fit.model_name)
         except Exception:
             logger.warning("browser_fit_persist_failed", measurement_id=mid, exc_info=True)

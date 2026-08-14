@@ -19,7 +19,6 @@ from softae.analysis.eis.arc import (
     UNKNOWN,
     annotate_arc_closure,
     arc_closure,
-    arc_provenance,
 )
 from softae.analysis.eis.engine import analyze_spectrum
 from softae.analysis.eis.geometry import CellConstant
@@ -182,7 +181,8 @@ class TestTheEngineAnnotatesWithoutDemoting:
 class TestTheAnnotationIsPersisted:
     def test_record_fit_legacy_path_stores_the_arc_record(self, tmp_path):
         # The path that ships: `[eis] engine` is legacy, and `analysis/eis/router.py`
-        # is what writes a campaign's fit rows.
+        # is what writes a campaign's fit rows. The record lands in the four columns,
+        # read straight off the fit with no `report=` in the call.
         import json
 
         from softae.core.data_store import DataStore
@@ -194,7 +194,7 @@ class TestTheAnnotationIsPersisted:
             measurement_id = store.record_measurement(run_id, eis)
             fit = analyze_spectrum(eis, cell=CELL, engine="legacy").fit
             fit_id = store.record_fit(measurement_id, fit, L_cm=0.2, t_cm=0.015,
-                                      w_cm=0.2, report=arc_provenance(fit))
+                                      w_cm=0.2)
             row = dict(store._conn.execute(
                 "SELECT gate_log_json, parameters_json, success, gate_verdict, engine, "
                 "arc_state, arc_f_peak_hz, arc_f_low_hz, arc_phase_low_deg "
@@ -202,28 +202,22 @@ class TestTheAnnotationIsPersisted:
         finally:
             store.close()
 
-        record = json.loads(row["gate_log_json"])[0]
-        assert record["state"] == OPEN
-        assert record["f_peak_hz"] == pytest.approx(record["f_low_hz"])
-        assert record["f_low_hz"] == pytest.approx(20.0)
-        assert record["phase_low_deg"] < 0.0
-        # One fit, two representations (T7.7 columns and the shim's JSON), and they
-        # must not drift: the columns are read off the fit, the JSON off the shim,
-        # so agreement here is two independent paths reaching the same verdict.
-        assert row["arc_state"] == record["state"]
-        assert row["arc_f_peak_hz"] == pytest.approx(record["f_peak_hz"])
-        assert row["arc_f_low_hz"] == pytest.approx(record["f_low_hz"])
-        assert row["arc_phase_low_deg"] == pytest.approx(record["phase_low_deg"])
-        # Everything else on the row is what it was before the shim existed.
+        assert row["arc_state"] == OPEN
+        assert row["arc_f_peak_hz"] == pytest.approx(row["arc_f_low_hz"])
+        assert row["arc_f_low_hz"] == pytest.approx(20.0)
+        assert row["arc_phase_low_deg"] < 0.0
+        # The columns agree with the annotation the engine put on the fit — one
+        # verdict, not a copy that can drift.
+        assert row["arc_state"] == fit.arc_closure.state
+        assert row["arc_f_peak_hz"] == pytest.approx(fit.arc_closure.f_peak_hz)
+        # Everything else on the row is what it was before the annotation existed,
+        # `gate_log_json` included: no report is passed, so it keeps its literal.
+        assert row["gate_log_json"] == "[]"
         assert row["success"] == 1
         assert row["gate_verdict"] is None
         assert row["engine"] == "legacy"
         assert json.loads(row["parameters_json"]) == pytest.approx(
             fit.parameters.tolist())
-
-    def test_arc_provenance_without_an_annotation_is_none(self):
-        # `record_fit(report=None)` is the pre-existing call, byte for byte.
-        assert arc_provenance(object()) is None
 
 
 class TestAnnotateArcClosureLeavesTheFitAlone:

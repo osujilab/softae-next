@@ -1460,9 +1460,9 @@ def _annotated(state: str = "open", f_peak: float = 20.0, f_low: float = 20.0,
 class TestArcColumns:
     """Four columns instead of a JSON blob, so the verdict is queryable by SQL.
 
-    The annotation reached the database only inside ``gate_log_json``, via the
-    ``arc_provenance`` shim, which meant every consumer had to ``json.loads`` a TEXT
-    column to ask what the arc did. These columns make the shim redundant.
+    The annotation used to reach the database only inside ``gate_log_json``, via a
+    provenance shim, which meant every consumer had to ``json.loads`` a TEXT column
+    to ask what the arc did. These columns made that shim redundant, and it is gone.
     """
 
     def _row(self, store: DataStore, fid: int) -> dict:
@@ -1573,24 +1573,13 @@ class TestArcColumns:
         assert row["arc_f_peak_hz"] == pytest.approx(20.0)
         assert row["arc_phase_low_deg"] == pytest.approx(-41.5)
 
-    def test_record_fit_stores_the_arc_columns_when_the_provenance_shim_is_passed(
-            self, store_with_run) -> None:
-        from softae.analysis.eis.arc import arc_provenance
-
-        store, run_id = store_with_run
-        mid = store.record_measurement(run_id, _make_eis_result())
-        fit = _annotated("closed", f_peak=1000.0, f_low=20.0)
-        fid = store.record_fit(mid, fit, report=arc_provenance(fit))
-        assert self._row(store, fid)["arc_state"] == "closed"
-
     def test_record_fit_stores_the_arc_columns_when_a_report_shaped_object_is_passed(
             self, store_with_run) -> None:
         """§3.3 made executable: a real report has NO arc entry in its gate log.
 
-        `annotate_arc_closure` writes to the fit; only the shim ever copies the
-        record into a `gate_log`. So an implementation that scanned `report` would
-        work exactly until P.18 passes the genuine SpectrumReport and would then
-        silently NULL these columns. This is that day, in advance.
+        `annotate_arc_closure` writes to the fit and nowhere else, so an
+        implementation that scanned `report` would silently NULL these columns the
+        day P.18 passes the genuine SpectrumReport. This is that day, in advance.
         """
         from types import SimpleNamespace
 
@@ -1649,30 +1638,14 @@ class TestArcColumns:
         assert row["arc_state"] == "open"
         assert row["arc_phase_low_deg"] is None
 
-    def test_the_gate_log_json_column_is_byte_identical_to_the_pre_t7_7_value(
+    def test_an_annotated_fit_leaves_the_gate_log_json_column_empty(
             self, store_with_run) -> None:
-        """The duplication is intentional; the JSON must not drift because of it.
-
-        `shadow_db` still reads that JSON for pre-T7.7 rows and
-        `TestTheAnnotationIsPersisted` pins its content, so adding the columns must
-        leave `_fit_report_columns`' output untouched — same shim in, same string
-        out, byte for byte.
-        """
-        from softae.analysis.eis.arc import arc_provenance
-        from softae.core.data_store import _fit_report_columns
-
+        # The arc record lives in the columns and only there. A `report=None` row —
+        # which every caller now is — carries the literal it always carried, which is
+        # what `shadow_db` distinguishes an unannotated pre-column row by.
         store, run_id = store_with_run
         mid = store.record_measurement(run_id, _make_eis_result())
-        fit = _annotated()
-        shim = arc_provenance(fit)
-        fid = store.record_fit(mid, fit, report=shim)
-
-        stored, = store._conn.execute(
-            "SELECT gate_log_json FROM fit_results WHERE fit_id = ?",
-            (fid,)).fetchone()
-        assert stored == _fit_report_columns(shim)["gate_log_json"]
-        # And a `report=None` row still carries the literal it always carried.
-        bare = store.record_fit(mid, fit)
+        fid = store.record_fit(mid, _annotated())
         assert store._conn.execute(
             "SELECT gate_log_json FROM fit_results WHERE fit_id = ?",
-            (bare,)).fetchone()[0] == "[]"
+            (fid,)).fetchone()[0] == "[]"

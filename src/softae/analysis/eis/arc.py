@@ -185,22 +185,3 @@ def annotate_arc_closure(fit: Any, eis_result: Any) -> ArcClosure:
     )
     fit.arc_closure = arc
     return arc
-
-
-def arc_provenance(fit: Any) -> Any:
-    """A ``record_fit(report=…)`` shim carrying the arc record and nothing else.
-
-    ``fit_results`` has no column for this and adding one belongs to whoever owns
-    the schema, so the record travels in ``gate_log_json`` — a TEXT column already
-    holding a JSON list of per-spectrum diagnostics, and holding the literal
-    ``"[]"`` on every row ever written, because no caller passes ``report=``.
-
-    That abstention is deliberate (P.18: passing the real ``SpectrumReport`` would
-    move stored ``gate_verdict`` values), so this shim exposes *only* ``gate_log``.
-    Every other attribute ``_fit_report_columns`` reads is absent from it and falls
-    through to the same default the row carries today.
-    """
-    from types import SimpleNamespace
-
-    arc = getattr(fit, "arc_closure", None)
-    return None if arc is None else SimpleNamespace(gate_log=[arc.as_record()])
