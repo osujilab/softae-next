@@ -49,13 +49,16 @@ ABSOLUTE_ZERO_C = -273.15
 #: used by :func:`resolve_temperature_C`, exactly as ``THICKNESS_METHODS`` is for
 #: :func:`~softae.analysis.eis.geometry.resolve_thickness_cm`.
 #:
-#: **One known mirror of this precedence exists outside Python, and it is a debt, not a
-#: pattern.** ``core/data_store.py``'s ``query_measurements(temp_range=…)`` filter has to
-#: choose a column inside SQL, before any row reaches this module, so it restates the
-#: order as a ``COALESCE``. Nothing enforces that the two agree. Changing this tuple
-#: therefore obliges a matching edit there, and the right end state is a derived column
-#: written from :func:`resolve_temperature_C` at record time so the SQL has one column to
-#: name — a data-epoch-grade change, deliberately not smuggled in under a rename.
+#: **The SQL mirror of this precedence is retired (schema epoch 4, 2026-08-12).**
+#: ``conditions`` now carries ``temperature_C`` + ``temperature_source``, written by
+#: this module's :func:`resolve_temperature_C` inside ``DataStore.record_conditions``
+#: and backfilled across every historical row, so ``query_measurements(temp_range=…)``
+#: filters one column that *is* this resolver's answer. Changing this tuple now changes
+#: what gets **written** — new rows follow immediately; historical rows keep the labels
+#: they were written with, and a re-resolve of old rows would be a new data epoch, not
+#: an edit here. Pre-epoch-4 rows carry the backfill's answer *at* epoch 4, not one
+#: contemporaneous with the measurement; the resolver is deterministic on stored
+#: values, so those coincide only for as long as this tuple does.
 TEMPERATURE_SOURCES = ("stage_pv", "stage_sp", "chamber_air")
 
 #: No thermometer had anything to say. A result, not an error — see the resolver.

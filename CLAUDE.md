@@ -30,7 +30,7 @@ delegated to subagents.
 1. **Spawns a research subagent** → produces a spec doc at `docs/SubAgent docs/<topic>.md`
 1. **Reviews** the spec (or asks the user to review)
 1. **Spawns an implementation subagent** → writes code + tests
-1. **Runs tests** in the terminal to confirm zero regressions
+1. **Runs tiered tests** in the terminal → neighbourhood after each edit, package before accepting the task, full serial suite before a commit (see "Tiered Test Execution")
 1. **Spawns update subagents** → updates PROGRESS.md, USER_GUIDE.md, ACTION_PLAN.md and other ".\docs" files as needed
 1. **Recurrent workflow reminders** → occasionally reminds the system to retain this workflow structure (roughly every three prompts).
 
@@ -107,5 +107,30 @@ After each development task, the system should perform cross-cutting reviews of 
 6. **Cross-cutting review cadence** — In addition to per-task reviews:
    - Every **5 development sessions**, a full-codebase review subagent is spawned to audit import graphs, docstring completeness, and config-key coverage between `softae_config.toml` and the loader.
    - Every **new phase milestone**, the orchestrator spawns a subagent to reconcile `ACTION_PLAN.md` against the actual file tree and test count, pruning completed items and surfacing drift.
+
+### 4. Tiered Test Execution
+
+Regression confidence is bought by **selection**, not by parallelism. Collection alone costs ~8 s on
+this rig, so a narrowed run is essentially free: a typical task's real regression surface is ~225
+tests in ~25 s, whereas the full 3552-test suite spends ~17 min largely re-proving subsystems the
+edit cannot reach. Three tiers, each with its own owner and its own gate:
+
+| Tier | Scope | Who runs it | When | Typical cost |
+|---|---|---|---|---|
+| 1. Neighbourhood | The touched module's own test file plus its direct neighbours — importers, callers, and the tests of modules it imports | Implementation subagent | Immediately after each edit | ~25 s |
+| 2. Package | The package glob covering the touched area (e.g. `tests/test_eis_*.py`) | Orchestrator | Before accepting a task as done | 1–3 min |
+| 3. Full serial suite | Everything, serial | Orchestrator | Before a commit, and at the end of a task arc | ~17 min, run backgrounded |
+
+- **The full suite is the commit gate, not the per-edit gate.** A green tier-1 run is what licenses
+  the next edit; a green tier-3 run is what licenses a commit. Tier 3 is the tier that actually
+  catches cross-cutting regressions, so it is never traded away before a commit — it is backgrounded
+  so it does not block.
+- **A slow test file is a defect to investigate, not merely a label.** When a file becomes the
+  bottleneck of a tier, it is diagnosed rather than annotated: a single test costing 77+ s is usually
+  reporting something real about the code under test, not about the test.
+- **The `slow` marker** is declared in `pyproject.toml` and currently used exactly once across 3552
+  tests. It remains available for genuinely irreducible long-running tests, and `-m "not slow"` may
+  then trim a tier-2 run — but only *after* the underlying cost has been investigated per the rule
+  above.
 
 ---
