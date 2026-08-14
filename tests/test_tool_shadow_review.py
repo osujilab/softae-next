@@ -19,10 +19,13 @@ from softae.tools.shadow_review import (
     ShadowReview,
     _cmd_status,
     _split_kv,
+    arc_summary,
     build_parser,
     db_summary,
     main,
     parse_line,
+    railed_summary,
+    recommendations,
     render,
     summarize,
 )
@@ -319,3 +322,438 @@ class TestRendering:
     def test_the_channel_column_is_labelled_inferred(self):
         text = render(summarize(one_rejected_spectrum(1)), None, "run.log")
         assert "POSITIONAL — INFERRED, NOT RECORDED" in text
+
+
+# ── T7.1: the metrics event, and the thresholds it supports ──────────────────
+
+METRICS = (
+    "2026-08-10 14:47:55 [info     ] eis_spectrum_metrics           "
+    "channel={ch} enforced=False fit_ok=True gates_failed={failed} "
+    "gates_run=['finiteness', 'cap_flatness', 'kk_truncation'] "
+    "metrics={{'cap_slope': {cap}, 'kk_max_resid_pct': {kk}, 'r_squared': {r2}, "
+    "'n_surviving': 41.0}} "
+    "n_dropped=0 n_surviving=41 report_mode=value "
+    "spectrum_key=c{ch:02d}:{key} verdict={verdict}"
+)
+
+
+def metric_lines(n: int = 30, *, bad: int = 6) -> list[str]:
+    """A population with a healthy bulk and a dispersive tail, as the engine logs it."""
+    out = []
+    for i in range(n):
+        dispersive = i < bad
+        out.append(METRICS.format(
+            ch=i % 8 + 1, key=f"{i:012x}",
+            cap=round(1.5 + 0.05 * i if dispersive else 0.02 + 0.001 * i, 4),
+            kk=round(0.3 + 0.01 * i, 4), r2=round(0.999 - 0.0005 * i, 6),
+            failed="['cap_flatness']" if dispersive else "[]",
+            verdict="suspect" if dispersive else "accept"))
+    return out
+
+
+class TestMetricsEventParsing:
+    def test_the_metrics_event_becomes_a_spectrum_record(self):
+        rv = summarize(metric_lines(3, bad=1))
+        assert len(rv.metric_events) == 3
+        assert rv.metric_events[0].metrics["cap_slope"] == 1.5
+        assert rv.metric_events[0].channel == 1
+
+    def test_the_metrics_event_is_gated_engine_evidence_on_its_own(self):
+        # It is emitted only from the gated branch, so it strengthens section 1 and
+        # cannot make a legacy log look gated.
+        assert summarize(metric_lines(2)).is_shadow_run is True
+
+    def test_repeat_analyses_of_one_spectrum_count_once_as_a_spectrum(self):
+        # router.py and autonomous_wiring.py both call analyze_spectrum on the same
+        # arrays. Without the fingerprint every n in section 7 would be doubled.
+        lines = metric_lines(20)
+        rv = summarize(lines + lines)
+        assert len(rv.metric_events) == 40
+        assert len(rv.spectra) == 20
+
+    def test_the_report_shows_events_and_spectra_separately(self):
+        lines = metric_lines(20)
+        text = render(summarize(lines + lines), None, "run.log",
+                      recommendations(summarize(lines + lines)))
+        assert "20 spectra (40 events, deduplicated by content fingerprint)" in text
+
+
+class TestSectionSeven:
+    def _text(self, lines, **kwargs):
+        rv = summarize(lines)
+        return render(rv, None, "run.log", recommendations(rv, **kwargs))
+
+    def test_the_section_names_the_rule_and_the_counts_behind_each_value(self):
+        text = self._text(metric_lines(30, bad=6))
+        assert "7. RECOMMENDED THRESHOLDS" in text
+        assert "cap_flatness_max" in text and "upper-fence" in text
+
+    def test_a_behavioural_key_is_marked_so_the_warning_is_not_buried(self):
+        text = self._text(metric_lines(30))
+        assert "! = changing this key changes a stored NUMBER" in text
+        assert "!kk_resid_pct" in text
+
+    def test_the_section_refuses_to_recommend_arming(self):
+        text = self._text(metric_lines(30))
+        assert "ARMING IS NOT RECOMMENDED HERE" in text
+        assert "enabled and [quality] enabled stay false" in text
+
+    def test_the_out_of_scope_keys_are_named_with_a_reason_each(self):
+        text = self._text(metric_lines(30))
+        assert "NOT RECOMMENDABLE FROM A SHADOW RUN" in text
+        for key in ("kk_c", "bound_tol", "plateau_tol_pct", "tand_headroom_mult"):
+            assert key in text
+
+    def test_the_joint_reject_count_is_reported_rather_than_the_column_sum(self):
+        text = self._text(metric_lines(30, bad=6))
+        assert "Per-key counts do not add" in text
+        assert "would reject" in text
+
+    def test_a_sixteen_well_run_recommends_nothing_and_says_why(self):
+        # examples/shadow_campaign.toml ships budget = 16, which sits BELOW the floor
+        # by design: the honest output is "run 32 wells", not a fence from 16 samples.
+        text = self._text(metric_lines(16, bad=4))
+        assert "REFUSED" in text and "need 20" in text
+
+    def test_lowering_the_evidence_floor_is_visible_in_the_output(self):
+        assert "cap_flatness_max" in self._text(metric_lines(16, bad=4),
+                                                min_evidence=12)
+
+
+class TestBackwardCompatibility:
+    """§6.3 — an old log must review exactly as it did, byte for byte."""
+
+    def test_an_old_log_without_the_metrics_event_renders_sections_one_to_six_unchanged(
+            self):
+        rv = summarize(one_rejected_spectrum(1))
+        before = render(rv, None, "run.log")               # the pre-T7.1 call shape
+        after = render(rv, None, "run.log", recommendations(rv))
+        assert after.startswith(before)
+        assert after[len(before):].lstrip("\n").startswith("7. RECOMMENDED THRESHOLDS")
+
+    def test_every_recommendation_refuses_on_an_old_log_with_the_one_sided_reason(self):
+        recs = recommendations(summarize(one_rejected_spectrum(1)))
+        assert recs and all(r.status == "refused" for r in recs)
+        assert all("pre-T7.1 log" in r.reason for r in recs)
+
+    def test_reviewing_an_old_log_still_exits_zero(self, tmp_path, capsys):
+        log = tmp_path / "run.log"
+        log.write_text("\n".join(one_rejected_spectrum(1)), encoding="utf-8")
+        assert main(["review", str(log)]) == 0
+        assert "7. RECOMMENDED THRESHOLDS" in capsys.readouterr().out
+
+
+class TestEmitToml:
+    @pytest.fixture()
+    def gated_log(self, tmp_path):
+        log = tmp_path / "run.log"
+        log.write_text("\n".join(metric_lines(30, bad=6)), encoding="utf-8")
+        return log
+
+    def test_emit_toml_writes_a_paste_ready_block_that_arms_nothing(
+            self, gated_log, tmp_path, capsys):
+        out = tmp_path / "proposed.toml"
+        assert main(["review", str(gated_log), "--emit-toml", str(out)]) == 0
+        text = out.read_text(encoding="utf-8")
+        assert "[eis.gates]" in text and "[quality]" in text
+        assert "enabled          = false" in text or "enabled" in text
+        assert "= true" not in text.replace("`enabled = true`", "")
+
+    def test_emit_toml_refuses_to_write_to_the_live_config_path(
+            self, gated_log, tmp_path, monkeypatch, capsys):
+        from softae.config import loader
+
+        live = tmp_path / "softae_config.toml"
+        monkeypatch.setattr(loader, "config_path", lambda: str(live))
+        assert main(["review", str(gated_log), "--emit-toml", str(live)]) == 1
+        assert not live.exists()
+        assert "Refusing to write to the live config" in capsys.readouterr().err
+
+    def test_emit_toml_refuses_to_overwrite_an_existing_file(
+            self, gated_log, tmp_path, capsys):
+        out = tmp_path / "proposed.toml"
+        out.write_text("previous run's proposal", encoding="utf-8")
+        assert main(["review", str(gated_log), "--emit-toml", str(out)]) == 1
+        assert out.read_text(encoding="utf-8") == "previous run's proposal"
+
+    def test_the_review_flags_are_on_the_parser(self):
+        args = build_parser().parse_args(["review", "x.log", "--min-evidence", "12"])
+        assert args.min_evidence == 12 and args.emit_toml is None
+
+
+# ── DataStore detectors ──────────────────────────────────────────────────────
+
+ARC_RECORD = {"gate": "arc_closure", "severity": "annotate", "passed": False,
+              "n_dropped": 0, "detail": "no descending branch", "state": "open"}
+
+
+@pytest.fixture()
+def railed_project(tmp_path):
+    """Four fit rows: the two railed *eras*, a healthy fit, and an unbounded model."""
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from softae.analysis.circuit_fitting import FitResult
+    from softae.analysis.eis_data import EISResult
+    from softae.core.data_store import DataStore
+
+    def fit(model, R1, success, error_msg=""):
+        return FitResult(model_name=model, parameters=[], R0=50.0, R1=R1,
+                         R0_guess=50.0, R1_guess=R1, z_indices=[], success=success,
+                         error_msg=error_msg)
+
+    rows = [
+        # Historical: success=1, R1 exactly on the simpleSalt floor, sigma ~ seawater,
+        # and NOTHING in the row marking it. 325 of 1440 in run 20260811T023757Z.
+        (1, fit("simpleSalt", 100.0, True), SimpleNamespace(gate_log=[ARC_RECORD])),
+        # New: the demotion clears success, NaNs R1 and names the bound.
+        (2, fit("simpleSalt", float("nan"), False,
+                "railed fit: R1 rests on the 100 ohm bound — parameter unidentified"),
+         SimpleNamespace(gate_log=[ARC_RECORD])),
+        (3, fit("simpleSalt", 2000.0, True),
+         SimpleNamespace(gate_log=[{**ARC_RECORD, "state": "closed", "passed": True}])),
+        # flexSalt declares no bounds, so no fit against it can be *railed*.
+        (4, fit("flexSalt", 100.0, True), None),
+    ]
+
+    store = DataStore(tmp_path / "proj")
+    run_id = store.start_run("railed_detectors", mode="campaign")
+    f = np.logspace(0, 5, 12)
+    for channel, fit_result, report in rows:
+        eis = EISResult.from_arrays(channel=channel, f=f, z_real=np.full(12, 2000.0),
+                                    z_imag_neg=np.full(12, 50.0))
+        mid = store.record_measurement(run_id, eis)
+        store.record_fit(mid, fit_result, L_cm=0.2, t_cm=0.015, w_cm=0.2,
+                         report=report)
+    store.close()
+    return tmp_path / "proj", run_id
+
+
+class TestRailedDetectors:
+    """Two detectors, because they see different eras and neither alone sees the run."""
+
+    @staticmethod
+    def _by_channel(project, run_id):
+        return {r["channel"]: r for r in railed_summary(str(project), run_id)["rows"]}
+
+    def test_a_historical_railed_row_is_detected_from_its_r1_at_the_model_bound(
+            self, railed_project):
+        rows = self._by_channel(*railed_project)
+        assert rows[1]["railed_historical"] == 1 and rows[1]["railed_new"] == 0
+        assert rows[1]["n_success"] == 1          # it still wears success = 1
+
+    def test_a_new_railed_row_is_detected_from_its_error_message(self, railed_project):
+        rows = self._by_channel(*railed_project)
+        assert rows[2]["railed_new"] == 1 and rows[2]["railed_historical"] == 0
+        assert rows[2]["n_success"] == 0
+
+    def test_a_healthy_fit_is_counted_in_neither_railed_column(self, railed_project):
+        rows = self._by_channel(*railed_project)
+        assert rows[3]["railed_new"] == rows[3]["railed_historical"] == 0
+        assert rows[3]["median_R1"] == 2000.0
+
+    def test_a_model_with_no_declared_bound_reports_unknown_not_zero(
+            self, railed_project):
+        # A zero would read as "the bound is 0 ohm and nothing can rail", which is a
+        # claim the registry never made.
+        rows = self._by_channel(*railed_project)
+        assert rows[4]["bound_ohm"] == "unknown"
+        assert rows[4]["railed_historical"] == 0
+        assert rows[1]["bound_ohm"] == 100.0
+
+    def test_the_railed_bound_comes_from_the_registry_not_a_literal(
+            self, railed_project, monkeypatch):
+        # Move the bound in CIRCUIT_MODELS and the detector must move with it: the
+        # 2000 ohm fit becomes railed, the 100 ohm one stays railed.
+        from softae.analysis import circuit_fitting
+
+        spec = dict(circuit_fitting.CIRCUIT_MODELS["simpleSalt"])
+        lower, upper = spec["bounds"]
+        raised = list(lower)
+        raised[spec["z_indices"][1]] = 5000.0
+        monkeypatch.setitem(circuit_fitting.CIRCUIT_MODELS, "simpleSalt",
+                            {**spec, "bounds": (raised, upper)})
+        rows = self._by_channel(*railed_project)
+        assert rows[3]["railed_historical"] == 1
+        assert rows[3]["bound_ohm"] == 5000.0
+
+    def test_an_unreadable_project_returns_an_error_rather_than_raising(self, tmp_path):
+        assert "error" in railed_summary(str(tmp_path / "nope"), None)
+
+
+class TestArcSummary:
+    def test_arc_closure_states_are_counted_from_the_gate_log_column(
+            self, railed_project):
+        project, run_id = railed_project
+        summary = arc_summary(str(project), run_id)
+        assert summary["states"] == {"open": 2, "closed": 1}
+
+    def test_a_row_with_an_empty_gate_log_is_counted_as_no_record_not_as_open(
+            self, railed_project):
+        project, run_id = railed_project
+        assert arc_summary(str(project), run_id)["no_record"] == 1
+
+    def test_sigma_is_bound_is_reported_as_a_stamped_default(self, railed_project):
+        project, run_id = railed_project
+        assert "stamped default" in arc_summary(str(project), run_id)["sigma_is_bound"]
+        assert "P.18" in arc_summary(str(project), run_id)["sigma_is_bound"]
+
+
+def test_db_summary_is_importable_from_both_modules_after_the_move():
+    # A pure move must not break a caller. The review re-exports it because that is
+    # where its public surface was first.
+    from softae.tools import shadow_db, shadow_review
+
+    assert shadow_review.db_summary is shadow_db.db_summary
+
+
+class TestStatusCostAdvisory:
+    def test_an_armed_config_warns_that_observing_mode_is_the_slow_one(
+            self, monkeypatch, capsys):
+        # The flag that reads as "observe only, change nothing" is what makes the run
+        # expensive: with gates enforcing, a blocking spectrum is rejected before the
+        # fitter; with them observing, the optimiser grinds a parallel-R model onto
+        # data that has no arc. An operator sizing a shadow run by well count alone
+        # would under-budget the clock by orders of magnitude.
+        from softae.analysis.eis import settings as eis_settings_mod
+        from softae.config import loader
+
+        armed = eis_settings_mod.EISSettings(
+            engine="gated", gates=eis_settings_mod.GateSettings(enabled=False))
+        monkeypatch.setattr(eis_settings_mod, "eis_settings", lambda *a, **k: armed)
+        monkeypatch.setattr(loader, "load", lambda *a, **k: {"quality": {}})
+
+        code = _cmd_status(build_parser().parse_args(["status"]))
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "ARMED FOR A SHADOW RUN" in out
+        assert "SLOWEST analysis setting" in out
+        assert "78 s" in out and "0.07 s" in out
+
+
+class TestModuleDocstringMatchesReality:
+    def test_the_docstring_no_longer_claims_the_gate_log_column_is_always_empty(self):
+        # router.py:458 passes arc_provenance(report.fit), so gate_log_json carries one
+        # arc_closure record per routed row. shadow_db.arc_summary depends on that being
+        # true, and a docstring asserting "[]" would argue the tool's own evidence away.
+        from softae.tools import shadow_review
+
+        doc = shadow_review.__doc__ or ""
+        assert "gate_log_json='[]'" not in doc
+        assert "arc_closure" in doc and "arc_provenance" in doc
+        # P.18 is open in substance and the docstring must still say so.
+        assert "P.18" in doc and "gate_verdict" in doc
+
+
+class TestSectionFiveBIsReachableFromTheCli:
+    """The DB detectors are only worth building if the report actually prints them.
+
+    Driven through ``main(["review", ...])`` rather than through ``render`` directly:
+    a helper that is importable but never called is the defect these tests exist to
+    prevent, and only the real command path proves the wiring.
+    """
+
+    @pytest.fixture()
+    def gated_log(self, tmp_path):
+        log = tmp_path / "run.log"
+        log.write_text("\n".join(metric_lines(24, bad=5)), encoding="utf-8")
+        return log
+
+    def test_the_cli_prints_the_railed_table_when_a_project_is_given(
+            self, gated_log, railed_project, capsys):
+        project, run_id = railed_project
+        assert main(["review", str(gated_log), "--project", str(project),
+                     "--run-id", run_id]) == 0
+        out = capsys.readouterr().out
+        assert "5b. RAILED FITS AND ARC CLOSURE" in out
+        assert "railed (new)" in out and "railed (historical)" in out
+        # Two detectors, one row each, plus the unbounded model reporting 'unknown'.
+        assert "unknown" in out
+
+    def test_the_cli_prints_the_arc_states_and_the_stamped_default_posture(
+            self, gated_log, railed_project, capsys):
+        project, run_id = railed_project
+        main(["review", str(gated_log), "--project", str(project), "--run-id", run_id])
+        out = capsys.readouterr().out
+        assert "arc_closure states" in out and "'open': 2" in out
+        assert "no record: 1" in out
+        # sigma_is_bound must keep the same posture section 5 takes on `engine`.
+        assert "sigma_is_bound" in out and "stamped default" in out
+
+    def test_section_5b_is_absent_without_a_project_so_the_old_report_is_unchanged(
+            self, gated_log, capsys):
+        assert main(["review", str(gated_log)]) == 0
+        out = capsys.readouterr().out
+        assert "5b." not in out
+        assert "5. PER-CHANNEL" in out and "6. ARM / DON'T-ARM" in out
+
+    def test_an_unreadable_project_degrades_each_half_separately(
+            self, gated_log, tmp_path, capsys):
+        # The log half carries the verdicts; a bad --project must not cost it, and one
+        # unanswerable question must not suppress the others.
+        main(["review", str(gated_log), "--project", str(tmp_path / "nope")])
+        out = capsys.readouterr().out
+        assert "5b. RAILED FITS AND ARC CLOSURE" in out
+        assert "railed: (unavailable:" in out and "arc closure: (unavailable:" in out
+        assert "7. RECOMMENDED THRESHOLDS" in out          # unaffected
+
+
+class TestHoldKindIsStructural:
+    """The rendered hold label comes from a field, not from parsing English."""
+
+    def test_a_unimodal_hold_renders_as_such_even_when_the_gate_never_fired(self):
+        from softae.analysis.eis.recommend import (
+            HOLD_UNIMODAL,
+            SpectrumRecord,
+            recommend_all,
+        )
+        from softae.tools.shadow_render import _status_label
+
+        # rho sits far below its -0.95 default, so nothing fires; and it is unimodal,
+        # so the gap rule finds no split. Both holds are live and the gap must win.
+        values = [-0.10 + 0.001 * i for i in range(30)]
+        recs = recommend_all([SpectrumRecord(key=f"c01:{i:012x}", metrics={"rho": v})
+                              for i, v in enumerate(values)])
+        rho = next(r for r in recs if r.key == "rho_degenerate")
+        assert rho.status == "hold"
+        assert rho.hold_kind == HOLD_UNIMODAL
+        assert rho.fired_at_default == 0          # the other hold would also have fired
+        assert _status_label(rho) == "hold (unimodal)"
+
+    def test_an_unexercised_hold_renders_as_such(self):
+        from softae.analysis.eis.recommend import (
+            HOLD_UNEXERCISED,
+            SpectrumRecord,
+            recommend_all,
+        )
+        from softae.tools.shadow_render import _status_label
+
+        recs = recommend_all([
+            SpectrumRecord(key=f"c01:{i:012x}", metrics={"cap_slope": 0.01 + 1e-4 * i})
+            for i in range(30)])
+        cap = next(r for r in recs if r.key == "cap_flatness_max")
+        assert cap.status == "hold" and cap.hold_kind == HOLD_UNEXERCISED
+        assert _status_label(cap) == "hold (unexercised)"
+
+    def test_a_recommended_key_that_measures_the_rig_says_so_in_the_status_column(self):
+        from softae.analysis.eis.recommend import SpectrumRecord, recommend_all
+        from softae.tools.shadow_render import _status_label
+
+        recs = recommend_all([
+            SpectrumRecord(key=f"c01:{i:012x}", metrics={"cap_slope": 2.0 + 0.01 * i})
+            for i in range(30)])
+        cap = next(r for r in recs if r.key == "cap_flatness_max")
+        assert _status_label(cap) == "recommended (measures-the-rig)"
+        assert cap.hold_kind == ""
+
+
+def test_the_unconfigurable_table_references_the_gate_constants_it_reports():
+    # A restated constant is a constant that disagrees with the gate after the first
+    # edit. Only the two that genuinely have no module-level name stay literal.
+    from softae.analysis.eis import gates
+    from softae.analysis.eis.recommend_report import UNCONFIGURABLE
+
+    by_metric = {m: threshold for m, _owner, threshold, _sense in UNCONFIGURABLE}
+    assert by_metric["frac_quadrant_violation"] == gates.RE_SUSPICION_FRAC
+    assert by_metric["plateau_n_points"] == float(gates.MIN_PLATEAU_POINTS)

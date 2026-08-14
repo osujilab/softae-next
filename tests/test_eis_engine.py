@@ -347,3 +347,311 @@ class TestVocabularyBridge:
                              np.ones(4, bool), {"cap_slope": -1.3})
         report = reduce_gates([flagged], n_surviving=20, min_fit_pts=8)
         assert report.metrics["cap_slope"] == -1.3
+
+
+# ── T7.1 part A: the pass side of the log ────────────────────────────────────
+#
+# Every fixture below is module-scoped, and the choice is operational rather than
+# stylistic. `analyze_spectrum` in the SHADOW configuration (`engine="gated"`,
+# `gates.enabled=False`) is the most expensive setting the rig has: an enforcing gate
+# rejects a blocking spectrum before the fitter, an *observing* one does not, so the
+# optimiser grinds a parallel-R model onto data with no arc — 78 s on a fully-blocking
+# synthetic against 0.07 s on the legacy engine.
+#
+# So the rejected-spectrum fixture is `stuck_instrument` (2 s) rather than
+# `pure_series_rc` (78 s). Both fail a `block_spectrum` gate under observation, which
+# is the property every test here needs; only the gate's name differs, and the fits
+# that make `pure_series_rc` expensive are already pinned by `TestGatedEngine` above.
+
+
+def _analyse(eis, **kwargs):
+    """One gated analysis, with its ``eis_spectrum_metrics`` event."""
+    import structlog
+
+    with structlog.testing.capture_logs() as logs:
+        report = analyze_spectrum(eis, cell=CELL, **kwargs)
+    events = [e for e in logs if e["event"] == "eis_spectrum_metrics"]
+    return report, events
+
+
+@pytest.fixture(scope="module")
+def healthy_analysis():
+    """A clean spectrum through the shadow configuration — the case with no log today."""
+    return _analyse(as_eis_result(*reference_spectrum()), settings=_gated(enabled=False))
+
+
+@pytest.fixture(scope="module")
+def rejected_analysis():
+    """A spectrum a ``block_spectrum`` gate refuses, *observed* rather than enforced.
+
+    The shadow-campaign configuration on the population it exists to watch: the verdict
+    reduces to SUSPECT because observing mode downgrades a rejection, and the fit
+    happens anyway because observing must not change behaviour.
+    """
+    return _analyse(as_eis_result(*stuck_instrument()), settings=_gated(enabled=False))
+
+
+@pytest.fixture(scope="module")
+def enforced_analysis():
+    """The same spectrum with the gates enforcing — the R18 early return.
+
+    Free by construction: the gate rejects it before the fitter runs, which is the
+    whole point of R18 and the reason observing mode is the expensive one.
+    """
+    return _analyse(as_eis_result(*stuck_instrument()), settings=_gated(enabled=True))
+
+
+@pytest.fixture(scope="module")
+def channel_11_analysis():
+    f, Z = reference_spectrum()
+    return _analyse(as_eis_result(f, Z, channel=11), settings=_gated(enabled=False))
+
+
+def _rendered_events(processors):
+    """Run one gated analysis through a real renderer and parse the text back.
+
+    ``capture_logs`` short-circuits the processor chain, so it can never prove the
+    rendered line is parseable — which is the only property the review tool depends on.
+    """
+    import io
+
+    import structlog
+
+    from softae.tools.shadow_review import parse_line
+
+    buf = io.StringIO()
+    saved = structlog.get_config()
+    try:
+        structlog.reset_defaults()
+        kwargs = {"logger_factory": structlog.PrintLoggerFactory(buf)}
+        if processors is not None:
+            kwargs["processors"] = processors
+        structlog.configure(**kwargs)
+        analyze_spectrum(as_eis_result(*reference_spectrum()), cell=CELL,
+                         settings=_gated(enabled=False))
+    finally:
+        structlog.configure(**saved)
+
+    return [p for p in (parse_line(ln) for ln in buf.getvalue().splitlines())
+            if p and p["event"] == "eis_spectrum_metrics"]
+
+
+@pytest.fixture(scope="module")
+def console_events():
+    return _rendered_events(None)
+
+
+@pytest.fixture(scope="module")
+def json_events():
+    import structlog
+
+    return _rendered_events([structlog.processors.JSONRenderer()])
+
+
+class TestSpectrumMetricsEvent:
+    """``reduce_gates`` logs ``metrics=`` only where a spectrum FAILS.
+
+    So a shadow run records the failing tail and nothing else, and every threshold rule
+    worth having needs the shape of the *healthy* population — you cannot place a fence
+    when you can only see what is already outside it. These pin that the event exists
+    for every spectrum, carries what the recommender needs, survives the reviewer's
+    parser, and changes nothing.
+    """
+
+    def test_the_metrics_event_is_emitted_once_for_a_clean_accept_spectrum(
+            self, healthy_analysis):
+        # The case today's log has no record of at all: nothing is emitted for a
+        # spectrum that passes, so the pass-side distribution does not exist.
+        _, events = healthy_analysis
+        assert len(events) == 1
+        assert events[0]["verdict"] in ("accept", "suspect")
+        assert events[0]["enforced"] is False
+
+    def test_the_metrics_event_is_emitted_for_a_rejected_spectrum_too(
+            self, rejected_analysis, enforced_analysis):
+        # Both the R18 early return and the terminal return emit, so no path escapes
+        # and a spectrum cannot vanish from the population when the flag flips.
+        for (_, events), enforced in ((rejected_analysis, False),
+                                      (enforced_analysis, True)):
+            assert len(events) == 1
+            assert events[0]["enforced"] is enforced
+
+    def test_the_r18_early_return_reports_no_report_mode_rather_than_guessing_one(
+            self, enforced_analysis):
+        # The value-vs-bound decision is taken after the fit, and this spectrum never
+        # reached one. Naming a mode here would invent a decision nobody made.
+        _, events = enforced_analysis
+        assert events[0]["report_mode"] == "not_reached"
+        assert events[0]["fit_ok"] is False
+
+    def test_the_metrics_event_carries_r_squared_which_reduce_gates_never_sees(
+            self, healthy_analysis):
+        # The reason the emit site is engine.py rather than policy.reduce_gates:
+        # `quality.metrics.update(fit_report.metrics)` runs AFTER the reduction, so an
+        # event raised inside it could never recommend [quality] min_r_squared.
+        _, events = healthy_analysis
+        assert "r_squared" in events[0]["metrics"]
+        assert "residual_rms_pct" in events[0]["metrics"]
+
+    def test_the_metrics_event_carries_its_own_channel_rather_than_relying_on_position(
+            self, channel_11_analysis):
+        _, events = channel_11_analysis
+        assert events[0]["channel"] == 11
+        assert events[0]["spectrum_key"].startswith("c11:")
+
+    def test_non_finite_metrics_are_dropped_so_the_mapping_stays_parseable(
+            self, healthy_analysis, rejected_analysis):
+        # repr(nan) is a bare `nan`, which ast.literal_eval refuses — one NaN would
+        # degrade the whole rendered metrics={...} to an unparsed string downstream.
+        # The rejected spectrum is the one that produces NaN metrics in quantity.
+        for _, events in (healthy_analysis, rejected_analysis):
+            assert events[0]["metrics"]
+            assert all(np.isfinite(v) for v in events[0]["metrics"].values())
+
+    def test_the_metrics_event_agrees_with_the_report_it_was_emitted_beside(
+            self, healthy_analysis, rejected_analysis):
+        # Part A is additive logging only. That the verdicts and sigma themselves did
+        # not move is pinned by the thirty-odd tests ABOVE this class, which are
+        # untouched by T7.1 and would fail first; what is left to check here is that
+        # the event describes the same spectrum the report does, rather than a stale
+        # interim taken before the Front-2 merge.
+        for report, events in (healthy_analysis, rejected_analysis):
+            event = events[0]
+            assert event["verdict"] == report.quality.verdict.value
+            assert report.mask.sum() == event["n_surviving"]
+            assert report.mask.size - report.mask.sum() == event["n_dropped"]
+            assert report.quality.metrics["n_surviving"] == event["n_surviving"]
+
+    def test_the_metrics_event_names_every_gate_that_ran_and_every_one_that_failed(
+            self, healthy_analysis, rejected_analysis):
+        for _, events in (healthy_analysis, rejected_analysis):
+            assert set(events[0]["gates_failed"]) <= set(events[0]["gates_run"])
+        # An admitted spectrum runs the whole Front-1 chain, topology triad included.
+        assert "tand_slope" in healthy_analysis[1][0]["gates_run"]
+        # A refused one does not, and the event must say so rather than implying the
+        # later gates ran and passed. `run_gates` breaks at a blocking failure, so a
+        # recommender counting "spectra carrying tand_slope" must see this spectrum
+        # absent from that denominator — not present with a silent zero.
+        rejected = rejected_analysis[1][0]
+        assert "stuck_instrument" in rejected["gates_failed"]
+        assert "tand_slope" not in rejected["gates_run"]
+
+    def test_the_metrics_event_is_proof_the_gated_engine_ran(self):
+        from softae.tools.shadow_review import GATED_ONLY_EVENTS
+
+        assert "eis_spectrum_metrics" in GATED_ONLY_EVENTS
+        _, events = _analyse(as_eis_result(*reference_spectrum()), engine="legacy")
+        assert events == []
+
+    def test_two_analyze_calls_on_one_spectrum_share_a_key_and_deduplicate_to_one(
+            self, healthy_analysis, console_events):
+        # router.py and autonomous_wiring.py both call analyze_spectrum on the same
+        # arrays. These two fixtures are genuinely independent invocations — one
+        # captured, one rendered and parsed back — so the key is proved stable across
+        # the render boundary as well as across calls.
+        from softae.analysis.eis.recommend import SpectrumRecord, deduplicate
+
+        captured = SpectrumRecord.from_event(dict(healthy_analysis[1][0],
+                                                  event="eis_spectrum_metrics"))
+        rendered = SpectrumRecord.from_event(console_events[0])
+        assert captured.key == rendered.key
+        assert len(deduplicate([captured, rendered])) == 1
+
+    def test_two_different_spectra_on_one_channel_do_not_share_a_key(
+            self, healthy_analysis, rejected_analysis):
+        # Both are channel 1. A timestamp key would collide here; the fingerprint is
+        # taken over the arrays, so it does not.
+        keys = {healthy_analysis[1][0]["spectrum_key"],
+                rejected_analysis[1][0]["spectrum_key"]}
+        assert len(keys) == 2
+        assert all(k.startswith("c01:") for k in keys)
+
+    def test_a_console_rendered_metrics_event_round_trips_through_parse_line(
+            self, console_events):
+        # The reviewer parses text, not objects. The nested metrics={...} mapping rides
+        # the existing brace-aware _split_kv, and this is the proof it survives.
+        assert len(console_events) == 1
+        assert isinstance(console_events[0]["metrics"], dict)
+        assert isinstance(console_events[0]["gates_run"], list)
+        assert console_events[0]["enforced"] is False
+        assert "r_squared" in console_events[0]["metrics"]
+
+    def test_a_json_rendered_metrics_event_round_trips_too(self, json_events):
+        assert len(json_events) == 1
+        assert isinstance(json_events[0]["metrics"], dict)
+        assert "r_squared" in json_events[0]["metrics"]
+
+
+class TestTelemetryNeverCostsASpectrum:
+    """A spectrum came off real hardware, in a well that is now used up.
+
+    Losing one to a defect in its own telemetry would be the mistake ``run_gates``
+    already refuses when it says a broken gate must not discard a measurement. The
+    "purely additive" claim in ``_log_spectrum_metrics``' docstring is enforced here
+    rather than asserted there.
+    """
+
+    def test_a_failing_metrics_emit_leaves_the_analysis_untouched(
+            self, monkeypatch, healthy_analysis):
+        from softae.analysis.eis import engine as engine_mod
+
+        class _Exploding:
+            """Fails on the metrics event, records the fallback, passes the rest."""
+
+            def __init__(self):
+                self.warnings = []
+
+            def info(self, event, **kw):
+                if event == "eis_spectrum_metrics":
+                    raise RuntimeError("structlog is on fire")
+
+            def warning(self, event, **kw):
+                self.warnings.append(event)
+
+        broken = _Exploding()
+        monkeypatch.setattr(engine_mod, "logger", broken)
+        report = analyze_spectrum(as_eis_result(*reference_spectrum()), cell=CELL,
+                                  settings=_gated(enabled=False))
+
+        # Byte-for-byte the verdict the healthy fixture got with the event working.
+        expected = healthy_analysis[0]
+        assert report.quality.verdict is expected.quality.verdict
+        assert report.quality.issues == expected.quality.issues
+        assert report.sigma.mode == expected.sigma.mode
+        assert report.sigma.value == pytest.approx(expected.sigma.value, nan_ok=True)
+        assert np.array_equal(report.mask, expected.mask)
+        # And it said so, rather than failing silently: a spectrum missing from the
+        # population would otherwise bias every later threshold recommendation.
+        assert "eis_spectrum_metrics_failed" in broken.warnings
+
+    def test_a_logger_that_also_fails_on_the_warning_still_raises_nothing(
+            self, monkeypatch, healthy_analysis):
+        # The nested swallow. Called directly rather than through a second full
+        # analysis, because the guard is what is under test, not the engine around it.
+        from softae.analysis.eis import engine as engine_mod
+
+        class _TotallyBroken:
+            def info(self, *a, **kw):
+                raise RuntimeError("down")
+
+            def warning(self, *a, **kw):
+                raise RuntimeError("also down")
+
+        report = healthy_analysis[0]
+        monkeypatch.setattr(engine_mod, "logger", _TotallyBroken())
+        freq, Z = engine_mod._physics_complex(as_eis_result(*reference_spectrum()))
+        engine_mod._log_spectrum_metrics(
+            as_eis_result(*reference_spectrum()), freq=freq, Z=Z,
+            quality=report.quality, results=list(report.gate_log), mask=report.mask,
+            enforced=False, report_mode="value", fit_ok=True,
+        )   # must return normally
+
+    def test_a_poisoned_metric_value_is_dropped_rather_than_raising(self):
+        # `_finite_metrics` is the one place a hostile value reaches: a string, a None,
+        # an object with no __float__. None of them may reach the renderer.
+        from softae.analysis.eis.engine import _finite_metrics
+
+        poisoned = {"good": 1.5, "nan": float("nan"), "inf": float("inf"),
+                    "text": "not a number", "none": None, "obj": object()}
+        assert _finite_metrics(poisoned) == {"good": 1.5}
+        assert _finite_metrics(None) == {}

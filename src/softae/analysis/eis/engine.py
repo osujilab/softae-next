@@ -21,6 +21,7 @@ that silently stopped fitting would be enforcement wearing an observer's badge.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 import numpy as np
@@ -288,6 +289,113 @@ def _legacy_report(
                           gate_log=(), mask=None, cell=cell)
 
 
+def spectrum_key(channel: Any, freq: Any, Z: Any) -> str:
+    """A content fingerprint naming one *physical* spectrum across repeat analyses.
+
+    Every measured spectrum in an autonomous campaign passes through
+    :func:`analyze_spectrum` **twice** — once for the auto-route fit that writes
+    ``fit_results``, once again when the objective is extracted — so anything that
+    counts the emitted metrics events sees each spectrum twice. Left uncorrected that
+    doubles every sample size a threshold recommendation is weighed against, and an
+    evidence floor passes at half the evidence it was set to demand.
+
+    The fingerprint is taken over the arrays rather than the timestamp because
+    :attr:`~softae.analysis.eis_data.EISResult.timestamp` is optional, two calls on one
+    object necessarily share it, and so would two genuinely distinct spectra measured
+    inside the same second. The channel is carried in the clear so the key stays
+    readable, and so two channels measuring an identical synthetic load stay distinct.
+    """
+    digest = hashlib.blake2s(
+        np.asarray(freq, dtype=float).tobytes()
+        + np.asarray(Z, dtype=complex).tobytes(),
+        digest_size=6,
+    ).hexdigest()
+    try:
+        return f"c{int(channel):02d}:{digest}"
+    except (TypeError, ValueError):
+        return f"c--:{digest}"
+
+
+def _finite_metrics(metrics: Any) -> dict[str, float]:
+    """The loggable subset of a metrics mapping — finite floats only.
+
+    ``repr(float("nan"))`` is a bare ``nan``, which ``ast.literal_eval`` refuses, so a
+    single non-finite value degrades the *whole* rendered ``metrics={...}`` mapping to
+    an unparsed string in ``softae-shadow review``. Dropping it costs nothing: a gate
+    that could not compute its metric has no observation to place a threshold against,
+    and the reviewer counts a metric's evidence by the records that carry it.
+    """
+    out: dict[str, float] = {}
+    for name, raw in (metrics or {}).items():
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(value):
+            out[str(name)] = value
+    return out
+
+
+def _log_spectrum_metrics(
+    eis_result: Any,
+    *,
+    freq: np.ndarray,
+    Z: np.ndarray,
+    quality: Any,
+    results: Any,
+    mask: np.ndarray,
+    enforced: bool,
+    report_mode: str,
+    fit_ok: bool,
+) -> None:
+    """One ``eis_spectrum_metrics`` line per spectrum, whatever the verdict.
+
+    :func:`~softae.analysis.eis.policy.reduce_gates` logs ``metrics=`` only where a
+    spectrum *fails*, so a shadow run records the failing tail and nothing else — and a
+    fence placed on a sample of rejects is a percentile of the wrong population. This
+    is the pass side, and the arming decision in ``docs/SHADOW_CAMPAIGN.md`` §8 is the
+    thing it exists to supply evidence for.
+
+    Emitted from here rather than from inside the reduction because ``r_squared`` and
+    ``residual_rms_pct`` are merged into ``quality.metrics`` *after* ``reduce_gates``
+    returns: an event raised one frame earlier could never carry them, and half the
+    recommendable keys live in ``[quality]``.
+
+    Purely additive — no verdict, σ, mask or return value depends on it, **and that is
+    enforced rather than asserted.** Everything below runs inside a guard, because a
+    spectrum is expensive and irreplaceable: it came off real hardware, in a well that
+    is now used up. Losing one to a defect in its own telemetry would be the same
+    mistake ``run_gates`` refuses when it says a broken gate must not discard a
+    measurement. A record that cannot be built is a record not written, and the
+    analysis carries on returning exactly what it would have returned anyway.
+    """
+    try:
+        surviving = np.asarray(mask, dtype=bool)
+        n_surviving = int(surviving.sum())
+        logger.info(
+            "eis_spectrum_metrics",
+            spectrum_key=spectrum_key(getattr(eis_result, "channel", None), freq, Z),
+            channel=getattr(eis_result, "channel", None),
+            verdict=str(getattr(quality.verdict, "value", quality.verdict)),
+            enforced=bool(enforced),
+            report_mode=str(report_mode),
+            fit_ok=bool(fit_ok),
+            n_surviving=n_surviving,
+            n_dropped=int(surviving.size - n_surviving),
+            gates_run=[str(r.name) for r in results],
+            gates_failed=[str(r.name) for r in results if not r.passed],
+            metrics=_finite_metrics(getattr(quality, "metrics", None)),
+        )
+    except Exception as exc:  # noqa: BLE001 - telemetry must never cost a spectrum
+        try:
+            logger.warning("eis_spectrum_metrics_failed", error=str(exc),
+                           msg="metrics event not emitted; the analysis is unaffected, "
+                               "but this spectrum is missing from any later threshold "
+                               "recommendation")
+        except Exception:  # noqa: BLE001 - the logger itself is what failed
+            pass
+
+
 def analyze_spectrum(
     eis_result: Any,
     *,
@@ -399,6 +507,15 @@ def analyze_spectrum(
     # R18: do not hand an inadmissible spectrum to an optimiser. Only when the gates
     # are actually enforcing — observing-only must not change what happens.
     if gate_cfg.enabled and pre.verdict is Verdict.REJECT:
+        # Never reached in a shadow run, and recorded anyway: a spectrum that simply
+        # vanishes from the population once the flag flips would bias every later
+        # re-review of the same log without leaving a trace that it had.
+        # ``report_mode`` is honestly absent here — the decision is taken after the
+        # fit, and this spectrum never reached one.
+        _log_spectrum_metrics(
+            eis_result, freq=freq, Z=Z, quality=pre, results=results, mask=mask,
+            enforced=True, report_mode="not_reached", fit_ok=False,
+        )
         return SpectrumReport(
             engine="gated", fit=None,
             sigma=SigmaReport(mode="unavailable"),
@@ -480,6 +597,13 @@ def analyze_spectrum(
         quality.verdict = Verdict.REJECT
     elif fit_report.verdict is Verdict.SUSPECT and quality.verdict is Verdict.ACCEPT:
         quality.verdict = Verdict.SUSPECT
+
+    # After every merge into ``quality.metrics`` and every verdict adjustment above —
+    # the event reports what this spectrum was finally judged to be, not an interim.
+    _log_spectrum_metrics(
+        eis_result, freq=freq, Z=Z, quality=quality, results=results, mask=mask,
+        enforced=bool(gate_cfg.enabled), report_mode=mode, fit_ok=bool(fit.success),
+    )
 
     return SpectrumReport(
         engine="gated", fit=fit, sigma=sigma, quality=quality,

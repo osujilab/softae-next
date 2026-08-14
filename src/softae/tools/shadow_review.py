@@ -12,20 +12,30 @@ each side of the run::
 take?") and after the revert ("is the rig back?").  The whole procedure is
 ``docs/SHADOW_CAMPAIGN.md``.
 
-**Where the verdicts actually live, and what is lost.**  A shadow run's gate verdicts
-are *not* persisted.  ``analysis/eis/router.py`` deliberately does not pass ``report=``
-to ``record_fit`` (that is P.18), so every ``fit_results`` row a gated campaign writes
-still carries ``engine='legacy'``, ``gate_verdict=NULL`` and ``gate_log_json='[]'``.
-The only record of a would-reject verdict is the **structlog stream**, and in the
-headless CLI structlog is unconfigured — a ``PrintLogger`` to stdout and nowhere else.
-So the reviewable artifact of bench item 7 exists only if the operator redirects the
-console, which is why the procedure makes ``| tee shadow_run.log`` a required step and
-why this tool's primary input is a log file rather than the database.
+**Where the verdicts actually live, and what is lost.**  A shadow run's gate *verdicts*
+are still not persisted.  ``analysis/eis/router.py`` does not pass the real
+:class:`~softae.analysis.eis.report.SpectrumReport` to ``record_fit`` — that is P.18,
+and it remains open — so every ``fit_results`` row a gated campaign writes still carries
+``engine='legacy'``, a NULL ``gate_verdict`` and ``sigma_is_bound = 0``.  The only
+record of a would-reject verdict is the **structlog stream**, and in the headless CLI
+structlog is unconfigured — a ``PrintLogger`` to stdout and nowhere else.  So the
+reviewable artifact of bench item 7 exists only if the operator redirects the console,
+which is why the procedure makes ``| tee shadow_run.log`` a required step and why this
+tool's primary input is a log file rather than the database.
 
-The DataStore is still read, for what it can honestly supply: which run, how many
-measurements per channel, and the stored σ.  It is asked nothing it would have to
-invent — in particular ``fit_results.engine`` is reported as a *stamped default*, never
-as evidence of which engine ran.
+``gate_log_json`` is the **one exception, and it is no longer empty.**  The router
+passes ``arc.arc_provenance(report.fit)`` unconditionally: a shim exposing ``gate_log``
+and nothing else, so each routed row now carries exactly one ``arc_closure`` record
+while every other stored column stays the stamped default it was.  That makes
+:func:`softae.tools.shadow_db.arc_summary` honest evidence — the arc states are
+observations — and leaves the rest of P.18 exactly where it was.
+
+The DataStore is otherwise read for what it can honestly supply: which run, how many
+measurements per channel, the stored σ, and which fits railed on the model's own R₁
+bound (:func:`~softae.tools.shadow_db.railed_summary`).  It is asked nothing it would
+have to invent — in particular ``fit_results.engine`` and ``sigma_is_bound`` are
+reported as *stamped defaults*, never as evidence of which engine ran or of what it
+concluded.
 
 Two attribution limits, stated rather than smoothed:
 
@@ -52,7 +62,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from softae.analysis.eis.recommend import (
+    DEFAULT_MIN_EVIDENCE,
+    Recommendation,
+    SpectrumRecord,
+    deduplicate,
+    recommend_all,
+)
+from softae.analysis.eis.recommend_report import as_toml_block
 from softae.tools import use_utf8_console
+from softae.tools.shadow_db import arc_summary, db_summary, railed_summary
+from softae.tools.shadow_render import render, render_status
+
+#: ``db_summary`` moved to :mod:`softae.tools.shadow_db` and ``render`` to
+#: :mod:`softae.tools.shadow_render` when this module passed the house line limit.
+#: Both are re-exported here because this module was their public surface first, and a
+#: pure move must not break a caller.
+__all__ = ["arc_summary", "db_summary", "railed_summary", "main", "parse_line",
+           "render", "render_status", "summarize", "build_parser", "ShadowReview"]
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -63,7 +90,7 @@ EXIT_NOT_A_SHADOW_RUN = 2
 GATED_ONLY_EVENTS = frozenset({
     "eis_gate_would_reject", "eis_gate_rejected", "eis_gate_points_dropped",
     "eis_gate_suspect", "eis_gate_raised", "eis_split_degenerate",
-    "eis_correction_skipped", "eis_fit_not_admitted",
+    "eis_correction_skipped", "eis_fit_not_admitted", "eis_spectrum_metrics",
     "objective_declined_bound", "objective_rejected_by_gates",
 })
 
@@ -195,6 +222,8 @@ class ShadowReview:
     sigma_shadow: list[tuple[float | None, float | None]] = field(default_factory=list)
     n_routed: int = 0
     routed_channels: Counter = field(default_factory=Counter)
+    #: Every ``eis_spectrum_metrics`` event, before deduplication.
+    metric_events: list = field(default_factory=list)
 
     @property
     def n_gated_events(self) -> int:
@@ -203,6 +232,15 @@ class ShadowReview:
     @property
     def is_shadow_run(self) -> bool:
         return self.n_gated_events > 0
+
+    @property
+    def spectra(self) -> "list[SpectrumRecord]":
+        """The metric events as *spectra* — one record per physical measurement.
+
+        ``n_events`` and ``len(spectra)`` are both reported so the 2× that repeat
+        analysis produces is visible rather than silently collapsed.
+        """
+        return deduplicate(self.metric_events)
 
 
 def summarize(lines: "list[str]") -> ShadowReview:
@@ -294,6 +332,10 @@ def summarize(lines: "list[str]") -> ShadowReview:
         elif event == "eis_objective_shadow":
             rv.sigma_shadow.append(
                 (_num(fields.get("mean_abs_z")), _num(fields.get("sigma"))))
+        elif event == "eis_spectrum_metrics":
+            record = SpectrumRecord.from_event(fields)
+            if record is not None:
+                rv.metric_events.append(record)
 
     _flush()
     return rv
@@ -307,186 +349,19 @@ def _num(value: Any) -> float | None:
     return out if out == out else None
 
 
-# ── DataStore side ───────────────────────────────────────────────────────────
-
-def db_summary(project: str, run_id: str | None) -> dict[str, Any]:
-    """Per-channel measurement/σ rows for one run.  Read-only.
-
-    Returns ``{"error": …}`` rather than raising: a missing or unreadable project must
-    not cost the operator the log half of the review, which is the half that carries
-    the verdicts.
-    """
-    from softae.core.data_store import DataStore
-
-    store = None
-    try:
-        store = DataStore(project)
-        if run_id is None:
-            runs = store.query_runs()
-            if not runs:
-                return {"error": f"no runs recorded in {project}"}
-            run_id = str(runs[0]["run_id"])
-        fits = {int(f["measurement_id"]): f for f in store.query_fits(run_id=run_id)}
-        rows = []
-        engines = Counter()
-        for m in store.query_measurements(run_id=run_id):
-            fit = fits.get(int(m["measurement_id"]), {})
-            engines[str(fit.get("engine") or "-")] += 1
-            rows.append({
-                "channel": int(m["channel"]),
-                "measurement_id": int(m["measurement_id"]),
-                "sigma": fit.get("sigma_S_per_cm"),
-                "R1": fit.get("R1"),
-                "engine": fit.get("engine"),
-                "gate_verdict": fit.get("gate_verdict"),
-            })
-        return {"run_id": run_id, "rows": rows, "engines": engines}
-    except Exception as exc:  # noqa: BLE001 - a CLI boundary over an optional input
-        return {"error": str(exc)}
-    finally:
-        if store is not None:
-            store.close()
-
-
-# ── Rendering ────────────────────────────────────────────────────────────────
-
-def _table(header: "tuple[str, ...]", rows: "list[tuple[Any, ...]]") -> str:
-    if not rows:
-        return "   (none)"
-    cols = [max(len(str(header[i])), *(len(str(r[i])) for r in rows))
-            for i in range(len(header))]
-    out = ["   " + "  ".join(str(h).ljust(cols[i]) for i, h in enumerate(header))]
-    out.append("   " + "  ".join("-" * c for c in cols))
-    for r in rows:
-        out.append("   " + "  ".join(str(v).ljust(cols[i]) for i, v in enumerate(r)))
-    return "\n".join(out)
-
-
-def render(rv: ShadowReview, db: dict[str, Any] | None, source: str) -> str:
-    """The operator-readable report."""
-    out: list[str] = [f"SHADOW CAMPAIGN REVIEW — {source}",
-                      f"   {rv.n_lines} line(s) → {rv.n_events} structured event(s)",
-                      ""]
-
-    out.append("1. DID THE GATED ENGINE RUN?")
-    if rv.is_shadow_run:
-        out.append(f"   YES — {rv.n_gated_events} gated-engine event(s), "
-                   f"{rv.n_routed} spectrum(s) routed to the store.")
-    else:
-        out.append("   NO — not one gated-engine event in this log. Either the config "
-                   "flip did not take,")
-        out.append("   or this is a legacy run. Check `softae-shadow status` and rerun; "
-                   "reviewing this")
-        out.append("   log would arm a gate against evidence it never produced.")
-    out.append("")
-
-    out.append("2. WOULD-REJECT VERDICTS  ([eis.gates] enabled = false)")
-    out.append(f"   spectra that WOULD have been discarded : {rv.would_reject}"
-               + (f"  of {rv.n_routed} routed" if rv.n_routed else ""))
-    out.append(f"   verdict lines logged                   : "
-               f"{rv.would_reject_verdicts} — the engine reduces the gate log twice "
-               f"per spectrum")
-    out.append("                                             (pre-fit admission, then "
-               "post-fit). The two are")
-    out.append("                                             paired; the count above "
-               "is spectra, not lines.")
-    out.append(f"   [quality] would-reject                 : {rv.quality_would_reject}")
-    gates = sorted(set(rv.gate_would_reject) | set(rv.gate_blocking_fail)
-                   | set(rv.gate_points_dropped))
-    out.append("")
-    out.append(_table(
-        ("gate", "would-reject", "blocking-fail", "points-dropped"),
-        [(g, rv.gate_would_reject[g], rv.gate_blocking_fail[g],
-          rv.gate_points_dropped[g]) for g in gates]))
-    out.append("   'would-reject' counts SPECTRA; 'blocking-fail' counts GATE failures "
-               "(a spectrum can fail")
-    out.append("   several); 'points-dropped' are removed from the fit EVEN NOW — "
-               "block_point masks are not")
-    out.append("   behind the enabled flag.")
-    if rv.other_issues:
-        out.append("")
-        out.append("   policy-level issues (no gate, so no threshold to calibrate):")
-        for issue, n in rv.other_issues.most_common():
-            out.append(f"     {n:>4}  {issue}")
-    if rv.gates_raised:
-        out.append(f"   ⚠ gates that RAISED and were skipped: {dict(rv.gates_raised)} "
-                   "— those checks did not run.")
-    out.append("")
-
-    out.append("3. VALUE-VS-BOUND DEMOTIONS")
-    total_bound = sum(rv.bound_modes.values())
-    out.append(f"   σ declined as an upper bound: {total_bound} "
-               f"{dict(rv.bound_modes) if rv.bound_modes else ''}")
-    out.append("   Not governed by [eis.gates] enabled. In a σ-objective campaign each "
-               "of these is an")
-    out.append("   UNMEASURED trial; in this volume-mode spec the objective is mean|Z| "
-               "and none of them")
-    out.append("   costs the search anything.")
-    pairs = [p for p in rv.sigma_shadow if p[1] is not None]
-    out.append(f"   eis_objective_shadow pairs (mean|Z| in use, σ observed): "
-               f"{len(rv.sigma_shadow)}, of which {len(pairs)} produced a σ")
-    out.append("")
-
-    out.append("4. CHANNEL ATTRIBUTION  (POSITIONAL — INFERRED, NOT RECORDED)")
-    channels = sorted(set(rv.channel_would_reject) | set(rv.channel_bound)
-                      | set(rv.routed_channels))
-    out.append(_table(
-        ("channel", "routed", "would-reject", "bound"),
-        [(c, rv.routed_channels[c], rv.channel_would_reject[c], rv.channel_bound[c])
-         for c in channels]))
-    out.append(f"   unattributed (no preceding channel= line): {rv.unattributed}")
-    out.append("   The would-reject event carries no channel. These come from the "
-               "nearest preceding")
-    out.append("   channel= line: sound for auto-fit gate events, UNSOUND for "
-               "objective-side ones, which")
-    out.append("   run after the round and land on whichever channel was routed last.")
-    out.append("")
-
-    out.append("5. PER-CHANNEL σ  (DataStore)")
-    if db is None:
-        out.append("   (not read — pass --project to include it)")
-    elif "error" in db:
-        out.append(f"   (unavailable: {db['error']})")
-    else:
-        out.append(f"   run_id {db['run_id']}")
-        out.append(_table(
-            ("channel", "meas", "R1 (Ω)", "σ (S/cm)", "engine col", "gate_verdict"),
-            [(r["channel"], r["measurement_id"], _g(r["R1"]), _g(r["sigma"]),
-              r["engine"] or "-", r["gate_verdict"] or "-") for r in db["rows"]]))
-        out.append(f"   engine column: {dict(db['engines'])} — a STAMPED DEFAULT, not "
-                   "an observation.")
-        out.append("   The router does not pass report= to record_fit (P.18 open), so "
-                   "a gated run still")
-        out.append("   writes engine='legacy' and a NULL gate_verdict. Section 1 is the "
-                   "engine evidence.")
-    out.append("")
-
-    out.append("6. ARM / DON'T-ARM DECISION INPUTS")
-    out.append("   DEVELOPMENT_FRONTS asks two things of this review, and neither is a "
-               "number this tool")
-    out.append("   can decide for you:")
-    out.append(f"     [eis.gates] enabled — needs 'a reviewed would-reject log'. "
-               f"You have {rv.would_reject} would-reject")
-    out.append("       verdict(s) over " + f"{rv.n_routed} spectrum(s). Read section 2 "
-               "gate by gate and ask of each: would")
-    out.append("       discarding those samples have been right? Every threshold "
-               "shipped is an engineering")
-    out.append("       default chosen without reference to this rig.")
-    out.append(f"     [quality] enabled — needs threshold calibration. "
-               f"{rv.quality_would_reject} would-reject verdict(s) here.")
-    out.append("     E6 cutover criterion 2 — 'a campaign's worth of reviewed "
-               "eis_gate_would_reject'. Met by")
-    out.append("       reviewing this log; criterion 1 (a version-controlled "
-               "calibration set) is separate and")
-    out.append("       still blocked on the RE→CE jumper.")
-    return "\n".join(out)
-
-
-def _g(value: Any) -> str:
-    return "-" if value is None else f"{float(value):.4g}"
-
+def recommendations(rv: ShadowReview,
+                    min_evidence: int = DEFAULT_MIN_EVIDENCE
+                    ) -> "list[Recommendation]":
+    """The proposed thresholds this log supports.  Deduplicated first, always."""
+    return recommend_all(rv.spectra, min_evidence=int(min_evidence))
 
 # ── Commands ─────────────────────────────────────────────────────────────────
+
+#: What each armed-state the renderer identifies means to a shell.  The exit code is a
+#: CLI policy, so it lives here rather than travelling with the text that explains it.
+_STATUS_EXIT = {"armed": EXIT_OK, "enforcing": EXIT_FAILED,
+                "not_armed": EXIT_NOT_A_SHADOW_RUN}
+
 
 def _cmd_status(args) -> int:
     """Report the flags the shadow procedure flips.  Reads; never writes."""
@@ -495,31 +370,9 @@ def _cmd_status(args) -> int:
 
     eis = eis_settings()
     quality = bool((loader.load().get("quality", {}) or {}).get("enabled", False))
-
-    print(f"config: {loader.config_path()}")
-    print(f"   {eis.describe()}")
-    print(f"   [eis] engine          = {eis.engine!r}")
-    print(f"   [eis] objective       = {eis.objective!r}")
-    print(f"   [eis.gates] enabled   = {str(eis.gates.enabled).lower()}")
-    print(f"   [quality] enabled     = {str(quality).lower()}")
-    print(f"   [eis.fixture] mode    = {eis.fixture.mode!r} on "
-          f"{eis.fixture.fixture_id!r}")
-    print()
-
-    if eis.engine == "gated" and not eis.gates.enabled and not quality:
-        print("ARMED FOR A SHADOW RUN — gated physics, every check observing, "
-              "nothing removed at the")
-        print("spectrum level. Revert `engine` to \"legacy\" when the run is reviewed.")
-        return EXIT_OK
-    if eis.engine == "gated":
-        print("GATED AND ENFORCING — this is a cutover, not a shadow run. A shadow run "
-              "needs")
-        print("[eis.gates] enabled = false and [quality] enabled = false.")
-        return EXIT_FAILED
-    print("NOT ARMED — the shipped legacy engine. Set [eis] engine = \"gated\" in the "
-          "config above")
-    print("to run a shadow campaign (docs/SHADOW_CAMPAIGN.md).")
-    return EXIT_NOT_A_SHADOW_RUN
+    text, state = render_status(eis, quality, config_path=str(loader.config_path()))
+    print(text)
+    return _STATUS_EXIT[state]
 
 
 def _cmd_review(args) -> int:
@@ -535,9 +388,55 @@ def _cmd_review(args) -> int:
         source = str(path)
 
     review = summarize(lines)
-    db = db_summary(args.project, args.run_id) if args.project else None
-    print(render(review, db, source))
+    # All three DataStore reads are gated on --project and each degrades to an
+    # ``{"error": …}`` of its own, so a project that answers one question and not
+    # another reports exactly that rather than costing the whole database half.
+    db = railed = arc = None
+    if args.project:
+        db = db_summary(args.project, args.run_id)
+        railed = railed_summary(args.project, args.run_id)
+        arc = arc_summary(args.project, args.run_id)
+    recs = recommendations(review, getattr(args, "min_evidence", DEFAULT_MIN_EVIDENCE))
+    print(render(review, db, source, recs, railed=railed, arc=arc))
+
+    emit = getattr(args, "emit_toml", None)
+    if emit and _write_toml(Path(emit), recs, review, source) != EXIT_OK:
+        return EXIT_FAILED
     return EXIT_OK if review.is_shadow_run else EXIT_NOT_A_SHADOW_RUN
+
+
+def _write_toml(path: Path, recs: "list[Recommendation]", rv: ShadowReview,
+                source: str) -> int:
+    """Write the paste-ready block, or refuse and say why.
+
+    Two refusals, both absolute. This tool **never edits the live config** — arming is
+    a decision taken by reading the would-reject table, not by running a command that
+    happens to write a file — and it **never clobbers**, because the one file an
+    operator would point it at twice is the one holding the previous run's proposal.
+    """
+    from datetime import datetime, timezone
+
+    from softae.config import loader
+
+    try:
+        live = Path(loader.config_path()).resolve()
+    except Exception:  # noqa: BLE001 - an unreadable config must not mask the refusal
+        live = None
+    target = path.expanduser()
+    if live is not None and target.resolve(strict=False) == live:
+        print(f"Refusing to write to the live config at {live}. This tool proposes "
+              f"values; arming them is yours.", file=sys.stderr)
+        return EXIT_FAILED
+    if target.exists():
+        print(f"Refusing to overwrite {target}. Name a new file.", file=sys.stderr)
+        return EXIT_FAILED
+
+    when = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    target.write_text(
+        as_toml_block(recs, source=source, n_spectra=len(rv.spectra), when=when),
+        encoding="utf-8")
+    print(f"\nWrote {target} — paste-ready, nothing armed.")
+    return EXIT_OK
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -556,6 +455,13 @@ def build_parser() -> argparse.ArgumentParser:
     rev.add_argument("--project", help="project directory, to add the DataStore half")
     rev.add_argument("--run-id", dest="run_id",
                      help="run to read (default: the most recent in the project)")
+    rev.add_argument("--emit-toml", dest="emit_toml", metavar="PATH",
+                     help="write the paste-ready threshold block to a NEW file; "
+                          "never the live config, never an existing path")
+    rev.add_argument("--min-evidence", dest="min_evidence", type=int,
+                     default=DEFAULT_MIN_EVIDENCE, metavar="N",
+                     help=f"spectra required before a key may be recommended "
+                          f"(default {DEFAULT_MIN_EVIDENCE})")
     rev.set_defaults(func=_cmd_review)
     return p
 

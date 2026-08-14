@@ -1523,7 +1523,9 @@ reversible per run.
 `enabled = false` runs every check and logs every verdict *while removing nothing* — which
 is how you review a campaign's worth of would-reject decisions before giving thresholds
 authority over data. Every gate threshold currently shipped is an engineering default from
-the specification, chosen without reference to this rig's spectra.
+the specification, chosen without reference to this rig's spectra — and values for these
+thresholds *can* be derived from the spectra a shadow run produces, which is what the review
+tool's section 7 does ([§20](#20-shadow-campaign-review)).
 
 ### What the gates catch
 
@@ -1826,6 +1828,8 @@ risk to a run. `softae-shadow` sits on either side of that run.
 softae-shadow status                                                 # is the rig armed?
 softae-shadow review shadow_run.log \
     --project ./runs/aug --run-id run_20260810T1400Z                 # what did it see?
+softae-shadow review shadow_run.log --project ./runs/aug \
+    --emit-toml proposed_thresholds.toml                             # where would they sit?
 ```
 
 > Equivalently `python -m softae.tools.shadow_review …` — note the module is **`shadow_review`**,
@@ -1843,10 +1847,25 @@ carries the same verdict for scripting:
 | **GATED AND ENFORCING** | engine gated but a gate is enforcing — this is a *cutover*, not a shadow run | 1 |
 | **NOT ARMED** | the shipped legacy engine | 2 |
 
+> **`status` also sizes the run.** When the config is armed, the screen ends with a wall-time
+> advisory, because observe-only is the **most expensive** analysis configuration the rig has
+> and the one that reads as free. An *enforcing* gate rejects a blocking spectrum before the
+> fitter runs; an *observing* gate does not, so the optimiser grinds a parallel-R model onto data
+> with no arc and takes the long way to failing. A synthetic fully-blocking spectrum measured
+> **~78 s** against **~0.07 s** on the legacy engine, and real near-blocking spectra vary.
+> **Size a shadow run by the clock, not by the well count.**
+
 **`review`** summarizes a run's would-reject verdicts: how many spectra would have been
 rejected, by which gate, and on which channel. `--project` adds the DataStore half —
-measurements per channel and the stored σ — and `--run-id` picks the run (default: the most
-recent in that project).
+measurements per channel, the stored σ, and the two columns `fit_results` records honestly
+(§5b below) — and `--run-id` picks the run (default: the most recent in that project).
+
+| Flag | Default | What it adds |
+|---|---|---|
+| `--project DIR` | *(log only)* | The DataStore half: section 5 (per-channel σ) and section 5b (railed fits, arc closure) |
+| `--run-id ID` | most recent run | Which run in that project to read |
+| `--min-evidence N` | `20` | Spectra a metric must be observed on before section 7 may propose a value for it |
+| `--emit-toml PATH` | *(not written)* | Write the paste-ready `[eis.gates]` / `[quality]` block to a **new** file |
 
 > **The log file is the artifact, and it exists only if you made it.** Gate verdicts are
 > **not persisted**: a gated campaign still writes `gate_verdict = NULL` to `fit_results`, so
@@ -1858,10 +1877,122 @@ Two attribution limits the report states rather than smooths: per-*gate* counts 
 gate name heads every issue string), while per-*channel* counts are **positional** and are sound
 only for verdicts emitted during the workflow's auto-fit. Verdicts emitted during objective
 extraction land on whichever channel was routed last; the summary counts those separately as
-unattributed rather than misattributing them.
+unattributed rather than misattributing them. That limit is the *verdict* event's, and section 4
+is where it lives: the `eis_spectrum_metrics` event behind section 7 carries `channel` and a
+content fingerprint outright, so its population is attributed and de-duplicated rather than
+inferred.
+
+### Section 5b — what `fit_results` records honestly
+
+Section 5 has to caveat almost every column it prints, because the router stamps defaults into
+most of them (`engine='legacy'`, `gate_verdict = NULL`). **Section 5b prints the two things the
+rows do record honestly**, and it appears whenever `--project` is given:
+
+- **Railed fits, per channel, across both eras.** A fit that came to rest on the model's own R₁
+  floor rather than on the data is detectable from the stored numbers whatever wrote them —
+  but by *two* detectors, because the eras differ. Rows written since the railed-fit demotion
+  landed carry `success = 0` and an `error_msg` naming the bound (**railed (new)**); rows
+  written before it carry `success = 1` with `R1` sitting exactly on the bound and nothing
+  marking them (**railed (historical)**) — a σ of roughly seawater from a dry film, wearing a
+  success flag. The bound is read from `CIRCUIT_MODELS`, never restated; a model declaring none
+  reports `unknown` rather than `0`.
+- **Arc-closure state counts.** The router passes the arc provenance on every routed fit, so
+  each row carries exactly one real `arc_closure` record. Rows predating that shim are counted
+  as **no record** rather than folded into an outcome they never reported.
+
+`sigma_is_bound` keeps section 5's posture and is labelled a **stamped default** — 0 on every
+row, not an observation — until P.18 passes the real report to `record_fit`.
+
+### Section 7 — recommended thresholds
+
+Whether to arm a gate is a scientific claim, and no arithmetic establishes it. But **where** a
+threshold would sit, given the decision to arm, is a percentile of a distribution — and doing
+that by eye across fourteen keys and hundreds of spectra is exactly the work that gets skipped.
+Section 7 computes the values and never decides — for what each key *means* before you move it,
+see [§17](#17-eis-analysis-engine--gates):
+
+```
+7. RECOMMENDED THRESHOLDS
+   Evidence: 61 spectra (122 events, deduplicated by content fingerprint).
+   ! = changing this key changes a stored NUMBER, not only a verdict.
+
+   section     key                default  recommended  rule         n   fired@def  rej@rec  status
+   ----------  -----------------  -------  -----------  -----------  --  ---------  -------  -----------------
+   eis.gates    tand_slope_max       -0.3            -  gap          61          0        0  hold (unimodal)
+   eis.gates    cap_flatness_max     0.15         0.41  upper-fence  61         22        3  recommended
+   eis.gates   !kk_resid_pct            1          2.6  upper-fence  58         31        2  recommended
+   eis.gates    min_fit_pts              8            -  count       61          0        0  hold (unexercised)
+   quality      min_r_squared        0.95        0.905  complement   47          9        2  recommended
+
+   REFUSED (evidence insufficient — the default stands):
+     eis.gates.max_rel_se
+       only 4 spectra carry rel_se_measurand (need 20); below 20 the P95 is a single observation
+   ...
+   ⚠ ARMING IS NOT RECOMMENDED HERE. These are values, not a decision.
+   Applying every 'recommended' value above (3 key(s)) would reject 7 of 61 spectra (11%).
+   Per-key counts do not add: one spectrum routinely fails several gates.
+```
+
+Four things to read off it:
+
+| Column / marker | Means |
+|---|---|
+| **`!`** before a key | **Behavioural** — changing it moves a stored *number*, not only a verdict. Re-fit before trusting any σ produced under it |
+| `fired@def` / `rej@rec` | How many spectra the gate fired on at its shipped default, and how many the proposed value would reject |
+| `hold (unexercised)` | 0 spectra failed this gate at its default. *Untested is not validated* — the default stands |
+| `hold (unimodal)` | A gap rule found no two populations to separate, so the theory-anchored default stands |
+| `recommended (measures-the-rig)` | The gate fired on ≈every spectrum (≥ 90 %): at its default it is measuring the rig, not the sample |
+
+The final **joint** count is the number to act on. Per-key counts do not add — one bad spectrum
+routinely fails several gates, so summing the column overstates the cost, sometimes by more than
+the population size. Two further blocks follow the table and are stated rather than omitted:
+**not recommendable from a shadow run** (`kk_c`, `bound_tol`, the `blank_*` and `geom_*` keys,
+one reason each) and **observed but unconfigurable** — hardcoded constants such as
+`cross_check_pct` and `runs_z` that fire in practice but have no config line to move, reported
+with their P50/P95 and fire count as evidence *for* a future key.
+
+> **A pre-T7.1 log recommends nothing, and says so.** The pass-side distribution comes from the
+> `eis_spectrum_metrics` event, which the gated engine emits once per spectrum on **both**
+> verdict paths. Older logs recorded `metrics=` only where a spectrum *failed*, so every key
+> refuses with that one-sided-evidence reason. Sections 1–6 of such a log render exactly as they
+> always did.
+
+### The `--emit-toml` workflow
+
+Four steps, and the tool performs exactly the first three:
+
+1. `softae-shadow review shadow_run.log --project <dir>` — read sections 1–6 gate by gate, as
+   `docs/SHADOW_CAMPAIGN.md` §8 asks.
+2. Read **section 7** for where each threshold would sit, and what it would cost.
+3. `--emit-toml proposed_thresholds.toml` — writes the paste-ready block.
+4. **You** paste what you accept into `softae_config.toml`, and **you** decide arming.
+
+The emitted block is auditable rather than merely pasteable: every value carries its rule, `n`,
+and its fired → rejected counts as a trailing comment, and **refused and held keys are emitted
+commented out with their reason**, so pasting the block can never silently apply a
+non-recommendation. `enabled` is written `false` in both sections and is never written otherwise.
+
+> **Two refusals, both absolute.** `--emit-toml` will not write to the **live config** — arming
+> is a decision taken by reading the would-reject table, not by running a command that happens
+> to write a file — and it will not **overwrite** an existing path, because the one file an
+> operator would aim it at twice is the one holding the previous run's proposal. Either refusal
+> prints the reason and exits 1.
+
+### The evidence floor: a 16-well run recommends nothing
+
+`--min-evidence` defaults to **20** spectra per metric, and that number is chosen rather than
+inherited: at *n* = 20 the empirical P95 is the second-largest observation, so a fence rests on
+two points instead of entirely on the single worst spectrum of the run. Below the floor, a key
+is **refused by name with a reason** rather than given a value.
+
+The packaged shadow spec (`examples/shadow_campaign.toml`) ships `budget = 16`, which sits
+**deliberately below** the floor. A 16-well run therefore recommends nothing — that is the
+design, not a failure. **Raise `budget` to 32** if you want the run to produce thresholds.
+Lowering `--min-evidence` instead is possible and visible in the output, but it buys a number
+the sample does not support.
 
 The full bench procedure — which keys to flip, in what order, and how to revert — is
-`docs/SHADOW_CAMPAIGN.md`. The two commands above are the whole invocation surface.
+`docs/SHADOW_CAMPAIGN.md`. `status` and `review` remain the whole invocation surface.
 
 ---
 
