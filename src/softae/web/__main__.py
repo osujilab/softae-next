@@ -11,8 +11,11 @@ import argparse
 import sys
 from pathlib import Path
 
+from softae.tools import use_utf8_console
+
 
 def main(argv: list[str] | None = None) -> None:
+    use_utf8_console()
     parser = argparse.ArgumentParser(
         prog="python -m softae.web",
         description="Launch the softae EIS web visualizer (Dash/Plotly).",

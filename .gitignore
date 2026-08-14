@@ -54,3 +54,5 @@ docs/*
 !docs/api/
 !docs/USER_GUIDE.md
 !docs/architecture.md
+# the mkdocs homepage; without it a clone's site root is a 404
+!docs/index.md

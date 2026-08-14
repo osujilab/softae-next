@@ -223,8 +223,19 @@ def render(rv: ShadowReview, db: dict[str, Any] | None, source: str,
     out.append("")
 
     out.append("2. WOULD-REJECT VERDICTS  ([eis.gates] enabled = false)")
+    # A rehearsal routes nothing, so its denominator comes from the metrics events
+    # instead. Where it does, the report says where it came from: a count whose
+    # provenance is invisible is read as a routed count and quietly over-trusted.
+    seen = rv.n_spectra_seen
+    from_metrics = not rv.n_routed and seen > 0
+    denominator = f"  of {seen} routed" if rv.n_routed else \
+        (f"  of {seen} seen" if from_metrics else "")
     out.append(f"   spectra that WOULD have been discarded : {rv.would_reject}"
-               + (f"  of {rv.n_routed} routed" if rv.n_routed else ""))
+               + denominator)
+    if from_metrics:
+        out.append("                                             (counted from metrics "
+                   "events — no router")
+        out.append("                                             anchors in this log)")
     out.append(f"   verdict lines logged                   : "
                f"{rv.would_reject_verdicts} — the engine reduces the gate log twice "
                f"per spectrum")
@@ -313,7 +324,8 @@ def render(rv: ShadowReview, db: dict[str, Any] | None, source: str,
     out.append("   can decide for you:")
     out.append(f"     [eis.gates] enabled — needs 'a reviewed would-reject log'. "
                f"You have {rv.would_reject} would-reject")
-    out.append("       verdict(s) over " + f"{rv.n_routed} spectrum(s). Read section 2 "
+    out.append("       verdict(s) over "
+               + f"{rv.n_spectra_seen} spectrum(s). Read section 2 "
                "gate by gate and ask of each: would")
     out.append("       discarding those samples have been right? Every threshold "
                "shipped is an engineering")

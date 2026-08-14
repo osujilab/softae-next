@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QApplication
 from softae.config import loader as cfg
 from softae.core.formulation import ChemicalCatalog, SolutionCatalog
 from softae.gui.widgets.deposition_panel import DepositionPanel
+from softae.tools import use_utf8_console
 
 
 def load_catalogs(config: dict | None) -> tuple[ChemicalCatalog, SolutionCatalog, str]:
@@ -132,6 +133,7 @@ def _open_editor(panel: DepositionPanel, config: dict | None) -> None:
 
 def main() -> None:
     """CLI entry point for the standalone deposition twin GUI."""
+    use_utf8_console()
     try:
         config = cfg.load()
     except FileNotFoundError:

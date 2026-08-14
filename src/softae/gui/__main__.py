@@ -13,10 +13,12 @@ import asyncio
 import sys
 
 from softae.gui.app import run_app
+from softae.tools import use_utf8_console
 
 
 def main() -> None:
     """CLI entry point for the SoftAE GUI."""
+    use_utf8_console()
     sys.exit(run_app())
 
 

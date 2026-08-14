@@ -378,6 +378,52 @@ class TestMetricsEventParsing:
         assert "20 spectra (40 events, deduplicated by content fingerprint)" in text
 
 
+class TestSpectrumCountFallback:
+    """A rehearsal routes nothing, and the report used to read as if it saw nothing.
+
+    ``eis_autorouted`` is a campaign event: ``rehearse`` replays spectra already on
+    disk, so a rehearsal log has metrics events by the hundred and no router lines at
+    all. Sections 2 and 6 both sized the run from the router count, so the review of a
+    real rehearsal announced ``over 0 spectrum(s)`` — the exact number an operator uses
+    to decide whether the run is worth reading.
+    """
+
+    def test_a_rehearsal_shaped_log_counts_its_spectra_from_the_metrics_events(self):
+        rv = summarize(metric_lines(30, bad=6))
+        assert rv.n_routed == 0 and rv.n_spectra_seen == 30
+        text = render(rv, None, "rehearse.log")
+        assert "over 30 spectrum(s)" in text
+        assert "of 30 seen" in text
+
+    def test_the_fallback_count_says_where_it_came_from(self):
+        text = render(summarize(metric_lines(30, bad=6)), None, "rehearse.log")
+        assert "counted from metrics events" in text and "no router" in text
+
+    def test_a_campaign_shaped_log_still_counts_routed_spectra_and_says_routed(self):
+        lines = [line for ch in (1, 2, 3, 4) for line in one_rejected_spectrum(ch)]
+        rv = summarize(lines)
+        assert rv.n_routed == 4 and rv.n_spectra_seen == 4
+        text = render(rv, None, "run.log")
+        assert "of 4 routed" in text and "over 4 spectrum(s)" in text
+        assert "counted from metrics events" not in text
+
+    def test_adding_the_fallback_changed_no_byte_of_a_campaign_report(self):
+        # The pins in TestBackwardCompatibility guard the section boundaries; this one
+        # guards the two lines actually touched, against a log that has both router
+        # anchors and metrics events, where the two counts could disagree.
+        lines = ([line for ch in (1, 2) for line in one_rejected_spectrum(ch)]
+                 + metric_lines(30, bad=6))
+        rv = summarize(lines)
+        assert rv.n_routed == 2 and rv.n_spectra_seen == 2  # router wins where it exists
+        text = render(rv, None, "run.log")
+        assert "of 2 routed" in text and "counted from metrics events" not in text
+
+    def test_a_log_with_neither_routes_nor_metrics_renders_the_bare_line(self):
+        text = render(ShadowReview(), None, "empty.log")
+        assert "spectra that WOULD have been discarded : 0\n" in text
+        assert "counted from metrics events" not in text
+
+
 class TestSectionSeven:
     def _text(self, lines, **kwargs):
         rv = summarize(lines)
@@ -713,15 +759,18 @@ class TestStatusCostAdvisory:
 
 
 class TestModuleDocstringMatchesReality:
-    def test_the_docstring_no_longer_claims_the_gate_log_column_is_always_empty(self):
-        # router.py:458 passes arc_provenance(report.fit), so gate_log_json carries one
-        # arc_closure record per routed row. shadow_db.arc_summary depends on that being
-        # true, and a docstring asserting "[]" would argue the tool's own evidence away.
+    def test_the_docstring_names_the_arc_columns_as_the_recorded_verdict(self):
+        # The arc verdict reaches the DataStore as four real arc_* columns that
+        # record_fit writes from fit_result.arc_closure — not as a JSON payload, and
+        # not via the retired arc_provenance shim. shadow_db.arc_summary reads those
+        # columns, so a docstring claiming the verdict goes unrecorded would argue the
+        # tool's own evidence away.
         from softae.tools import shadow_review
 
         doc = shadow_review.__doc__ or ""
-        assert "gate_log_json='[]'" not in doc
-        assert "arc_closure" in doc and "arc_provenance" in doc
+        assert "arc_state" in doc
+        assert "annotate_arc_closure" in doc and "record_fit" in doc
+        assert "arc_closure" in doc
         # P.18 is open in substance and the docstring must still say so.
         assert "P.18" in doc and "gate_verdict" in doc
 

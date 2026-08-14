@@ -176,6 +176,28 @@ class TestRefusals:
         assert rec.exercise == "measures-the-rig"
         assert "measuring the rig, not the sample" in rec.reason
 
+    def test_a_negative_r_squared_population_refuses_instead_of_fencing_below_zero(self):
+        # The real case: the 2026-08-14 rehearsal proposed min_r_squared = -0.17. A
+        # negative R2 floor is not a loose gate, it is a nonsensical one — it admits
+        # fits that explain the data WORSE than the sample mean. The complement rule is
+        # arithmetically correct here; what it is telling us is that the population is
+        # unfittable, and that has to be said rather than pasted into a config.
+        rec = only(recommend_all(records("r_squared", [-0.02 - 0.004 * i
+                                                       for i in range(N)])),
+                   "min_r_squared")
+        assert rec.status == "refused" and rec.value is None
+        assert "sanity floor" in rec.reason and "-0.46" in rec.reason
+        assert "worse than predicting the mean" in rec.reason.lower()
+
+    def test_the_sanity_floor_leaves_an_ordinary_bad_tail_alone(self):
+        # The floor must stay a rare refusal, not a second default: a population with a
+        # genuinely poor tail still gets its number.
+        values = [0.999 - 0.0005 * i for i in range(30)] + [0.5 + 0.01 * i
+                                                            for i in range(10)]
+        rec = only(recommend_all(records("r_squared", values)), "min_r_squared")
+        assert rec.status == "recommended" and rec.value > 0.0
+        assert "sanity floor" not in rec.reason
+
     def test_an_empty_population_refuses_every_key_with_the_pre_t71_reason(self):
         recs = recommend_all([])
         assert len(recs) == len(METRIC_KEYS)

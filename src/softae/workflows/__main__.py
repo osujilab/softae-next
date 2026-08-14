@@ -27,6 +27,7 @@ import structlog
 
 from softae.config import loader as cfg
 from softae.drivers.factory import create_manager
+from softae.tools import use_utf8_console
 from softae.workflows.experiment_logger import ExperimentLogger
 from softae.workflows.workflow_executor import ExecutorState, WorkflowExecutor
 from softae.workflows.workflow_model import WorkflowStep
@@ -162,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
         Exit code: 0 for success, 1 for workflow error, 2 for bad args,
         3 for validation failures.
     """
+    use_utf8_console()
     parser = build_parser()
     args = parser.parse_args(argv)
 

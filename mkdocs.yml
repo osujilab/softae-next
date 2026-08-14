@@ -46,9 +46,10 @@ markdown_extensions:
       permalink: true
 
 # Nav is limited to the version-controlled documentation surface:
-# USER_GUIDE.md, architecture.md and api/. Working documents (roadmaps,
-# progress logs, specs) stay local and are excluded via .gitignore.
+# index.md, USER_GUIDE.md, architecture.md and api/. Working documents
+# (roadmaps, progress logs, specs) stay local and are excluded via .gitignore.
 nav:
+  - Home: index.md
   - User Guide: USER_GUIDE.md
   - API Reference:
     - Core:

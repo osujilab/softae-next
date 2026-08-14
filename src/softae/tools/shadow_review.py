@@ -23,12 +23,17 @@ reviewable artifact of bench item 7 exists only if the operator redirects the co
 which is why the procedure makes ``| tee shadow_run.log`` a required step and why this
 tool's primary input is a log file rather than the database.
 
-``gate_log_json`` is the **one exception, and it is no longer empty.**  The router
-passes ``arc.arc_provenance(report.fit)`` unconditionally: a shim exposing ``gate_log``
-and nothing else, so each routed row now carries exactly one ``arc_closure`` record
-while every other stored column stays the stamped default it was.  That makes
-:func:`softae.tools.shadow_db.arc_summary` honest evidence — the arc states are
-observations — and leaves the rest of P.18 exactly where it was.
+``arc_state`` and its three companions are the **one exception**, and they are real
+columns rather than a JSON payload.  ``record_fit`` writes them from
+``fit_result.arc_closure`` — the annotation
+:func:`~softae.analysis.eis.arc.annotate_arc_closure` attaches on every
+``analyze_spectrum`` that produces a fit, on **both** engines — so a routed row carries
+the arc verdict whether or not any report is passed.  ``gate_log_json`` is therefore
+empty again on rows written since the ``arc_provenance`` shim was retired; the
+T7.1-era rows that carry the record as a JSON entry are still read, which is why
+:func:`softae.tools.shadow_db.arc_summary` distinguishes three eras of row.  It remains
+honest evidence — the arc states are observations, not stamped defaults — and the rest
+of P.18 is exactly where it was.
 
 The DataStore is otherwise read for what it can honestly supply: which run, how many
 measurements per channel, the stored σ, and which fits railed on the model's own R₁
@@ -241,6 +246,23 @@ class ShadowReview:
         analysis produces is visible rather than silently collapsed.
         """
         return deduplicate(self.metric_events)
+
+    @property
+    def n_spectra_seen(self) -> int:
+        """How many spectra this log is evidence about — router count, or the metrics.
+
+        ``n_routed`` counts ``eis_autorouted`` lines, which a **campaign** emits and a
+        **rehearsal** never does: a rehearsal replays spectra already on disk and routes
+        nothing. Reading the run size from the router alone therefore reported ``0
+        spectrum(s)`` for a rehearsal carrying hundreds of metrics events — the one
+        number an operator sizes the review by, wrong in the direction that says "there
+        is nothing here".
+
+        The router count stays authoritative wherever it exists, because it anchors
+        spectra to channels and the metrics events do not. The fallback is used only
+        when there are no anchors at all, and the renderer says so where it is used.
+        """
+        return self.n_routed or len(self.spectra)
 
 
 def summarize(lines: "list[str]") -> ShadowReview:

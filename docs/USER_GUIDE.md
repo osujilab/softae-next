@@ -502,11 +502,12 @@ instruments.
 > back to `python -m softae.tools.<name>`, which resolves whether or not a script was
 > generated.
 
-**All ten resolve in this venv, verified 2026-08-11.** `softae-shadow`, `softae-thickness` and
-`softae-equilibration` were added after the previous editable install and were module-only
-until it was refreshed; the refresh generated all three `.exe`s in `.venv/Scripts/`. Every
-section below names the console script first, with the module form given as the exact
-equivalent:
+**All ten resolve in this venv, re-verified 2026-08-14** — each of the ten names above resolves
+to a generated `.exe` under `.venv/Scripts/`, and `softae-shadow --help` prints its three
+subcommands. `softae-shadow`, `softae-thickness` and `softae-equilibration` were added after
+the previous editable install and were module-only until it was refreshed; the refresh
+generated all three `.exe`s. Every section below names the console script first, with the
+module form given as the exact equivalent:
 
 ```bash
 softae-shadow --help          # equivalently: python -m softae.tools.shadow_review
@@ -1291,6 +1292,29 @@ silently resuming would make a re-run mean something different from what was typ
 checkpoint is fingerprinted against the spec — a changed parameter space, objective or
 optimizer setting is refused rather than continued into.
 
+### Seeding an offline BO run: `SOFTAE_SEED_DATASET`
+
+`SOFTAE_SEED_DATASET` points at a **historical aggregated-conductivity dataset** — a past
+campaign's results, used as a stand-in oracle so a BO run can be exercised without touching
+the rig. It is a path to a file, not a directory:
+
+```bash
+export SOFTAE_SEED_DATASET=/path/to/aggregated_conductivity.txt   # PowerShell: $env:SOFTAE_SEED_DATASET = "..."
+python examples/bo_campaign_demo.py                               # or pass the path as argv[1]
+```
+
+Two consumers, and **neither invents data when it is unset**:
+
+| Consumer | Unset or missing |
+|---|---|
+| `examples/bo_campaign_demo.py` | prints what to set and exits **1**; an explicit path as the first argument wins over the variable |
+| the seeded tests (`tests/campaign_helpers.py`) | those tests **skip** |
+
+Skipping is deliberate. The dataset is a lab record, not a fixture — it is not in the
+repository, so a clone has no copy — and a test that quietly substituted synthetic numbers
+for it would report a convergence result about a curve nobody measured. Unset is a supported
+state: the rest of the campaign suite runs on synthetic frames and does not need it.
+
 ---
 
 ## 16. EIS Commissioning & Calibration
@@ -1835,8 +1859,9 @@ softae-shadow review shadow_run.log --project ./runs/aug \
 ```
 
 > Equivalently `python -m softae.tools.shadow_review …` — note the module is **`shadow_review`**,
-> not `shadow`. The console script exists here as of the 2026-08-11 editable install; the module
-> form resolves regardless ([§5](#5-cli-workflow-runner)).
+> not `shadow`. The console script resolves in this venv (re-verified 2026-08-14, see
+> [§5](#5-cli-workflow-runner), which holds the one authoritative verification date); the module
+> form resolves regardless.
 
 **`status`** is read-only and answers one question — *is the config armed for a shadow run?* —
 which you ask **twice**: before the run ("did the flip take?") and after the revert ("is the rig

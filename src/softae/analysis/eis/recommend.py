@@ -182,7 +182,9 @@ class Recommendation:
     status: str                  # "recommended" | "hold" | "refused"
     direction: str               # "loosens" | "tightens" | "unchanged" | "-"
     reason: str                  # always populated
-    n: int                       # spectra carrying a finite value for this metric
+    #: Spectra carrying a finite value for this metric — which is to say, spectra that
+    #: **reached** this gate. Not the run's spectrum count: see :data:`METRIC_KEYS`.
+    n: int
     fired_at_default: int
     would_reject_at_value: int
     exercise: str                # unexercised | exercised | measures-the-rig
@@ -218,12 +220,26 @@ class _Key:
     min_gap: float = 0.0
     span: tuple[float, float] = (-math.inf, math.inf)
     floor: float | None = None   # a value may never be proposed below this
+    #: A proposal below this is **refused**, not clamped. The distinction is the point:
+    #: :attr:`floor` says "the arithmetic overshot a physical edge, use the edge", while
+    #: this says "the arithmetic is sound and the answer is absurd, so the *population*
+    #: is the finding". Clamping here would emit a plausible-looking number and hide it.
+    refuse_below: float | None = None
     note: str = ""
 
 
 #: The map. Metric names are exactly the keys ``gates.gate_metrics()`` produces; the
 #: ``[quality]`` metrics arrive from the ``fit_report.metrics`` merge inside
 #: ``analyze_spectrum`` and from ``gate_phase_noise_extrapolated``.
+#:
+#: **Each key's ``n`` counts the spectra that reached its gate, not the spectra in the
+#: run.** ``run_gates`` short-circuits on the first *blocking* failure — observe-only
+#: suppresses the rejection, not the short-circuit — so a metric produced late in the
+#: chain exists only for the spectra that survived everything before it. The evidence
+#: floor is therefore applied per key against an attrition-thinned sample, and a small
+#: ``n`` on a late key is that attrition rather than a missing metric. Measured: the
+#: Front-1 triad reached ``n = 44`` of 192 spectra in the 2026-08-14 rehearsal, while
+#: keys near the head of the chain saw the full population.
 METRIC_KEYS: tuple[_Key, ...] = (
     _Key("eis.gates", "tand_slope_max", "tand_slope", "gap", "upper",
          min_gap=0.25, span=(-1.2, 0.5),
@@ -245,7 +261,8 @@ METRIC_KEYS: tuple[_Key, ...] = (
          behavioural=True, min_gap=0.03, span=(-1.0, 1.0)),
     _Key("eis.gates", "residual_hard_pct", "residual_rms_pct", "upper-fence",
          "upper", floor=0.0),
-    _Key("quality", "min_r_squared", "r_squared", "complement", "lower"),
+    _Key("quality", "min_r_squared", "r_squared", "complement", "lower",
+         refuse_below=0.0),
     _Key("quality", "max_residual_pct", "residual_rms_pct", "upper-fence", "upper",
          floor=0.0,
          note="the same distribution as eis.gates.residual_hard_pct, graded twice — "
@@ -354,6 +371,16 @@ def _recommend_one(spec: _Key, records: Sequence[SpectrumRecord], *, settings: A
     # ("has anything challenged the default?"), so the reason reported is the one that
     # actually stopped the recommendation.
     proposed = _propose(spec, values, floor_points)
+    if proposed is not None and spec.refuse_below is not None \
+            and proposed < spec.refuse_below:
+        absurd = (" — a floor at or below zero admits fits WORSE than predicting the "
+                  "mean, which is not a fence" if spec.refuse_below == 0.0 else "")
+        return _out("refused",
+                    f"{spec.rule} on {n} spectra proposes {proposed:.4g} for "
+                    f"{spec.key}, below the sanity floor of {spec.refuse_below:g}"
+                    f"{absurd}. Refused rather than clamped: a proposal this low means "
+                    f"the {spec.metric} population is itself degenerate, and that is "
+                    f"the finding")
     if proposed is None:
         return _out("hold", hold_kind=HOLD_UNIMODAL, reason=(
             f"unimodal at n={n} — no two populations to separate, so the "
