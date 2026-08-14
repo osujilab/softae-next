@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,7 +88,12 @@ SCHEMA_EPOCHS: tuple[tuple[int, str, str], ...] = (
      "NULL-for-historical columns of T2.6 / T3.1b - see "
      "_migrate_conditions_resolved_temperature for why a derivation differs "
      "from a fact the past failed to record. temperature_source is never NULL "
-     "after this epoch; 'unavailable' means no thermometer spoke"),
+     "after this epoch; 'unavailable' means no thermometer spoke. The "
+     "per-database distribution is not recorded here - it is a fact about one "
+     "file, not about the epoch, and this tuple is a per-code constant - so it "
+     "is obtained with SELECT temperature_source, COUNT(*) FROM conditions "
+     "GROUP BY temperature_source. The migration that wrote it logs the same "
+     "counts once, per database, as it goes"),
 )
 
 # ---------------------------------------------------------------------------
@@ -150,6 +156,13 @@ CREATE TABLE IF NOT EXISTS conditions (
     -- columns above, written once at record time (schema epoch 4). NULL
     -- `temperature_C` means no thermometer spoke; `temperature_source` is then
     -- 'unavailable' and is never NULL on a row any writer since epoch 4 wrote.
+    --
+    -- The stored pair is a RECORD, NOT A VIEW: it is what `resolve_temperature_C`
+    -- concluded from this row's source columns *at write time*. Editing
+    -- `TEMPERATURE_SOURCES` changes what future writes conclude and does not move a
+    -- single stored row. `softae.analysis.conditions` remains the authority for
+    -- re-analysis -- a consumer that wants today's precedence over yesterday's rows
+    -- must call the resolver on the source columns, which are all still here.
     temperature_C       REAL,
     temperature_source  TEXT,
     notes               TEXT    NOT NULL DEFAULT ''
@@ -182,12 +195,55 @@ CREATE TABLE IF NOT EXISTS fit_results (
     success             INTEGER NOT NULL DEFAULT 1,
     error_msg           TEXT    NOT NULL DEFAULT '',
     parameters_json     TEXT    NOT NULL DEFAULT '{}',
-    fitted_at           TEXT    NOT NULL
+    fitted_at           TEXT    NOT NULL,
+    -- The gated engine's provenance columns (E0/E1). Declared here as well as in
+    -- `_migrate_fit_gate_columns`, in that migration's order and with its
+    -- declarations verbatim, so a fresh install and an upgraded one hold the same
+    -- table rather than two shapes that only a `SELECT *` reader can survive. The
+    -- pair is idempotent by construction: on a fresh database the CREATE supplies
+    -- these and every `if name not in cols` is false; on a legacy one the CREATE is
+    -- a no-op and the ALTERs supply them.
+    engine              TEXT    NOT NULL DEFAULT 'legacy',
+    gate_verdict        TEXT,
+    gate_log_json       TEXT    NOT NULL DEFAULT '[]',
+    n_points_used       INTEGER,
+    n_points_dropped    INTEGER,
+    report_mode         TEXT    NOT NULL DEFAULT 'split',
+    R_sum_ohm           REAL,
+    R_sum_se_ohm        REAL,
+    rho_series_bulk     REAL,
+    sigma_is_bound      INTEGER NOT NULL DEFAULT 0,
+    sigma_rel_unc       REAL,
+    phase_headroom      REAL,
+    model_free_R_ohm    REAL,
+    K_per_cm            REAL,
+    K_route             TEXT,
+    dead_height_cm      REAL    NOT NULL DEFAULT 0.0,
+    thickness_method    TEXT,
+    thickness_unc_cm    REAL,
+    -- Arc closure (T7.7): did the impedance semicircle peak inside the swept
+    -- window, or is R1 reached by extrapolating off the high-frequency side?
+    -- NOT ONE of these carries a NOT NULL DEFAULT, and that is binding rather than
+    -- stylistic. `arc.UNKNOWN` means *the annotator looked and could not tell* --
+    -- an answer, and one that carries a reason. A DEFAULT 'unknown' would stamp
+    -- that answer onto every historical row nobody ever inspected. NULL here means
+    -- never annotated, and on a row written before this column it is the only
+    -- honest statement available.
+    arc_state           TEXT,
+    arc_f_peak_hz       REAL,
+    arc_f_low_hz        REAL,
+    arc_phase_low_deg   REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_fit_results_measurement_id ON fit_results(measurement_id);
 CREATE INDEX IF NOT EXISTS idx_fit_results_run_id         ON fit_results(run_id);
 CREATE INDEX IF NOT EXISTS idx_fit_results_model_name     ON fit_results(model_name);
+-- NO `arc_state` index is declared here, for the reason the conditions block
+-- above spells out: this script runs before the migrations, so on a legacy
+-- database `fit_results` is still whatever it was created with (the CREATE above
+-- is a no-op there), and `CREATE INDEX ... ON fit_results(arc_state)` would raise
+-- `no such column` inside `executescript` and fail the open of every existing
+-- project. `_migrate_fit_gate_columns` owns that index, on both paths.
 
 CREATE TABLE IF NOT EXISTS formulations (
     formulation_id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -435,6 +491,39 @@ def _fit_report_columns(report: Any | None) -> dict[str, Any]:
         thickness_unc_cm=_f_or_none(getattr(cell, "thickness_unc_cm", None)),
     )
     return defaults
+
+
+def _arc_columns(fit_result: Any) -> dict[str, Any]:
+    """The arc-closure columns for one row — read off the FIT, not the report.
+
+    **This deviates from :func:`_fit_report_columns`' report-only convention, and
+    the deviation is the point.** A real
+    :class:`~softae.analysis.eis.report.SpectrumReport` carries ``run_gates``' log,
+    and that log has **no** ``arc_closure`` entry:
+    :func:`~softae.analysis.eis.arc.annotate_arc_closure` writes to the *fit*, and
+    only the ``arc_provenance`` shim ever copies the record into a ``gate_log``. A
+    report-scanning implementation would therefore work exactly as long as the shim
+    is in use and go quiet the day P.18 starts passing the real report — a column
+    that empties itself on an upgrade is worse than no column at all.
+
+    Reading the fit also reaches further: ``annotate_arc_closure`` runs on every
+    ``analyze_spectrum`` call on both engines, so ``fit.arc_closure`` is present for
+    every fit that came through analysis, including the ``report=None`` callers the
+    shim cannot reach.
+
+    All four are ``None`` when nothing annotated the fit, which is a different fact
+    from ``'unknown'`` — see the DDL. The three REALs go through :func:`_f_or_none`,
+    the file's NaN→NULL boundary, so an ``unknown`` state and a phase-less spectrum
+    both arrive as NaN and both land as NULL with no special-casing here.
+    """
+    arc = getattr(fit_result, "arc_closure", None)
+    if arc is None:
+        return {"arc_state": None, "arc_f_peak_hz": None,
+                "arc_f_low_hz": None, "arc_phase_low_deg": None}
+    return {"arc_state": str(arc.state),
+            "arc_f_peak_hz": _f_or_none(arc.f_peak_hz),
+            "arc_f_low_hz": _f_or_none(arc.f_low_hz),
+            "arc_phase_low_deg": _f_or_none(arc.phase_low_deg)}
 
 
 @dataclass(frozen=True)
@@ -938,6 +1027,10 @@ class DataStore:
         When absent — which is every legacy-engine call — the gate columns take their
         defaults and the row means exactly what such a row has always meant.
 
+        The four ``arc_*`` columns are the one exception to that split: they come
+        from *fit_result*, never from *report*, so they populate whether or not a
+        report is passed. :func:`_arc_columns` says why.
+
         Returns the new ``fit_id``.
         """
         sigma: float | None = None
@@ -959,6 +1052,16 @@ class DataStore:
             sigma = CellConstant.from_legacy(L_cm, t_cm, w_cm).sigma(fit_result.R1)
 
         extra = _fit_report_columns(report)
+        # DELIBERATE DEVIATION from the report-only convention one line above: the
+        # arc columns are sourced from the *fit*, because the arc record is not in
+        # any real report's gate log — only the `arc_provenance` shim ever puts it
+        # there. Scanning `report` would work until P.18 passes the genuine
+        # SpectrumReport and would then silently NULL these columns. See
+        # `_arc_columns`. `gate_log_json` is untouched by this and stays byte for
+        # byte what `_fit_report_columns` produced; the record living in both the
+        # JSON and the columns is an intentional one-release duplication, so
+        # pre-T7.7 rows and new ones stay readable by the same consumer.
+        extra.update(_arc_columns(fit_result))
         # A bounded σ is not a value.  Storing it in ``sigma_S_per_cm`` would let any
         # reader that does not check ``sigma_is_bound`` treat a ceiling as a
         # measurement, so the column is cleared and the bound travels separately.
@@ -975,9 +1078,11 @@ class DataStore:
                 n_points_dropped, report_mode, R_sum_ohm, R_sum_se_ohm,
                 rho_series_bulk, sigma_is_bound, sigma_rel_unc, phase_headroom,
                 model_free_R_ohm, K_per_cm, K_route, dead_height_cm,
-                thickness_method, thickness_unc_cm)
+                thickness_method, thickness_unc_cm,
+                arc_state, arc_f_peak_hz, arc_f_low_hz, arc_phase_low_deg)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?)""",
             (
                 measurement_id,
                 run_id,
@@ -1014,6 +1119,10 @@ class DataStore:
                 extra["dead_height_cm"],
                 extra["thickness_method"],
                 extra["thickness_unc_cm"],
+                extra["arc_state"],
+                extra["arc_f_peak_hz"],
+                extra["arc_f_low_hz"],
+                extra["arc_phase_low_deg"],
             ),
         )
         self._conn.commit()
@@ -2101,7 +2210,16 @@ class DataStore:
                 resolved,
             )
             self._conn.commit()
-            logger.info("conditions_temperature_backfilled", rows=len(resolved))
+            # The per-source distribution belongs here and not in the epoch note:
+            # it is a fact about *this* file, and `SCHEMA_EPOCHS` is a per-code
+            # constant seeded INSERT OR IGNORE, so a count baked into the note
+            # would be false for every other database and would never reach the
+            # ones that actually hold the backfilled rows. The backfill targets
+            # `temperature_source IS NULL`, so this fires once per database and
+            # counts exactly the rows it wrote -- not the whole table, which is
+            # the wrong denominator.
+            logger.info("conditions_temperature_backfilled", rows=len(resolved),
+                        sources=dict(Counter(source for _, source, _ in resolved)))
 
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_conditions_temperature_C "
@@ -2578,6 +2696,22 @@ class DataStore:
 
         ``gate_log_json`` holds ``run_gates``' log verbatim — R17's "named gate and
         reason" with no translation layer between the check and the record.
+
+        **The four ``arc_*`` columns (T7.7) ride along here** rather than in a
+        migration of their own: they are four more nullable additions to the same
+        table, and a second PRAGMA pass over ``fit_results`` would buy nothing. They
+        take no ``NOT NULL DEFAULT`` — ``'unknown'`` is an *answer* the annotator can
+        give, so defaulting to it would put that answer in the mouth of every row
+        written before anything looked. NULL means never annotated, and there is
+        nothing to prove otherwise for a row written in July.
+
+        **The ``arc_state`` index is created here and cannot be created in ``_DDL``.**
+        That script runs at ``__init__`` before any migration, where a legacy
+        ``fit_results`` still lacks the column and ``CREATE INDEX`` would raise
+        ``no such column`` inside ``executescript``, failing the open of every
+        existing project — the same trap the conditions DDL documents, resolved the
+        same way. Creating it unconditionally after the ALTER loop covers both
+        paths, because this migration runs on every open.
         """
         cols = {
             row[1]
@@ -2604,6 +2738,10 @@ class DataStore:
             "dead_height_cm": "REAL NOT NULL DEFAULT 0.0",
             "thickness_method": "TEXT",
             "thickness_unc_cm": "REAL",
+            "arc_state": "TEXT",
+            "arc_f_peak_hz": "REAL",
+            "arc_f_low_hz": "REAL",
+            "arc_phase_low_deg": "REAL",
         }
         changed = False
         for name, decl in additions.items():
@@ -2614,6 +2752,12 @@ class DataStore:
                 changed = True
         if changed:
             self._conn.commit()
+
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fit_results_arc_state "
+            "ON fit_results(arc_state)"
+        )
+        self._conn.commit()
 
     def _migrate_modality(self) -> None:
         """Add the modality/payload contract to ``measurements`` (Tier 2 comp. 3).

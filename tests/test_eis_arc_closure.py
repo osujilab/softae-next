@@ -196,7 +196,8 @@ class TestTheAnnotationIsPersisted:
             fit_id = store.record_fit(measurement_id, fit, L_cm=0.2, t_cm=0.015,
                                       w_cm=0.2, report=arc_provenance(fit))
             row = dict(store._conn.execute(
-                "SELECT gate_log_json, parameters_json, success, gate_verdict, engine "
+                "SELECT gate_log_json, parameters_json, success, gate_verdict, engine, "
+                "arc_state, arc_f_peak_hz, arc_f_low_hz, arc_phase_low_deg "
                 "FROM fit_results WHERE fit_id = ?", (fit_id,)).fetchone())
         finally:
             store.close()
@@ -206,6 +207,13 @@ class TestTheAnnotationIsPersisted:
         assert record["f_peak_hz"] == pytest.approx(record["f_low_hz"])
         assert record["f_low_hz"] == pytest.approx(20.0)
         assert record["phase_low_deg"] < 0.0
+        # One fit, two representations (T7.7 columns and the shim's JSON), and they
+        # must not drift: the columns are read off the fit, the JSON off the shim,
+        # so agreement here is two independent paths reaching the same verdict.
+        assert row["arc_state"] == record["state"]
+        assert row["arc_f_peak_hz"] == pytest.approx(record["f_peak_hz"])
+        assert row["arc_f_low_hz"] == pytest.approx(record["f_low_hz"])
+        assert row["arc_phase_low_deg"] == pytest.approx(record["phase_low_deg"])
         # Everything else on the row is what it was before the shim existed.
         assert row["success"] == 1
         assert row["gate_verdict"] is None

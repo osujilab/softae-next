@@ -242,6 +242,63 @@ def test_browser_fit_persists_to_datastore(qapp, tmp_path, sample_eis, sample_fi
     assert latest["sigma_S_per_cm"] == pytest.approx(0.3 / (500.0 * 0.1 * 0.25))
 
 
+def test_browser_fit_persists_the_arc_state_column(qapp, tmp_path, sample_eis,
+                                                   sample_fit):
+    """A browser-saved row must be the same era of row as a router-written one.
+
+    The entry's fit comes from `fit_entry` -> `analyze_spectrum` ->
+    `annotate_arc_closure`, so it carries `.arc_closure`; the columns are read off
+    the fit, and `report=arc_provenance(fit)` additionally lines the gate log up
+    with what the router writes.
+    """
+    import json
+
+    from softae.analysis.eis.arc import ArcClosure
+    from softae.core.data_store import DataStore
+    from softae.gui.tabs.tab_analysis import AnalysisTab
+
+    sample_fit.arc_closure = ArcClosure("open", 20.0, 20.0, -41.5)
+
+    with DataStore(tmp_path / "ds") as store:
+        run_id = store.start_run("test", mode="manual", campaign="c", quality="explore")
+        mid = store.record_measurement(run_id, sample_eis)
+
+        tab = AnalysisTab(MagicMock(), data_store=store)
+        e = EISEntry(label="Ch01 — run", eis=sample_eis, fit=sample_fit, sigma=None,
+                     measurement_id=mid)
+        tab._on_browser_fit_saved(e, 0.3, 0.1, 0.25)
+
+        latest = store.query_fits(measurement_id=mid)[-1]
+
+    assert latest["arc_state"] == "open"
+    assert latest["arc_f_low_hz"] == pytest.approx(20.0)
+    assert latest["arc_phase_low_deg"] == pytest.approx(-41.5)
+    # One era of rows, not two: the shim's JSON matches the router's.
+    assert json.loads(latest["gate_log_json"])[0]["gate"] == "arc_closure"
+
+
+def test_browser_fit_persists_a_fit_without_an_annotation_without_raising(
+        qapp, tmp_path, sample_eis, sample_fit):
+    # `arc_provenance` returns None for an unannotated object, so the call site is
+    # safe on whatever the browser hands over — a hand-built FitResult included.
+    from softae.core.data_store import DataStore
+    from softae.gui.tabs.tab_analysis import AnalysisTab
+
+    with DataStore(tmp_path / "ds") as store:
+        run_id = store.start_run("test", mode="manual", campaign="c", quality="explore")
+        mid = store.record_measurement(run_id, sample_eis)
+
+        tab = AnalysisTab(MagicMock(), data_store=store)
+        e = EISEntry(label="Ch01 — run", eis=sample_eis, fit=sample_fit, sigma=None,
+                     measurement_id=mid)
+        tab._on_browser_fit_saved(e, 0.3, 0.1, 0.25)
+
+        latest = store.query_fits(measurement_id=mid)[-1]
+
+    assert latest["arc_state"] is None
+    assert latest["gate_log_json"] == "[]"
+
+
 def test_browser_fit_saved_noop_without_store(qapp):
     from softae.gui.tabs.tab_analysis import AnalysisTab
 

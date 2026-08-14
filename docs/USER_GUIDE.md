@@ -1822,10 +1822,12 @@ campaign:
 A **shadow campaign** runs the gated physics engine with every data-quality gate *observing
 rather than enforcing*: nothing is rejected, but everything that would have been is recorded.
 It is how the gated engine and the quality gates earn their cutover — on real spectra, at no
-risk to a run. `softae-shadow` sits on either side of that run.
+risk to a run. `softae-shadow` sits on either side of that run — and, with `rehearse`, well
+before it.
 
 ```bash
 softae-shadow status                                                 # is the rig armed?
+softae-shadow rehearse --dry-run                                     # what will a run cost?
 softae-shadow review shadow_run.log \
     --project ./runs/aug --run-id run_20260810T1400Z                 # what did it see?
 softae-shadow review shadow_run.log --project ./runs/aug \
@@ -1848,12 +1850,85 @@ carries the same verdict for scripting:
 | **NOT ARMED** | the shipped legacy engine | 2 |
 
 > **`status` also sizes the run.** When the config is armed, the screen ends with a wall-time
-> advisory, because observe-only is the **most expensive** analysis configuration the rig has
-> and the one that reads as free. An *enforcing* gate rejects a blocking spectrum before the
-> fitter runs; an *observing* gate does not, so the optimiser grinds a parallel-R model onto data
-> with no arc and takes the long way to failing. A synthetic fully-blocking spectrum measured
-> **~78 s** against **~0.07 s** on the legacy engine, and real near-blocking spectra vary.
-> **Size a shadow run by the clock, not by the well count.**
+> advisory, because observe-only is the **slowest** analysis setting the rig has and the one that
+> reads as the cheapest. A spectrum the gates would have rejected pre-fit still reaches the
+> fitter, and **a fit with no arc to find takes the long way to failing** — the cost is set by
+> **arc closure**, not by the gate verdict and not by the engine: an open arc has no in-band
+> feature for the fitter to converge onto. The screen quotes measurements, not estimates. Over
+> **192 real spectra (2026-08-14)**: open-arc median **~38 s**, max **~58 s**, against closed-arc
+> **~0.16 s**. **Size the run by the clock, not by the well count** — and run `rehearse` first,
+> because the open-arc *mix* is what sets the total and it is a property of the material.
+
+### `rehearse` — a dress rehearsal on spectra you already have
+
+A bench shadow run is single-shot: it spends half a board, and the two things you most want to
+know beforehand — *what will this cost in wall time?* and *what will the review actually say?* —
+are only answerable afterwards. **`rehearse` answers both in advance**, by replaying stored
+spectra through the very same gated observe-only engine.
+
+```bash
+softae-shadow rehearse --dry-run                            # the plan and the projected duration
+softae-shadow rehearse                                      # → logs/rehearsal_<UTC>.log
+softae-shadow review logs/rehearsal_<UTC>.log --project ~/softae_data
+```
+
+It is a **replay, not a simulation**: the same `analyze_spectrum`, the same gates, the same
+structlog stream, so the log it writes is one `softae-shadow review` reads with no special case
+at all. Selection is **stratified and deterministic** — a cell is `(leg, setpoint, channel)`, and
+the default takes 2 rounds from each of them, spaced across the round axis. A convenience slice
+would sample one block and report the fast mode as the whole distribution; stratifying makes the
+open-arc mix a *measured* quantity.
+
+**Three read-only guarantees, structural rather than promised:**
+
+| Guarantee | How |
+|---|---|
+| No database write | The corpus is opened `sqlite3.connect("file:…?mode=ro", uri=True)`. `DataStore` is never constructed, so its `mkdir`/DDL/migrate/commit path never runs, and `record_fit` is never called |
+| No config edit | The gated engine is chosen by a `settings=` **argument**. `[eis] engine` is never read and never written — `softae-shadow status` says the same thing after a rehearsal as before |
+| No rig | Analysis modules only. No instrument is opened, no pose read, no stage moved |
+
+| Flag | Default | Behaviour |
+|---|---|---|
+| `--project DIR` | `[data] project_dir` from the config loader | Where the corpus lives |
+| `--run-id ID` | most recent run with spectra | Which run to replay; the plan line names it, so a wrong default shows in the first line rather than in the totals |
+| `--rounds N` | `2` | Rounds per cell |
+| `--all` | — | Every spectrum in the run |
+| `--limit N` | *(none)* | Hard cap applied **after** stratification, so a cut is a prefix of a balanced plan; the summary reports the cells it dropped |
+| `--seed S` | *(deterministic)* | Randomise the round picks for a sensitivity check. Without it two rehearsals of one corpus compare line by line |
+| `--out PATH` | `logs/rehearsal_<UTC>.log` | The log. Refuses to overwrite, like `--emit-toml` |
+| `--tee` | off | Mirror to stdout for a watched run |
+| `--model NAME` | the fit row's `model_name` | Override |
+| `--enforced` | off | Replay with the gates **enforcing**, to measure what observing costs |
+| `--dry-run` | off | Print the plan and the projected duration; analyse nothing |
+
+One consequence of `--enforced` worth carrying into campaign design: under enforcing gates a
+rejected spectrum never reaches the fit that would annotate its arc, so an enforcing campaign
+**cannot report arc closure for the spectra it rejected** — their `arc_state` stays NULL — which
+matters to any analysis that selects on closed arcs.
+
+**Two outputs.** The **log** carries the engine's own events (`eis_spectrum_metrics`,
+`eis_gate_would_reject`, `eis_gate_points_dropped`) interleaved with the rehearsal's own
+(`rehearsal_started`, `rehearsal_spectrum_done`, `rehearsal_summary`), so an hours-long run is
+observable while it runs. The tool **owns the file handle** rather than relying on shell
+redirection — opened `utf-8`/`errors="replace"`, because a gate detail containing `tan δ` will
+otherwise kill the run on a cp1252 console, on its first interesting spectrum. Beside it sits a
+**timing CSV** (`<out>.timing.csv`), one row per analysed spectrum with `seconds`, `verdict`,
+`arc_state`, `sigma_mode` and provenance. It is written **incrementally**, so a rehearsal
+interrupted at spectrum 140 still leaves 139 rows of evidence.
+
+> **When to run it.** Before any bench shadow run, and again after a recalibration — a new
+> calibration set moves the envelope every gate is measured against. The 2026-08-14 rehearsal
+> measured **192 spectra in 36 m 42 s**, median **0.46 s** but P90 **39.45 s**: the cost is
+> **bimodal**, closed arcs at 0.16 s against open arcs at 38 s, and the *mix* sets the total. In
+> analysis alone that brackets a 16-well bench run at **2.5 s → 4 min → 10 min** and a 32-well
+> run at **5 s → 8 min → 20 min** (all-closed floor → measured mix → all-open ceiling). Read the
+> brackets: the mix is a property of the material, and the bench campaign casts something else.
+> Full figures and caveats in `docs/SHADOW_CAMPAIGN.md` §5.
+
+> **A rehearsal's section 7 is evidence about the recommender, not thresholds for the rig.**
+> Replaying an equilibration corpus tells you whether the rules behave on a real distribution —
+> the first such run found two that did not. It does not tell you where *this* campaign's gates
+> belong. Nothing from a rehearsal is pasted into `softae_config.toml`.
 
 **`review`** summarizes a run's would-reject verdicts: how many spectra would have been
 rejected, by which gate, and on which channel. `--project` adds the DataStore half —
@@ -1896,9 +1971,13 @@ rows do record honestly**, and it appears whenever `--project` is given:
   marking them (**railed (historical)**) — a σ of roughly seawater from a dry film, wearing a
   success flag. The bound is read from `CIRCUIT_MODELS`, never restated; a model declaring none
   reports `unknown` rather than `0`.
-- **Arc-closure state counts.** The router passes the arc provenance on every routed fit, so
-  each row carries exactly one real `arc_closure` record. Rows predating that shim are counted
-  as **no record** rather than folded into an outcome they never reported.
+- **Arc-closure state counts.** Since T7.7 the verdict is a real column — `record_fit` writes
+  `arc_state` with `arc_f_peak_hz` / `arc_f_low_hz` / `arc_phase_low_deg` beside it, from the
+  fit itself. They are NULLable with **no default**, because NULL ("never annotated") and
+  `'unknown'` ("looked, and could not tell") are different facts. Older rows carried the same
+  verdict as a `gate_log_json` entry from the router's arc-provenance shim, so section 5b reads
+  **column first, JSON fallback**, counting each row exactly once. Rows predating the shim are
+  counted as **no record** rather than folded into an outcome they never reported.
 
 `sigma_is_bound` keeps section 5's posture and is labelled a **stamped default** — 0 on every
 row, not an observation — until P.18 passes the real report to `record_fit`.
@@ -1992,7 +2071,7 @@ Lowering `--min-evidence` instead is possible and visible in the output, but it 
 the sample does not support.
 
 The full bench procedure — which keys to flip, in what order, and how to revert — is
-`docs/SHADOW_CAMPAIGN.md`. `status` and `review` remain the whole invocation surface.
+`docs/SHADOW_CAMPAIGN.md`. `status`, `rehearse` and `review` are the whole invocation surface.
 
 ---
 

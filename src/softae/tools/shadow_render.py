@@ -178,10 +178,13 @@ def _render_db_evidence(railed: dict[str, Any] | None,
         states = dict(arc.get("states") or {})
         out.append(f"   arc_closure states: {states or '(none recorded)'}"
                    f"   no record: {arc.get('no_record', 0)}")
-        out.append("   Honest evidence: the router passes arc_provenance on every "
-                   "routed fit, so each row")
-        out.append("   carries exactly one real record. Rows counted as 'no record' "
-                   "predate that shim.")
+        out.append("   Honest evidence: the verdict is a real column "
+                   "(fit_results.arc_state), written from the fit")
+        out.append("   itself, so nothing stamps a default into it. Older rows are "
+                   "read from the arc_provenance")
+        out.append("   record in their gate log instead; each row counts once, "
+                   "whichever way it was read.")
+        out.append("   Rows counted as 'no record' predate both.")
         out.append(f"   sigma_is_bound: {arc.get('sigma_is_bound', '')}")
     return "\n".join(out)
 
@@ -363,17 +366,23 @@ def render_status(eis: Any, quality_enabled: bool, *,
         # Observing-only is the *most expensive* configuration the rig has, and it is
         # the one that reads as free.  Enforcing gates reject a blocking spectrum before
         # the fitter runs; observing gates do not, so the optimiser grinds a parallel-R
-        # model onto data with no arc and takes the long way to failing.  Budget the
-        # wall-time, not the numbers: a synthetic fully-blocking spectrum measured 78 s
-        # against 0.07 s on the legacy engine, and real near-blocking spectra vary.
+        # model onto data with no arc and takes the long way to failing.
+        #
+        # These are measurements, not estimates.  The T7.8 rehearsal replayed 192 real
+        # spectra (2026-08-14, run 20260811T023757Z_equilibration_characterization) and
+        # the distribution is bimodal on arc closure: an open arc has no in-band feature
+        # for the fitter to converge onto, and that — not the gate verdict — is what
+        # costs the time.  They replace the synthetic ~78 s / ~0.07 s pair this advisory
+        # used to quote.
         out.append("BUDGET WALL-TIME. Observing mode is the SLOWEST analysis setting, "
                    "not the cheapest:")
         out.append("a spectrum the gates would have rejected pre-fit still reaches the "
                    "fitter, and a fit")
-        out.append("that has no arc to find takes the long way to failing (~78 s on a "
-                   "synthetic blocking")
-        out.append("spectrum vs ~0.07 s legacy). Size the run by the clock, not by the "
-                   "well count.")
+        out.append("that has no arc to find takes the long way to failing. Measured over "
+                   "192 real")
+        out.append("spectra (2026-08-14): open-arc median ~38 s (max ~58 s) against "
+                   "closed-arc ~0.16 s.")
+        out.append("Size the run by the clock, not by the well count.")
         return "\n".join(out), "armed"
 
     if eis.engine == "gated":

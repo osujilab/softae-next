@@ -463,7 +463,36 @@ def build_parser() -> argparse.ArgumentParser:
                      help=f"spectra required before a key may be recommended "
                           f"(default {DEFAULT_MIN_EVIDENCE})")
     rev.set_defaults(func=_cmd_review)
+
+    reh = sub.add_parser(
+        "rehearse",
+        help="replay the gated engine over spectra already on disk (T7.8)",
+        description="Answer what observe-only gating costs per spectrum, and what the "
+                    "recommender says about a real population, before the single-shot "
+                    "bench run spends the board. Reads a run's spectra through a "
+                    "read-only sqlite connection; writes nothing but its own log.",
+    )
+    from softae.tools.shadow_rehearse import add_rehearse_arguments
+
+    add_rehearse_arguments(reh)
+    reh.set_defaults(func=_cmd_rehearse)
     return p
+
+
+def _cmd_rehearse(args) -> int:
+    """Dispatch to the replay tool.
+
+    This import is **not** what keeps ``softae-shadow status`` fast, and an earlier
+    version of this comment claimed it was. :func:`build_parser` imports
+    ``add_rehearse_arguments`` unconditionally, so :mod:`softae.tools.shadow_rehearse`
+    is loaded on every invocation whatever the subcommand. What actually costs nothing
+    is that module's *import surface*: stdlib plus structlog, with numpy, ``impedance``
+    and the fitter imported inside ``run_rehearsal`` at the moment a spectrum is
+    analysed. The wrapper stays because it reads as the dispatch it is.
+    """
+    from softae.tools.shadow_rehearse import cmd_rehearse
+
+    return cmd_rehearse(args)
 
 
 def main(argv: "list[str] | None" = None) -> int:

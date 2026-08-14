@@ -582,15 +582,89 @@ class TestRailedDetectors:
         assert "error" in railed_summary(str(tmp_path / "nope"), None)
 
 
+@pytest.fixture()
+def mixed_era_project(tmp_path):
+    """One row from each of the three eras the counter has to keep apart.
+
+    Column era (T7.7, verdict in `fit_results.arc_state`), shim era (verdict only
+    in `gate_log_json`), and pre-shim (nothing recorded). A run in the wild will
+    hold all three at once, so the counter is only trustworthy if it can read a
+    mixture without double-counting or dropping any of it.
+    """
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from softae.analysis.circuit_fitting import FitResult
+    from softae.analysis.eis.arc import ArcClosure
+    from softae.analysis.eis_data import EISResult
+    from softae.core.data_store import DataStore
+
+    def fit():
+        return FitResult(model_name="simpleSalt", parameters=[], R0=50.0, R1=2000.0,
+                         R0_guess=50.0, R1_guess=2000.0, z_indices=[], success=True)
+
+    column_era = fit()
+    column_era.arc_closure = ArcClosure("closed", 1000.0, 20.0, -41.5)
+
+    rows = [
+        # T7.7: the column is written from the fit, and the shim also fills the JSON
+        # — the duplication that the one-increment rule has to survive.
+        (1, column_era, SimpleNamespace(gate_log=[{**ARC_RECORD, "state": "closed",
+                                                   "passed": True}])),
+        (2, fit(), SimpleNamespace(gate_log=[ARC_RECORD])),   # shim era: JSON only
+        (3, fit(), None),                                      # pre-shim: nothing
+    ]
+
+    store = DataStore(tmp_path / "proj")
+    run_id = store.start_run("mixed_era", mode="campaign")
+    f = np.logspace(0, 5, 12)
+    for channel, fit_result, report in rows:
+        eis = EISResult.from_arrays(channel=channel, f=f, z_real=np.full(12, 2000.0),
+                                    z_imag_neg=np.full(12, 50.0))
+        mid = store.record_measurement(run_id, eis)
+        store.record_fit(mid, fit_result, L_cm=0.2, t_cm=0.015, w_cm=0.2,
+                         report=report)
+    store.close()
+    return tmp_path / "proj", run_id
+
+
 class TestArcSummary:
-    def test_arc_closure_states_are_counted_from_the_gate_log_column(
+    def test_arc_states_are_counted_from_the_column_when_it_is_populated(
+            self, mixed_era_project):
+        # `fit_results.arc_state` is the first thing asked since T7.7, and it comes
+        # free with `query_fits`' SELECT * — no `json.loads` per row. This fixture's
+        # column-era row carries the verdict in BOTH places, so a count of 1 is also
+        # what says the JSON copy was not read a second time; the whole-run version
+        # of that invariant is `test_a_mixed_era_project_counts_every_row_exactly_once`.
+        project, run_id = mixed_era_project
+        assert arc_summary(str(project), run_id)["states"]["closed"] == 1
+
+    def test_arc_states_fall_back_to_the_gate_log_for_pre_t7_7_rows(
             self, railed_project):
+        # The `railed_project` fixture builds a plain FitResult with no
+        # `.arc_closure` and hands `record_fit` a hand-built gate log, so its rows
+        # ARE the pre-T7.7 era: NULL column, populated JSON. These three counts are
+        # unchanged from before T7.7, which is the point.
         project, run_id = railed_project
         summary = arc_summary(str(project), run_id)
         assert summary["states"] == {"open": 2, "closed": 1}
 
-    def test_a_row_with_an_empty_gate_log_is_counted_as_no_record_not_as_open(
+    def test_a_mixed_era_project_counts_every_row_exactly_once(
+            self, mixed_era_project):
+        # For one release the verdict lives in both places on a T7.7 row. Reading
+        # both would double it and break `sum(states) + no_record == rows`, which is
+        # the property that makes these counts a row count rather than a tally of
+        # sightings.
+        project, run_id = mixed_era_project
+        summary = arc_summary(str(project), run_id)
+        assert summary["states"] == {"closed": 1, "open": 1}
+        assert summary["no_record"] == 1
+        assert sum(summary["states"].values()) + summary["no_record"] == 3
+
+    def test_a_row_with_neither_a_column_nor_a_gate_log_is_counted_as_no_record(
             self, railed_project):
+        # Never folded into an outcome it never reported.
         project, run_id = railed_project
         assert arc_summary(str(project), run_id)["no_record"] == 1
 
@@ -629,7 +703,13 @@ class TestStatusCostAdvisory:
         assert code == 0
         assert "ARMED FOR A SHADOW RUN" in out
         assert "SLOWEST analysis setting" in out
-        assert "78 s" in out and "0.07 s" in out
+        # The invariant is that the advisory quotes MEASURED medians and keeps the
+        # clock line — not any particular constant. T7.8 replaced the synthetic
+        # ~78 s / ~0.07 s pair with the 192-spectrum distribution; a later rehearsal
+        # may move these numbers again, and should update this assertion with them.
+        assert "38 s" in out and "0.16 s" in out
+        assert "192 real" in out
+        assert "clock, not by the well count" in out
 
 
 class TestModuleDocstringMatchesReality:

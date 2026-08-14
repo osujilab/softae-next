@@ -730,6 +730,56 @@ class TestConditionsResolvedTemperatureMigration:
         assert row[0] == "schema"
         assert "temperature_source" in row[1]
 
+    def test_the_epoch_four_note_names_the_query_for_the_per_database_distribution(
+            self, tmp_path: Path) -> None:
+        """A count of rows per source is a fact about one FILE, not about the epoch.
+
+        The literal ask was to bake the distribution into the note. It cannot be:
+        ``SCHEMA_EPOCHS`` is a per-code constant seeded ``INSERT OR IGNORE``, so an
+        amended note reaches only databases that have never been opened — never the
+        ones that actually hold the backfilled rows — and one database's numbers in
+        source would be false for every other. So the note names the query instead,
+        and the migration logs the counts (below).
+        """
+        with DataStore(tmp_path / "epoch4_query") as store:
+            note, = store._conn.execute(
+                "SELECT note FROM schema_version WHERE version = 4").fetchone()
+        assert "GROUP BY temperature_source" in note
+        # The pre-existing pin survives the amendment, twice over.
+        assert "temperature_source" in note
+
+    def test_the_backfill_log_line_carries_a_count_per_temperature_source(
+            self, tmp_path: Path) -> None:
+        # Per-database by construction, and it lands in the run log beside the
+        # migration that produced it. `temperature_source IS NULL` is the target,
+        # so it fires once per database and counts exactly the rows it wrote.
+        import structlog
+
+        project = tmp_path / "backfill_log"
+        _build_legacy_conditions_db(
+            project, _LEGACY_CONDITIONS_DDL_PRE_STAGE_PV, self._OLDEST_ROWS)
+
+        with structlog.testing.capture_logs() as logs:
+            DataStore(project).close()
+
+        events = [e for e in logs
+                  if e.get("event") == "conditions_temperature_backfilled"]
+        assert len(events) == 1
+        assert events[0]["rows"] == 3
+        assert events[0]["sources"] == {"stage_sp": 1, "chamber_air": 1,
+                                        "unavailable": 1}
+
+    def test_the_conditions_ddl_states_that_the_stored_pair_is_a_record_not_a_view(
+            self) -> None:
+        # The columns' epistemic status, pinned so it cannot be deleted silently:
+        # editing TEMPERATURE_SOURCES changes what future writes conclude and moves
+        # no stored row, which is exactly what a reader of the column needs to know
+        # and what the DDL did not say before.
+        from softae.core.data_store import _DDL
+
+        assert "RECORD, NOT A VIEW" in _DDL
+        assert "resolve_temperature_C" in _DDL
+
 
 # ---------------------------------------------------------------------------
 # Temperature-range query via conditions join
@@ -1327,3 +1377,302 @@ class TestMeasurementPayloadColumns:
         # retiring the .txt files must not become a payload migration.
         assert store.payload_dir(run_id, "image") != store.eis_dir(run_id)
         assert store.eis_dir(run_id) not in store.payload_dir(run_id, "eis").parents
+
+
+# ---------------------------------------------------------------------------
+# Arc-closure columns on `fit_results` (T7.7)
+#
+# The legacy fixture below spells the OLDEST reachable `fit_results` — before the
+# E0/E1 gate columns and long before the arc ones — because that is the shape a
+# migration actually meets on disk, and because it is the only shape that can prove
+# the index trap of §3.2 is avoided.
+# ---------------------------------------------------------------------------
+
+
+#: `fit_results` as it stood before any gate or arc column existed.
+_LEGACY_FIT_RESULTS_DDL = """\
+CREATE TABLE fit_results (
+    fit_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    measurement_id      INTEGER NOT NULL,
+    run_id              TEXT    NOT NULL,
+    model_name          TEXT    NOT NULL,
+    R0                  REAL,
+    R1                  REAL,
+    sigma_S_per_cm      REAL,
+    electrode_L_cm      REAL,
+    electrode_t_cm      REAL,
+    electrode_w_cm      REAL,
+    success             INTEGER NOT NULL DEFAULT 1,
+    error_msg           TEXT    NOT NULL DEFAULT '',
+    parameters_json     TEXT    NOT NULL DEFAULT '{}',
+    fitted_at           TEXT    NOT NULL
+)"""
+
+_LEGACY_FIT_ROW = (
+    "INSERT INTO fit_results (measurement_id, run_id, model_name, R0, R1, "
+    "fitted_at) VALUES (1, 'old_run', 'simpleSalt', 50.0, 1000.0, "
+    "'2026-07-01T00:00:00Z')"
+)
+
+
+def _build_legacy_fit_results_db(project: Path) -> None:
+    """Write a pre-T7.7 database carrying one fit row, and close it."""
+    import sqlite3
+
+    (project / "db").mkdir(parents=True)
+    conn = sqlite3.connect(str(project / "db" / "softae.db"))
+    conn.execute(_LEGACY_FIT_RESULTS_DDL)
+    conn.execute(_LEGACY_FIT_ROW)
+    conn.commit()
+    conn.close()
+
+
+def _fit_results_columns(store: DataStore) -> set[str]:
+    return {r[1] for r in store._conn.execute(
+        "PRAGMA table_info(fit_results)").fetchall()}
+
+
+def _fit_results_declarations(store: DataStore) -> dict[str, tuple]:
+    """``{name: (type, notnull, default)}`` — the DDL and the ALTERs, compared."""
+    return {r[1]: (r[2].upper(), r[3], r[4]) for r in store._conn.execute(
+        "PRAGMA table_info(fit_results)").fetchall()}
+
+
+def _fit_results_indexes(store: DataStore) -> set[str]:
+    return {r[0] for r in store._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' "
+        "AND tbl_name = 'fit_results'").fetchall()}
+
+
+ARC_COLUMNS = {"arc_state", "arc_f_peak_hz", "arc_f_low_hz", "arc_phase_low_deg"}
+
+
+def _annotated(state: str = "open", f_peak: float = 20.0, f_low: float = 20.0,
+               phase: float = -41.5):
+    """A fit carrying an `ArcClosure`, as `annotate_arc_closure` leaves one."""
+    from softae.analysis.eis.arc import ArcClosure
+
+    fit = _FakeFitResult()
+    fit.arc_closure = ArcClosure(state, f_peak, f_low, phase)
+    return fit
+
+
+class TestArcColumns:
+    """Four columns instead of a JSON blob, so the verdict is queryable by SQL.
+
+    The annotation reached the database only inside ``gate_log_json``, via the
+    ``arc_provenance`` shim, which meant every consumer had to ``json.loads`` a TEXT
+    column to ask what the arc did. These columns make the shim redundant.
+    """
+
+    def _row(self, store: DataStore, fid: int) -> dict:
+        return dict(store._conn.execute(
+            "SELECT arc_state, arc_f_peak_hz, arc_f_low_hz, arc_phase_low_deg "
+            "FROM fit_results WHERE fit_id = ?", (fid,)).fetchone())
+
+    # ── Schema ──────────────────────────────────────────────────────────────
+
+    def test_a_fresh_database_has_the_arc_columns_from_the_ddl_not_only_from_the_migration(
+            self, store: DataStore) -> None:
+        # `_DDL` and the migration are two descriptions of one schema; covering only
+        # the migration lets the DDL drift until a fresh install and an upgraded one
+        # disagree about what a fit row contains.
+        assert ARC_COLUMNS <= _fit_results_columns(store)
+
+    def test_a_legacy_database_gains_the_arc_columns_from_the_migration(
+            self, tmp_path: Path) -> None:
+        project = tmp_path / "legacy_arc"
+        _build_legacy_fit_results_db(project)
+
+        with DataStore(project) as store:
+            assert ARC_COLUMNS <= _fit_results_columns(store)
+
+    def test_a_fresh_and_a_migrated_database_agree_on_the_fit_results_column_set(
+            self, tmp_path: Path, store: DataStore) -> None:
+        # Sets, not sequences: `query_fits` does `SELECT *` into a dict and
+        # `record_fit` names every column, so nothing depends on ordering — but
+        # everything depends on the two paths producing the same columns, with the
+        # same declarations. The eighteen E0/E1 columns are in this comparison too:
+        # they were migration-only until T7.7 declared them in `_DDL` as well.
+        project = tmp_path / "legacy_parity"
+        _build_legacy_fit_results_db(project)
+
+        with DataStore(project) as migrated:
+            assert _fit_results_columns(migrated) == _fit_results_columns(store)
+            assert _fit_results_declarations(migrated) == _fit_results_declarations(
+                store)
+
+    def test_reopening_a_store_twice_adds_no_column_and_raises_nothing(
+            self, tmp_path: Path) -> None:
+        # The DDL/migration pair is idempotent by its PRAGMA guard; a second open
+        # must be a no-op rather than a duplicate-column error.
+        project = tmp_path / "reopen"
+        _build_legacy_fit_results_db(project)
+
+        with DataStore(project) as first:
+            once = _fit_results_columns(first)
+        with DataStore(project) as second:
+            assert _fit_results_columns(second) == once
+
+    def test_the_arc_state_index_exists_on_both_a_fresh_and_a_migrated_database(
+            self, tmp_path: Path, store: DataStore) -> None:
+        project = tmp_path / "legacy_index_arc"
+        _build_legacy_fit_results_db(project)
+
+        with DataStore(project) as migrated:
+            assert "idx_fit_results_arc_state" in _fit_results_indexes(migrated)
+        # The migration runs on every open, so a fresh database gets it too even
+        # though `_DDL` deliberately does not declare it.
+        assert "idx_fit_results_arc_state" in _fit_results_indexes(store)
+
+    def test_opening_a_pre_t7_7_database_does_not_fail_on_the_index(
+            self, tmp_path: Path) -> None:
+        """The trap: `_DDL` runs BEFORE the migrations, so it cannot index this.
+
+        On a legacy database `CREATE TABLE IF NOT EXISTS fit_results` is a no-op and
+        the table still lacks `arc_state` at that moment, so a `CREATE INDEX ... ON
+        fit_results(arc_state)` in the DDL's index block raises `no such column`
+        inside `executescript` and fails the open of every existing project. Opening
+        the oldest shape without raising is the whole proof, so the assertion is
+        that we get here at all — plus the DDL text itself, which is what a future
+        hand would edit.
+        """
+        from softae.core.data_store import _DDL
+
+        project = tmp_path / "pre_t77"
+        _build_legacy_fit_results_db(project)
+
+        with DataStore(project) as store:               # must not raise
+            assert "idx_fit_results_arc_state" in _fit_results_indexes(store)
+        assert "idx_fit_results_arc_state" not in _DDL
+
+    def test_a_row_written_before_the_columns_existed_reads_null_not_unknown(
+            self, tmp_path: Path) -> None:
+        # NULL means *never annotated*. 'unknown' is an answer the annotator gives
+        # when it looked and could not tell, and stamping it on a July row would
+        # manufacture an inspection that never happened.
+        project = tmp_path / "legacy_null"
+        _build_legacy_fit_results_db(project)
+
+        with DataStore(project) as store:
+            row = self._row(store, 1)
+        assert row == {"arc_state": None, "arc_f_peak_hz": None,
+                       "arc_f_low_hz": None, "arc_phase_low_deg": None}
+
+    # ── `record_fit` population ─────────────────────────────────────────────
+
+    def test_record_fit_stores_the_arc_state_from_the_fit_when_no_report_is_passed(
+            self, store_with_run) -> None:
+        # The columns come from the FIT, so the legacy `report=None` call — which is
+        # most of them — populates them just the same.
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        fid = store.record_fit(mid, _annotated())
+        row = self._row(store, fid)
+        assert row["arc_state"] == "open"
+        assert row["arc_f_peak_hz"] == pytest.approx(20.0)
+        assert row["arc_phase_low_deg"] == pytest.approx(-41.5)
+
+    def test_record_fit_stores_the_arc_columns_when_the_provenance_shim_is_passed(
+            self, store_with_run) -> None:
+        from softae.analysis.eis.arc import arc_provenance
+
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        fit = _annotated("closed", f_peak=1000.0, f_low=20.0)
+        fid = store.record_fit(mid, fit, report=arc_provenance(fit))
+        assert self._row(store, fid)["arc_state"] == "closed"
+
+    def test_record_fit_stores_the_arc_columns_when_a_report_shaped_object_is_passed(
+            self, store_with_run) -> None:
+        """§3.3 made executable: a real report has NO arc entry in its gate log.
+
+        `annotate_arc_closure` writes to the fit; only the shim ever copies the
+        record into a `gate_log`. So an implementation that scanned `report` would
+        work exactly until P.18 passes the genuine SpectrumReport and would then
+        silently NULL these columns. This is that day, in advance.
+        """
+        from types import SimpleNamespace
+
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        report = SimpleNamespace(
+            sigma=SimpleNamespace(mode="split", is_bound=False),
+            cell=SimpleNamespace(dead_height_cm=0.0),
+            quality=SimpleNamespace(verdict="ok"),
+            gate_log=[{"gate": "kk_residual", "severity": "warn", "passed": True,
+                       "n_dropped": 0, "detail": "no arc entry here"}],
+        )
+        fid = store.record_fit(mid, _annotated(), report=report)
+
+        row = self._row(store, fid)
+        assert row["arc_state"] == "open"
+        # ...and the gate log is still the report's own, untranslated.
+        import json
+        log, = store._conn.execute(
+            "SELECT gate_log_json FROM fit_results WHERE fit_id = ?",
+            (fid,)).fetchone()
+        assert [e["gate"] for e in json.loads(log)] == ["kk_residual"]
+
+    def test_record_fit_leaves_the_arc_columns_null_for_a_fit_without_an_annotation(
+            self, store_with_run) -> None:
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        fid = store.record_fit(mid, _FakeFitResult())
+        assert self._row(store, fid) == {
+            "arc_state": None, "arc_f_peak_hz": None,
+            "arc_f_low_hz": None, "arc_phase_low_deg": None}
+
+    def test_an_unknown_arc_state_is_stored_as_the_word_unknown_not_as_null(
+            self, store_with_run) -> None:
+        # UNKNOWN is an answer with a reason attached, and it is a different fact
+        # from a row nobody annotated. The two must not collapse into one NULL.
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        fid = store.record_fit(mid, _annotated(
+            "unknown", f_peak=float("nan"), f_low=float("nan"),
+            phase=float("nan")))
+        row = self._row(store, fid)
+        assert row["arc_state"] == "unknown"
+        # Its numbers are absent, though — there was no peak to report.
+        assert row["arc_f_peak_hz"] is None and row["arc_f_low_hz"] is None
+
+    def test_a_nan_peak_frequency_is_stored_as_null_not_as_nan(
+            self, store_with_run) -> None:
+        # `_f_or_none` is the file's NaN -> NULL boundary and the columns go through
+        # it, so a phase-less spectrum lands as NULL rather than as a number that
+        # reads as present to anything checking only for None.
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        fid = store.record_fit(mid, _annotated(phase=float("nan")))
+        row = self._row(store, fid)
+        assert row["arc_state"] == "open"
+        assert row["arc_phase_low_deg"] is None
+
+    def test_the_gate_log_json_column_is_byte_identical_to_the_pre_t7_7_value(
+            self, store_with_run) -> None:
+        """The duplication is intentional; the JSON must not drift because of it.
+
+        `shadow_db` still reads that JSON for pre-T7.7 rows and
+        `TestTheAnnotationIsPersisted` pins its content, so adding the columns must
+        leave `_fit_report_columns`' output untouched — same shim in, same string
+        out, byte for byte.
+        """
+        from softae.analysis.eis.arc import arc_provenance
+        from softae.core.data_store import _fit_report_columns
+
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        fit = _annotated()
+        shim = arc_provenance(fit)
+        fid = store.record_fit(mid, fit, report=shim)
+
+        stored, = store._conn.execute(
+            "SELECT gate_log_json FROM fit_results WHERE fit_id = ?",
+            (fid,)).fetchone()
+        assert stored == _fit_report_columns(shim)["gate_log_json"]
+        # And a `report=None` row still carries the literal it always carried.
+        bare = store.record_fit(mid, fit)
+        assert store._conn.execute(
+            "SELECT gate_log_json FROM fit_results WHERE fit_id = ?",
+            (bare,)).fetchone()[0] == "[]"

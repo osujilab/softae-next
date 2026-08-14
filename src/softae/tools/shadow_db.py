@@ -130,28 +130,45 @@ def _finalise(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def arc_summary(project: str, run_id: str | None) -> dict[str, Any]:
-    """Counts of ``arc_closure`` states across the run's stored gate logs.
+    """Counts of ``arc_closure`` states across the run's fit rows.
 
-    The auto-route path in ``analysis/eis/router.py`` passes ``arc.arc_provenance``
-    unconditionally as ``report=``, so every row written by the current code carries
-    exactly one real arc record — honest evidence, unlike the ``engine`` column beside
-    it, because that shim exposes ``gate_log`` and nothing else and so cannot smuggle a
-    stamped default in with it. Rows whose ``gate_log_json`` is ``[]`` predate the shim
-    and are counted separately as ``no record``, never folded into an outcome they
-    never reported.
+    Honest evidence, unlike the ``engine`` column beside it: nothing stamps a
+    default into these, so a count here is a count of spectra somebody actually
+    looked at.
+
+    **Three eras of row, read in the order that keeps them distinguishable.**
+    Since T7.7 the verdict is a real column, ``fit_results.arc_state``, written
+    from the fit itself by ``record_fit`` — that is the first thing asked, and it
+    arrives free because ``query_fits`` is a ``SELECT *``. Before T7.7 the same
+    verdict travelled as a JSON entry in ``gate_log_json``, put there by the
+    ``arc.arc_provenance`` shim the router passes as ``report=``; those rows have a
+    NULL column and are read from the log instead. Before the shim, nothing was
+    recorded at all, and such a row is counted as ``no record`` — never folded
+    into an outcome it never reported.
+
+    **At most one increment per row**, which is what makes the totals a row count.
+    A T7.7 row carries the record twice over for one release (column *and* JSON,
+    deliberately, so both readers work); counting it from the column and then again
+    from its log would double it and quietly break ``sum(states) + no_record ==
+    len(rows)``.
     """
     def _read(store: Any, run: str) -> dict[str, Any]:
         states: Counter = Counter()
         no_record = 0
         for fit in store.query_fits(run_id=run):
-            entries = _gate_log(fit.get("gate_log_json"))
-            found = [e for e in entries
-                     if isinstance(e, dict) and e.get("gate") == "arc_closure"]
-            if not found:
+            state = fit.get("arc_state")
+            if not state:
+                # Pre-T7.7: the column is NULL, so fall back to the shim's record.
+                # `next` and not a comprehension — one entry per row, by the rule
+                # above, even in the pathological case of a log carrying two.
+                entry = next((e for e in _gate_log(fit.get("gate_log_json"))
+                              if isinstance(e, dict) and e.get("gate") == "arc_closure"),
+                             None)
+                state = (entry.get("state", "?") or "?") if entry is not None else None
+            if state is None:
                 no_record += 1
-                continue
-            for entry in found:
-                states[str(entry.get("state", "?"))] += 1
+            else:
+                states[str(state)] += 1
         return {"run_id": run, "states": states, "no_record": no_record,
                 "sigma_is_bound": "stamped default — 0 on every row, not an "
                                   "observation. It becomes evidence once P.18 passes "
