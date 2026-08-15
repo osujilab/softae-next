@@ -44,10 +44,15 @@ logger = structlog.get_logger(__name__)
 #: ========  ====  =======  =================
 #: preset    npts  f_lo     measured s/channel
 #: ========  ====  =======  =================
-#: Quick       25  20 Hz    10.47
+#: Quick       25  20 Hz    10.47  (RETIRED -- see below)
 #: Standard    35  4 Hz     40.85
 #: Extended    45  1.2 Hz   115.2
 #: ========  ====  =======  =================
+#:
+#: ``Quick``'s row is kept here because it is what the two constants were fitted
+#: to, and refitting them on two points would be a different model. It is **not**
+#: kept in :data:`EIS_MEASURED_S_PER_CHANNEL`: ``[eis_presets.Quick]`` moved to a
+#: 7 Hz floor on 2026-08-14, and 10.47 s timed the 20 Hz sweep.
 #:
 #: ``Longest`` (35 pts, 0.2 Hz) is **not** an anchor — it has never been timed on
 #: this rig. The model predicts ~503 s/channel for it; that is extrapolation and
@@ -69,8 +74,16 @@ EIS_MIN_POINT_S = 0.342
 #: measurement and which are the model speaking beyond its anchors — ``Longest``
 #: is the live case, and a duration quoted for it with the same confidence as
 #: ``Standard`` is how the 10x error stayed invisible for four months.
+#: ``Quick`` was retired from this table on 2026-08-14, when
+#: ``[eis_presets.Quick]`` moved its floor from 20 Hz to 7 Hz. The 10.47 s/channel
+#: reading is a stopwatch on the *20 Hz* sweep; the 7 Hz one costs a modelled ~2x
+#: and has never been timed here. Leaving the entry would have made
+#: :func:`eis_duration_basis` answer ``"measured"`` for a sweep that does not
+#: exist, and every projection would have quoted half a night with a stopwatch's
+#: authority — the exact class of silently-wrong number this table was built to
+#: expose. **Restore it from a real run**: time one all-channel round at 7 Hz and
+#: put the per-channel figure back.
 EIS_MEASURED_S_PER_CHANNEL: dict[str, float] = {
-    "Quick": 10.47,
     "Standard": 40.85,
     "Extended": 115.2,
 }
@@ -82,6 +95,10 @@ def eis_duration_basis(preset: str | None) -> str:
     A one-word provenance tag, not a confidence score: the model reproduces its
     three anchors to 7.8 %, and says nothing at all about how it behaves outside
     them. ``Longest`` reaches 0.2 Hz, a factor of six below the lowest anchor.
+
+    ``Quick`` answers ``"extrapolated"`` since its floor moved to 7 Hz — the
+    default preset is now on the model's word, which is the honest state and not
+    a defect to be tuned away. Re-time it and the answer changes back.
     """
     return "measured" if preset in EIS_MEASURED_S_PER_CHANNEL else "extrapolated"
 

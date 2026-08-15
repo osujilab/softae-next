@@ -266,10 +266,26 @@ f_hi   = 200_000
 f_lo_mHz = 4_000
 mv_ac  = 10
 
+# `Quick` is DEFAULT_PRESET and what the equilibration runs use, so its floor is
+# the system's default reach. 7 Hz, not the 20 Hz it was through 2026-08-13:
+# f_lo is a CONDUCTIVITY floor in disguise. The -Z'' apex sits at
+# f = 1/(2*pi*R*C_cell) and C_cell is a property of the BOARD (0.09 nF median over
+# 1152 spectra, IQR 0.07-0.16, while R moved 109x), so
+# sigma_min = 2*pi*f_lo*C_cell*L/(t*w) -- see core/eis_scripts.sigma_floor_S_per_cm.
+# At 20 Hz that is 5.7e-7 S/cm and 476 of run 20260811T023757Z's 1440 spectra
+# (33 %, rising to 73 % at the cold end of the down leg) never closed their arc,
+# so their R1 came from extrapolating the high-frequency limb -- a measured 61 %
+# median OVERESTIMATE, systematic, and 175 % with a full CPE fit. 7 Hz reaches
+# 2.0e-7 S/cm, about a decade below anything this rig has measured, for roughly
+# 2x the time (10.47 -> ~21 s/channel).
+#
+# Moving this RETIRED the `Quick` stopwatch anchor in core/preflight.py: 10.47
+# s/channel timed the 20 Hz sweep and says nothing about this one. Durations
+# quoted for `Quick` are extrapolated until a real run re-times it.
 [eis_presets.Quick]
 npts   = 25
 f_hi   = 200_000
-f_lo_mHz = 20_000
+f_lo_mHz = 7_000
 mv_ac  = 10
 
 [eis_presets.Extended]

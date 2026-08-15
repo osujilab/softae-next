@@ -20,6 +20,7 @@ measures with the settings it claims to.
 
 from __future__ import annotations
 
+import math
 import os
 import tempfile
 from dataclasses import dataclass
@@ -35,6 +36,52 @@ DEFAULT_F_LO_MHZ = 100
 DEFAULT_NPTS = 20
 DEFAULT_MV_AC = 10
 DEFAULT_MV_DC = 0
+
+#: Effective cell capacitance of the 4-stripe board, from 1152 spectra of
+#: 20260811T023757Z_equilibration_characterization: median 0.09 nF, IQR 0.07-0.16.
+#: It is a property of the ELECTRODES, not the sample -- R varied 109x across that
+#: set while this moved ~2x -- which is what lets `sigma_floor_S_per_cm` predict a
+#: reach for a material nobody has measured yet. It is board-specific: a different
+#: electrode geometry needs its own number, and this one should move to the board
+#: config when a second board is characterised.
+CELL_CAPACITANCE_F = 0.09e-9
+
+
+def sigma_floor_S_per_cm(
+    f_lo_hz: float | None,
+    L_cm: float | None,
+    t_cm: float | None,
+    w_cm: float | None,
+    *,
+    C_F: float = CELL_CAPACITANCE_F,
+) -> float | None:
+    """Lowest conductivity whose arc still closes inside a sweep ending at *f_lo_hz*.
+
+    The semicircle's apex sits at ``f_peak = 1/(2*pi*R*C)`` and σ = ``L/(R*t*w)``,
+    so eliminating R turns a frequency floor into a conductivity floor::
+
+        sigma_min = 2*pi*f_lo*C_cell*L/(t*w)
+
+    Below it the −Z″ peak falls off the bottom of the sweep and R₁ comes from
+    extrapolating the high-frequency limb, which measures a **60.9 % median
+    overestimate** at only 1.5× past the apex (and 175 % with the full CPE
+    fitter). That is a systematic bias, not a widened error bar, so the honest
+    move is to state the reach rather than to extrapolate past it.
+
+    Returns ``None`` — never a number computed from a default geometry — when any
+    term is absent or non-positive. A σ reach quoted against a geometry nobody
+    supplied is exactly the silently-wrong number this refusal exists to prevent;
+    it is the posture :func:`~softae.analysis.eis.geometry.resolve_thickness_cm`
+    already takes for thickness.
+    """
+    try:
+        terms = [float(x) for x in (f_lo_hz, L_cm, t_cm, w_cm, C_F)]
+    except (TypeError, ValueError):
+        return None
+    if any(x <= 0 for x in terms):
+        return None
+    f_lo, L, t, w, C = terms
+    return 2.0 * math.pi * f_lo * C * L / (t * w)
 
 
 @dataclass(frozen=True)

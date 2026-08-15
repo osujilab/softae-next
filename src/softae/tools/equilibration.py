@@ -21,7 +21,7 @@ resolves in either state, which is why everything printed here uses it.
 every design flag not repeated on ``run`` silently reverts to its default. That
 is not hypothetical: on 2026-08-10 it cost ~40 minutes of rig time and the whole
 scientific result — ``--preset`` fell back to ``Standard`` (40.7 s/channel
-measured, against ``Quick``'s 10.47) and the electrode geometry was dropped
+measured, against ``Quick``'s then-10.47) and the electrode geometry was dropped
 whole, so ``sigma_S_per_cm`` was NULL for all 41 fits while every log line
 reported success.
 
@@ -120,6 +120,7 @@ from softae.workflows.equilibration import (
     EV_SETPOINT_FINISHED,
     EV_SETPOINT_STARTED,
     EV_SETTLE_VERDICT,
+    REFERENCE_GEOMETRY_CM,
     ROUND_BUFFER_S,
     VERDICT_ABORTED,
     VERDICT_MET,
@@ -595,6 +596,7 @@ def build_config(args) -> EquilibrationConfig:
         channels=channels, temperatures_C=temps, legs=legs,
         rh_setpoint_pct=args.rh, rounds_per_setpoint=args.rounds,
         round_period_s=args.round_period_s, eis_preset=args.preset,
+        eis_f_lo_mHz=getattr(args, "f_lo_mHz", None),
         eis_model=args.model,
         electrode_geometry=geometry,
         thickness_method=getattr(args, "thickness_method", "target"),
@@ -666,7 +668,13 @@ def _chamber_settings(args) -> dict[str, float]:
 #: the ascending leg's 1800 s allowance. Executing one here with those defaulted
 #: would silently change what "held" means and how long the chamber is given to
 #: get there, on a file that states neither. Re-save the design.
-PLAN_SCHEMA = "equilibration-plan/3"
+#:
+#: ``/4`` added ``f_lo_mHz``. Same rule again, and it decides what the run can
+#: *see*: a ``/3`` plan was written when ``Quick`` ended at 20 Hz, and executing
+#: one here would take it to the preset's new 7 Hz — a different sweep, roughly
+#: twice the cost, and a different set of samples whose arcs close — on a file
+#: that names no floor at all. Re-save the design.
+PLAN_SCHEMA = "equilibration-plan/4"
 
 #: Every design flag :func:`build_config` reads, by its ``argparse`` dest. A key
 #: absent from a saved plan is a value that reverts to its default on ``run``, so
@@ -681,7 +689,7 @@ PLAN_DESIGN_KEYS = (
     "channels", "temperatures", "legs", "rh", "rounds", "round_period_s",
     "settle", "settle_tol_rel", "settle_n_rounds", "settle_min_channels",
     "min_hold_first_s", "min_hold_s", "tau_setpoints",
-    "preset", "model", "measured_per_channel_s",
+    "preset", "f_lo_mHz", "model", "measured_per_channel_s",
     "electrode_l_cm", "electrode_t_cm", "electrode_w_cm", "thickness_method",
     # The chamber. In the plan for the same reason the settle criterion is: what
     # counts as "held", and how long the chamber is given to get there, is as much
@@ -692,10 +700,13 @@ PLAN_DESIGN_KEYS = (
 )
 
 #: The design keys that legitimately have no value — the geometry, which may be
-#: absent altogether, and the measured cost, which most rigs do not have. Every
+#: absent altogether; the measured cost, which most rigs do not have; and the
+#: sweep floor, whose absence *is* a design statement ("take the preset's"),
+#: exactly as ``preset`` records a name rather than the sweep behind it. Every
 #: other key missing from a plan file is a corrupt plan, not an empty one.
-PLAN_OPTIONAL_KEYS = frozenset({"measured_per_channel_s", "electrode_l_cm",
-                                "electrode_t_cm", "electrode_w_cm"})
+PLAN_OPTIONAL_KEYS = frozenset({"measured_per_channel_s", "f_lo_mHz",
+                                "electrode_l_cm", "electrode_t_cm",
+                                "electrode_w_cm"})
 
 
 class PlanFileError(ValueError):
@@ -901,6 +912,69 @@ def _measured_per_channel(value: Any) -> float | None:
     return float(value)
 
 
+def _preset_f_lo_hz(preset: str) -> float:
+    """A preset's own sweep floor, in Hz."""
+    from softae.core.eis_scripts import EISParams
+
+    return EISParams.from_preset(preset).f_lo_mHz / 1000.0
+
+
+def _reference_sigma_floor() -> float:
+    """The σ the default preset reaches on the 4-stripe board's nominal geometry.
+
+    Computed from the live preset and :data:`REFERENCE_GEOMETRY_CM` rather than
+    written down, so moving ``[eis_presets.Quick]`` again — or re-characterising
+    ``CELL_CAPACITANCE_F`` — moves the number quoted in ``--help`` instead of
+    leaving it asserting a reach the tool no longer has.
+    """
+    from softae.core.eis_scripts import sigma_floor_S_per_cm
+
+    return sigma_floor_S_per_cm(_preset_f_lo_hz(DEFAULT_EIS_PRESET),
+                                *REFERENCE_GEOMETRY_CM) or 0.0
+
+
+def _reference_geometry_str() -> str:
+    L, t, w = REFERENCE_GEOMETRY_CM
+    return f"L={L:g} t={t:g} w={w:g} cm"
+
+
+def _print_sigma_reach(config: EquilibrationConfig) -> None:
+    """What the sweep floor can actually see — the guardrail, stated up front.
+
+    The floor is a conductivity floor wearing a frequency's clothes: the -Z''
+    peak sits at ``1/(2*pi*R*C_cell)``, so a sample below
+    ``2*pi*f_lo*C_cell*L/(t*w)`` never brings its apex inside the sweep and its
+    R₁ is read off the high-frequency limb instead — a *systematic* 61 % median
+    overestimate (175 % with a CPE fit), not scatter that averages out. Run
+    ``20260811T023757Z`` produced 476 such spectra and said so nowhere before the
+    fit; this line is where it now says so, before the night is committed.
+
+    Printed from the plan's **own** ``f_lo`` and geometry. With no geometry there
+    is no number to print and none is invented: σ = L/(R·t·w) has no value here,
+    and quoting a reach against a geometry nobody supplied would be the same class
+    of silent wrongness in the opposite direction.
+    """
+    from softae.core.eis_scripts import CELL_CAPACITANCE_F, sigma_floor_S_per_cm
+
+    f_lo_hz = config.eis_params().f_lo_mHz / 1000.0
+    geometry = config.electrode_geometry or {}
+    sigma = sigma_floor_S_per_cm(f_lo_hz, geometry.get("L_cm"),
+                                 geometry.get("t_cm"), geometry.get("w_cm"))
+    if sigma is None:
+        print(f"  sigma reach:  unavailable, geometry not supplied -- the "
+              f"{f_lo_hz:g} Hz floor is")
+        print("                a conductivity floor, but naming it needs L, t and w.")
+        return
+    print(f"  sigma reach:  f_lo {f_lo_hz:g} Hz -> arcs close for sigma >~ "
+          f"{sigma:.1e} S/cm")
+    print(f"                at L={geometry['L_cm']:g} t={geometry['t_cm']:g} "
+          f"w={geometry['w_cm']:g} cm (C_cell {CELL_CAPACITANCE_F * 1e9:g} nF); "
+          f"below that")
+    print("                R1 is EXTRAPOLATED off the high-frequency limb, which "
+          "reads")
+    print("                ~61% HIGH as a bias, not as noise.")
+
+
 def _print_design(config: EquilibrationConfig, *,
                   measured_per_channel_s: float | None = None) -> None:
     """The design, budgeted on **one** cost basis throughout.
@@ -930,6 +1004,7 @@ def _print_design(config: EquilibrationConfig, *,
           f"{config.rounds_per_setpoint} x "
           f"{config.round_period_s:g}s per setpoint ({config.eis_preset}), "
           f"one preset throughout")
+    _print_sigma_reach(config)
     _print_settle(config, projection)
     print()
     _print_round_cost(config, cost, measured=measured)
@@ -1097,7 +1172,7 @@ def _print_round_cost(config: EquilibrationConfig, cost: float, *,
           f"({cost / max(1, len(config.channels)):.1f}s/channel)")
     if measured:
         return
-    print("    NOTE: the model is FITTED to three presets timed on this rig and")
+    print("    NOTE: the model is FITTED to presets timed on this rig and")
     print(f"    reproduces them within ~{model_underestimate_frac():.0%}. That is a fit "
           f"residual, not a")
     print("    bound: it says nothing about a preset that was never timed, and it")
@@ -1124,7 +1199,7 @@ def _print_basis(config: EquilibrationConfig, cost: float, *,
         return
     frac = model_underestimate_frac()
     print(f"    (basis: MODELLED {per_channel:.1f}s/channel, from a sweep model "
-          f"fitted to three")
+          f"fitted to the")
     print(f"     presets timed on this rig. It runs up to {frac:.0%} UNDER a real "
           f"round on those:")
     print(f"     'Standard' measured {MEASURED_PER_CHANNEL_S_STANDARD:g}s/channel over "
@@ -1132,6 +1207,49 @@ def _print_basis(config: EquilibrationConfig, cost: float, *,
     print(f"     +/-{frac:.0%}, not as a prediction; --measured-per-channel-s "
           f"{MEASURED_PER_CHANNEL_S_STANDARD:g} plans")
     print("     from that stopwatch instead.)")
+    _print_floor_extrapolation(config)
+
+
+def _print_floor_extrapolation(config: EquilibrationConfig) -> None:
+    """Say when the cost above rests on no stopwatch at all.
+
+    Two ways to get here and they deserve one notice, because the operator's
+    exposure is identical. Either the preset itself has no anchor —
+    ``eis_duration_basis`` says so, and ``Quick`` has said so since its floor moved
+    to 7 Hz and its 20 Hz reading was retired — or ``--f-lo-mHz`` has changed the
+    sweep out from under an anchored preset, which is the same downgrade
+    ``preflight.project_campaign`` applies on the campaign path. Said here because
+    the equilibration plan does not pass through that function, and a night is
+    committed off this screen.
+    """
+    from softae.core.eis_scripts import EISParams
+    from softae.core.preflight import (
+        EIS_MEASURED_S_PER_CHANNEL,
+        eis_duration_basis,
+    )
+
+    preset_f_lo = EISParams.from_preset(config.eis_preset).f_lo_mHz
+    f_lo = config.eis_params().f_lo_mHz
+    overridden = f_lo != preset_f_lo
+    if not overridden and eis_duration_basis(config.eis_preset) == "measured":
+        return
+    if overridden:
+        print(f"     ! EXTRAPOLATED: --f-lo-mHz {f_lo:d} makes this NOT the "
+              f"'{config.eis_preset}' the")
+        print(f"     preset defines. That sweeps to {preset_f_lo / 1000:g} Hz; this "
+              f"run sweeps to {f_lo / 1000:g} Hz.")
+    else:
+        print(f"     ! EXTRAPOLATED: '{config.eis_preset}' has never been timed on "
+              f"this rig at its")
+        print(f"     {f_lo / 1000:g} Hz floor, so nothing above rests on a stopwatch.")
+    # Deliberately not the word "anchor" here: in this tool's output that names
+    # the retired --anchor-preset round, and one noun for two ideas on the screen
+    # an operator reads before a nine-hour heat is one too many.
+    print(f"     The model is calibrated against "
+          f"{', '.join(sorted(EIS_MEASURED_S_PER_CHANNEL))} only, and this is not")
+    print("     one of them. Time one all-channel round at the rig and plan the "
+          "next")
+    print("     from it with --measured-per-channel-s.")
 
 
 def _print_period_caution(config: EquilibrationConfig, cost: float, *,
@@ -2044,33 +2162,76 @@ def _add_design_args(parser: argparse.ArgumentParser, *,
     _add_settle_args(parser)
     design.add_argument("--round-period-s", dest="round_period_s", type=float,
                         default=DEFAULT_ROUND_PERIOD_S,
-                        help=f"sigma(t) sampling interval, and the thing that sets "
-                             f"the shortest resolvable tau (~2x this). Default "
+                        help=f"sigma(t) sampling interval. Default "
                              f"{DEFAULT_ROUND_PERIOD_S:g}s is two terms kept apart: "
                              f"{DEFAULT_N_CHANNELS} channels (the --channels default) "
-                             f"x the MEASURED per-channel cost of "
+                             f"x the per-channel cost of "
                              f"'{DEFAULT_EIS_PRESET}' (the --preset default), which is "
                              f"derived, plus a CHOSEN {ROUND_BUFFER_S:g}s per-round "
                              f"buffer for executor and mscr overhead, rounded up to a "
-                             f"typable ten. Shorten it by taking fewer channels or a "
-                             f"faster preset -- the cost is PER CHANNEL, and a period "
-                             f"a round does not fit inside is not honoured, it is "
-                             f"simply exceeded.")
+                             f"typable ten. That cost is currently MODELLED, not "
+                             f"measured -- the 7 Hz floor has never been timed here. "
+                             f"It does NOT bound the settle check, which asks only "
+                             f"whether sigma has gone flat for --settle-n-rounds "
+                             f"rounds and needs no tau at all. It bounds the tau "
+                             f"DIAGNOSTIC: the shortest resolvable tau is ~2x this, so "
+                             f"~{2 * DEFAULT_ROUND_PERIOD_S / 60:.0f} min at "
+                             f"{DEFAULT_N_CHANNELS} channels -- which is the "
+                             f"SATURATED-BOARD case, not a typical batch. A batch of "
+                             f"4/6/8 channels derives 120/160/200s and resolves tau "
+                             f"down to ~4.0/5.3/6.7 min, comfortably under the ~8.3 "
+                             f"min tau once seen at a first setpoint (one observation, "
+                             f"not a target; tau moves with sample, formulation and "
+                             f"setpoint). FEWER CHANNELS is the lever, not a longer "
+                             f"period: the cost is PER CHANNEL, and a period a round "
+                             f"does not fit inside is not honoured, it is simply "
+                             f"exceeded.")
     design.add_argument("--preset", default=DEFAULT_EIS_PRESET,
                         help=f"EIS preset for the series. Default "
                              f"'{DEFAULT_EIS_PRESET}': at 'Standard' an all-channel "
                              f"round costs 654s, forcing a sampling interval whose "
                              f"tau floor (~22 min) is coarser than the ~8.3 min tau "
-                             f"this run exists to measure.")
+                             f"once seen at a first setpoint -- a tau of that order "
+                             f"could not be fitted at all.")
+    # A frequency in the flag, a CONDUCTIVITY in the help: the floor is only
+    # incidentally about Hz.
+    #
+    # No default, and that is the point: `[eis_presets.Quick]` already carries the
+    # 7 Hz floor, so an ordinary run needs no override at all. Defaulting this to
+    # 7000 would make every run look like an override and downgrade its own
+    # duration to EXTRAPOLATED for a reason that is not true. This flag exists for
+    # the run that needs a DIFFERENT floor -- a material two decades less
+    # conductive -- where editing global config for one night is the wrong tool.
+    design.add_argument("--f-lo-mHz", dest="f_lo_mHz", type=int, default=None,
+                        help=f"lowest sweep frequency in mHz, overriding the "
+                             f"preset's own (default: the preset's, "
+                             f"{_preset_f_lo_hz(DEFAULT_EIS_PRESET):g} Hz on "
+                             f"'{DEFAULT_EIS_PRESET}'). This is a CONDUCTIVITY "
+                             f"floor wearing a frequency's clothes: the -Z\" peak "
+                             f"sits at f = 1/(2*pi*R*C_cell), so a sample below "
+                             f"sigma = 2*pi*f_lo*C_cell*L/(t*w) never closes its "
+                             f"arc and its R1 is EXTRAPOLATED off the "
+                             f"high-frequency limb -- measured at a 61%% median "
+                             f"overestimate (175%% with a CPE fit), a systematic "
+                             f"bias and not a widened error bar. The preset's "
+                             f"{_preset_f_lo_hz(DEFAULT_EIS_PRESET):g} Hz reaches "
+                             f"sigma ~ {_reference_sigma_floor():.1e} S/cm at "
+                             f"{_reference_geometry_str()}, about a decade below "
+                             f"anything this rig has measured. The relationship is "
+                             f"LINEAR -- to reach a tenth the conductivity, take a "
+                             f"tenth the floor -- and the plan prints the reach "
+                             f"this run actually buys.")
     # No default. The measured number belongs to one rig and one preset, and a
     # constant applied silently would be wrong the moment either changed -- while
     # still reading, to the next operator, like a prediction.
     design.add_argument("--measured-per-channel-s", dest="measured_per_channel_s",
                         type=float, default=None,
                         help="plan from a MEASURED per-channel round cost instead of "
-                             "the model. The model is fitted to three presets timed "
+                             "the model. The model is fitted to the presets timed "
                              "on this rig and runs up to ~8%% under them; it says "
-                             "nothing about a preset that was never timed. This rig "
+                             f"nothing about a preset that was never timed, and "
+                             f"'{DEFAULT_EIS_PRESET}' is now one of those -- its 7 Hz "
+                             f"floor has never been stopwatched. This rig "
                              f"measured {MEASURED_PER_CHANNEL_S_STANDARD:g} s/channel "
                              "on 'Standard' over 12 channels. Overrides the modelled "
                              "cost in the round cost, the inter-round gap, the "

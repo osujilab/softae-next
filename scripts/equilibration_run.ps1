@@ -6,8 +6,8 @@
     `plan` and `run` are separate processes sharing no state, so any flag not
     repeated on `run` silently reverts to its default. That cost a real run on
     2026-08-10: --preset fell back to Standard (40.7 s/channel against Quick's
-    measured 10.47) and the electrode geometry was dropped whole, so every sigma
-    in the run was NULL while every log line reported success.
+    then-measured 10.47) and the electrode geometry was dropped whole, so every
+    sigma in the run was NULL while every log line reported success.
 
     The tool now closes that itself. `plan --save` writes the FULLY RESOLVED
     design -- every value the run will use, including the defaults nobody typed
@@ -53,12 +53,21 @@ $Design = @(
     # Films are on channels 1-16; 4-7 are deliberately excluded from this run.
     '--channels', '1-3,8-16'
 
-    # Measured on this rig: Quick 10.47 s/channel, Standard 40.85, Extended 115.2.
-    # The cost is dominated by the low-frequency tail, not the point count.
+    # Quick now sweeps to 7 Hz (was 20). The cost is dominated by the
+    # low-frequency tail, not the point count, so that floor roughly DOUBLED the
+    # round -- ~19 s/channel modelled against the 10.47 s stopwatched at 20 Hz --
+    # and bought a 2.9x deeper conductivity reach: arcs close down to ~2e-7 S/cm
+    # instead of ~5.7e-7. 476 of the 1440 spectra in the 2026-08-11 run did not
+    # close their arc at 20 Hz, and an unclosed arc's R1 is EXTRAPOLATED off the
+    # high-frequency limb -- measured at a 61% median OVERESTIMATE, a systematic
+    # bias, not scatter. The plan prints the reach this geometry actually buys.
     '--preset', 'Quick'
 
-    # 12 channels x 10.47 s = 126 s, so a 240 s period is actually achievable.
-    # At Standard the same round costs 488 s and the period cannot be honoured.
+    # 12 channels x ~19 s = ~230 s modelled, so 240 s still contains a round --
+    # but only just, and 240 s resolves tau no shorter than ~8 min against the
+    # ~8.3 min tau measured at the first setpoint. Watch the plan's period
+    # caution: if it says UNACHIEVABLE, drop channels rather than raise this,
+    # because raising it is what stops the transient being resolvable at all.
     '--round-period-s', '240'
 
     # [pcb.SoftAE_IDE_EIS] / [pcb.SoftAE_EIS_4Stripe] both carry L = w = 0.2 cm.
@@ -73,13 +82,16 @@ $Design = @(
     # board casts sessile (no wells), so nothing on it predicts a footprint.
     '--thickness-method', 'target'
 
-    # Plan from the bench figure rather than the model. That model WAS ~10x low
-    # (EIS_CYCLES_PER_POINT = 3.0) and has since been recalibrated against these
-    # same three measured presets -- it now sits within ~8%, over-counting Quick
-    # rather than under-counting it. Passing the measured anchor is therefore no
-    # longer a correction, it is a statement of provenance: the plan says which
-    # numbers came off this rig and which came out of a fit.
-    '--measured-per-channel-s', '10.47'
+    # NO --measured-per-channel-s. It passed 10.47 here until 2026-08-14, which
+    # was a stopwatch reading of the 20 Hz Quick sweep -- a sweep this run no
+    # longer takes. Keeping it would have planned a ~2x-longer night against a
+    # measurement of a different experiment, wearing the word MEASURED. The 7 Hz
+    # Quick has not been timed on this rig, so the plan's duration is
+    # EXTRAPOLATED and says so on the screen.
+    #
+    # RESTORE IT after the next real run: read the per-channel figure out of the
+    # run sidecar (the executor measures its own round cost) and put it back
+    # here, and into EIS_MEASURED_S_PER_CHANNEL['Quick'] in core/preflight.py.
 
     # ---- How long each setpoint is held --------------------------------------
     # --rounds is now a CEILING. The 2026-08-11 run held all eight setpoints for

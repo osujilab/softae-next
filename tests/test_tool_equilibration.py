@@ -465,21 +465,29 @@ class TestPlan:
         assert _cmd_plan(_args("plan")) == EXIT_OK
         out = capsys.readouterr().out
 
-        # 8, not MIN_POINTS_FOR_TAU: at the 200 s period the shipped preset now
-        # allows, the 1500 s first-setpoint hold floor buys ceil(1500/200) = 8
-        # rounds and OVERTAKES the fit minimum. That is the point of the faster
-        # preset -- the first setpoint carries essentially the whole transient,
-        # and it now gets 8 sigma points instead of the 5 the fitter demands as a
-        # bare minimum.
-        assert "effective minimum 8 rounds at setpoint 1 of the run" in out
+        # Read off the projection rather than written as literals. These floors
+        # are ceil(hold / period), and the period is DERIVED from the preset's
+        # cost -- it moved 200 -> 370 s when `Quick`'s floor moved to 7 Hz, which
+        # took the first setpoint from 8 rounds down to 5. A literal here would
+        # pin the arithmetic of one preset instead of the property being tested:
+        # that all three regimes are named and distinguishable.
+        projection = project_duration(build_config(_args("plan")))
+        assert (f"effective minimum {projection.min_rounds_first} rounds at "
+                f"setpoint 1 of the run") in out
         assert f"The first 2 setpoint(s) may not stop under " \
                f"{MIN_POINTS_FOR_TAU} rounds" in out
         assert "MIN_POINTS_FOR_TAU" in out
-        # Past the window the floor is --settle-n-rounds alone: ceil(600/200) = 3
-        # rounds of time floor, and the detection window is also 3.
-        assert "3 after that" in out
-        assert "a setpoint runs 3-15 rounds" in out
-        assert "8/5/3/3/3/3/3/3 rounds in run order, of 15" in out
+        # Past the tau window the floor is --settle-n-rounds alone.
+        assert f"{projection.min_rounds_later} after that" in out
+        assert (f"a setpoint runs {projection.min_rounds_later}-15 rounds") in out
+        assert "/".join(str(r) for r in projection.floor_rounds) + \
+               " rounds in run order, of 15" in out
+        # The tau floor still binds SOMEWHERE, which is the only reason the
+        # middle regime exists: at the 370 s period the first setpoint's 1500 s
+        # hold buys ceil(1500/370) = 5 rounds and no longer overtakes the fit
+        # minimum, so the two coincide rather than the hold dominating.
+        assert projection.min_rounds_first >= MIN_POINTS_FOR_TAU
+        assert projection.min_rounds_tau == MIN_POINTS_FOR_TAU
 
     def test_plan_states_which_setpoints_the_tau_floor_applies_to(
             self, project, capsys):
@@ -600,7 +608,7 @@ class TestPlan:
         # number for that preset is 651 s. `plan` must not let 620 read as safe.
         _cmd_plan(_args("plan", "--preset", "Standard", "--round-period-s", "620"))
         out = capsys.readouterr().out
-        assert "FITTED to three presets" in out
+        assert "FITTED to presets" in out
         assert "s/channel of margin" in out
         assert "CAUTION" in out
         assert "--round-period-s" in out
@@ -625,7 +633,6 @@ class TestPlan:
         # --channels defaulted to all 16, which costs ~168 s even on the fastest
         # preset. Someone accepting every default got a run that could not honour
         # its own sampling interval.
-        from softae.core.preflight import EIS_MEASURED_S_PER_CHANNEL
         from softae.tools.equilibration import DEFAULT_ROUND_PERIOD_S
         from softae.workflows.equilibration import (
             ROUND_BUFFER_S,
@@ -635,9 +642,12 @@ class TestPlan:
 
         config = EquilibrationConfig()
         assert config.round_period_s == DEFAULT_ROUND_PERIOD_S
-        measured = round_cost_s(config, measured_per_channel_s=(
-            EIS_MEASURED_S_PER_CHANNEL[config.eis_preset]))
-        assert measured <= config.round_period_s - ROUND_BUFFER_S
+        # Against the cost the period is DERIVED from, whichever branch supplied
+        # it. It used to be indexed straight out of EIS_MEASURED_S_PER_CHANNEL,
+        # which broke the moment `Quick`'s reading was retired with its 20 Hz
+        # floor -- and the invariant was never about that dict, it is that the
+        # shipped period contains the shipped round with the buffer to spare.
+        assert round_cost_s(config) <= config.round_period_s - ROUND_BUFFER_S
 
         _cmd_plan(_args("plan"))
         out = capsys.readouterr().out
@@ -662,7 +672,10 @@ class TestPlan:
 
     def test_the_anchor_preset_flag_is_gone_because_the_concept_is(self):
         # An anchor round at the series preset is byte-identical to a series
-        # round; at Longest it sampled to 0.2 Hz against a ~9 Hz phase floor.
+        # round; at Longest it cost ~503 s/channel modelled -- never timed here --
+        # to reach 0.2 Hz. Cost is the live reason it is gone: the ~9 Hz phase
+        # floor once cited beside it rested on a Z_phi ceiling that
+        # analysis/eis/envelope.py has withdrawn.
         with pytest.raises(SystemExit):
             build_parser().parse_args(["plan", "--anchor-preset", "Longest"])
 
@@ -746,7 +759,10 @@ class TestPlanningFromAMeasuredCost:
         # What must survive is the label and the size of the doubt -- a modelled
         # figure is never printed bare, and the note quotes the model's own fitted
         # error rather than leaving the reader to guess at it.
-        assert "fitted to three" in out
+        # Not "three": the count is no longer written down. `Quick`'s reading was
+        # retired when its floor moved to 7 Hz, and a literal here would have gone
+        # on asserting an anchor that no longer exists.
+        assert "fitted to the" in out
         assert "UNDER a real round" in out
         assert "8%" in out
         assert "--measured-per-channel-s 40.7" in out   # the flag that fixes it
@@ -1510,12 +1526,15 @@ class TestPlanArtifact:
         path = _write_plan_file(tmp_path / "plan.toml", "--channels", "1-4", *GEOMETRY)
         data = tomllib.loads(Path(path).read_text(encoding="utf-8"))
 
-        # `/3` since the chamber joined [design]: tau_setpoints and the eight
-        # bands and allowances. A `/2` plan is refused rather than read with them
-        # defaulted -- it was written when tolerance_C was 0.5, --rh was 15 and
-        # the descending leg had the ascending leg's 1800 s allowance, so
-        # executing one here would silently change what "held" means.
-        assert data["schema"] == PLAN_SCHEMA == "equilibration-plan/3"
+        # `/4` since the sweep floor joined [design]. A `/3` plan is refused
+        # rather than read with it defaulted: those were written while `Quick`
+        # ended at 20 Hz, and executing one here would take it to the preset's
+        # 7 Hz -- roughly twice the cost and a different set of samples whose arcs
+        # close -- on a file that names no floor at all. `/3` itself was the
+        # chamber joining [design], on the same rule: a `/2` plan was written when
+        # tolerance_C was 0.5 and --rh was 15, so executing one here would
+        # silently change what "held" means.
+        assert data["schema"] == PLAN_SCHEMA == "equilibration-plan/4"
         # Never `__name__`, which is "__main__" under `python -m` and names
         # nothing a reader could open.
         assert data["written_by"] == "softae.tools.equilibration"

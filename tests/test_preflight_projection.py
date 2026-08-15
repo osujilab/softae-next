@@ -111,8 +111,14 @@ class TestEISDuration:
 
 #: What one channel of each preset **actually** cost on this rig, from timestamp
 #: deltas in production runs and reproducible to ±0.1 s over four months. These
-#: are the only three anchors the sweep model has; ``Longest`` has never been
-#: timed and deliberately has no entry.
+#: are the three points the sweep model's two constants were fitted to;
+#: ``Longest`` has never been timed and deliberately has no entry.
+#:
+#: The ``Quick`` row is the **20 Hz** sweep, spelled out as explicit ``EISParams``
+#: rather than resolved from the preset for exactly this reason: the preset moved
+#: to 7 Hz on 2026-08-14 and its entry in ``EIS_MEASURED_S_PER_CHANNEL`` was
+#: retired with it. The fit was still made against these three, so this stays a
+#: valid statement about the model even though only two presets are now "timed".
 MEASURED_S_PER_CHANNEL = {
     "Quick":    (EISParams(f_hi=200_000, f_lo_mHz=20_000, npts=25), 10.47),
     "Standard": (EISParams(f_hi=200_000, f_lo_mHz=4_000, npts=35), 40.85),

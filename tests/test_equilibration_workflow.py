@@ -431,29 +431,30 @@ class TestProjection:
         config = EquilibrationConfig()          # 16 channels, 4 temps, 2 legs, 15 rounds
         projection = project_duration(config)
         assert projection.n_setpoints == 8
-        # The CEILING, which is what the old fixed-count projection was. It moved
-        # with the round-period default: 120 s -> 660 s when the period was
-        # derived from 'Standard', then 660 -> 200 s when the shipped preset
-        # became 'Quick'. The night got SHORTER because the sampling interval did,
-        # not because anything was cut: 15 rounds x 200 s is 50 min of series
-        # where 15 x 660 s was 2.75 h. The down leg's own approach allowance is
-        # still in here -- 4 setpoints at 5400 s against 4 at 1800 s.
-        assert projection.typical_s / 3600 == pytest.approx(10.02, abs=0.05)
-        assert projection.worst_case_s / 3600 == pytest.approx(19.02, abs=0.05)
+        # The CEILING, which is what the old fixed-count projection was. It tracks
+        # the round-period default, which is DERIVED and has moved several times:
+        # 120 s -> 660 s when the period came off 'Standard', 660 -> 200 s when
+        # the shipped preset became 'Quick', and 200 -> 370 s on 2026-08-14 when
+        # `Quick`'s floor moved to 7 Hz. The night got longer for the last of
+        # those because the sweep did -- ~2x the low-frequency tail buys arcs that
+        # close down to ~2e-7 S/cm instead of ~5.7e-7. The down leg's own approach
+        # allowance is still in here: 4 setpoints at 5400 s against 4 at 1800 s.
+        assert projection.typical_s / 3600 == pytest.approx(15.33, abs=0.05)
+        assert projection.worst_case_s / 3600 == pytest.approx(24.33, abs=0.05)
         # And the FLOOR, which the settle criterion makes reachable. Read off the
-        # three regimes rather than one number: at the 200 s period the 1500 s
-        # first-setpoint hold floor buys ceil(1500/200) = 8 rounds, which now
-        # EXCEEDS MIN_POINTS_FOR_TAU instead of falling under it -- the shortest
-        # legal first setpoint is 8 sigma points where it used to be 5. Setpoint 2
-        # is still inside the tau window with only ceil(600/200) = 3 rounds of
-        # time floor, so MIN_POINTS_FOR_TAU binds there; past the window the floor
-        # is settle_n_rounds alone.
-        assert projection.min_rounds_first == 8 > MIN_POINTS_FOR_TAU
+        # three regimes rather than one number: at the 370 s period the 1500 s
+        # first-setpoint hold floor buys ceil(1500/370) = 5 rounds, so it now
+        # COINCIDES with MIN_POINTS_FOR_TAU rather than overtaking it -- the
+        # slower sweep spent the two extra sigma points the 200 s period had won.
+        # Setpoint 2 is inside the tau window with only ceil(600/370) = 2 rounds
+        # of time floor, so MIN_POINTS_FOR_TAU binds there; past the window the
+        # floor is settle_n_rounds alone.
+        assert projection.min_rounds_first == MIN_POINTS_FOR_TAU
         assert projection.min_rounds_tau == MIN_POINTS_FOR_TAU
         assert projection.min_rounds_later == config.settle_n_rounds == 3
-        assert projection.floor_rounds == (8, 5, 3, 3, 3, 3, 3, 3)
-        assert projection.typical_floor_s / 3600 == pytest.approx(4.81, abs=0.05)
-        assert projection.worst_floor_s / 3600 == pytest.approx(13.81, abs=0.05)
+        assert projection.floor_rounds == (5, 5, 3, 3, 3, 3, 3, 3)
+        assert projection.typical_floor_s / 3600 == pytest.approx(5.88, abs=0.05)
+        assert projection.worst_floor_s / 3600 == pytest.approx(14.88, abs=0.05)
         assert projection.adaptive is True
         assert "anchor_rounds" not in projection.breakdown_typical
 
@@ -607,8 +608,11 @@ class TestRunLoop:
         assert payload["setpoints"][0]["temp_approach_reached"] is False
         assert not payload["aborted"]
         # It ran to completion: every round measured, and nothing else -- the
-        # Longest anchor rounds are retired (they sampled below the ~9 Hz phase
-        # floor), so a setpoint is exactly `rounds_per_setpoint` rounds.
+        # Longest anchor rounds are retired on cost (~503 s/channel modelled and
+        # never timed on this rig, against ~19 s at Quick; the ~9 Hz phase floor
+        # once cited with them rested on a Z_phi ceiling that
+        # analysis/eis/envelope.py has withdrawn), so a setpoint is exactly
+        # `rounds_per_setpoint` rounds.
         assert len(payload["points"]) == 5
         assert temp.setpoints[-1] == pytest.approx(run.config.ambient_C)
 
@@ -1123,17 +1127,19 @@ class TestMeasuredRoundCost:
         # first number in the system that includes the mux switch, the script
         # upload, the retrieval and the file write.
         #
-        # `Quick` at 15 s/channel: the sweep model now says 11.3 s/channel
-        # (measured 10.47 on this rig), so 15 leaves a real ~4 s of unmodelled
-        # overhead. The old 10x-low model made almost any per-step cost exceed
-        # it, which is why this used to pass with the default `Standard`.
-        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path, per_step_s=15.0,
+        # `Quick` at 25 s/channel: the sweep model says ~19.1 s/channel since the
+        # preset's floor moved to 7 Hz, so 25 leaves a real ~6 s of unmodelled
+        # overhead. It was 15 s/channel against the 20 Hz sweep's ~11.3 s model;
+        # the simulated round has to stay ABOVE the model or the comparison being
+        # made here -- measured exceeds modelled, and the difference is the work
+        # the sweep model does not carry -- is not the one being tested.
+        run, _temp, _rh, _ex = _runner([45.0], ON_RH, tmp_path, per_step_s=25.0,
                                        channels=[1, 2, 3, 4], eis_preset="Quick")
         payload = await run.run()
 
         cost = payload["measured_cost"]
-        assert cost["series"]["measured_round_s"] == pytest.approx(60.0)
-        assert cost["series"]["measured_per_channel_s"] == pytest.approx(15.0)
+        assert cost["series"]["measured_round_s"] == pytest.approx(100.0)
+        assert cost["series"]["measured_per_channel_s"] == pytest.approx(25.0)
         assert cost["series"]["measured_round_s"] > cost["series"]["modelled_round_s"]
         assert cost["series"]["ratio_measured_over_modelled"] > 1.0
         assert cost["series"]["unmodelled_per_channel_s"] > 0.0
@@ -1210,22 +1216,23 @@ class TestMeasuredRoundCost:
         # The regression the default closes: 120 s against 16 channels could not
         # contain a round on ANY preset, so a run accepting every default could
         # not honour its own sampling interval and sigma(t) was not evenly spaced
-        # as the fitter reads it. Asserted against the MEASURED anchor for
-        # whatever preset ships, not against a preset named here -- the default
-        # moved from 'Standard' to 'Quick' and this invariant is about the pairing
-        # of period and preset, not about either one.
-        from softae.core.preflight import EIS_MEASURED_S_PER_CHANNEL
+        # as the fitter reads it. Asserted against the cost the period is DERIVED
+        # from for whatever preset ships, not against a preset named here -- the
+        # default moved 'Standard' -> 'Quick', and `Quick` then lost its stopwatch
+        # reading when its floor moved to 7 Hz. Indexing EIS_MEASURED_S_PER_CHANNEL
+        # here raised KeyError the moment that happened, which is the wrong failure:
+        # this invariant is about the pairing of period and round, not about
+        # whether the round has been timed yet.
         from softae.workflows.equilibration import ROUND_BUFFER_S, round_cost_s
 
         config = EquilibrationConfig()
-        anchor = EIS_MEASURED_S_PER_CHANNEL[config.eis_preset]
-        measured = round_cost_s(config, measured_per_channel_s=anchor)
+        cost = round_cost_s(config)
 
-        assert measured <= config.round_period_s
-        assert round_headroom_s_per_channel(config, measured) >= 0.0
+        assert cost <= config.round_period_s
+        assert round_headroom_s_per_channel(config, cost) >= 0.0
         # And it fits by at least the chosen buffer, which is what that buffer is
-        # for: per-round executor and mscr work no per-channel anchor covers.
-        assert config.round_period_s - measured >= ROUND_BUFFER_S
+        # for: per-round executor and mscr work no per-channel figure covers.
+        assert config.round_period_s - cost >= ROUND_BUFFER_S
 
 
 # ── The round period is honoured from the round's START ──────────────────────
@@ -1253,11 +1260,20 @@ class TestRoundPeriodIsHonoured:
     def test_the_gap_with_no_measurement_still_returns_the_modelled_value(self):
         # Pins the projection path: `plan` and `project_duration` have nothing
         # measured and must keep the behaviour they had.
+        #
+        # The poll floor is part of that behaviour, and since `Quick` moved to a
+        # 7 Hz floor it is what BINDS at the operator's own settings: 12 channels
+        # model ~229 s against a 240 s period, leaving 11 s -- under the 30 s the
+        # watched gap never drops below, because both axes are graded by sampling
+        # it. Asserting the subtraction bare would now be asserting a gap that
+        # would leave the chamber ungraded.
         from softae.workflows.equilibration import eis_round_cost_s
 
         config = _operator_config()
+        modelled = eis_round_cost_s(config, config.eis_preset)
         assert inter_round_gap_s(config) == pytest.approx(
-            config.round_period_s - eis_round_cost_s(config, config.eis_preset))
+            max(config.poll_interval_s, config.round_period_s - modelled))
+        assert config.round_period_s - modelled < config.poll_interval_s
 
     @pytest.mark.parametrize("measured_s", [1.0, 60.0, 130.0, 209.9])
     def test_the_round_plus_the_gap_equals_the_configured_period(self, measured_s):

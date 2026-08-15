@@ -896,9 +896,12 @@ def session_drift(
     question 3's retrace evidence at the reference point.
 
     It costs **no instrument time**. The spec originally bought this with two
-    ``Longest`` rounds per setpoint; those acquired points below the fixture's
-    ~9 Hz phase-reliable floor and have been retired. The blocks compared here are
-    the ordinary settled tails that the σ(t) series already produces.
+    ``Longest`` rounds per setpoint, retired on the argument that they acquired
+    points below a ~9 Hz phase-reliable floor. That floor rested on the ``Z_φ``
+    ceiling ``analysis/eis/envelope.py`` has since **withdrawn**, so the retirement
+    now stands on cost rather than on a floor — 0.2 Hz for reach nothing here needs.
+    Either way the blocks compared here are the ordinary settled tails that the
+    σ(t) series already produces.
 
     The yardstick is the run's **own measured noise floor**, not a typed constant:
     a drift smaller than the scatter of the settled block is not evidence of

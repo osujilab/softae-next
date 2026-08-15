@@ -29,16 +29,29 @@ text — see :func:`watch_hold`.
 No ``Longest`` anchor rounds — retired, and here is why
 -------------------------------------------------------
 The spec budgeted two ``Longest`` rounds per setpoint "where the low-frequency
-information matters". That contradicts its own physics: the phase-reliable floor
-on this fixture is **~9 Hz**, and ``Longest`` sweeps to **0.2 Hz**. The two most
-expensive rounds of every setpoint — ~14.6 min each at the measured per-channel
-overhead — were therefore buying points *below* the trustworthy phase floor, in a
-design that elsewhere argues ``Quick`` (20 Hz) is the only clean preset. Most
-paid for, least usable.
+information matters". The argument made at the time was that a **~9 Hz**
+phase-reliable floor on this fixture made ``Longest``'s sweep to **0.2 Hz** the
+most paid for and least usable rounds of every setpoint — spent below the
+trustworthy floor, in a design that elsewhere argues ``Quick`` is the only clean
+preset.
+
+**That ~9 Hz floor is history, not a live constraint.** It rested on the ``Z_φ``
+ceiling that ``analysis/eis/envelope.py`` has since **withdrawn** — there is no
+phase-reliable ceiling below the magnitude ceiling — which is what allowed
+``Quick`` itself to move to 7 Hz on 2026-08-14 under no such bar. The conclusion
+about ``Longest`` survives its premise on cost alone: **~502.9 s/channel modelled
+at 0.2 Hz against ~19.1 s/channel at 7 Hz, a factor of ~26**, buying reach nothing
+on this rig needs. Both figures are ``estimate_eis_duration`` output, and
+``Longest`` has **never been timed here** — ``EIS_MEASURED_S_PER_CHANNEL`` holds
+only ``Standard`` and ``Extended`` — so this is a modelled cost, not a stopwatch
+one. It is large enough that the distinction does not change the verdict: two such
+rounds at the shipped 16 channels would be ~134 min *each*, longer than most whole
+setpoints.
 
 Dropping the preset to ``Quick`` would have made an "anchor round" byte-identical
 to a series round, so the concept is removed rather than repriced. **Do not
-reintroduce it** without first moving the phase floor.
+reintroduce it** without an argument for the reach that survives the cost — the
+phase-floor argument no longer does the work.
 
 The idea it was conflated with — a settled block at the start and another at the
 end of the down leg, their agreement being the session-drift evidence — is
@@ -248,19 +261,37 @@ DEFAULT_N_CHANNELS = 16
 #: transient this tool exists to characterise; it was a *feasible* default that
 #: could not answer the question.
 #:
-#: ``Quick`` costs 10.47 s/channel measured, which is a 200 s interval and a ~6.7
-#: min τ floor — under the measured τ, so the relaxation is resolved. It is also
-#: what the operator's own production runs and ``scripts/equilibration_run.ps1``
-#: already use, so this aligns the default with practice rather than inventing one.
+#: ``Quick`` is also what the operator's own production runs and
+#: ``scripts/equilibration_run.ps1`` already use, so this aligns the default with
+#: practice rather than inventing one.
 #:
-#: The counter-argument is arc closure: 33 % of the 1440 spectra in run
-#: ``20260811T023757Z`` showed an unclosed arc at ``Quick`` (peak of -Z'' at the
-#: lowest measured frequency), and ``Standard``'s 4 Hz floor would close some of
-#: them. It does not justify a 4x cost on **every** round: ``Standard`` does not
-#: close them at the cold end either, where ch1 sits at 6.5e7 Ω. The right answer
-#: is to detect and report an unclosed arc, not to buy a slower sweep everywhere
-#: in the hope of avoiding one.
+#: The counter-argument was arc closure: 33 % of the 1440 spectra in run
+#: ``20260811T023757Z`` showed an unclosed arc at ``Quick``'s then-20 Hz floor
+#: (peak of -Z'' at the lowest measured frequency), and the answer taken here was
+#: to detect and report it rather than buy ``Standard``'s 4x cost on every round.
+#: **That answer was half of one.** Detection stands and is what ``arc_state``
+#: records, but the 2026-08-14 measurement showed the reach is *computable* —
+#: σ_min = 2π·f_lo·C_cell·L/(t·w), with C_cell a property of the board — so the
+#: floor could be moved to exactly where it needed to be instead of being traded
+#: against a whole preset. ``[eis_presets.Quick]`` now sweeps to **7 Hz**, a
+#: 2.0e-7 S/cm reach for ~2x the time rather than ``Standard``'s 4x, and the plan
+#: prints the reach it buys.
+#:
+#: The cost lands on the sampling interval: ~19 s/channel modelled at 7 Hz means a
+#: *full-board* round of 16 stops fitting inside a τ-resolving period. That is the
+#: saturated case; a batch of the size BO actually casts stays well inside one.
+#: Settle detection is unaffected either way — it needs rounds, not a short
+#: interval — so this bounds the τ diagnostic only. See
+#: :func:`default_round_period_s` for the trade; the lever is channels, and the run
+#: this default was aligned with takes 12.
 DEFAULT_EIS_PRESET = "Quick"
+
+#: Nominal L, t, w of the 4-stripe board, in cm — quoted in ``--help`` to make the
+#: σ reach concrete. **Not a default**: nothing computes a run's σ from these, and
+#: :func:`_resolve_geometry` still refuses a partial geometry rather than filling
+#: it in from here. A reach printed against a geometry nobody supplied is the
+#: silently-wrong number this whole change exists to prevent.
+REFERENCE_GEOMETRY_CM = (0.2, 0.02, 0.2)
 
 
 @lru_cache(maxsize=1)
@@ -306,33 +337,60 @@ ROUND_BUFFER_S = 30.0
 
 def default_round_period_s(preset: str = DEFAULT_EIS_PRESET,
                            n_channels: int = DEFAULT_N_CHANNELS) -> float:
-    """The shipped σ(t) sampling interval: a measured round plus a chosen buffer.
+    """The shipped σ(t) sampling interval: a round's cost plus a chosen buffer.
 
     Two terms, kept apart on purpose::
 
-        n_channels × EIS_MEASURED_S_PER_CHANNEL[preset]   DERIVED  167.5 s
-        + ROUND_BUFFER_S                                  CHOSEN    30.0 s
-        rounded up to a typable ten                                200.0 s
+        n_channels × per-channel round cost   DERIVED
+        + ROUND_BUFFER_S                      CHOSEN    30.0 s
+        rounded up to a typable ten
 
     Rounded by the same rule :func:`minimum_feasible_period_s` uses, because a
     default an operator cannot retype from memory is a default they will type
-    wrongly. 200 rather than 198 for that reason alone.
+    wrongly.
 
-    Two properties worth checking against, neither of which drove the number:
+    The per-channel term is ``EIS_MEASURED_S_PER_CHANNEL[preset]`` when the preset
+    has been timed, and otherwise the model plus its own worst under-count
+    (:func:`model_underestimate_frac`) — an untimed preset gets a period honest
+    about resting on an extrapolation rather than one that silently reads as
+    measured.
 
-    * The modelled round at ``Quick``/16 is ~180.5 s, and its worst case under
-      :func:`model_underestimate_frac` is ~195.4 s — under 200, so an operator's
-      first ``plan`` neither refuses the shipped defaults nor cautions on them. A
-      period derived from the measurement alone (170 s) would have done both, the
-      model over-counting ``Quick`` by 7.8 %.
-    * 200 s resolves τ no shorter than ~6.7 min, against the ~500 s (8.3 min) τ
-      measured at the first setpoint. The interval this replaced was 660 s — a
-      ~22 min τ floor, ~2.6x too coarse to see the transient the run exists to
-      characterise.
+    **Since ``Quick`` moved to a 7 Hz floor on 2026-08-14 the shipped case is the
+    untimed branch**, and the number it derives is ~370 s at 16 channels rather
+    than the 200 s that stood while ``Quick``'s 20 Hz reading was current. That is
+    a real cost of the reach, not a regression to tune away.
 
-    Falls back to the model alone for a preset with no anchor, buffer included: an
-    untimed preset gets a period that is honest about resting on an extrapolation
-    rather than one that silently reads as measured.
+    What it does and does not cost is worth stating, because the two are easy to
+    confuse. The operational question is **"has this sample equilibrated?"**, and
+    the settle criterion answers it — σ flat inside the tolerance band for
+    ``settle_n_rounds`` consecutive rounds across at least ``settle_min_channels``
+    channels — with **no τ involved at all**. That is what a batch BO round
+    consumes when q channels are cast, annealed and studied together, and it is
+    indifferent to the period beyond needing enough rounds to fill the window.
+    370 s serves it as well as 200 s did.
+
+    τ is a **diagnostic, not the spec**. Fitting one additionally needs an interval
+    short enough to resolve it — the shortest τ a run can see is ~2x the interval —
+    and that requirement trades against channel count, because the cost is per
+    channel. This function *is* that trade, evaluated::
+
+        channels    period      shortest τ resolvable
+        4           120 s       ~4.0 min
+        6           160 s       ~5.3 min
+        8           200 s       ~6.7 min
+        12          280 s       ~9.3 min
+        16          370 s       ~12.3 min   (the shipped default)
+
+    **16 is the saturated-board ceiling, not a representative batch.** A batch BO
+    round casts q samples with q typically a handful, so the interval a real batch
+    runs at sits in the top rows, where settle detection and τ fitting are both
+    comfortable. It is only at a full board that the secondary measurement — τ — is
+    the thing that gives way first, and settle detection there is unaffected.
+
+    The τ figures worth resolving are of the ~500 s (8.3 min) order once observed at
+    a first setpoint, which is **one observation, not a target**: τ varies with
+    sample, formulation, setpoint and how wet the film starts. Re-time one 7 Hz
+    round at the rig and this returns to the measured branch.
     """
     from softae.core.eis_scripts import EISParams
     from softae.core.preflight import EIS_MEASURED_S_PER_CHANNEL, estimate_eis_duration
@@ -346,7 +404,8 @@ def default_round_period_s(preset: str = DEFAULT_EIS_PRESET,
 
 
 #: σ(t) sampling interval for a run that types nothing. See
-#: :func:`default_round_period_s` — 200 s at the shipped preset and channel count.
+#: :func:`default_round_period_s` — derived from the shipped preset and channel
+#: count, so it tracks the preset's floor instead of outliving it.
 DEFAULT_ROUND_PERIOD_S = default_round_period_s()
 
 _ABORT_UNREADABLE = "unreadable_pv"
@@ -564,6 +623,14 @@ class EquilibrationConfig:
     #: everywhere; anything ≥ :attr:`n_setpoints` applies it everywhere.
     tau_setpoints: int = DEFAULT_TAU_SETPOINTS
     eis_preset: str = DEFAULT_EIS_PRESET
+    #: Sweep floor in mHz, overriding the preset's own. ``None`` means "whatever
+    #: ``[eis_presets.<eis_preset>]`` says" — the preset is left unmutated, so
+    #: :data:`~softae.core.preflight.EIS_MEASURED_S_PER_CHANNEL` keeps meaning the
+    #: sweep it was stopwatched on. The floor is a **conductivity** floor in
+    #: disguise (:func:`~softae.core.eis_scripts.sigma_floor_S_per_cm`): it decides
+    #: which samples close their arc and which have R₁ extrapolated, so it is part
+    #: of the design and not a driver detail.
+    eis_f_lo_mHz: int | None = None
     eis_model: str = "simpleSalt"
     electrode_geometry: dict[str, float] | None = None
     #: How ``electrode_geometry["t_cm"]`` was obtained, in the analysis layer's own
@@ -610,6 +677,19 @@ class EquilibrationConfig:
     rh_instrument: str = "rh_controller"
     eis_instrument: str | None = None
 
+    def eis_params(self, preset: str | None = None) -> Any:
+        """The sweep this design really measures with: the preset, then the floor.
+
+        One resolver, so the sweep the plan costs, the sweep the ``.mscr`` files
+        command and the sweep the σ reach is quoted against cannot fork. *preset*
+        defaults to :attr:`eis_preset` and exists for the measured-vs-modelled
+        comparison, which asks the question of one named preset at a time.
+        """
+        from softae.core.eis_scripts import EISParams
+
+        return EISParams.from_preset(preset or self.eis_preset,
+                                     f_lo_mHz=self.eis_f_lo_mHz)
+
     def validate(self) -> None:
         """Refuse a design that cannot be executed or cannot be analysed."""
         if not self.channels:
@@ -641,6 +721,11 @@ class EquilibrationConfig:
                 f"{self.tau_setpoints} -- none of those setpoints could ever yield "
                 f"a tau. Pass --tau-setpoints 0 if no tau is wanted anywhere.")
         self._validate_settle()
+        if self.eis_f_lo_mHz is not None and int(self.eis_f_lo_mHz) <= 0:
+            raise ValueError(
+                f"eis_f_lo_mHz {self.eis_f_lo_mHz} is not a frequency: the sweep "
+                f"floor sets the lowest conductivity whose arc closes, and zero "
+                f"reaches nothing. Omit it to take the preset's own floor.")
         if not 0.0 <= self.rh_setpoint_pct <= 100.0:
             raise ValueError(f"rh_setpoint_pct {self.rh_setpoint_pct} is not a %RH")
         if self.tolerance_C <= 0 or self.rh_tolerance_pct <= 0:
@@ -1396,11 +1481,14 @@ def eis_round_cost_s(config: EquilibrationConfig, preset: str) -> float:
     every hold would project as free *and* ``DurationEstimate.is_complete`` would
     still report ``True``. A projection that is confidently wrong is worse than
     one that admits a gap, so the holds are computed from this config instead.
+
+    The sweep comes from :meth:`EquilibrationConfig.eis_params`, so an
+    ``--f-lo-mHz`` that doubles the sweep doubles the projected night here rather
+    than surfacing only at the rig.
     """
-    from softae.core.eis_scripts import EISParams
     from softae.core.preflight import estimate_eis_duration
 
-    return estimate_eis_duration(EISParams.from_preset(preset)) * len(config.channels)
+    return estimate_eis_duration(config.eis_params(preset)) * len(config.channels)
 
 
 def inter_round_gap_s(config: EquilibrationConfig,
@@ -2446,11 +2534,10 @@ class EquilibrationRun:
     def _build_mscr(self, kind: str) -> None:
         """Write the per-channel scripts for this round's preset."""
         try:
-            from softae.core.eis_scripts import EISParams
             from softae.drivers.mscr_library import eis_run_mscrbuild
         except ImportError:
             return
-        params = EISParams.from_preset(self.config.eis_preset)
+        params = self.config.eis_params()
         for channel in self.config.channels:
             try:
                 eis_run_mscrbuild(
@@ -2586,6 +2673,11 @@ class EquilibrationRun:
                 "tau_setpoints": cfg.tau_setpoints,
                 "round_period_s": cfg.round_period_s,
                 "eis_preset": cfg.eis_preset,
+                # RESOLVED, not the override: with a floor override in play the
+                # preset name no longer names the sweep, and "which frequencies
+                # did this actually reach?" is what decides whether a spectrum's
+                # arc could have closed at all.
+                "eis_f_lo_mHz": cfg.eis_params().f_lo_mHz,
                 "eis_model": cfg.eis_model,
                 "electrode_geometry": cfg.electrode_geometry,
                 "tolerance_C": cfg.tolerance_C,
