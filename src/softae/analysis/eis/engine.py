@@ -17,17 +17,37 @@ residuals.** So a rejected spectrum is not fitted at all... *while the gates are
 enabled*. With ``enabled = false`` the fit still happens, because observing-only mode
 must not change behaviour — it exists so the thresholds can be watched, and a mode
 that silently stopped fitting would be enforcement wearing an observer's badge.
+
+The route lives here; its arithmetic lives next door in
+:mod:`softae.analysis.eis.engine_support`, which holds seven helpers this module calls
+and nothing else calls directly — the ``(f, Z)`` convention guarantee, the fixture
+correction on bare arrays, the surviving-points repack, the sum-vs-split resistance
+decision, the railed-fit demotion, the spectrum fingerprint and the finite-metrics
+filter. All seven are re-exported below, so ``engine.<helper>`` still resolves. What
+stayed behind stayed for a reason, and that reason is recorded at the two boundaries
+it belongs to: ``engine_support``'s own docstring says why ``_legacy_report``,
+``_sigma_from_R``, ``analyze_spectrum`` and ``_log_spectrum_metrics`` cannot live
+there, and the note on ``__all__`` below says who reaches these names through this
+module.
 """
 
 from __future__ import annotations
 
-import hashlib
 from typing import Any
 
 import numpy as np
 import structlog
 
 from softae.analysis.eis.arc import annotate_arc_closure
+from softae.analysis.eis.engine_support import (
+    _as_eis,
+    _demote_if_railed,
+    _finite_metrics,
+    _physics_complex,
+    _resolve_reported_resistance,
+    apply_correction_arrays,
+    spectrum_key,
+)
 from softae.analysis.eis.geometry import CellConstant
 from softae.analysis.eis.policy import build_context, reduce_gates
 from softae.analysis.eis.report import (
@@ -40,143 +60,26 @@ from softae.analysis.eis.settings import eis_settings
 
 logger = structlog.get_logger(__name__)
 
-
-def _physics_complex(eis_result: Any) -> tuple[np.ndarray, np.ndarray]:
-    """``(f, Z)`` with ``Im Z < 0`` for a capacitive response.
-
-    :attr:`~softae.analysis.eis_data.EISResult.z_complex` already returns the physics
-    convention; this exists so the engine has one place that guarantees it, rather
-    than each gate trusting its caller.
-    """
-    freq = np.asarray(eis_result.frequency, dtype=float)
-    z = getattr(eis_result, "z_complex", None)
-    if z is None:
-        z = np.asarray(eis_result.z_real, dtype=float) - 1j * np.asarray(
-            eis_result.z_imag_neg, dtype=float)
-    return freq, np.asarray(z, dtype=complex)
-
-
-def apply_correction_arrays(
-    freq: np.ndarray, Z: np.ndarray, correction: Any
-) -> tuple[np.ndarray, Any]:
-    """``(Z_corrected, outcome)`` — the correction applied to bare arrays.
-
-    Arrays rather than an ``EISResult`` because §6 applies the correction *mid-gate-
-    chain*, where the working data is already a ``(f, Z)`` pair. Returns the input
-    array itself when nothing applies, so an uncorrected gated run is bit-identical
-    to one built before E3 existed.
-    """
-    from softae.analysis.eis.fixture import CorrectionOutcome, apply_series_correction
-
-    Zc = np.asarray(Z, dtype=complex)
-    if correction is None or not getattr(correction, "applies", False):
-        return Zc, CorrectionOutcome(applied=False, n_points=int(Zc.size))
-    return apply_series_correction(freq, Zc, correction)
-
-
-def _as_eis(eis_result: Any, freq: np.ndarray, Z: np.ndarray, mask: np.ndarray) -> Any:
-    """The surviving, corrected points as an ``EISResult`` the fitter can consume."""
-    from softae.analysis.eis_data import EISResult
-
-    m = np.asarray(mask, dtype=bool)
-    return EISResult.from_arrays(
-        channel=getattr(eis_result, "channel", 0),
-        f=np.asarray(freq, dtype=float)[m],
-        z_real=np.asarray(Z.real, dtype=float)[m],
-        # Stored negated: the file convention is −Z″, the physics one is Im Z.
-        z_imag_neg=-np.asarray(Z.imag, dtype=float)[m],
-        timestamp=getattr(eis_result, "timestamp", None) or None,
-        eis_params=dict(getattr(eis_result, "eis_params", {}) or {}),
-    )
-
-
-def _resolve_reported_resistance(
-    fit: Any, *, rho_degenerate: float
-) -> tuple[float, float, str, float]:
-    """Pick which resistance the evidence licenses reporting. Returns
-    ``(R, SE, basis, rho)``.
-
-    **R2 is behavioural, not advisory.** The framework is explicit that the reporting
-    function must select sum-vs-split from ``ρ`` rather than leaving the choice to an
-    analyst, and :class:`SigmaReport` therefore carries exactly one resistance.
-
-    Once the relaxation corner leaves the band the optimiser trades resistance between
-    the two terms at near-zero cost: ``ρ → −1``, both individual variances inflate, and
-    ``Var(R_series + R_bulk)`` collapses far below their sum. Measured on a synthetic
-    spectrum with the corner pushed above ``F_MAX``: ρ = −0.977, individual relative
-    standard errors 31 % and 7 %, but the **sum** determined to 1.4 % with 35× less
-    variance. Reporting ``R_bulk`` alone there silently drops a σ-dependent fraction of
-    the true resistance — overhaul §3.1 identifies exactly that as the origin of the
-    apparent "non-constant cell constant".
-    """
-    cov = getattr(fit, "covariance", None)
-    R_split = float(getattr(fit, "R1", float("nan")))
-    if cov is None:
-        return R_split, float("nan"), "split_bulk", float("nan")
-
-    from softae.analysis.eis.models import roles_for
-
-    roles = roles_for(getattr(fit, "model_name", "")) or {}
-    a = roles.get("R_series", "R0")
-    b = roles.get("R_bulk", "R1")
-
-    rho = cov.rho(a, b)
-    degenerate = cov.singular or (rho == rho and rho <= float(rho_degenerate))
-
-    if degenerate:
-        logger.info(
-            "eis_split_degenerate", rho=rho,
-            r_sum_ohm=cov.sum_value(a, b), r_sum_se_ohm=cov.sum_se(a, b),
-            msg="relaxation corner out of band — reporting R_series+R_bulk only",
-        )
-        return cov.sum_value(a, b), cov.sum_se(a, b), "sum", rho
-
-    return cov.value(b), cov.se(b), "split_bulk", rho
-
-
-def _demote_if_railed(fit: Any) -> str:
-    """Strip the measurement claim off a fit that railed. Returns why, or ``""``.
-
-    A fit whose ``R_bulk`` came to rest on a box constraint reports the *bound*,
-    not the sample, and it does so with the same ``success`` flag as a genuine
-    measurement — so every consumer that reads only ``success`` (the optimiser,
-    the settle criterion, the analysis tab, ``fit_results.sigma_S_per_cm``) takes
-    a constant that is a property of ``CIRCUIT_MODELS`` for an observation.
-
-    Three things change, and each closes one of those routes:
-
-    ``success = False``
-        The single flag most consumers branch on. A *distinct* quality state was
-        the alternative and was rejected: it would leave ``success = 1`` on the
-        row, so every reader that does not yet know about the new state keeps
-        believing the number. Demoting an unidentified parameter to "not a fit"
-        is also simply what it is — the optimiser reported where the wall was.
-    ``error_msg``
-        Names the bound and its value, so a railed row is distinguishable from a
-        fit that failed to converge without re-deriving anything.
-    ``R1 = NaN``
-        σ follows from R₁ everywhere it is computed, including inside
-        ``DataStore.record_fit``, which derives it from ``fit_result.R1`` and
-        cannot see this reason. A NaN R₁ fails that guard, so no conductivity is
-        stored — the ``resolve_thickness_cm`` posture: absence, not an invented
-        value. The railed value itself survives in ``parameters_json``, which is
-        where a diagnostic belongs.
-
-    ``parameters``, ``z_fit`` and ``quality`` are deliberately untouched: the
-    residuals against a railed model are real, and are the evidence for the
-    demotion rather than a casualty of it.
-    """
-    from softae.analysis.eis.models import railed_measurand
-
-    reason = railed_measurand(fit)
-    if not reason:
-        return ""
-
-    fit.success = False
-    fit.error_msg = f"railed fit: {reason} — parameter unidentified, no conductivity"
-    fit.R1 = float("nan")
-    logger.info("eis_fit_railed", model=getattr(fit, "model_name", "?"), reason=reason)
-    return reason
+#: Re-exported so ``engine.<helper>`` keeps resolving after the seven moved out for
+#: length. They are still *this* module's helpers: it calls them as bare globals, so a
+#: test that patches one here still lands, ``tests/test_eis_engine.py`` reaches
+#: ``engine_mod._physics_complex`` and imports ``_finite_metrics`` from here,
+#: ``tests/test_eis_fitter.py`` imports ``_resolve_reported_resistance`` from here, and
+#: ``arc.py`` / ``recommend.py`` / ``shadow_db.py`` name ``engine._demote_if_railed``
+#: and ``engine.spectrum_key`` in their prose.
+__all__ = [
+    "_as_eis",
+    "_demote_if_railed",
+    "_finite_metrics",
+    "_legacy_report",
+    "_log_spectrum_metrics",
+    "_physics_complex",
+    "_resolve_reported_resistance",
+    "_sigma_from_R",
+    "analyze_spectrum",
+    "apply_correction_arrays",
+    "spectrum_key",
+]
 
 
 def _sigma_from_R(
@@ -287,53 +190,6 @@ def _legacy_report(
 
     return SpectrumReport(engine="legacy", fit=fit, sigma=sigma, quality=quality,
                           gate_log=(), mask=None, cell=cell)
-
-
-def spectrum_key(channel: Any, freq: Any, Z: Any) -> str:
-    """A content fingerprint naming one *physical* spectrum across repeat analyses.
-
-    Every measured spectrum in an autonomous campaign passes through
-    :func:`analyze_spectrum` **twice** — once for the auto-route fit that writes
-    ``fit_results``, once again when the objective is extracted — so anything that
-    counts the emitted metrics events sees each spectrum twice. Left uncorrected that
-    doubles every sample size a threshold recommendation is weighed against, and an
-    evidence floor passes at half the evidence it was set to demand.
-
-    The fingerprint is taken over the arrays rather than the timestamp because
-    :attr:`~softae.analysis.eis_data.EISResult.timestamp` is optional, two calls on one
-    object necessarily share it, and so would two genuinely distinct spectra measured
-    inside the same second. The channel is carried in the clear so the key stays
-    readable, and so two channels measuring an identical synthetic load stay distinct.
-    """
-    digest = hashlib.blake2s(
-        np.asarray(freq, dtype=float).tobytes()
-        + np.asarray(Z, dtype=complex).tobytes(),
-        digest_size=6,
-    ).hexdigest()
-    try:
-        return f"c{int(channel):02d}:{digest}"
-    except (TypeError, ValueError):
-        return f"c--:{digest}"
-
-
-def _finite_metrics(metrics: Any) -> dict[str, float]:
-    """The loggable subset of a metrics mapping — finite floats only.
-
-    ``repr(float("nan"))`` is a bare ``nan``, which ``ast.literal_eval`` refuses, so a
-    single non-finite value degrades the *whole* rendered ``metrics={...}`` mapping to
-    an unparsed string in ``softae-shadow review``. Dropping it costs nothing: a gate
-    that could not compute its metric has no observation to place a threshold against,
-    and the reviewer counts a metric's evidence by the records that carry it.
-    """
-    out: dict[str, float] = {}
-    for name, raw in (metrics or {}).items():
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            continue
-        if np.isfinite(value):
-            out[str(name)] = value
-    return out
 
 
 def _log_spectrum_metrics(

@@ -1,9 +1,25 @@
-"""Commissioning constants: acquired once, derived, persisted, reused across campaigns.
+"""Commissioning contracts: the roles, the guards, and the shapes everything shares.
 
 Every "blocked on bench data" item in the overhaul reduces to the same sentence: *run
-this workflow once*. This module owns what that workflow produces — the fixture's short
-resistance and lead inductance, whether its open is usable at all, the measured phase
-accuracy, and the impedance window this particular fixture actually reproduces.
+this workflow once*. Three modules own what that workflow produces, and this one owns
+the vocabulary the other two are written in:
+
+``calibration`` (here)
+    Which roles a measurement may carry, which of them are commissioning artifacts,
+    which must be sensed two-terminal, whether a short blank is plausible at all, and
+    :func:`hardware_hash` — the identity a calibration is keyed to. Then the three
+    frozen contracts every consumer passes around: :class:`FixtureConductance`,
+    :class:`PhaseAccuracyTable`, :class:`CalibrationCapabilities`.
+``calibration_derive``
+    Turning an acquired spectrum into a number: the short, the open, the phase table,
+    the reference capacitor and resistor.
+``calibration_set``
+    :class:`~softae.analysis.eis.calibration_set.CalibrationSet` — everything derived,
+    for one fixture at one hardware state — and its persistence.
+
+**Every name in all three is importable from here.** See the re-export block at the
+foot of this module: ``from softae.analysis.eis.calibration import X`` is the published
+spelling and the split is invisible to callers.
 
 **A calibration is a durable asset, not a per-run chore.** Fixture electronics drift is
 minimal, so a set stays valid until the *hardware* changes. That is why staleness is
@@ -16,17 +32,17 @@ same columns, the same file format and the same conditions row as a sample; only
 ``record_measurement`` unchanged, and this module reads back what they wrote.
 
 .. warning::
-   **``Z_φ`` is not here, deliberately.** Earlier drafts had this module derive a
-   "phase-reliable ceiling" ≈ 5×10⁷ Ω. That ceiling is **withdrawn** — it was an
-   artefact of a floating reference electrode (overhaul §3.7, F13), and with RE
+   **``Z_phi`` is not here, deliberately.** Earlier drafts had this module derive a
+   "phase-reliable ceiling" ~ 5x10^7 ohm. That ceiling is **withdrawn** - it was an
+   artefact of a floating reference electrode (overhaul 3.7, F13), and with RE
    correctly connected no negative ``Re Z`` occurs anywhere in the band. What replaces
-   it is :class:`PhaseAccuracyTable`: ``ε`` as a function of ``|Z|`` and frequency,
+   it is :class:`PhaseAccuracyTable`: ``eps`` as a function of ``|Z|`` and frequency,
    measured where the samples actually sit, with **no** extrapolation past the
    impedances that were characterised.
 
 .. note::
    Calibration is **incremental, never all-or-nothing**. Each artifact unlocks specific
-   capabilities and :class:`CalibrationCapabilities` reports which — and, more usefully,
+   capabilities and :class:`CalibrationCapabilities` reports which - and, more usefully,
    names the one artifact that would unblock each thing still missing.
 """
 
@@ -35,9 +51,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, field, replace
-from pathlib import Path
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -235,7 +250,6 @@ def hardware_hash(config: Mapping[str, Any] | None = None) -> str:
     blob = json.dumps(material, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
-
 # ── Phase accuracy, measured rather than assumed ─────────────────────────────
 
 @dataclass(frozen=True)
@@ -422,920 +436,82 @@ class CalibrationCapabilities:
         return "; ".join(parts)
 
 
-# ── The set itself ───────────────────────────────────────────────────────────
-
-@dataclass(frozen=True)
-class CalibrationSet:
-    """Everything commissioning derived, for one fixture, at one hardware state."""
-
-    fixture_id: str = "default"
-    hardware_hash: str = ""
-    created_at: str = ""
-    channels_measured: tuple[int, ...] = ()
-    #: Channels inheriting a representative channel's constants. Listed explicitly so
-    #: using one can *log the assumption* — never a silent extrapolation.
-    channels_assumed: tuple[int, ...] = ()
-
-    R_short_ohm: dict[int, float] = field(default_factory=dict)
-    L_lead_H: dict[int, float] = field(default_factory=dict)
-    C_stray_F: dict[int, float] = field(default_factory=dict)
-    open_usable: dict[int, bool] = field(default_factory=dict)
-    #: Per-channel ``Re(Y_fixture)`` over frequency, from the open blank. A table
-    #: rather than a scalar because on this fixture it is dielectric loss
-    #: (``d ln G/d ln f`` ≈ 1), so one number describes one frequency only.
-    G_fixture: dict[int, FixtureConductance] = field(default_factory=dict)
-
-    phase_acc: PhaseAccuracyTable = field(default_factory=PhaseAccuracyTable)
-    z_min_ohm: float = float("nan")
-    z_max_ohm: float = float("nan")
-    load_error_pct: float = float("nan")
-
-    #: role → measurement_id, so every derived number can be traced to its spectrum (R17).
-    sources: dict[str, int] = field(default_factory=dict)
-
-    # ── Interrogation ────────────────────────────────────────────────────────
-
-    @property
-    def has_short(self) -> bool:
-        return bool(self.R_short_ohm)
-
-    @property
-    def has_load(self) -> bool:
-        return self.load_error_pct == self.load_error_pct
-
-    @property
-    def has_open(self) -> bool:
-        return bool(self.open_usable)
-
-    def open_is_usable(self, channel: int | None = None) -> bool:
-        """Whether the open blank is a measurement rather than noise.
-
-        An unusable open is **not a missing artifact** — it is the positive evidence
-        that shunt admittance is negligible, which is exactly the condition under
-        which short-only series correction is *exact* (framework §3.9). One free
-        bare-board pass therefore answers "is OSL legitimate here?" with a defensible
-        no, which is worth more than a missing answer.
-        """
-        if not self.open_usable:
-            return False
-        if channel is None:
-            return any(self.open_usable.values())
-        return bool(self.open_usable.get(int(channel), False))
-
-    def capabilities(self) -> CalibrationCapabilities:
-        """The ladder: what is unlocked, and the one artifact that unblocks each rest."""
-        blocked: dict[str, str] = {}
-
-        if self.has_short:
-            mode = "osl" if self.open_is_usable() else "series"
-        else:
-            mode = "none"
-            blocked["fixture correction"] = "run the short blank"
-
-        if mode == "series" and self.has_open:
-            # Not a limitation worth reporting: an unmeasurable open *selects* this.
-            pass
-        elif mode == "series":
-            blocked["OSL correction"] = (
-                "run the open blank (an unusable open is itself a valid answer)")
-
-        phase = not self.phase_acc.is_empty
-        if not phase:
-            blocked["qualified upper bounds"] = (
-                "run the reference capacitor — bounds stay provisional without it")
-
-        window = self.z_min_ohm == self.z_min_ohm and self.z_max_ohm == self.z_max_ohm
-        if not window:
-            blocked["measured |Z| window"] = (
-                "run the reference resistors (≥1 per decade)")
-
-        if not self.has_load:
-            blocked["correction validation"] = "run the load blank"
-
-        return CalibrationCapabilities(
-            correction_mode=mode,
-            phase_floor_measured=phase,
-            magnitude_window_measured=window,
-            can_validate_correction=self.has_load,
-            open_is_usable=self.open_is_usable(),
-            blocked=blocked,
-        )
-
-    def is_stale(self, *, current_hash: str | None = None) -> bool:
-        """Whether this set belongs to different hardware than the rig now has.
-
-        An unknown hash on either side reads as **stale**: "we do not know what this
-        was taken on" must degrade capabilities, not pass silently.
-        """
-        current = current_hash if current_hash is not None else hardware_hash()
-        if not self.hardware_hash or not current:
-            return True
-        return self.hardware_hash != current
-
-    def measured_spread(self, field_name: str = "C_stray_F") -> float:
-        """max/min of a per-channel constant over the channels actually measured.
-
-        The empirical size of what :attr:`channels_assumed` is assuming away. NaN when
-        fewer than two channels were measured — with one channel there is nothing to
-        compare, and reporting 1.0 would read as "no variation" rather than "unknown".
-        """
-        mapping = getattr(self, field_name, None)
-        if not isinstance(mapping, Mapping):
-            return float("nan")
-        vals = [float(v) for ch, v in mapping.items()
-                if ch in self.channels_measured
-                and float(v) == float(v) and float(v) > 0]
-        if len(vals) < 2:
-            return float("nan")
-        return float(max(vals) / min(vals))
-
-    def for_channel(self, channel: int) -> dict[str, float]:
-        """This channel's constants, logging when they are inherited rather than its own.
-
-        The inheritance is **not** a formality on this fixture. Seven tied open blanks
-        across nominally identical stripes (ch17–23, 2026-08-06) gave ``C_stray``
-        spanning 10.2–24.7 pF — a 2.4× spread — while repeating to 1% on any single
-        channel. So channel-to-channel variation is real and roughly an order of
-        magnitude larger than the measurement error it would otherwise be mistaken for.
-        The warning carries that number, because "inherited" without a magnitude reads
-        as bookkeeping and gets skimmed.
-        """
-        ch = int(channel)
-        if ch in self.channels_assumed:
-            logger.warning(
-                "eis_calibration_channel_assumed", channel=ch,
-                measured=self.channels_measured,
-                measured_spread=self.measured_spread("C_stray_F"),
-                msg="constants inherited from a representative channel — measured "
-                    "channel-to-channel C_stray spread on this fixture is 2.4x "
-                    "(10.2-24.7 pF over 7 identical stripes), so this is a real "
-                    "uncertainty, not a formality",
-            )
-        return {
-            "R_short_ohm": float(self.R_short_ohm.get(ch, float("nan"))),
-            "L_lead_H": float(self.L_lead_H.get(ch, float("nan"))),
-            "C_stray_F": float(self.C_stray_F.get(ch, float("nan"))),
-        }
-
-    def envelope(self, base: Any = None) -> Any:
-        """An :class:`InstrumentEnvelope` with whatever this set actually measured.
-
-        Unmeasured quantities keep the configured estimate *and its
-        ``*_measured = False`` flag*, so a partial calibration never silently
-        promotes a guess to a measurement.
-        """
-        from softae.analysis.eis.envelope import InstrumentEnvelope, instrument_envelope
-
-        env = base if base is not None else instrument_envelope()
-        updates: dict[str, Any] = {}
-
-        if not self.phase_acc.is_empty:
-            # The lowest characterised impedance is the conservative headline value.
-            idx = int(np.argmin(np.asarray(self.phase_acc.z_ohm, dtype=float)))
-            updates["phase_noise_deg"] = float(self.phase_acc.eps_deg[idx])
-            updates["phase_noise_at_ohm"] = float(self.phase_acc.z_ohm[idx])
-            updates["phase_noise_load"] = self.phase_acc.load
-            updates["phase_noise_valid_decades"] = float(self.phase_acc.valid_decades)
-            updates["phase_noise_measured"] = True
-
-        if self.z_min_ohm == self.z_min_ohm and self.z_max_ohm == self.z_max_ohm:
-            updates["z_min_ohm"] = float(self.z_min_ohm)
-            updates["z_max_ohm"] = float(self.z_max_ohm)
-            updates["magnitude_window_measured"] = True
-
-        if self.created_at:
-            updates["measured_at"] = self.created_at
-
-        if not updates:
-            return env
-        if isinstance(env, InstrumentEnvelope):
-            return replace(env, **updates)
-        return env
-
-    def describe(self) -> str:
-        caps = self.capabilities()
-        n = len(self.channels_measured)
-        assumed = (f" (+{len(self.channels_assumed)} assumed)"
-                   if self.channels_assumed else "")
-        return (
-            f"calibration '{self.fixture_id}' @{self.hardware_hash or '?'} "
-            f"[{self.created_at or 'undated'}], {n} channel(s){assumed}: "
-            f"{caps.describe()}"
-        )
-
-    # ── Persistence ──────────────────────────────────────────────────────────
-
-    def to_dict(self) -> dict[str, Any]:
-        """A plain mapping, keys stringified for TOML/JSON round-tripping."""
-        return {
-            "fixture_id": self.fixture_id,
-            "hardware_hash": self.hardware_hash,
-            "created_at": self.created_at,
-            "channels_measured": list(self.channels_measured),
-            "channels_assumed": list(self.channels_assumed),
-            "R_short_ohm": {str(k): float(v) for k, v in self.R_short_ohm.items()},
-            "L_lead_H": {str(k): float(v) for k, v in self.L_lead_H.items()},
-            "C_stray_F": {str(k): float(v) for k, v in self.C_stray_F.items()},
-            "open_usable": {str(k): bool(v) for k, v in self.open_usable.items()},
-            "G_fixture": {
-                str(k): {"freq_hz": list(v.freq_hz), "G_S": list(v.G_S),
-                         "exponent": float(v.exponent)}
-                for k, v in self.G_fixture.items()
-            },
-            "phase_acc": {
-                "z_ohm": list(self.phase_acc.z_ohm),
-                "eps_deg": list(self.phase_acc.eps_deg),
-                "load": self.phase_acc.load,
-                "valid_decades": self.phase_acc.valid_decades,
-            },
-            "z_min_ohm": self.z_min_ohm,
-            "z_max_ohm": self.z_max_ohm,
-            "load_error_pct": self.load_error_pct,
-            "sources": {str(k): int(v) for k, v in self.sources.items()},
-        }
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "CalibrationSet":
-        """Rebuild from :meth:`to_dict`, tolerating a partial or older mapping."""
-        def _imap(key: str) -> dict[int, float]:
-            out: dict[int, float] = {}
-            for k, v in (data.get(key) or {}).items():
-                try:
-                    out[int(k)] = float(v)
-                except (TypeError, ValueError):
-                    continue
-            return out
-
-        def _f(key: str) -> float:
-            try:
-                return float(data.get(key, float("nan")))
-            except (TypeError, ValueError):
-                return float("nan")
-
-        pa = data.get("phase_acc") or {}
-        phase = PhaseAccuracyTable(
-            z_ohm=tuple(float(z) for z in (pa.get("z_ohm") or [])),
-            eps_deg=tuple(float(e) for e in (pa.get("eps_deg") or [])),
-            load=str(pa.get("load", "resistive")),
-            valid_decades=float(pa.get("valid_decades", 1.0) or 1.0),
-        )
-        opens: dict[int, bool] = {}
-        for k, v in (data.get("open_usable") or {}).items():
-            try:
-                opens[int(k)] = bool(v)
-            except (TypeError, ValueError):
-                continue
-        gfix: dict[int, FixtureConductance] = {}
-        for k, v in (data.get("G_fixture") or {}).items():
-            try:
-                gfix[int(k)] = FixtureConductance(
-                    freq_hz=tuple(float(x) for x in (v.get("freq_hz") or [])),
-                    G_S=tuple(float(x) for x in (v.get("G_S") or [])),
-                    exponent=float(v.get("exponent", float("nan"))),
-                )
-            except (TypeError, ValueError, AttributeError):
-                continue
-        sources: dict[str, int] = {}
-        for k, v in (data.get("sources") or {}).items():
-            try:
-                sources[str(k)] = int(v)
-            except (TypeError, ValueError):
-                continue
-
-        return cls(
-            fixture_id=str(data.get("fixture_id", "default")),
-            hardware_hash=str(data.get("hardware_hash", "")),
-            created_at=str(data.get("created_at", "")),
-            channels_measured=tuple(
-                int(c) for c in (data.get("channels_measured") or [])),
-            channels_assumed=tuple(
-                int(c) for c in (data.get("channels_assumed") or [])),
-            R_short_ohm=_imap("R_short_ohm"),
-            L_lead_H=_imap("L_lead_H"),
-            C_stray_F=_imap("C_stray_F"),
-            open_usable=opens,
-            G_fixture=gfix,
-            phase_acc=phase,
-            z_min_ohm=_f("z_min_ohm"),
-            z_max_ohm=_f("z_max_ohm"),
-            load_error_pct=_f("load_error_pct"),
-            sources=sources,
-        )
-
-
-# ── Derivation from acquired spectra ─────────────────────────────────────────
-
-def derive_short(f: np.ndarray, Z: np.ndarray) -> tuple[float, float]:
-    """``(R_fixture, L_lead)`` from a shorted channel.
-
-    ``R`` is the median ``Re Z`` — median rather than mean because a single railed
-    point should not move a fixture constant. ``L`` comes from the slope of
-    ``Im Z`` against ``ω``, which is what a series inductance *is*.
-
-    R11 exists because F5 recorded fitted inductances of 400–500 µH against a short
-    blank's true 4.18 µH: a HF phase artifact absorbed as inductance. Measuring L here
-    is what licenses pinning it to ≈0 in the sample fit rather than letting the
-    optimizer discover a fictitious one.
-    """
-    freq = np.asarray(f, dtype=float)
-    Zc = np.asarray(Z, dtype=complex)
-    good = np.isfinite(freq) & np.isfinite(Zc.real) & np.isfinite(Zc.imag) & (freq > 0)
-    if not np.any(good):
-        return float("nan"), float("nan")
-
-    R = float(np.median(Zc.real[good]))
-    omega = 2.0 * math.pi * freq[good]
-    im = Zc.imag[good]
-    if omega.size < 2:
-        return R, float("nan")
-    # Slope through the origin: L = <ωX>/<ω²>, least squares with no intercept, since
-    # a short has no reason to carry one and fitting one absorbs real inductance.
-    denom = float(np.sum(omega ** 2))
-    L = float(np.sum(omega * im) / denom) if denom > 0 else float("nan")
-    return R, L
-
-
-def derive_open(
-    f: np.ndarray, Z: np.ndarray, *, envelope: Any = None, gates: Any = None
-) -> tuple[bool, float, float]:
-    """``(usable, over_range_frac, im_flip_frac)`` for an open blank.
-
-    Two orthogonal signatures, per framework §3.9: how much of the band sits above
-    the magnitude ceiling, and how often ``Im Z`` changes sign. A smooth physical
-    blank flips rarely; noise flips constantly.
-
-    ⚠️ **An open cell inherently floats the reference electrode** (overhaul §3.7),
-    which is the same condition that produced the withdrawn ``Z_φ``. A bare-board open
-    on a three-electrode fixture is therefore a measurement of inter-stripe geometry,
-    **not** a fixture open — a genuine one needs RE tied to CE at the connector. The
-    verdict here is still meaningful (an unusable open selects series-only, which is
-    the right answer either way), but ``usable = False`` on this hardware should be
-    read as "not yet attempted properly" rather than "the fixture has no open".
-    """
-    from softae.analysis.eis.envelope import instrument_envelope
-    from softae.analysis.eis.settings import eis_settings
-
-    env = envelope if envelope is not None else instrument_envelope()
-    cfg = gates if gates is not None else eis_settings().gates
-
-    Zc = np.asarray(Z, dtype=complex)
-    mag = np.abs(Zc)
-    finite = np.isfinite(mag)
-    if not np.any(finite):
-        return False, 1.0, 1.0
-
-    over = float(np.mean(mag[finite] > env.z_max_ohm))
-    signs = np.sign(Zc.imag[finite])
-    flips = float(np.mean(np.diff(signs) != 0)) if signs.size > 1 else 1.0
-    usable = (over < cfg.blank_over_frac) and (flips < cfg.blank_flip_frac)
-    return usable, over, flips
-
-
-def derive_open_constants(
-    f: np.ndarray, Z: np.ndarray, *, lo_hz: float = 1e2, hi_hz: float = 1e4
-) -> tuple[float, FixtureConductance]:
-    """``(C_stray, G_fixture(f))`` from an open blank.
-
-    :func:`derive_open` returns only a *verdict* — usable or not. That left
-    ``CalibrationSet.C_stray_F`` declared, serialised, read by ``for_channel``, and
-    **written by nothing**: the fixture's two shunt constants were derivable from an
-    artifact the module already collected and were simply never extracted. This is the
-    missing producer.
-
-    ``C_stray`` is the median of ``Im(Y)/ω`` over *lo_hz–hi_hz*, a band chosen to sit
-    above the low-frequency phase floor (where ``Re Z`` goes negative on a near-ideal
-    blank) and below the top of the sweep. ``G_fixture`` is kept as a **table over the
-    whole band**, because on this fixture it is dielectric loss and varies with ω;
-    see :class:`FixtureConductance`.
-
-    Both are per channel. The measured channel-to-channel spread is 2.4×, so this is
-    not a quantity to derive once and share — which is what ``channels_assumed`` warns
-    about when it must be.
-    """
-    f = np.asarray(f, dtype=float)
-    Zc = np.asarray(Z, dtype=complex)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        Y = np.where(np.abs(Zc) > 0, 1.0 / np.where(np.abs(Zc) > 0, Zc, 1.0),
-                     np.nan + 0j)
-    omega = 2.0 * np.pi * f
-
-    band = (f >= lo_hz) & (f <= hi_hz) & np.isfinite(np.abs(Y)) & (omega > 0)
-    if not np.any(band):
-        band = np.isfinite(np.abs(Y)) & (omega > 0)
-    C = float(np.nanmedian((np.imag(Y) / omega)[band])) if np.any(band) else float("nan")
-
-    # G is tabulated only where it is positive and finite. A negative Re(Y) is the
-    # phase floor showing through on a near-ideal blank -- real, and meaningless as a
-    # conductance, so it is dropped rather than clipped to zero: a floor of zero would
-    # read as "no loss here" when the truth is "below what this instrument resolves".
-    G_ok = np.isfinite(np.real(Y)) & (np.real(Y) > 0) & (f > 0)
-    freqs = tuple(float(v) for v in f[G_ok])
-    gs = tuple(float(v) for v in np.real(Y)[G_ok])
-
-    exponent = float("nan")
-    if len(freqs) >= 3:
-        try:
-            exponent = float(np.polyfit(np.log10(freqs), np.log10(gs), 1)[0])
-        except (np.linalg.LinAlgError, ValueError):
-            exponent = float("nan")
-
-    return C, FixtureConductance(freq_hz=freqs, G_S=gs, exponent=exponent)
-
-
-@dataclass(frozen=True)
-class ReferenceLoad:
-    """What a reference component's own physics says its spectrum must look like.
-
-    The gates in :func:`derive_phase_table` are only as good as the expectation they
-    compare against, and that expectation is a property of the *part*, not of the
-    function. A capacitor falls at ``d log|Z| / d log f = −1`` and lives in the fourth
-    quadrant; a resistor is flat and on the real axis. Naming the expectation rather
-    than hardcoding "capacitor" is what lets a resistive reference ladder use the same
-    tabulation later without a second copy of it.
-    """
-
-    #: Name recorded on :attr:`PhaseAccuracyTable.load`.
-    name: str
-    #: Expected ``d log|Z| / d log f``. −1 for a capacitor, 0 for a resistor.
-    log_slope: float
-    #: Required sign of ``Im Z``: −1 capacitive, +1 inductive, 0 unconstrained.
-    im_sign: int
-    #: Whether ``Re Z`` must be positive. A passive part dissipates; it never sources.
-    positive_real: bool = True
-
-
-CAPACITIVE_REFERENCE = ReferenceLoad("capacitive", log_slope=-1.0, im_sign=-1)
-RESISTIVE_REFERENCE = ReferenceLoad("resistive", log_slope=0.0, im_sign=0)
-
-REFERENCE_LOADS = {
-    "capacitive": CAPACITIVE_REFERENCE,
-    "resistive": RESISTIVE_REFERENCE,
+# ── The re-export contract ───────────────────────────────────────────────────
+#
+# ``calibration`` is the published name for all three modules. Consumers import from
+# here in single statements spanning every cluster (``commissioning.py`` takes nine
+# names at once), and ``tests/test_eis_calibration.py`` monkeypatches
+# ``calmod.derive_reference_cap`` on *this* module while the consumer imports it
+# function-locally from *this* module — so the re-export is what makes both work.
+#
+# It is **lazy** rather than a bottom-of-module ``from .calibration_set import ...``.
+# The eager form only survives being imported hub-first: import a sibling first and it
+# closes a cycle on a half-built module, ``cannot import name ... from partially
+# initialized module``. PEP 562 removes the cycle from the import graph entirely — this
+# module imports neither sibling until a name is actually asked for, so the arrows run
+# one way (sibling → hub) in every order. The first lookup caches into ``globals()``,
+# after which the name is an ordinary module attribute: ``monkeypatch.setattr`` and its
+# undo behave exactly as they would have with an eager binding.
+
+_REEXPORTS: dict[str, str] = {
+    # ── calibration_derive: acquired spectrum → number ────────────────────────
+    "CAPACITIVE_REFERENCE": "calibration_derive",
+    "PHASE_TABLE_SLOPE_TOL": "calibration_derive",
+    "REFERENCE_LOADS": "calibration_derive",
+    "RESISTIVE_REFERENCE": "calibration_derive",
+    "ReferenceCapResult": "calibration_derive",
+    "ReferenceLoad": "calibration_derive",
+    "_log_log_slope": "calibration_derive",
+    "derive_open": "calibration_derive",
+    "derive_open_constants": "calibration_derive",
+    "derive_phase_table": "calibration_derive",
+    "derive_reference_cap": "calibration_derive",
+    "derive_reference_r": "calibration_derive",
+    "derive_short": "calibration_derive",
+    "phase_table_gate": "calibration_derive",
+    # ── calibration_set: the set itself, and its persistence ──────────────────
+    "CalibrationSet": "calibration_set",
+    "_to_toml": "calibration_set",
+    "calibration_path": "calibration_set",
+    "describe_or_absent": "calibration_set",
+    "load_calibration": "calibration_set",
+    "resolve_calibration": "calibration_set",
+    "save_calibration": "calibration_set",
 }
 
-#: How far a point's local ``d log|Z| / d log f`` may sit from its load's expectation
-#: before it is treated as saturation or a range-switch artifact rather than a
-#: measurement.
-#:
-#: 0.5 is chosen from the measured sweeps rather than by taste. On this rig's reference
-#: capacitor the *good* band holds |slope + 1| ≲ 0.2, the instrument's ~1.0147 GΩ input
-#: rail shows as a plateau at slope ≈ 0 (deviation 1.0), and a range-switch step between
-#: adjacent points reads |slope| ≳ 2 (deviation ≳ 1.0). 0.5 therefore sits in the empty
-#: middle: it admits every genuine point with margin and excludes both failure shapes.
-PHASE_TABLE_SLOPE_TOL = 0.5
-
-
-def _log_log_slope(freq: np.ndarray, mag: np.ndarray) -> np.ndarray:
-    """``d log|Z| / d log f`` at each point, by central differences across the sweep.
-
-    Points are sorted by frequency first, because the instrument reports descending and
-    a gradient taken in report order would come back sign-flipped.
-    """
-    slope = np.full(freq.shape, np.nan, dtype=float)
-    if freq.size < 3:
-        return slope
-    order = np.argsort(freq)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        slope[order] = np.gradient(np.log10(mag[order]), np.log10(freq[order]))
-    return slope
-
-
-def phase_table_gate(
-    f: np.ndarray,
-    Z: np.ndarray,
-    *,
-    load: "str | ReferenceLoad" = CAPACITIVE_REFERENCE,
-    slope_tol: float = PHASE_TABLE_SLOPE_TOL,
-) -> np.ndarray:
-    """Mask of points a *load* reference may legitimately contribute to a phase table.
-
-    Three gates, in order of how badly the ungated version failed on real data:
-
-    **Finiteness.** ``|Z|`` and the loss angle must exist and be positive. This was the
-    only gate the function had.
-
-    **Quadrant.** ``tan δ = |Re Z| / |Im Z|`` takes absolute values, so a point in the
-    wrong quadrant — a passive capacitor reading ``Re Z < 0``, or ``Im Z > 0`` — does
-    not fail, it produces a *large* ε and is then averaged in as though it were a
-    measured loss. On the mux16 reference capacitor that turned instrument-noise points
-    at the top of the sweep into 34–45° "phase accuracy". A quadrant violation is not a
-    lossy measurement; it is not a measurement, and it is dropped.
-
-    **Saturation.** A reference capacitor obeys ``|Z| = 1/(2πfC)``, i.e. a log-log slope
-    of exactly −1. Where the instrument rails at its input-impedance ceiling the sweep
-    stops following that law and *plateaus* — slope → 0 — which is what the mux16 record
-    shows at ~1.0147 GΩ, entering the table as both a 44.96° point and a 0.45° one from
-    the same railed magnitude. Detecting the departure from the part's own power law
-    needs no ceiling constant, so it also catches a rail at a different level, on a
-    different instrument, or a mid-sweep range switch.
-
-    .. note::
-       **Failure directions are deliberately asymmetric.** Over-dropping costs table
-       coverage — fewer decades characterised, ``epsilon_deg`` returning NaN more often,
-       and callers pushed onto the provisional-bound path. Under-dropping puts a
-       non-measurement into the phase *floor*, which silently qualifies spectra that
-       should have stayed provisional. The first is visible and recoverable; the second
-       is neither, so ``slope_tol`` is set to over-drop.
-
-       Two known over-drops: the two points either side of a genuine range switch lose
-       their local slope to it, and a sweep of fewer than three points gets no slope at
-       all — there the saturation gate abstains rather than dropping everything, since
-       with no neighbours there is no plateau to see.
-    """
-    if isinstance(load, str):
-        # Refused rather than defaulted: a mistyped load name would silently apply a
-        # capacitor's expectation to a resistor and empty the table, which reads as
-        # "nothing survived gating" — a plausible result, and the wrong one.
-        if load not in REFERENCE_LOADS:
-            raise ValueError(
-                f"unknown reference load {load!r}; expected one of "
-                f"{sorted(REFERENCE_LOADS)}")
-        spec = REFERENCE_LOADS[load]
-    else:
-        spec = load
-
-    freq = np.asarray(f, dtype=float)
-    Zc = np.asarray(Z, dtype=complex)
-    mag = np.abs(Zc)
-
-    ok = np.isfinite(mag) & (mag > 0) & np.isfinite(freq) & (freq > 0)
-    ok &= np.isfinite(Zc.real) & np.isfinite(Zc.imag)
-
-    if spec.positive_real:
-        ok &= Zc.real > 0
-    if spec.im_sign < 0:
-        ok &= Zc.imag < 0
-    elif spec.im_sign > 0:
-        ok &= Zc.imag > 0
-
-    slope = _log_log_slope(freq, mag)
-    railed = np.isfinite(slope) & (np.abs(slope - spec.log_slope) > float(slope_tol))
-    return ok & ~railed
-
-
-def derive_phase_table(
-    f: np.ndarray,
-    Z: np.ndarray,
-    *,
-    per_decade: bool = True,
-    load: "str | ReferenceLoad" = CAPACITIVE_REFERENCE,
-    slope_tol: float = PHASE_TABLE_SLOPE_TOL,
-) -> tuple[list[float], list[float]]:
-    """``(|Z| points, phase-error bounds in degrees)`` from one reference component.
-
-    **A single capacitor populates the whole table.** Swept 4 Hz–200 kHz, a 1 nF part
-    traverses ``|Z|`` from ~800 Ω to ~40 MΩ — four and a half decades, which is most of
-    the working range. R25 asks for a table over ``|Z|`` "populated from reference
-    components spanning the working decades", and one component spans them by virtue of
-    the sweep. Reducing that sweep to a single number throws the span away.
-
-    The statistic per decade is the **median** loss angle, not the minimum.
-
-    That distinction is the whole correctness of this function. The measured loss angle
-    is an *upper bound* on the instrument's phase error, because it also contains the
-    reference part's own loss — which is the conservative direction a gate wants. But
-    the **minimum** across a sweep is not a bound on anything: it is the single luckiest
-    point, where noise happened to cancel. Taking it on this rig's 1 nF C0G yields
-    ``tan δ = 7e-5``, i.e. 0.004°, roughly a hundred times tighter than the 0.2–0.5°
-    the same data supports per decade — and a phase floor that small would qualify
-    almost any spectrum as a measured value rather than a bound, which is precisely the
-    §3.3 failure the value-vs-bound machinery exists to prevent.
-
-    **A median is only as good as what it is a median of**, which is why
-    :func:`phase_table_gate` runs first. The median defends against one unlucky point;
-    it does not defend against a *population* of railed or wrong-quadrant points, and on
-    the mux16 record there were enough of both to move whole decades — 7 of 24 tabulated
-    points sat above 30°, and the two extremes of the table were the instrument's input
-    rail rather than the capacitor. Gating first and taking the median second are
-    complementary, not alternatives.
-    """
-    freq = np.asarray(f, dtype=float)
-    Zc = np.asarray(Z, dtype=complex)
-    mag = np.abs(Zc)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        tand = np.abs(Zc.real) / np.abs(Zc.imag)
-    eps = np.degrees(np.arctan(tand))
-
-    ok = phase_table_gate(freq, Zc, load=load, slope_tol=slope_tol) & np.isfinite(eps)
-    if not np.any(ok):
-        return [], []
-    if int(np.size(ok)) - int(np.count_nonzero(ok)):
-        logger.info("eis_phase_table_gated", kept=int(np.count_nonzero(ok)),
-                    total=int(np.size(ok)))
-    mag, eps = mag[ok], eps[ok]
-
-    if not per_decade:
-        return [float(np.median(mag))], [float(np.median(eps))]
-
-    decade = np.floor(np.log10(mag)).astype(int)
-    z_pts: list[float] = []
-    e_pts: list[float] = []
-    for d in sorted(set(decade.tolist())):
-        m = decade == d
-        if not np.any(m):
-            continue
-        z_pts.append(float(np.median(mag[m])))
-        e_pts.append(float(np.median(eps[m])))
-    return z_pts, e_pts
-
-
-@dataclass(frozen=True)
-class ReferenceCapResult:
-    """What one reference-capacitor sweep says, raw and stray-corrected.
-
-    Unpacks as the ``(C, tand_min, z_at_tand_min)`` triple :func:`derive_reference_cap`
-    has always returned — the same affordance
-    :class:`~softae.workflows.commissioning.AcquiredSpectrum` uses — so every existing
-    caller is unaffected. The extra fields exist so the marked-value check can *show its
-    working*: "149.8 pF disagrees with a 100 pF marking" and "96.6 pF agrees with it,
-    once the fixture's 53 pF shunt is taken off" are the same measurement, and only the
-    second is a statement about the part.
-    """
-
-    #: Median ``1/(ω|Im Z|)`` over the sweep — the part **plus** whatever shunts it.
-    C_raw_F: float
-    tand_min: float
-    z_at_tand_min_ohm: float
-    #: The fixture's stray shunt, or NaN when none was measured for this channel.
-    C_stray_F: float = float("nan")
-
-    @property
-    def corrected(self) -> bool:
-        """Whether a usable stray was supplied — i.e. whether the correction ran."""
-        return self.C_stray_F == self.C_stray_F
-
-    @property
-    def C_corrected_F(self) -> float:
-        """The part alone: raw minus the parallel stray. NaN without a stray."""
-        return self.C_raw_F - self.C_stray_F
-
-    @property
-    def C_F(self) -> float:
-        """The value the marked-value check judged — corrected where one was possible."""
-        return self.C_corrected_F if self.corrected else self.C_raw_F
-
-    def __iter__(self) -> Iterator[float]:
-        return iter((self.C_F, self.tand_min, self.z_at_tand_min_ohm))
-
-
-def derive_reference_cap(
-    f: np.ndarray,
-    Z: np.ndarray,
-    *,
-    nominal_F: float | None = None,
-    C_stray_F: float | None = None,
-) -> ReferenceCapResult:
-    """What a reference capacitor measured, checked against what it is marked.
-
-    The single most valuable and most-skipped commissioning artifact (§7.4): it is the
-    only route to a *measured* ``ε`` where the samples actually sit.
-
-    Overhaul §3.7 is also the cautionary tale. The capacitor marked "102" (decoding to
-    1 nF) measured ~150 nF with a minimum ``tan δ`` of 0.18 — 70× above the instrument
-    floor. Whatever it was, it was unusable as a phase reference. So this returns the
-    *measured* capacitance alongside the loss, and comparing them against the marking is
-    exactly the check that would have caught it.
-
-    **The check is run against the corrected value when there is one.** The fixture's
-    stray capacitance sits in **parallel** with the part, so what the sweep sees is
-    ``C_part + C_stray`` and the part's own capacitance is
-    ``Im(Y)/ω − C_stray``. On this rig the stray is ~53 pF against 100 pF parts, so the
-    uncorrected check reads 1.50× and flags two perfectly good C0G capacitors while
-    telling the operator to re-read a part code that was right all along. Pass
-    *C_stray_F* — the same per-channel number :func:`derive_open_constants` produces —
-    and the check judges the part rather than the part plus the fixture. Omit it and
-    the behaviour is exactly as before: the raw value is checked, and the report says so.
-
-    Subtracting the stray from the **median** rather than from each point is not an
-    approximation of the per-point correction, it is identical to it: the stray is one
-    constant, and ``median(x_i − c) = median(x_i) − c`` for any constant. Per-point
-    would matter only if the correction varied across the sweep, which a fixed shunt
-    capacitance does not.
-
-    A stray that is NaN, zero or negative is treated as **absent**, not as zero. Those
-    are the shapes :func:`derive_open_constants` returns from a trace it could not read,
-    and a fixture with literally no shunt is not a thing this hardware produces —
-    silently subtracting nothing would report "corrected" for a correction that never
-    happened.
-
-    .. note::
-       This correction is **local to the marked-value check**, deliberately. The
-       production fixture correction is series-only by design (see
-       ``analysis/eis/fixture.py``): it has no shunt term to carry this, and giving it
-       one would reopen the OSL path that corrupted whole spectra. Nothing outside this
-       function's report is corrected here.
-    """
-    freq = np.asarray(f, dtype=float)
-    Zc = np.asarray(Z, dtype=complex)
-    good = (
-        np.isfinite(freq) & (freq > 0)
-        & np.isfinite(Zc.real) & np.isfinite(Zc.imag) & (Zc.imag < 0)
-    )
-
-    stray = float(C_stray_F) if C_stray_F is not None else float("nan")
-    if not (stray > 0):
-        stray = float("nan")
-
-    if not np.any(good):
-        return ReferenceCapResult(float("nan"), float("nan"), float("nan"), stray)
-
-    omega = 2.0 * math.pi * freq[good]
-    C = 1.0 / (omega * np.abs(Zc.imag[good]))
-    tand = np.abs(Zc.real[good]) / np.abs(Zc.imag[good])
-
-    k = int(np.argmin(tand))
-    result = ReferenceCapResult(
-        C_raw_F=float(np.median(C)),
-        tand_min=float(tand[k]),
-        z_at_tand_min_ohm=float(np.abs(Zc[good][k])),
-        C_stray_F=stray,
-    )
-
-    judged = result.C_F
-    if nominal_F is not None and nominal_F > 0 and judged == judged:
-        ratio = judged / float(nominal_F)
-        if ratio > 2.0 or ratio < 0.5:
-            logger.warning(
-                "eis_reference_cap_mismatch", measured_F=judged,
-                C_raw_F=result.C_raw_F,
-                C_corrected_F=result.C_corrected_F if result.corrected else None,
-                C_stray_F=result.C_stray_F if result.corrected else None,
-                stray_corrected=result.corrected,
-                nominal_F=float(nominal_F), ratio=ratio,
-                msg="measured capacitance disagrees with the marking — re-read the "
-                    "part code and confirm on a meter before trusting it as a "
-                    "phase reference"
-                    + ("" if result.corrected else
-                       " (no open blank on this channel, so this is the RAW value: "
-                       "the fixture's parallel stray is still in it)"),
-            )
-    return result
-
-
-def derive_reference_r(
-    f: np.ndarray, Z: np.ndarray, *, nominal_ohm: float
-) -> tuple[float, float, float]:
-    """``(R_measured, error_pct, phase_noise_deg)`` from a reference resistor.
-
-    A resistor's phase is 0° by definition, so the *scatter* of its measured phase is
-    a direct read of ``ε`` at that impedance — which is what makes a resistor ladder
-    the cheap route to a magnitude window and a phase floor at the same time.
-    """
-    Zc = np.asarray(Z, dtype=complex)
-    good = np.isfinite(Zc.real) & np.isfinite(Zc.imag)
-    if not np.any(good):
-        return float("nan"), float("nan"), float("nan")
-
-    R = float(np.median(Zc.real[good]))
-    err = ((R - nominal_ohm) / nominal_ohm * 100.0) if nominal_ohm else float("nan")
-    phase = np.degrees(np.angle(Zc[good]))
-    return R, err, float(np.std(phase))
-
-
-# ── Persistence ──────────────────────────────────────────────────────────────
-
-def calibration_path(fixture_id: str, *, root: Path | None = None) -> Path:
-    """Where a fixture's canonical calibration lives.
-
-    Version-controlled beside the code, because framework §8.5 requires commissioning
-    data to travel with the software and be re-validated after a hardware change. The
-    database keeps history; *this* file is what a checkout reproduces.
-    """
-    base = root if root is not None else Path("calibration") / "eis"
-    return base / f"{fixture_id}.toml"
-
-
-def save_calibration(
-    calibration: CalibrationSet, *, root: Path | None = None
-) -> Path:
-    """Write the canonical TOML. Returns the path written."""
-    path = calibration_path(calibration.fixture_id, root=root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_to_toml(calibration.to_dict()), encoding="utf-8")
-    logger.info("eis_calibration_saved", path=str(path),
-                fixture=calibration.fixture_id,
-                hardware_hash=calibration.hardware_hash)
-    return path
-
-
-def load_calibration(
-    fixture_id: str = "default",
-    *,
-    root: Path | None = None,
-    path: Path | None = None,
-) -> CalibrationSet | None:
-    """Load a calibration, or ``None`` when there is none to load.
-
-    ``None`` is a legitimate state, not an error: the envelope then falls back to
-    ``[eis.instrument]``'s estimates *with their ``measured = False`` flags intact*,
-    which is exactly how an uncalibrated rig should behave.
-    """
-    target = path if path is not None else calibration_path(fixture_id, root=root)
-    if not target.exists():
-        logger.info("eis_calibration_absent", path=str(target),
-                    msg="falling back to configured estimates, flagged unmeasured")
-        return None
-    try:
-        import tomllib
-
-        data = tomllib.loads(target.read_text(encoding="utf-8"))
-    except Exception:
-        logger.warning("eis_calibration_unreadable", path=str(target), exc_info=True)
-        return None
-    return CalibrationSet.from_dict(data)
-
-
-def resolve_calibration(
-    fixture_id: str = "default",
-    *,
-    root: Path | None = None,
-    path: Path | None = None,
-    config: Mapping[str, Any] | None = None,
-) -> CalibrationSet | None:
-    """Load a calibration and **degrade it if the hardware has changed**.
-
-    A stale set is not applied. Returning it unchanged would let a short blank from a
-    different board correct today's spectra — silently, and with every number looking
-    plausible. Instead the fixture constants are dropped and the capability ladder
-    falls back to "run the short blank", which is the truth.
-    """
-    cal = load_calibration(fixture_id, root=root, path=path)
-    if cal is None:
-        return None
-
-    current = hardware_hash(config)
-    if not cal.is_stale(current_hash=current):
-        return cal
-
-    logger.warning(
-        "eis_calibration_stale", fixture=fixture_id,
-        recorded=cal.hardware_hash or "(none)", current=current,
-        msg="hardware changed since this calibration — constants dropped rather "
-            "than applied to a different fixture",
-    )
-    return replace(
-        cal, R_short_ohm={}, L_lead_H={}, C_stray_F={}, open_usable={},
-        phase_acc=PhaseAccuracyTable(), z_min_ohm=float("nan"),
-        z_max_ohm=float("nan"), load_error_pct=float("nan"),
-    )
-
-
-def _to_toml(data: Mapping[str, Any]) -> str:
-    """Minimal TOML writer — the stdlib reads TOML but does not write it.
-
-    Deliberately not a dependency, but it must handle **nested** tables. The first
-    version emitted one level and fell through to ``json.dumps(str(v))`` for anything
-    deeper, so ``G_fixture`` — a mapping of per-channel tables — serialised as quoted
-    Python reprs and was silently discarded on load. The file looked fine and the
-    calibration came back missing a field, which is the worst shape a persistence bug
-    can take. Recursion costs four lines and removes the whole class of it.
-    """
-    def _fmt(v: Any) -> str:
-        if isinstance(v, bool):
-            return "true" if v else "false"
-        if isinstance(v, (int,)):
-            return str(v)
-        if isinstance(v, float):
-            if v != v:
-                return "nan"
-            return repr(v)
-        if isinstance(v, (list, tuple)):
-            return "[" + ", ".join(_fmt(x) for x in v) + "]"
-        return json.dumps(str(v))
-
-    def _emit(node: Mapping[str, Any], prefix: str, tables: list[str]) -> list[str]:
-        """Return this table's scalar lines, appending nested tables to *tables*."""
-        own: list[str] = []
-        nested: list[tuple[str, Mapping[str, Any]]] = []
-        for k, v in node.items():
-            if isinstance(v, Mapping):
-                nested.append((str(k), v))
-            else:
-                own.append(f"{k} = {_fmt(v)}")
-        for k, v in nested:
-            # TOML permits digit-only bare keys, which is what channel numbers are.
-            path = f"{prefix}.{k}" if prefix else str(k)
-            body = _emit(v, path, tables)
-            tables.append(f"\n[{path}]\n" + "\n".join(body))
-        return own
-
-    tables: list[str] = []
-    scalars = _emit(data, "", tables)
-
-    header = (
-        "# EIS commissioning calibration — generated, but version-controlled.\n"
-        "# Framework §8.5: commissioning data travels with the code and is\n"
-        "# re-validated after any hardware change. Staleness is by hardware_hash,\n"
-        "# not by date: fixture drift is minimal, so there is no expiry.\n"
-    )
-    return header + "\n".join(scalars) + "\n" + "\n".join(tables) + "\n"
-
-
-def describe_or_absent(calibration: CalibrationSet | None) -> str:
-    """One startup line, whether or not a calibration exists."""
-    if calibration is None:
-        return (
-            "EIS calibration: none — using configured estimates (flagged unmeasured). "
-            "Run commissioning to measure the fixture: short blank → load blank → "
-            "reference capacitor, in that order of value per hour of bench time."
-        )
-    return calibration.describe()
+__all__ = [
+    "ARTIFACT_NOMINAL_UNITS",
+    "COMMISSIONING_ROLES",
+    "CORRECTION_MODES",
+    "DRIFT_REPEAT_ROLE",
+    "ELECTRODE_MODES",
+    "HARDWARE_SECTIONS",
+    "MAX_PLAUSIBLE_L_LEAD_H",
+    "MAX_PLAUSIBLE_SHORT_OHM",
+    "MEASUREMENT_ROLES",
+    "TWO_TERMINAL_ROLES",
+    "CalibrationCapabilities",
+    "FixtureConductance",
+    "PhaseAccuracyTable",
+    "electrode_mode_ok",
+    "hardware_hash",
+    "short_is_plausible",
+    *sorted(_REEXPORTS),
+]
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve a re-exported name from its owning sibling, once, then cache it."""
+    module = _REEXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    from importlib import import_module
+
+    value = getattr(import_module(f"{__package__}.{module}"), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_REEXPORTS))
