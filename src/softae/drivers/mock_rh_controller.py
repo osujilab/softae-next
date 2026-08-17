@@ -12,6 +12,7 @@ import time as _time
 from typing import Any
 
 from softae.drivers.contracts import validate_rh_setpoint
+from softae.errors import InstrumentError
 from softae.server.base_instrument import BaseInstrument, InstrumentState
 
 import structlog
@@ -79,12 +80,34 @@ class MockRHController(BaseInstrument):
         tol: float = 2.0,
         timeout: float = 120.0,
         equilibration_s: float = 0.0,
+        raise_on_timeout: bool = False,
     ) -> None:
-        """Snap RH to target in mock (instant stabilisation).\n\n        Respects ``_wait_abort`` so abort tests work correctly.\n        """
+        """Snap RH to target in mock (instant stabilisation).
+
+        Respects ``_wait_abort`` so abort tests work correctly.
+
+        ``raise_on_timeout`` mirrors :meth:`AsyncRHController.wait` in both
+        signature *and* behaviour.  The signature must match because
+        ``BaseInstrument.execute`` forwards task params verbatim — a catalogued
+        ``rh_wait`` carrying the flag would otherwise ``TypeError`` on the
+        simulated path, which is exactly where an unattended recipe is exercised
+        before it touches hardware.  The behaviour must match because a mock
+        that accepts the flag and then silently never honours it is worse than
+        one that rejects it: the aborted case genuinely does not reach target,
+        and a gated step has to hear about that in simulation too.
+        """
         if target is None:
             target = self._setpoint
         if not self._wait_abort.is_set():
-            self._rh = target + random.gauss(0, tol * 0.3)
+            # Clamped into the band: the mock is claiming to have settled, so it
+            # must actually satisfy the same check the real driver applies.
+            self._rh = target + max(-tol, min(tol, random.gauss(0, tol * 0.3)))
+        if raise_on_timeout and abs(self._rh - target) > tol:
+            raise InstrumentError(
+                f"RH did not reach {target:g} ±{tol:g} %RH within {timeout:g} s "
+                f"(last reading {self._rh:g} %RH)",
+                instrument=self.name,
+            )
 
     def get_H(self) -> float:
         self._update_sim()

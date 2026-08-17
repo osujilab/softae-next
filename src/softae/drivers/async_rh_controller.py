@@ -44,6 +44,7 @@ from softae.drivers.mcp2221_bus import I2C_BUS_LOCK
 from softae.errors import (
     CommunicationError,
     ConnectionError_,
+    InstrumentError,
 )
 from softae.server.base_instrument import BaseInstrument, InstrumentState
 
@@ -385,6 +386,7 @@ class AsyncRHController(BaseInstrument):
         tol: float = 2.0,
         timeout: float = 120.0,
         equilibration_s: float = 0.0,
+        raise_on_timeout: bool = False,
     ) -> None:
         """Block until RH reaches *target* ± *tol* or *timeout* expires.
 
@@ -392,11 +394,22 @@ class AsyncRHController(BaseInstrument):
         *equilibration_s* > 0 the method holds for that many additional seconds
         after the setpoint is reached, matching the temperature controller
         ``wait(equilibration_time=…)`` pattern.
+
+        ``raise_on_timeout`` decides what an unmet target *means*.  Default
+        ``False`` keeps the historical behaviour — log and return — so existing
+        callers (monitoring, best-effort settles) are unchanged.  A workflow step
+        that **gates** on humidity sets it ``True``: a step which cannot fail is
+        not a check, and proceeding into a multi-hour cure at an unknown RH is
+        worse than stopping.  The failure is an :class:`InstrumentError` rather
+        than a comms/timeout error precisely so the executor does *not* treat it
+        as a recoverable glitch and replay the channel — the humidity did not
+        arrive, and retrying the wait does not change that.
         """
         if target is None:
             target = self._setpoint
         deadline = time.time() + timeout
 
+        rh = float("nan")
         while time.time() < deadline:
             with self._thread_lock:
                 rh = self._current_rh
@@ -407,7 +420,16 @@ class AsyncRHController(BaseInstrument):
                 return
             time.sleep(self._poll_period)
 
-        logger.warning("rh_wait_timeout", target=target, timeout=timeout)
+        logger.warning("rh_wait_timeout", target=target, timeout=timeout, rh=rh)
+        if raise_on_timeout:
+            # Deliberately NOT CommunicationError/StepTimeoutError: those are the
+            # classes WorkflowExecutor._recoverable_cause replays the channel on,
+            # and retrying a wait does not make the humidity arrive.
+            raise InstrumentError(
+                f"RH did not reach {target:g} ±{tol:g} %RH within {timeout:g} s "
+                f"(last reading {rh:g} %RH)",
+                instrument=self.name,
+            )
 
     def get_TH(self) -> tuple[float, float]:
         """Return ``(chamber_temp_C, %RH)`` — both from one sensor read.

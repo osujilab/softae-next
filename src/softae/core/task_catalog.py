@@ -15,6 +15,10 @@ The public surface (``add``/``remove``/``get``/``list_names``/``__len__`` +
 ``save_toml``/``load_toml``) mirrors :class:`ChemicalCatalog` /
 :class:`SolutionCatalog` in :mod:`softae.core.formulation`, including the
 "missing file → empty catalog, never raise" load contract.
+
+Loading also *validates* (:func:`validate_task`): a task whose declared ceiling
+cannot outlast the hold it asks for is rejected rather than catalogued, since
+that inconsistency only shows up hours into an unattended run.
 """
 
 from __future__ import annotations
@@ -24,9 +28,66 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import structlog
 import tomli_w
 
+from softae.errors import ValidationError_
 from softae.workflows.workflow_model import WorkflowStep
+
+logger = structlog.get_logger(__name__)
+
+#: Method name whose ``hold_time_s`` param dictates how long the step must live.
+ANNEAL_METHOD = "anneal"
+
+
+class TaskValidationError(ValidationError_):
+    """A catalogued task is internally inconsistent and must not be run."""
+
+
+def _positive_float(value: Any) -> float | None:
+    """Coerce *value* to a positive float, or ``None`` if it isn't one."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if out > 0 else None
+
+
+def validate_task(task: "Task") -> list[str]:
+    """Return the reasons *task* must not be run — empty list when it is sound.
+
+    Today there is exactly one rule, and it exists because the failure it
+    prevents is silent and expensive.  An ``anneal`` step's duration is set by
+    its ``hold_time_s`` **param**, while its execution ceiling is the separate
+    ``timeout_s`` **field**; a run-plan override
+    (:attr:`~softae.core.run_plan.RunPhase.anneal_params`) rewrites the former
+    and not the latter.  A task shipping an 8 h hold under a 600 s ceiling is
+    killed mid-hold with the stage hot — overnight, unattended, no operator.
+
+    :func:`~softae.core.deposition_recipe.anneal_timeout_s` already raises the
+    ceiling at *build* time for the deposition engine, so this is defence in
+    depth rather than the only guard — but it is the one that covers the paths
+    that hand a catalogued task straight to a step (Process Studio, the sandbox,
+    a hand-built workflow) and the one that catches the mistake in the file
+    rather than on the rig.
+    """
+    if task.method != ANNEAL_METHOD:
+        return []
+    hold = _positive_float(task.params.get("hold_time_s"))
+    if hold is None:  # no declared hold → nothing to outlast
+        return []
+    if task.timeout_s is None:
+        return [
+            f"anneal task declares hold_time_s={hold:g} s but no timeout_s; "
+            f"the executor's default ceiling will kill the hold partway"
+        ]
+    if float(task.timeout_s) <= hold:
+        return [
+            f"anneal task timeout_s={float(task.timeout_s):g} s does not exceed "
+            f"hold_time_s={hold:g} s; the hold would be aborted with the stage hot "
+            f"(allow the hold plus ramp, settle and setpoint restore)"
+        ]
+    return []
 
 
 @dataclass
@@ -52,6 +113,10 @@ class Task:
     version: int = 1
     provenance: dict[str, Any] = field(default_factory=dict)  # source/ported_by/ported_on/…
     evidence: dict[str, Any] = field(default_factory=dict)  # tests/validated_run_id/…
+
+    def validate(self) -> list[str]:
+        """Reasons this task must not be run (see :func:`validate_task`)."""
+        return validate_task(self)
 
     def to_step(self, step_name: str | None = None) -> WorkflowStep:
         """Build a :class:`WorkflowStep` from this task.
@@ -145,9 +210,29 @@ class TaskCatalog:
     def __init__(self) -> None:
         self._tasks: dict[str, Task] = {}
 
-    def add(self, task: Task) -> None:
-        """Insert or replace a task (keyed by name, so add doubles as update)."""
+    def add(self, task: Task, *, strict: bool = False) -> None:
+        """Insert or replace a task (keyed by name, so add doubles as update).
+
+        An unsound task (:func:`validate_task`) is always logged.
+        ``strict=True`` additionally refuses it — used by :meth:`load_toml`, so
+        a malformed long hold cannot reach the rig from the catalog file, while
+        interactive callers (the sandbox's "save step as task") still get their
+        edit stored with a loud complaint rather than an exception mid-dialog.
+        """
+        problems = validate_task(task)
+        if problems:
+            logger.warning("task_invalid", task=task.name, problems=problems)
+            if strict:
+                raise TaskValidationError(f"task '{task.name}': {'; '.join(problems)}")
         self._tasks[task.name] = task
+
+    def validate(self) -> dict[str, list[str]]:
+        """Return ``{task_name: [problem, ...]}`` for every unsound task."""
+        return {
+            name: problems
+            for name in self.list_names()
+            if (problems := validate_task(self._tasks[name]))
+        }
 
     def remove(self, name: str) -> None:
         del self._tasks[name]
@@ -189,6 +274,11 @@ class TaskCatalog:
 
         Mirrors :meth:`ChemicalCatalog.load_csv` — never raises on a missing
         file so a fresh install (no ``tasks.toml`` yet) degrades gracefully.
+
+        Tasks failing :func:`validate_task` are **rejected**: logged at *error*
+        and left out of the catalog, so a name that would abort mid-hold fails
+        loudly at resolution rather than quietly on the rig.  One bad table does
+        not cost the rest of the file.
         """
         cat = cls()
         if not path.exists():
@@ -198,6 +288,10 @@ class TaskCatalog:
         tasks = data.get("tasks", {})
         if isinstance(tasks, dict):
             for name, table in tasks.items():
-                if isinstance(table, dict):
-                    cat.add(Task.from_dict(name, table))
+                if not isinstance(table, dict):
+                    continue
+                try:
+                    cat.add(Task.from_dict(name, table), strict=True)
+                except TaskValidationError:
+                    logger.error("task_rejected_from_catalog", task=name, path=str(path))
         return cat

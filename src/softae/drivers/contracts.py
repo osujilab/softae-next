@@ -14,15 +14,20 @@ Contents
   (MockTempController / AsyncTempController).
 - :func:`validate_rh_setpoint` — relative-humidity setpoint cap
   (MockRHController / AsyncRHController).
+- :func:`sustained_above` / :func:`sustained_below` — the one grace-windowed,
+  one-sided excursion test, shared by the equilibration overshoot guard and the
+  RH hold watchdog.
+- :func:`classify_rh_hold` — three-state verdict on a held %RH series.
 - :func:`apply_piezo_profile` — combined frequency + sweep profile application
   (MockPiezoController / AsyncPiezoController).
 """
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 import structlog
 
@@ -319,6 +324,48 @@ def validate_temp_setpoint(T_SP: float, config: dict[str, Any], instrument: str)
         )
 
 
+# ── Excursion tests: one implementation, both signs, every axis ──────────────
+
+def sustained_above(
+    series: Sequence[tuple[float, float]], target: float, band: float, grace_s: float
+) -> bool:
+    """True when the trailing run of samples above ``target + band`` spans *grace_s*.
+
+    Two properties, both load-bearing, which is why there is exactly one of these.
+
+    **One-sided.** :func:`monitored_hold` grades ``abs(pv - target)``, so a stage
+    that cannot *reach* 85 °C and a heater that *runs past* it produce the same
+    :class:`SafetyError`. The first is data; the second is a hazard. The sign is
+    checked here, from the caller's own recorded series.
+
+    **Grace-windowed on the trailing run only.** A sample inside the band — or an
+    unreadable one — breaks the run, so a legitimate ramp *through* the band is
+    not read as a fault. That was written for a temperature approach and is the
+    same hazard during an RH approach, which is why this is shared rather than
+    reimplemented: two grace-windowed excursion tests would drift apart.
+
+    Fewer than two consecutive samples cannot span an interval, so a young run is
+    never an excursion.
+    """
+    above: list[tuple[float, float]] = []
+    for t, v in reversed(list(series)):
+        if isinstance(v, float) and math.isfinite(v) and v > target + band:
+            above.append((t, v))
+        else:
+            break
+    if len(above) < 2:
+        return False
+    return (above[0][0] - above[-1][0]) >= float(grace_s)
+
+
+def sustained_below(
+    series: Sequence[tuple[float, float]], target: float, band: float, grace_s: float
+) -> bool:
+    """The mirror of :func:`sustained_above` — reflected, not reimplemented."""
+    reflected = [(t, -v if isinstance(v, float) else v) for t, v in series]
+    return sustained_above(reflected, -float(target), band, grace_s)
+
+
 # ── Anneal hold watchdog ─────────────────────────────────────────────────────
 
 #: Deviation from the anneal target that raises a warning but keeps holding (°C).
@@ -457,7 +504,7 @@ def monitored_hold(
             elif t - bad_since >= float(grace_s):
                 held = t - start
                 detail = (
-                    f"PV unreadable" if not readable
+                    "PV unreadable" if not readable
                     else f"PV {pv:.1f} °C vs target {float(target_C):.1f} °C"
                 )
                 raise SafetyError(
@@ -477,12 +524,35 @@ def monitored_hold(
     )
 
 
-def run_anneal_hold(controller, hold_time_s: float, target_C: float) -> HoldReport:
+def run_anneal_hold(
+    controller,
+    hold_time_s: float,
+    target_C: float,
+    *,
+    rh_reader: Any = None,
+    rh_setpoint_pct: float | None = None,
+    data_store: Any = None,
+    run_id: str | None = None,
+    sleep: Any = None,
+    now: Any = None,
+) -> HoldReport:
     """Watched hold for a temperature controller — the one call both drivers make.
 
     Pulls the PV reader and abort signal off *controller* so the mock and real
     implementations cannot drift into different watchdog behaviour, which is the
     whole reason this module exists.
+
+    **Humidity is watched too, when the caller supplies a reader.** Pass
+    *rh_reader* (``get_TH`` returning ``(chamber_T_C, %RH)``, or any callable
+    returning a bare %RH) together with the *rh_setpoint_pct* that was commanded,
+    and the hold samples humidity on the temperature poll's own cadence —
+    throttled to ``[safety] rh_poll_interval_s`` — and classifies it per
+    :func:`classify_rh_hold`. A ``floor_limited`` verdict **alerts and keeps
+    holding**; only a ``fault`` stops the hold, and it does so by raising
+    :class:`SafetyError` on the return path, which is the park-immediately fault
+    class the autonomous loop already handles.
+
+    With no *rh_reader* this is exactly the thermal-only hold it has always been.
 
     Anti-clog purging is **not** wired here. It is executor-driven for every kind
     of dead time (see ``PURGE_WINDOW_TAG``), so this watchdog stays purely
@@ -490,23 +560,40 @@ def run_anneal_hold(controller, hold_time_s: float, target_C: float) -> HoldRepo
     """
     cfg = anneal_watchdog_config()
     stop = getattr(controller, "_stop_wait", None)
+    instrument = getattr(controller, "name", "temp_controller")
+    read_pv = controller.get_pv
+    should_abort = stop.is_set if stop is not None else None
+
+    watch: RHHoldWatch | None = None
+    if rh_reader is not None and rh_setpoint_pct is not None:
+        watch = RHHoldWatch(
+            rh_reader, float(rh_setpoint_pct), fallback_temperature_C=float(target_C),
+            data_store=data_store, run_id=run_id, now=now or time.monotonic,
+        )
+        read_pv = watch.wrap_reader(read_pv)
+        should_abort = watch.wrap_abort(should_abort)
 
     def _on_warn(pv: float, deviation: float, message: str) -> None:
         logger.warning(
-            "anneal_pv_excursion", instrument=getattr(controller, "name", "temp"),
+            "anneal_pv_excursion", instrument=instrument,
             pv=pv, target_C=target_C, deviation_C=round(deviation, 2),
             detail=message,
         )
 
-    return monitored_hold(
+    clock = {k: v for k, v in (("sleep", sleep), ("now", now)) if v is not None}
+    report = monitored_hold(
         hold_time_s,
-        read_pv=controller.get_pv,
+        read_pv=read_pv,
         target_C=target_C,
-        instrument=getattr(controller, "name", "temp_controller"),
+        instrument=instrument,
         on_warn=_on_warn,
-        should_abort=(stop.is_set if stop is not None else None),
+        should_abort=should_abort,
         **cfg,
+        **clock,
     )
+    if watch is not None:
+        watch.raise_if_fault()
+    return report
 
 
 def anneal_watchdog_config(config: dict[str, Any] | None = None) -> dict[str, float]:
@@ -548,6 +635,310 @@ def validate_rh_setpoint(val: float, max_rh: float, instrument: str) -> None:
             requested=val,
             limit=max_rh,
         )
+
+
+# ── RH hold watchdog ─────────────────────────────────────────────────────────
+#
+# `validate_rh_setpoint` caps the commanded value at write time and never looks
+# again. Through a multi-hour hot hold the interesting failure is not drift — the
+# loop is PID-controlled and effective — it is that **the attainable RH floor
+# rises with chamber temperature**, because the flush basin holds water inside
+# the heated enclosure. A setpoint below that floor saturates the controller: the
+# PV sits above the command indefinitely with nothing broken. Measured
+# 2026-08-11: 15 %RH commanded returned 16.9–20.4 at 65 °C and 19.5–23.2 at 85 °C.
+
+#: Sustained |PV − SP| worth saying out loud (%RH).
+DEFAULT_RH_WARN_PCT = 3.0
+#: Deviation beyond the known floor effect — a real problem (%RH).
+DEFAULT_RH_FAULT_PCT = 10.0
+#: Long **on purpose**: a humidity loop settling over minutes is normal, and a
+#: short grace would produce alerts an operator learns to ignore — which is the
+#: failure this whole mechanism exists to prevent.
+DEFAULT_RH_GRACE_S = 600.0
+#: Floor on the interval between RH samples (s).
+DEFAULT_RH_POLL_S = 60.0
+
+#: PV outside the band, but the hold is young or still trending in. An ordinary
+#: approach: say nothing.
+RH_CONVERGING = "converging"
+#: PV sustained **above** SP beyond tolerance. The setpoint is unattainable at
+#: this temperature. Alert, record — and **keep holding**.
+RH_FLOOR_LIMITED = "floor_limited"
+#: Beyond the fault band, or sustained *below* SP, or no readable PV at all.
+RH_FAULT = "fault"
+
+#: ``Alert.kind`` for the floor-limited finding. Spelled apart from
+#: :data:`RH_FLOOR_LIMITED` because alert kinds are one flat namespace shared with
+#: ``park`` and ``reservoir``, where a bare "floor_limited" says nothing about
+#: which axis found a floor.
+ALERT_RH_FLOOR_LIMITED = "rh_floor_limited"
+
+
+@dataclass(frozen=True)
+class RHHoldVerdict:
+    """What the humidity did during a watched hold, in three states rather than two.
+
+    A binary in-band check would report :data:`RH_FLOOR_LIMITED` as a fault and
+    park an overnight run on a plumbing fact. It is the expected outcome of
+    asking for 15 %RH at 85 °C, it is information rather than damage, and parking
+    on it at 3 a.m. is the failure mode the autonomy work exists to prevent — the
+    same posture the settle phase takes toward ``ceiling``.
+
+    ``PV below SP`` is a fault deliberately: the basin can only push humidity
+    **up**, so an undershoot is not the known plumbing effect and must not be
+    absorbed by the same excuse.
+    """
+
+    state: str
+    setpoint_pct: float
+    pv_pct: float = float("nan")
+    temperature_C: float = float("nan")
+    deviation_pct: float = float("nan")
+    n_samples: int = 0
+    reason: str = ""
+
+    @property
+    def parks(self) -> bool:
+        """Only a fault stops the run. This is the central behaviour."""
+        return self.state == RH_FAULT
+
+    def describe(self) -> str:
+        """The operator's sentence. SP, PV and chamber temperature **together** —
+        any one of the three alone is not actionable."""
+        at = ("" if math.isnan(self.temperature_C)
+              else f" at {self.temperature_C:.1f} C")
+        seen = (f"{self.pv_pct:.1f} %RH" if math.isfinite(self.pv_pct)
+                else "no readable PV")
+        head = (f"RH commanded {self.setpoint_pct:.1f} %RH, measured {seen}{at} "
+                f"over {self.n_samples} sample(s)")
+        if self.state == RH_FLOOR_LIMITED:
+            return (f"{head}: the setpoint is below what this enclosure delivers "
+                    f"at this temperature. Recorded; the hold continues.")
+        if self.state == RH_FAULT:
+            return f"{head}: {self.reason or 'humidity fault'}."
+        return f"{head}: within band or still approaching."
+
+
+def rh_watchdog_config(config: dict[str, Any] | None = None) -> dict[str, float]:
+    """Resolve the RH watchdog thresholds from ``[safety]`` (single parse point).
+
+    Mirrors :func:`anneal_watchdog_config` exactly — same shape, same discipline.
+    """
+    if config is None:
+        try:
+            from softae.config.loader import safety
+
+            config = safety()
+        except Exception:
+            config = {}
+
+    def _f(key: str, default: float) -> float:
+        try:
+            return float(config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "warn_pct": _f("rh_deviation_warn_pct", DEFAULT_RH_WARN_PCT),
+        "fault_pct": _f("rh_deviation_fault_pct", DEFAULT_RH_FAULT_PCT),
+        "grace_s": _f("rh_deviation_grace_s", DEFAULT_RH_GRACE_S),
+        "poll_interval_s": _f("rh_poll_interval_s", DEFAULT_RH_POLL_S),
+    }
+
+
+def classify_rh_hold(
+    series: Sequence[tuple[float, float]],
+    setpoint_pct: float,
+    *,
+    warn_pct: float = DEFAULT_RH_WARN_PCT,
+    fault_pct: float = DEFAULT_RH_FAULT_PCT,
+    grace_s: float = DEFAULT_RH_GRACE_S,
+    temperature_C: float = float("nan"),
+    poll_interval_s: float | None = None,   # accepted so **rh_watchdog_config() fits
+) -> RHHoldVerdict:
+    """Grade a ``(t, %RH)`` series into :data:`RH_CONVERGING` / :data:`RH_FLOOR_LIMITED`
+    / :data:`RH_FAULT`.
+
+    Every excursion question is asked of :func:`sustained_above` — the same
+    grace-windowed, one-sided test the equilibration overshoot guard uses — so a
+    transient ramp through the band cannot trip any of them.
+    """
+    del poll_interval_s
+    finite = [(t, v) for t, v in series
+              if isinstance(v, float) and math.isfinite(v)]
+    sp = float(setpoint_pct)
+    if not finite:
+        return RHHoldVerdict(
+            RH_FAULT, sp, temperature_C=float(temperature_C),
+            n_samples=0, reason="no readable %RH for the whole window",
+        )
+    pv = finite[-1][1]
+    common: dict[str, Any] = dict(
+        setpoint_pct=sp, pv_pct=pv, temperature_C=float(temperature_C),
+        deviation_pct=pv - sp, n_samples=len(finite),
+    )
+    if sustained_above(series, sp, float(fault_pct), grace_s):
+        return RHHoldVerdict(
+            RH_FAULT, reason=f"sustained more than {float(fault_pct):g} %RH above "
+                             f"the setpoint, beyond the known floor effect", **common)
+    if sustained_below(series, sp, float(warn_pct), grace_s):
+        return RHHoldVerdict(
+            RH_FAULT, reason=f"sustained more than {float(warn_pct):g} %RH BELOW the "
+                             f"setpoint; the basin can only push humidity up, so "
+                             f"this is not the floor effect", **common)
+    if sustained_above(series, sp, float(warn_pct), grace_s):
+        return RHHoldVerdict(RH_FLOOR_LIMITED, reason="floor-limited", **common)
+    return RHHoldVerdict(RH_CONVERGING, reason="converging", **common)
+
+
+def alert_rh_verdict(
+    verdict: RHHoldVerdict,
+    *,
+    data_store: Any = None,
+    run_id: str | None = None,
+    instrument: str = "rh_controller",
+) -> None:
+    """Raise the floor-limited alert through the existing alert path. Never raises.
+
+    Only :data:`RH_FLOOR_LIMITED` is announced here; a fault travels as a
+    :class:`SafetyError` and is announced by the machinery that parks on it.
+    """
+    if verdict.state != RH_FLOOR_LIMITED:
+        return
+    from softae.core.alerts import WARNING, Alert, raise_alert
+
+    raise_alert(
+        Alert(
+            kind=ALERT_RH_FLOOR_LIMITED,
+            message=verdict.describe(),
+            severity=WARNING,
+            run_id=run_id,
+            details={
+                "instrument": instrument,
+                "rh_setpoint_pct": verdict.setpoint_pct,
+                "rh_pv_pct": verdict.pv_pct,
+                "temperature_C": verdict.temperature_C,
+                "deviation_pct": verdict.deviation_pct,
+            },
+        ),
+        data_store=data_store,
+    )
+
+
+class RHHoldWatch:
+    """Samples %RH alongside a temperature hold and keeps the verdict as a value.
+
+    Rides the temperature poll rather than opening a second loop (``get_TH``
+    returns both in one transaction), throttled to its own
+    ``rh_poll_interval_s``. The floor-limited alert fires **once** per hold: a
+    verdict that is true for eight hours is one finding, not four hundred.
+    """
+
+    def __init__(
+        self,
+        reader: Any,
+        setpoint_pct: float,
+        *,
+        fallback_temperature_C: float = float("nan"),
+        thresholds: dict[str, float] | None = None,
+        data_store: Any = None,
+        run_id: str | None = None,
+        instrument: str = "rh_controller",
+        now: Any = None,
+    ) -> None:
+        self._reader = reader
+        self._setpoint_pct = float(setpoint_pct)
+        self._fallback_C = float(fallback_temperature_C)
+        self._cfg = dict(thresholds if thresholds is not None else rh_watchdog_config())
+        self._data_store = data_store
+        self._run_id = run_id
+        self._instrument = instrument
+        self._now = now or time.monotonic
+        self.series: list[tuple[float, float]] = []
+        self.temperature_C = float(fallback_temperature_C)
+        self.verdict = RHHoldVerdict(
+            RH_CONVERGING, self._setpoint_pct,
+            temperature_C=self._fallback_C, reason="not yet sampled")
+        self._alerted = False
+        self._last_sample_t: float | None = None
+
+    # ── sampling ─────────────────────────────────────────────────────────────
+
+    def wrap_reader(self, read_pv: Any) -> Any:
+        """Return *read_pv* with an RH sample taken on the same call.
+
+        Failure to read humidity must never look like a dead thermocouple, so
+        every exception from the RH side is swallowed here and recorded as a
+        non-finite sample — which breaks the trailing run and therefore cannot
+        manufacture a verdict either.
+        """
+
+        def _read() -> float:
+            pv = read_pv()
+            try:
+                self.sample()
+            except Exception:
+                logger.warning("rh_hold_sample_failed", exc_info=True)
+            return pv
+
+        return _read
+
+    def sample(self) -> None:
+        """Take one throttled %RH sample and re-classify."""
+        t = float(self._now())
+        interval = float(self._cfg.get("poll_interval_s", DEFAULT_RH_POLL_S))
+        if self._last_sample_t is not None and t - self._last_sample_t < interval:
+            return
+        self._last_sample_t = t
+        rh, temp = _read_rh(self._reader)
+        if math.isfinite(temp):
+            self.temperature_C = temp
+        self.series.append((t, rh))
+        self.verdict = classify_rh_hold(
+            self.series, self._setpoint_pct, temperature_C=self.temperature_C,
+            **{k: v for k, v in self._cfg.items() if k != "poll_interval_s"},
+        )
+        if self.verdict.state == RH_FLOOR_LIMITED and not self._alerted:
+            self._alerted = True
+            alert_rh_verdict(self.verdict, data_store=self._data_store,
+                             run_id=self._run_id, instrument=self._instrument)
+
+    # ── consequence ──────────────────────────────────────────────────────────
+
+    def wrap_abort(self, should_abort: Any) -> Any:
+        """Compose the caller's abort signal with "an RH fault has been seen"."""
+
+        def _abort() -> bool:
+            if should_abort is not None and should_abort():
+                return True
+            return self.verdict.parks
+
+        return _abort
+
+    def raise_if_fault(self) -> None:
+        if not self.verdict.parks:
+            return
+        raise SafetyError(
+            f"Anneal hold aborted on humidity: {self.verdict.describe()}",
+            instrument=self._instrument,
+            requested=self.verdict.setpoint_pct,
+            limit=float(self._cfg.get("fault_pct", DEFAULT_RH_FAULT_PCT)),
+        )
+
+
+def _read_rh(reader: Any) -> tuple[float, float]:
+    """``(%RH, temperature_C)`` from a ``get_TH``-shaped or bare-%RH reader.
+
+    ``get_TH`` returns ``(chamber_air_C, %RH)``, and the chamber air is the right
+    thermometer for a claim about the enclosure's humidity floor — the basin sits
+    in that air, not on the stage. A bare reader yields NaN and the caller's
+    fallback stands.
+    """
+    value = reader()
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        temp, rh = value
+        return float(rh), float(temp)
+    return float(value), float("nan")
 
 
 # ── Piezo ────────────────────────────────────────────────────────────────────

@@ -27,13 +27,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import tempfile
 import uuid
 from dataclasses import dataclass, field, replace
-from typing import Any, Awaitable, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Sequence
 
 import structlog
+
+if TYPE_CHECKING:  # annotation-only; the settle criterion is imported on use
+    from softae.analysis.equilibration import RoundFit
 
 from softae.config import loader
 from softae.core.autonomous_loop import (
@@ -78,7 +82,7 @@ from softae.core.measurement_spec import (
 # module exclusively inside functions, so its module body never reaches back
 # here. Keep it that way — see `modality_registry`'s "Import discipline".
 from softae.core.modality_registry import ObjectiveSpec, get_modality
-from softae.core.run_plan import RunPlan
+from softae.core.run_plan import RunPlan, SettlePlan
 from softae.core.alerts import CRITICAL, Alert, raise_alert
 from softae.core.safe_park import safe_park
 from softae.core.task_catalog import TaskCatalog
@@ -122,6 +126,31 @@ BoardCheckFn = Callable[[int, "set[int]"], "Any"]
 
 _DEPOSIT_STEP = "deposit"  # engine names deposit steps f"deposit_ch{ch}"
 _MEASURE_STEP = "measure_eis"
+#: ``CampaignSpec.equilibration_method`` value that turns on the EQUILIBRATE phase.
+SETTLE_METHOD = "settle"
+#: Step-name prefix and ``measurement`` tag for a settle round's sweep. Tagged
+#: apart from ``primary`` so a round can never enter the objective on its own —
+#: the *last* one does, by being injected under the trial's own measure-step
+#: name, and that injection is a decision the driver makes rather than a
+#: side-effect of a tag (the same mechanism ``confirmation_measure_step`` uses).
+SETTLE_STEP = "settle_eis"
+SETTLE_MEASUREMENT = "settle"
+#: The circuit model the campaign's σ path fits with. The campaign measure step
+#: declares no ``circuit_model``, so ``analyze_spectrum`` fits with its own
+#: default — named here **only** so ``r1_lower_bound_ohms`` can be asked for the
+#: matching R₁ bound. A fit railed on that bound reports a CONSTANT σ, and a
+#: constant is exactly what a settle criterion mistakes for settled: 325 of 1440
+#: fits in the reference run railed while reporting ``success = 1``.
+SETTLE_CIRCUIT_MODEL = "simpleSalt"
+
+#: The six flat settle fields on :class:`CampaignSpec`, and the three of them
+#: that cannot be defaulted. Named once so :meth:`CampaignSpec.settle_plan` and
+#: its refusals cannot drift from the dataclass.
+_SETTLE_FIELDS = (
+    "round_period_s", "min_hold_s", "max_hold_s",
+    "settle_tol_rel", "settle_n_rounds", "settle_min_channels",
+)
+_SETTLE_REQUIRED = ("round_period_s", "min_hold_s", "max_hold_s")
 
 #: Workflow-metadata key carrying ``{step_name: tags}`` for the steps built to
 #: *measure*. Loop closure is tag-based (T1.5): the objective extractors receive
@@ -251,8 +280,37 @@ class CampaignSpec:
     electrode_start: int = 1
     #: Hardware equilibration routine run after a board swap (one step).
     equilibration_instrument: str = "rh_controller"
+    #: ``"wait"`` (the default) or ``"settle"``.
+    #:
+    #: ``"wait"`` is the behaviour that has always shipped: a fixed
+    #: ``equilibration_s`` stabilization on the RH controller after a board
+    #: exchange, and **nothing that waits for the sample**. Against the τ ≈ 500 s
+    #: measured at the first setpoint of
+    #: ``20260811T023757Z_equilibration_characterization`` the shipped 60 s is
+    #: ~0.12 τ, so every σ such a campaign feeds its optimiser is taken off a film
+    #: that is still drying.
+    #:
+    #: ``"settle"`` adds an EQUILIBRATE phase per trial: the run measures every
+    #: ``round_period_s`` and stops when σ stops moving, or at ``max_hold_s``.
+    #: **Opt-in on purpose.** An unattended campaign that starts measuring on a
+    #: criterion nobody has exercised is a worse failure than one that waits too
+    #: little, so the default is unchanged until a real batch has run it.
     equilibration_method: str = "wait"
     equilibration_s: float = 60.0
+    #: ── EQUILIBRATE phase parameters (``equilibration_method = "settle"``) ──
+    #:
+    #: Sentinel-defaulted, like the T1.3 optimizer knobs: "unset" and "set to the
+    #: shipped default" must stay distinct, because a spec that also carries an
+    #: EQUILIBRATE phase in its ``run_plan`` is speaking twice and
+    #: :meth:`settle_plan` refuses rather than picking one. Names mirror
+    #: :class:`~softae.core.run_plan.SettlePlan` and the equilibration CLI so an
+    #: operator meets one vocabulary. See :meth:`settle_plan`.
+    round_period_s: float = SPEC_UNSET       # type: ignore[assignment]
+    min_hold_s: float = SPEC_UNSET           # type: ignore[assignment]
+    max_hold_s: float = SPEC_UNSET           # type: ignore[assignment]
+    settle_tol_rel: float = SPEC_UNSET       # type: ignore[assignment]
+    settle_n_rounds: int = SPEC_UNSET        # type: ignore[assignment]
+    settle_min_channels: int = SPEC_UNSET    # type: ignore[assignment]
     #: Optional explicit run plan (phase ordering). ``None`` → the engine's legacy
     #: pointwise layout (per-channel deposit + EIS). Set :meth:`RunPlan.batch` to
     #: defer anneal/measurement into whole-plate blocks (formulate-all →
@@ -356,6 +414,58 @@ class CampaignSpec:
         if self.recipe_name:
             return self.recipe_name
         return "two_phase" if self.two_phase else "single_drop"
+
+    def settle_plan(self) -> SettlePlan | None:
+        """This campaign's EQUILIBRATE settings, or ``None`` if it does not settle.
+
+        **One authority, two spellings, and it refuses to guess between them.**
+        A :class:`~softae.core.run_plan.SettlePlan` may arrive either on an
+        EQUILIBRATE phase inside :attr:`run_plan` (the structural spelling, which
+        also fixes the phase's *scope*) or on the six flat fields above (the
+        operator spelling, reachable from a config file). Supplying both raises,
+        exactly as :func:`~softae.core.measurement_spec.canonicalize_measurement`
+        refuses a spec that names its measurement twice — picking one silently is
+        how a campaign ends up holding for a duration nobody wrote down.
+
+        The three durations have no defaults (see :class:`SettlePlan`), so
+        ``equilibration_method = "settle"`` without them is an error rather than
+        an invented hold.
+        """
+        phases = self.run_plan.equilibrate_phases() if self.run_plan else []
+        supplied = {f: getattr(self, f) for f in _SETTLE_FIELDS
+                    if getattr(self, f) is not SPEC_UNSET}
+        wants_settle = str(self.equilibration_method).strip().lower() == SETTLE_METHOD
+
+        if phases:
+            if supplied or wants_settle:
+                raise ValueError(
+                    "settle is specified twice: run_plan carries an EQUILIBRATE "
+                    f"phase and the spec also sets {sorted(supplied) or ['equilibration_method']}"
+                    " — say it once so the hold has one authority"
+                )
+            if len({p.settle for p in phases}) > 1:
+                raise ValueError("run_plan carries EQUILIBRATE phases with "
+                                 "different SettlePlans; the campaign path drives one")
+            return phases[0].settle
+
+        if not wants_settle:
+            if supplied:
+                raise ValueError(
+                    f"{sorted(supplied)} set but equilibration_method is "
+                    f"'{self.equilibration_method}'; settle parameters do nothing "
+                    f"unless the method is '{SETTLE_METHOD}'"
+                )
+            return None
+
+        missing = [f for f in _SETTLE_REQUIRED if f not in supplied]
+        if missing:
+            raise ValueError(
+                f"equilibration_method='{SETTLE_METHOD}' requires {missing}; "
+                f"min_hold_s is the cure time and belongs to the recipe, and "
+                f"max_hold_s is the ceiling that makes the phase terminate — "
+                f"neither has a safe default"
+            )
+        return SettlePlan(**supplied)
 
     def deposition_settings(
         self, *, pcb: dict[str, Any], n_pumps: int | None = None
@@ -1302,7 +1412,16 @@ def build_equilibration_workflow(spec: CampaignSpec) -> Workflow:
 
     Defaults to the RH controller's stabilization wait (``equilibration_s``); the
     instrument/method are configurable for a fuller re-equilibration routine.
+
+    ``equilibration_method = "settle"`` names a **sample** criterion, not an
+    instrument method — no driver exposes it — so the chamber step falls back to
+    ``"wait"``. The two are different equilibrations: this one is the chamber
+    recovering from an open lid, and the settle phase is the film drying. A
+    campaign that settles still wants the chamber wait after a board exchange.
     """
+    method = spec.equilibration_method
+    if str(method).strip().lower() == SETTLE_METHOD:
+        method = "wait"
     return Workflow(
         name=f"{spec.name}_equilibrate",
         description="Board-exchange equilibration",
@@ -1310,7 +1429,7 @@ def build_equilibration_workflow(spec: CampaignSpec) -> Workflow:
             WorkflowStep(
                 name="equilibrate",
                 instrument=spec.equilibration_instrument,
-                method=spec.equilibration_method,
+                method=method,
                 params={"timeout": float(spec.equilibration_s)},
                 timeout_s=max(120.0, spec.equilibration_s * 2),
             )
@@ -1343,6 +1462,290 @@ def build_confirmation_workflow(
             _MEASUREMENT_TAGS_KEY: {step.name: dict(step.tags)},
         },
     )
+
+
+# ── The EQUILIBRATE phase: stop holding when the measurement stops moving ────
+#
+# A campaign trial has always cast, held for a fixed time, and measured ONCE.
+# Nothing waited for the *sample*. This is the driver that does — the caller
+# `SettleTracker` was written for and never had:
+#
+#     "Deliberately holds no clock and no store: the caller owns the floor and
+#      the ceiling, because those are time and this is evidence."
+#
+# So the split is: `analysis/equilibration.py` decides whether σ has stopped
+# moving, and everything below decides when to ask it and when to stop asking.
+# No settle criterion is reimplemented here, and none should be.
+
+def settle_step_name(channel: int, round_index: int) -> str:
+    """Name of one settle round's sweep on *channel* (0-based *round_index*)."""
+    return f"{SETTLE_STEP}_ch{channel}_r{round_index}"
+
+
+def settle_measure_step(
+    channel: int, round_index: int, measurement: MeasurementSpec | None = None
+) -> WorkflowStep | None:
+    """One settle round's sweep — **the trial's own measurement, taken early**.
+
+    Built from the modality's own ``build_measure_step``, not from a second
+    route: a settle round and a measure round must be the *same sweep*, or the
+    criterion is judging a different quantity than the campaign records.
+
+    Tagged ``measurement="settle"`` so a round cannot enter the objective by
+    itself — the same mechanism ``confirmation_measure_step`` uses, and for the
+    same reason. The round the campaign finally scores is chosen explicitly by
+    the driver, not by a tag that happens to match.
+    """
+    from softae.core.measurement_spec import MeasurementSpec as _MSpec
+
+    spec = measurement or _MSpec()
+    step = get_modality(spec.modality).build_measure_step(int(channel), spec)
+    if step is None:
+        return None
+    return type(step)(
+        name=settle_step_name(channel, round_index),
+        instrument=step.instrument,
+        method=step.method,
+        params=dict(step.params),
+        timeout_s=step.timeout_s,
+        retry=step.retry,
+        tags={**dict(step.tags), "measurement": SETTLE_MEASUREMENT,
+              "settle_round": str(int(round_index))},
+    )
+
+
+def build_settle_round_workflow(
+    spec: CampaignSpec, channels: Sequence[int], round_index: int
+) -> Workflow | None:
+    """One round: every channel in scope measured once, no cast and no new well.
+
+    ``None`` when the modality builds no per-electrode measurement step — an
+    analysis-only stream has nothing for a settle criterion to watch, and a
+    phase that cannot observe must not pretend to have waited.
+    """
+    steps = [s for s in (settle_measure_step(ch, round_index, spec.measurement)
+                         for ch in channels) if s is not None]
+    if not steps:
+        return None
+    return Workflow(
+        name=f"{spec.name}_settle_r{round_index}",
+        description="Equilibrate round — re-read every channel, no re-cast",
+        setup=steps,
+        iterations=1,
+        metadata={"source": "settle_round", "campaign": spec.name,
+                  "settle_round": int(round_index),
+                  _MEASUREMENT_TAGS_KEY: {s.name: dict(s.tags) for s in steps}},
+    )
+
+
+def settle_round_fits(
+    raws: Mapping[int, Any],
+    channels: Sequence[int],
+    *,
+    thickness_for: Callable[[int], Any] | None = None,
+) -> list["RoundFit"]:
+    """σ and R₁ per channel for one round — **one entry per channel, always**.
+
+    A channel whose step did not complete comes back as an all-``None``
+    :class:`~softae.analysis.equilibration.RoundFit` rather than being dropped,
+    exactly as :func:`~softae.analysis.equilibration.load_round_fits` does it: a
+    shorter list would read to ``settle_check`` as a smaller board rather than as
+    missing evidence.
+
+    **R₁ rides beside σ and is never discarded**, because it is the only thing
+    that distinguishes a film that stopped changing from a fit that came to rest
+    on the model's R₁ floor. The second reports a constant, and a constant is
+    what a settle criterion mistakes for settled.
+    """
+    from softae.analysis.equilibration import RoundFit
+
+    out: list[RoundFit] = []
+    for channel in channels:
+        raw = raws.get(int(channel))
+        thickness = thickness_for(int(channel)) if thickness_for is not None else None
+        report = (None if raw is None else
+                  _spectrum_report_from_raw(raw, channel=int(channel),
+                                            thickness_um=thickness))
+        out.append(RoundFit(channel=int(channel),
+                            sigma=_report_sigma(report),
+                            r1_ohms=_report_r1(report)))
+    return out
+
+
+def _report_sigma(report: Any) -> float | None:
+    """σ from a spectrum report when it is a *value*, else ``None``.
+
+    An upper bound is a legitimate scientific result and not a number: a window
+    of bounds is as constant as a railed fit, and would settle just as falsely.
+    """
+    try:
+        if report is None or not report.ok or not report.sigma.is_value:
+            return None
+        value = float(report.sigma.value)
+    except Exception:
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def _report_r1(report: Any) -> float | None:
+    """The fitted R₁, whatever the gates thought of the spectrum around it."""
+    fit = getattr(report, "fit", None)
+    try:
+        r1 = float(getattr(fit, "R1"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return r1 if math.isfinite(r1) else None
+
+
+def settle_r1_bound_ohms() -> float | None:
+    """The R₁ lower bound the campaign's own fits rest against, or ``None``.
+
+    Read off the circuit registry through the one existing spelling of it rather
+    than written down again — a bound restated in a second place is a bound that
+    will disagree with the fitter after the first edit.
+    """
+    from softae.analysis.equilibration import r1_lower_bound_ohms
+
+    return r1_lower_bound_ohms(SETTLE_CIRCUIT_MODEL)
+
+
+@dataclass(frozen=True)
+class SettleOutcome:
+    """Why an equilibrate phase stopped, and what evidence it stopped on.
+
+    Three states, never two. *"We stopped because it settled"* and *"we stopped
+    because time ran out"* are different claims about the sample, and a σ taken
+    at ``ceiling`` is a weaker claim than one taken at ``settled`` — downstream
+    must be able to see which it has, the same posture ``arc_state`` takes for an
+    extrapolated R₁.
+
+    ``ceiling`` is an **ordinary outcome, not a failure**. A film that drifts
+    slowly is a normal film; parking an unattended run at 3 a.m. because one
+    equilibrated slowly is the failure mode P0–P1 exists to prevent.
+    """
+
+    outcome: str
+    n_rounds: int
+    held_s: float
+    participating: list[int] = field(default_factory=list)
+    excluded: dict[int, str] = field(default_factory=dict)
+    max_deviation_rel: float | None = None
+    noise_floor_rel: float | None = None
+    tolerance_achievable: bool | None = None
+    endorsement: str = ""
+
+    @property
+    def settled(self) -> bool:
+        from softae.analysis.equilibration import SETTLE_SETTLED
+
+        return self.outcome == SETTLE_SETTLED
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "settle_outcome": self.outcome,
+            "n_rounds": self.n_rounds,
+            "held_s": round(float(self.held_s), 3),
+            "participating": list(self.participating),
+            "excluded": {str(k): v for k, v in self.excluded.items()},
+            "max_deviation_rel": self.max_deviation_rel,
+            "noise_floor_rel": self.noise_floor_rel,
+            "tolerance_achievable": self.tolerance_achievable,
+            "endorsement": self.endorsement,
+        }
+
+    def describe(self) -> str:
+        """One line an operator can read at the bench."""
+        return (f"{self.outcome}: {self.n_rounds} round(s) over "
+                f"{self.held_s:.0f}s, {len(self.participating)} channel(s) "
+                f"participating, {len(self.excluded)} excluded")
+
+
+async def drive_settle_phase(
+    plan: SettlePlan,
+    *,
+    channels: Sequence[int],
+    measure_round: Callable[[int], Awaitable[Mapping[int, Any]]],
+    fits_from: Callable[[Mapping[int, Any]], Sequence["RoundFit"]],
+    r1_bound_ohms: float | None,
+    sleep: Callable[[float], Awaitable[None]] | None = None,
+    now: Callable[[], float] | None = None,
+    on_round: Callable[[int, Any], None] | None = None,
+) -> tuple[SettleOutcome, dict[int, Any]]:
+    """Hold, measure, ask, stop — and return the round the campaign should score.
+
+    The loop the spec describes, and nothing else:
+
+    1. hold ``min_hold_s`` **before** the first round (the bulk of a cure);
+    2. measure every channel in scope every ``round_period_s``;
+    3. stop as soon as :class:`SettleTracker` says the trailing window settled;
+    4. stop unconditionally at ``max_hold_s``, whatever the tracker says.
+
+    Everything time-shaped is injected (``measure_round`` / ``sleep`` / ``now``)
+    so the phase is testable end-to-end against fabricated rounds — no rig, no
+    store, no eight-hour wait. Consecutiveness, the two-round floor and the
+    evaluable/settled split are **not** re-implemented here: ``SettleTracker``
+    already owns all three, and a second copy would be a second thing to get
+    wrong.
+
+    Returns the outcome and the **last round's raw results**, which is the
+    reading taken closest to equilibrium and therefore the one worth recording.
+    """
+    import asyncio
+    import time
+
+    from softae.analysis.equilibration import SettleTracker
+
+    sleep = sleep or asyncio.sleep
+    now = now or time.monotonic
+
+    tracker = SettleTracker(
+        tol_rel=plan.settle_tol_rel,
+        n_rounds=plan.settle_n_rounds,
+        min_channels=plan.settle_min_channels,
+        # THE correctness detail of this whole change. Without it a board whose
+        # fits railed on the R₁ floor reports the same σ every round and settles
+        # on round three, under-conditioning the entire campaign.
+        r1_bound_ohms=r1_bound_ohms,
+    )
+
+    start = now()
+    deadline = start + float(plan.max_hold_s)
+    await sleep(float(plan.min_hold_s))
+
+    last_raws: dict[int, Any] = {}
+    n_rounds = 0
+    settled_early = False
+    while True:
+        raws = dict(await measure_round(n_rounds))
+        n_rounds += 1
+        if raws:
+            last_raws = raws
+        check = tracker.observe(fits_from(raws))
+        if on_round is not None:
+            on_round(n_rounds - 1, check)
+        if tracker.settled:
+            settled_early = True
+            break
+        remaining = deadline - now()
+        if remaining <= 0:
+            break
+        await sleep(min(float(plan.round_period_s), remaining))
+
+    endorsed, endorsement, noise_floor_rel = tracker.endorsement()
+    outcome = SettleOutcome(
+        outcome=tracker.outcome(stopped_early=settled_early),
+        n_rounds=n_rounds,
+        held_s=now() - start,
+        participating=tracker.participating,
+        excluded=dict(tracker.last.excluded) if tracker.last else {},
+        max_deviation_rel=(tracker.last.max_deviation_rel if tracker.last else None),
+        noise_floor_rel=noise_floor_rel,
+        tolerance_achievable=endorsed,
+        endorsement=endorsement,
+    )
+    logger.info("campaign_settle_verdict", channels=list(channels),
+                **outcome.as_dict())
+    return outcome, last_raws
 
 
 class DataStoreOutcomeSink:
@@ -1724,6 +2127,38 @@ def _sigma_from_eis_raw(raw: Any, *, channel: int = 0,
 
     Never raises: a broken analysis path must not discard a measurement.
     """
+    report = _spectrum_report_from_raw(raw, channel=channel, thickness_um=thickness_um)
+    if report is None:
+        return None
+    try:
+        if not report.ok:
+            logger.warning("objective_rejected_by_gates",
+                           reason=report.quality.summary())
+            return None
+        if not report.sigma.is_value:
+            logger.info("objective_declined_bound", mode=report.sigma.mode,
+                        upper_bound=report.sigma.upper_bound,
+                        msg="σ is an upper bound, not a value — reported as unmeasured")
+            return None
+        value = float(report.sigma.value)
+    except Exception:
+        logger.warning("sigma_objective_unavailable", exc_info=True)
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def _spectrum_report_from_raw(raw: Any, *, channel: int = 0,
+                              thickness_um: float | None = None) -> Any | None:
+    """One EIS step result → a ``SpectrumReport``, or ``None`` if it cannot be built.
+
+    **The single raw → physics hop on the campaign path.** σ and R₁ come out of
+    the *same* analysis of the *same* spectrum, which is what the settle
+    criterion needs: it asks whether σ stopped moving and whether the fit that
+    produced it railed on the model's R₁ floor, and those two questions are only
+    comparable when one fit answers both.
+
+    Never raises: a broken analysis path must not discard a measurement.
+    """
     try:
         import numpy as np
 
@@ -1771,21 +2206,7 @@ def _sigma_from_eis_raw(raw: Any, *, channel: int = 0,
         # the campaign and the screen report different σ for one spectrum, with nothing
         # saying so. The user ruled that one config key governs σ everywhere; flipping
         # `[eis] engine` now moves the objective and the display together.
-        report = analyze_spectrum(eis, cell=cell,
-                                  re_connection="bridged_by_sample")
-
-        if not report.ok:
-            logger.warning("objective_rejected_by_gates",
-                           reason=report.quality.summary())
-            return None
-        if not report.sigma.is_value:
-            logger.info("objective_declined_bound", mode=report.sigma.mode,
-                        upper_bound=report.sigma.upper_bound,
-                        msg="σ is an upper bound, not a value — reported as unmeasured")
-            return None
-
-        value = float(report.sigma.value)
-        return value if np.isfinite(value) and value > 0 else None
+        return analyze_spectrum(eis, cell=cell, re_connection="bridged_by_sample")
     except Exception:
         logger.warning("sigma_objective_unavailable", exc_info=True)
         return None
@@ -2103,6 +2524,10 @@ async def run_autonomous_campaign(
     # (T2.4 hand-wrote that refusal; `UnknownModalityError` subclasses
     # NotImplementedError, so the contract it established is unchanged.)
     modality = get_modality(spec.measurement.modality)
+    # Resolved here for the same reason: a spec that names its settle parameters
+    # twice, or asks for `"settle"` without a cure time, is a caller bug and must
+    # fail before a run row is written rather than eight hours into a hold.
+    settle_plan = spec.settle_plan()
 
     owns_manager = manager is None
     owns_store = data_store is None
@@ -2386,6 +2811,24 @@ async def run_autonomous_campaign(
         if spec.batch and batch_size > 1:
             emit("batch_mode", q=batch_size, channels=channels)
 
+        if settle_plan is not None:
+            emit("settle_mode", **{f: getattr(settle_plan, f)
+                                   for f in _SETTLE_FIELDS})
+            # Said once, at the start, rather than discovered eight hours in: a
+            # board narrower than `settle_min_channels` can never make the
+            # criterion evaluable, so every trial would run to its ceiling. That
+            # is the SAFE direction and the run proceeds — but silently spending
+            # `max_hold_s` per trial for a reason nobody can see is not.
+            if len(channels) < settle_plan.settle_min_channels:
+                emit("settle_unevaluable_board", channels=len(channels),
+                     settle_min_channels=settle_plan.settle_min_channels)
+                logger.warning(
+                    "settle_min_channels_exceeds_board", campaign=spec.name,
+                    channels=len(channels),
+                    settle_min_channels=settle_plan.settle_min_channels,
+                    detail="fewer channels than the criterion needs; every trial "
+                           "will run to max_hold_s and record 'not_evaluable'")
+
         # Electrode/board management: when a capacity is set, electrodes are
         # single-use and allocated sequentially; a full board triggers a prompted
         # exchange + equilibration. The placement builder casts onto the allocator's
@@ -2562,6 +3005,114 @@ async def run_autonomous_campaign(
 
             return step_results
 
+        # ── The EQUILIBRATE phase (opt-in: equilibration_method = "settle") ──
+        #
+        # Sited on `on_trial_measured` because that is the one hook where the
+        # trial's raw results, the channels they came from and an awaitable
+        # context coexist. The trial's own sweep has already run by then and is
+        # kept on record as the pre-equilibration reading; the round the campaign
+        # SCORES is the last settle round, injected below under the trial's own
+        # measure-step name. That injection is the whole point: an optimiser fed
+        # a σ off a still-drying film cannot tell a better formulation from one
+        # that was measured later.
+        settle_verdicts: list[dict[str, Any]] = []
+
+        def _primary_channels(step_results: dict[str, Any]) -> dict[int, str]:
+            """``{channel: step name}`` for this trial's objective-bearing sweeps.
+
+            Read off the tag index rather than from ``spec.channels``: a narrowed
+            final round, and every board-aware round, casts onto fewer or other
+            electrodes than the spec names, and settling channels that were never
+            cast would hold on wells that hold nothing.
+            """
+            found: dict[int, str] = {}
+            for name in step_results:
+                tags = trial_step_tags.get(name)
+                if not is_primary_measurement(tags):
+                    continue
+                try:
+                    found[int(str(tags["channel"]))] = name
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return found
+
+        async def _settle_round(
+            round_channels: list[int], round_index: int
+        ) -> dict[int, Any]:
+            """One round: re-read every channel in scope. No cast, no new well."""
+            wf = build_settle_round_workflow(spec, round_channels, round_index)
+            if wf is None:
+                return {}
+            from softae.workflows.workflow_executor import WorkflowExecutor
+
+            # One sample, several measurements: the rounds re-read the films the
+            # trial just cast, so they carry those films' identities.
+            _stamp_sample_uuids(wf, trial_sample_uuids)
+            captured: dict[str, Any] = {}
+            executor = WorkflowExecutor(manager, data_store=data_store,
+                                        run_id=run_id)
+            executor.on_step_complete = (
+                lambda step, idx, total, result, *_: captured.update(
+                    {step.name: result}))
+            await executor.run(wf)
+            return {ch: captured.get(settle_step_name(ch, round_index))
+                    for ch in round_channels}
+
+        def _record_settle(outcome: SettleOutcome, round_channels: list[int]) -> None:
+            """Say which of the three outcomes this was — and keep saying it.
+
+            The event stream dies with the process, so the verdict also goes to a
+            sidecar beside the run: a σ taken at ``ceiling`` is a weaker claim
+            than one taken at ``settled``, and a reader months later must be able
+            to tell which one the campaign recorded.
+            """
+            payload = {"iteration": loop.iteration,
+                       "channels": list(round_channels), **outcome.as_dict()}
+            settle_verdicts.append(payload)
+            emit("settle_verdict", **payload)
+            try:
+                path = data_store.run_dir(run_id) / "settle.json"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(settle_verdicts, indent=2),
+                                encoding="utf-8")
+            except Exception:
+                logger.warning("settle_sidecar_failed", run_id=run_id, exc_info=True)
+
+        async def _equilibrate(step_results: dict[str, Any]) -> dict[str, Any]:
+            """Hold until σ stops moving, then hand back the settled reading.
+
+            **A ``ceiling`` returns normally.** It is an ordinary outcome for a
+            slowly-drifting film, not a fault, and nothing here raises, parks or
+            withholds the measurement on one — parking an unattended run at 3 a.m.
+            because a film equilibrated slowly is the failure mode P0–P1 exists
+            to prevent. What the ceiling changes is the *claim*, and the claim is
+            recorded.
+            """
+            targets = _primary_channels(step_results)
+            if not targets:
+                return step_results
+            round_channels = sorted(targets)
+            outcome, last_raws = await drive_settle_phase(
+                settle_plan,
+                channels=round_channels,
+                measure_round=lambda i: _settle_round(round_channels, i),
+                fits_from=lambda raws: settle_round_fits(
+                    raws, round_channels, thickness_for=_thickness_for),
+                r1_bound_ohms=settle_r1_bound_ohms(),
+            )
+            for channel, name in targets.items():
+                raw = last_raws.get(channel)
+                if raw is not None:
+                    step_results[name] = raw
+            _record_settle(outcome, round_channels)
+            return step_results
+
+        async def _equilibrate_then_label(
+            step_results: dict[str, Any]
+        ) -> dict[str, Any]:
+            """Settle first, gate second — the gate must judge the recorded sweep."""
+            return await _confirm_and_label(await _equilibrate(step_results))
+
         loop = AutonomousLoop(
             optimizer=optimizer,
             workflow_template=None,
@@ -2627,7 +3178,8 @@ async def run_autonomous_campaign(
                                          objective_value=o)
 
         loop.on_result = _on_result
-        loop.on_trial_measured = _confirm_and_label
+        loop.on_trial_measured = (
+            _equilibrate_then_label if settle_plan is not None else _confirm_and_label)
         loop.on_state_change = lambda old, new: emit("state", old=old.name, new=new.name)
         loop.on_converged = lambda i, best: emit("converged", iteration=i, best=best)
         loop.on_board_exchange_requested = lambda board, remaining: emit(

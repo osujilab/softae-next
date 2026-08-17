@@ -174,7 +174,7 @@ from softae.analysis.equilibration import (
 )
 from softae.core.conditions_capture import ENV_KEYS, read_environment
 from softae.core.deposition_steps import eis_measure_step
-from softae.drivers.contracts import monitored_hold
+from softae.drivers.contracts import monitored_hold, sustained_above
 from softae.errors import SafetyError
 from softae.workflows.workflow_model import Workflow, WorkflowStep
 
@@ -1068,27 +1068,6 @@ def _finite(series: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
     return [(t, v) for t, v in series if isinstance(v, float) and math.isfinite(v)]
 
 
-def _sustained_overshoot(
-    series: Sequence[tuple[float, float]], target: float, fault: float, grace_s: float
-) -> bool:
-    """True when the trailing run of samples above ``target + fault`` spans *grace_s*.
-
-    ``monitored_hold`` grades ``abs(pv − target)``, so a stage that cannot *reach*
-    85 °C and a heater that *runs past* it produce the same ``SafetyError``. The
-    first is data; the second is a hazard. The sign is checked here, from this
-    run's own series.
-    """
-    above: list[tuple[float, float]] = []
-    for t, v in reversed(list(series)):
-        if isinstance(v, float) and math.isfinite(v) and v > target + fault:
-            above.append((t, v))
-        else:
-            break
-    if len(above) < 2:
-        return False
-    return (above[0][0] - above[-1][0]) >= float(grace_s)
-
-
 def approach_setpoint(
     read_pv: Any,
     target: float,
@@ -1226,7 +1205,11 @@ def watch_hold(
             f"blind.",
             kind=_ABORT_UNREADABLE, axis=axis,
         )
-    if _sustained_overshoot(series, float(target), float(fault), grace_s):
+    # One-sided on purpose: `monitored_hold` grades abs(pv - target), so a stage
+    # that cannot REACH 85 C and a heater running past it raise the same
+    # SafetyError. `sustained_above` lives in `drivers.contracts` because the RH
+    # hold watchdog asks the identical question of humidity — see its docstring.
+    if sustained_above(series, float(target), float(fault), grace_s):
         raise EquilibrationAbort(
             f"{axis} PV stayed above {float(target) + float(fault):.1f} for more than "
             f"{float(grace_s):.0f}s (peak {max(v for _, v in finite):.1f}). An "

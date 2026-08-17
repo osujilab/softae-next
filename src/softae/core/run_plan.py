@@ -19,19 +19,38 @@ The plan is a pure, declarative object.  :func:`~softae.core.deposition_recipe.b
 consumes it (a ``None`` plan defaults to the legacy pointwise ordering, so
 existing callers are unchanged); the engine decides how each phase's steps are
 emitted from the phase's :class:`PhaseKind` and :class:`PhaseScope`.
+
+:attr:`PhaseKind.EQUILIBRATE` is the exception, and deliberately so. It cannot
+be a list of steps: it terminates on **evidence** — measure, judge, decide —
+which is a loop, not a sequence, so the deposition engine emits nothing for it
+and :func:`softae.core.autonomous_wiring.drive_settle_phase` drives it on the
+campaign path instead.
+
+.. warning::
+   That means an EQUILIBRATE phase in a plan handed straight to the deposition
+   engine (the HT tab's path) is currently a **no-op**: the plan describes a
+   hold nothing performs. Only the campaign path drives it today. Teaching the
+   engine to call the driver is a separate change.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping
+
+from softae.analysis.equilibration import (
+    DEFAULT_SETTLE_MIN_CHANNELS,
+    DEFAULT_SETTLE_N_ROUNDS,
+    DEFAULT_SETTLE_TOL_REL,
+)
 
 __all__ = [
     "PhaseKind",
     "PhaseScope",
     "RunPhase",
     "RunPlan",
+    "SettlePlan",
     "DEFAULT_ANNEAL_TASK",
 ]
 
@@ -42,12 +61,28 @@ DEFAULT_ANNEAL_TASK = "anneal_150C_5min"
 class PhaseKind(Enum):
     """What a phase does.
 
+    ``ANNEAL`` and ``EQUILIBRATE`` are **not** the same step wearing two names,
+    and a run may legitimately carry both — cure, then equilibrate:
+
+    ==================  ==========================  ===========================
+    ..                  ANNEAL                      EQUILIBRATE
+    ==================  ==========================  ===========================
+    purpose             hold at temperature to      hold until the *measurement*
+                        **cure**                    stops moving
+    terminates on       elapsed time (a catalog     evidence, or a ceiling
+                        task)
+    measures during     no                          yes, every ``round_period_s``
+    outcome             done / failed               settled / ceiling /
+                                                    not-evaluable
+    ==================  ==========================  ===========================
+
     ``ARRHENIUS`` is reserved for a future temperature-sweep measurement phase
     and is intentionally not yet handled by the engine.
     """
 
     FORMULATE = "formulate"   # precondition + drop-cast (the recipe's phases)
     ANNEAL = "anneal"         # hold the plate/sample at temperature (cure)
+    EQUILIBRATE = "equilibrate"  # hold until the measurement stops moving
     MEASURE = "measure"       # EIS measurement
     ARRHENIUS = "arrhenius"   # reserved (temperature-sweep EIS) — not implemented
 
@@ -60,22 +95,92 @@ class PhaseScope(Enum):
 
 
 @dataclass(frozen=True)
+class SettlePlan:
+    """When an :attr:`PhaseKind.EQUILIBRATE` phase may stop, and when it must.
+
+    The **time** half of the settle decision. Its evidence half lives in
+    :class:`~softae.analysis.equilibration.SettleTracker`, whose docstring says
+    why the split exists: *"Deliberately holds no clock and no store: the caller
+    owns the floor and the ceiling, because those are time and this is
+    evidence."* This is that caller's half, written down.
+
+    The three durations are **required** and have no defaults, because none of
+    them can be invented safely:
+
+    * ``min_hold_s`` is the cure and belongs to the recipe — a wrong one measures
+      a wet film;
+    * ``max_hold_s`` is the ceiling that guarantees the phase terminates at all;
+    * ``round_period_s`` is instrument time spent per sample.
+
+    The three settle parameters default to the values measured on
+    ``20260811T023757Z_equilibration_characterization`` and are imported from
+    :mod:`softae.analysis.equilibration` rather than restated, so a criterion
+    retuned there moves the phase defaults with it. Notably
+    ``settle_tol_rel = 0.10``: the measured noise floor on that run was 5.98 %,
+    so a 2 % band is unsatisfiable by any hold length.
+    """
+
+    round_period_s: float
+    min_hold_s: float
+    max_hold_s: float
+    settle_tol_rel: float = DEFAULT_SETTLE_TOL_REL
+    settle_n_rounds: int = DEFAULT_SETTLE_N_ROUNDS
+    settle_min_channels: int = DEFAULT_SETTLE_MIN_CHANNELS
+
+    def __post_init__(self) -> None:
+        if self.round_period_s < 0 or self.min_hold_s < 0:
+            raise ValueError("round_period_s and min_hold_s must be non-negative")
+        if self.max_hold_s <= 0:
+            raise ValueError("max_hold_s must be positive — it is the ceiling that "
+                             "guarantees the phase terminates")
+        if self.max_hold_s < self.min_hold_s:
+            raise ValueError(
+                f"max_hold_s ({self.max_hold_s:g}s) is below min_hold_s "
+                f"({self.min_hold_s:g}s); the ceiling would fire before the floor"
+            )
+        if self.settle_tol_rel <= 0:
+            raise ValueError("settle_tol_rel must be positive; a zero band can "
+                             "never be satisfied")
+
+    def label(self) -> str:
+        """``'≤2h, ≥30min, every 2min'`` — the three durations, in one glance."""
+        return (f"≤{_minutes(self.max_hold_s)}, ≥{_minutes(self.min_hold_s)}, "
+                f"every {_minutes(self.round_period_s)}")
+
+
+def _minutes(seconds: float) -> str:
+    """Duration in the largest unit that stays readable."""
+    if seconds < 60:
+        return f"{seconds:g}s"
+    if seconds < 3600:
+        return f"{seconds / 60:g}min"
+    return f"{seconds / 3600:g}h"
+
+
+@dataclass(frozen=True)
 class RunPhase:
     """One phase in a run plan.
 
     ``anneal_task`` / ``anneal_params`` apply only to :attr:`PhaseKind.ANNEAL`:
     the catalog task to run (default :data:`DEFAULT_ANNEAL_TASK`) and optional
     per-run overrides (e.g. ``{"target_temp_C": 120, "hold_time_s": 600}``).
+
+    ``settle`` applies only to :attr:`PhaseKind.EQUILIBRATE`, where it is
+    **required** — an equilibrate phase with no floor and no ceiling is a hold
+    with no stopping rule at either end.
     """
 
     kind: PhaseKind
     scope: PhaseScope = PhaseScope.PER_SAMPLE
     anneal_task: str = DEFAULT_ANNEAL_TASK
     anneal_params: Mapping[str, Any] | None = None
+    settle: SettlePlan | None = None
 
     def label(self) -> str:
         """Short human-readable phase label (for :meth:`RunPlan.describe`)."""
-        if self.kind is PhaseKind.ANNEAL:
+        if self.kind is PhaseKind.EQUILIBRATE:
+            name = f"Equilibrate ({self.settle.label()})" if self.settle else "Equilibrate"
+        elif self.kind is PhaseKind.ANNEAL:
             over = dict(self.anneal_params or {})
             temp = over.get("target_temp_C")
             hold = over.get("hold_time_s")
@@ -114,6 +219,17 @@ class RunPlan:
             raise ValueError("FORMULATE must be per-sample (each sample is cast individually)")
         if any(p.kind is PhaseKind.ARRHENIUS for p in self.phases):
             raise ValueError("ARRHENIUS phase is reserved and not yet supported")
+        for phase in self.phases:
+            if phase.kind is PhaseKind.EQUILIBRATE and phase.settle is None:
+                raise ValueError(
+                    "EQUILIBRATE requires a SettlePlan — min_hold_s is the cure "
+                    "time and belongs to the recipe, so there is no safe default"
+                )
+            if phase.kind is not PhaseKind.EQUILIBRATE and phase.settle is not None:
+                raise ValueError(
+                    f"{phase.kind.name} carries a SettlePlan; only EQUILIBRATE "
+                    f"terminates on evidence"
+                )
 
     # ── queries ───────────────────────────────────────────────────────────
 
@@ -127,6 +243,14 @@ class RunPlan:
     @property
     def has_anneal(self) -> bool:
         return self.has_kind(PhaseKind.ANNEAL)
+
+    @property
+    def has_equilibrate(self) -> bool:
+        return self.has_kind(PhaseKind.EQUILIBRATE)
+
+    def equilibrate_phases(self) -> list[RunPhase]:
+        """Every EQUILIBRATE phase, in plan order (each carries its own plan)."""
+        return [p for p in self.phases if p.kind is PhaseKind.EQUILIBRATE]
 
     @property
     def defers_measurement(self) -> bool:
@@ -165,21 +289,16 @@ class RunPlan:
         anneal: bool = False,
         anneal_task: str = DEFAULT_ANNEAL_TASK,
         anneal_params: Mapping[str, Any] | None = None,
+        settle: SettlePlan | None = None,
     ) -> "RunPlan":
-        """Everything per-sample: formulate → (anneal) → (measure), interleaved.
+        """Everything per-sample: formulate → (anneal) → (equilibrate) → (measure).
 
-        With ``anneal=False`` and ``measure=True`` this is exactly the legacy
-        deposition ordering (deposit then EIS, per channel).
+        With ``anneal=False``, ``settle=None`` and ``measure=True`` this is
+        exactly the legacy deposition ordering (deposit then EIS, per channel).
         """
-        phases: list[RunPhase] = [RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE)]
-        if anneal:
-            phases.append(RunPhase(
-                PhaseKind.ANNEAL, PhaseScope.PER_SAMPLE,
-                anneal_task=anneal_task, anneal_params=anneal_params,
-            ))
-        if measure:
-            phases.append(RunPhase(PhaseKind.MEASURE, PhaseScope.PER_SAMPLE))
-        return cls(tuple(phases))
+        return cls._assemble(PhaseScope.PER_SAMPLE, measure=measure, anneal=anneal,
+                             anneal_task=anneal_task, anneal_params=anneal_params,
+                             settle=settle)
 
     @classmethod
     def batch(
@@ -189,14 +308,44 @@ class RunPlan:
         anneal: bool = False,
         anneal_task: str = DEFAULT_ANNEAL_TASK,
         anneal_params: Mapping[str, Any] | None = None,
+        settle: SettlePlan | None = None,
     ) -> "RunPlan":
-        """Formulate-all → anneal-all → measure-all: cast per-sample, the rest per-batch."""
+        """Formulate-all → anneal-all → measure-all: cast per-sample, the rest per-batch.
+
+        An equilibrate phase lands per-batch too, and that is the case it was
+        built for: :func:`~softae.analysis.equilibration.settle_check` judges a
+        round **across channels** and refuses to settle on fewer than
+        ``settle_min_channels`` of them, which is exactly the shape a q-channel
+        batch round already produces.
+        """
+        return cls._assemble(PhaseScope.PER_BATCH, measure=measure, anneal=anneal,
+                             anneal_task=anneal_task, anneal_params=anneal_params,
+                             settle=settle)
+
+    @classmethod
+    def _assemble(
+        cls,
+        scope: PhaseScope,
+        *,
+        measure: bool,
+        anneal: bool,
+        anneal_task: str,
+        anneal_params: Mapping[str, Any] | None,
+        settle: SettlePlan | None,
+    ) -> "RunPlan":
+        """Cast per-sample, then the optional tail at *scope* — the shared spine.
+
+        Order is cure → equilibrate → measure: the anneal carries the bulk of the
+        hold, the equilibrate phase decides when the *tail* of it has stopped
+        moving, and only then is the reading worth recording.
+        """
         phases: list[RunPhase] = [RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE)]
         if anneal:
-            phases.append(RunPhase(
-                PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
-                anneal_task=anneal_task, anneal_params=anneal_params,
-            ))
+            phases.append(RunPhase(PhaseKind.ANNEAL, scope,
+                                   anneal_task=anneal_task,
+                                   anneal_params=anneal_params))
+        if settle is not None:
+            phases.append(RunPhase(PhaseKind.EQUILIBRATE, scope, settle=settle))
         if measure:
-            phases.append(RunPhase(PhaseKind.MEASURE, PhaseScope.PER_BATCH))
+            phases.append(RunPhase(PhaseKind.MEASURE, scope))
         return cls(tuple(phases))

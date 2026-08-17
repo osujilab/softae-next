@@ -2055,6 +2055,18 @@ one reason each) and **observed but unconfigurable** — hardcoded constants suc
 `cross_check_pct` and `runs_z` that fire in practice but have no config line to move, reported
 with their P50/P95 and fire count as evidence *for* a future key.
 
+> **A threshold that admits open-arc spectra admits a biased number.** Measured over **929
+> closed-arc spectra** truncated to force an extrapolation, R₁ recovered past the apex comes back
+> **systematically high — 60 % (two-point read) to 175 % (full CPE fit) median absolute error** —
+> and it is a *bias*, not scatter, so a wide threshold does not average it away. The surprise is
+> that the full fitter is **worse** than the cheap two-point read: with no in-band feature to
+> anchor on it wanders, and a sixth of its fits land ~30× *under* truth while still reporting
+> success. So when reading section 7, a proposed value that would admit many open-arc spectra
+> deserves suspicion rather than acceptance — check it against the arc-state split `rehearse`
+> already reports and section 5b's arc-closure counts, remembering that the alternative is not
+> free either: under enforcing gates those same spectra are rejected before the fit and their
+> `arc_state` stays NULL. `docs/SHADOW_CAMPAIGN.md` §8 carries the full table.
+
 > **A pre-T7.1 log recommends nothing, and says so.** The pass-side distribution comes from the
 > `eis_spectrum_metrics` event, which the gated engine emits once per spectrum on **both**
 > verdict paths. Older logs recorded `metrics=` only where a spectrum *failed*, so every key
