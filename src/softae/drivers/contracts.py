@@ -368,6 +368,17 @@ def sustained_below(
 
 # ── Anneal hold watchdog ─────────────────────────────────────────────────────
 
+# DEFECT, NOTED NOT FIXED: the two values below disagree with `[safety]`
+# (`anneal_deviation_warn_C = 2.0` / `_fault_C = 5.0`). The toml comment records
+# 3/10 as the explicitly *rejected* engineering guess — "a heater 9 C off target
+# would never have faulted" — superseded by the measured 2/5. Because
+# `anneal_watchdog_config` swallows a config-load exception and proceeds with
+# `{}`, a config-load failure silently restores the rejected bands. Recommended
+# resolution: align these to 2.0/5.0. Left alone deliberately: changing a thermal
+# fault band is a decision that needs its own review, and the RH demotion that
+# found this does not own the temperature axis. (The RH side below is clean and
+# has a test pinning it that way — see `test_the_rh_defaults_match_the_shipped_config`.)
+
 #: Deviation from the anneal target that raises a warning but keeps holding (°C).
 DEFAULT_ANNEAL_WARN_C = 3.0
 #: Sustained deviation that aborts the hold (°C).
@@ -390,6 +401,12 @@ class HoldReport:
     pv_max: float | None = None
     n_warn: int = 0
     aborted: bool = False
+    #: The humidity verdict, when the caller supplied an ``rh_reader``; ``None``
+    #: otherwise. :func:`monitored_hold` never sets it — it knows nothing about
+    #: humidity and must not start to. :func:`run_anneal_hold` attaches it on the
+    #: return path, so a film annealed under an RH fault is a weaker provenance
+    #: claim carried as a *value* rather than an error.
+    rh: "RHHoldVerdict | None" = None
 
     @property
     def excursion_C(self) -> float | None:
@@ -547,10 +564,18 @@ def run_anneal_hold(
     returning a bare %RH) together with the *rh_setpoint_pct* that was commanded,
     and the hold samples humidity on the temperature poll's own cadence —
     throttled to ``[safety] rh_poll_interval_s`` — and classifies it per
-    :func:`classify_rh_hold`. A ``floor_limited`` verdict **alerts and keeps
-    holding**; only a ``fault`` stops the hold, and it does so by raising
-    :class:`SafetyError` on the return path, which is the park-immediately fault
-    class the autonomous loop already handles.
+    :func:`classify_rh_hold`.
+
+    **No humidity verdict stops the hold.** A polymer cure at >100 °C is
+    dominated by its thermal history; humidity modulates the result rather than
+    defining it, so killing an 8 h cure — and with it the board, the stock and
+    the overnight slot — because a *secondary* variable left its band trades a
+    certain loss for an uncertain one. Part of the RH trajectory through a long
+    cure is a consumable draining rather than a process going wrong, which is a
+    supply curve and not a fault. So humidity is **announced and recorded**: the
+    alert row is the durable evidence, ``report.rh`` is the in-process value for
+    whoever records the sample. Temperature stays blocking exactly as it was,
+    including its unreadable-PV fault.
 
     With no *rh_reader* this is exactly the thermal-only hold it has always been.
 
@@ -571,7 +596,6 @@ def run_anneal_hold(
             data_store=data_store, run_id=run_id, now=now or time.monotonic,
         )
         read_pv = watch.wrap_reader(read_pv)
-        should_abort = watch.wrap_abort(should_abort)
 
     def _on_warn(pv: float, deviation: float, message: str) -> None:
         logger.warning(
@@ -592,7 +616,7 @@ def run_anneal_hold(
         **clock,
     )
     if watch is not None:
-        watch.raise_if_fault()
+        report.rh = watch.verdict
     return report
 
 
@@ -640,17 +664,27 @@ def validate_rh_setpoint(val: float, max_rh: float, instrument: str) -> None:
 # ── RH hold watchdog ─────────────────────────────────────────────────────────
 #
 # `validate_rh_setpoint` caps the commanded value at write time and never looks
-# again. Through a multi-hour hot hold the interesting failure is not drift — the
-# loop is PID-controlled and effective — it is that **the attainable RH floor
-# rises with chamber temperature**, because the flush basin holds water inside
-# the heated enclosure. A setpoint below that floor saturates the controller: the
-# PV sits above the command indefinitely with nothing broken. Measured
-# 2026-08-11: 15 %RH commanded returned 16.9–20.4 at 65 °C and 19.5–23.2 at 85 °C.
+# again, so through a multi-hour hot hold nothing watches what the humidity did.
+# The interesting failure is not drift — the loop is PID-controlled and effective
+# — it is a PV that sits away from the command for hours. Measured 2026-08-11:
+# 15 %RH commanded returned 16.9–20.4 at 65 °C and 19.5–23.2 at 85 °C.
+#
+# **Why the states below name an observation and not a cause.** At least two
+# explanations fit that record — an attainable floor that rises with chamber
+# temperature, and a flush basin still evaporating its water out — and the
+# distinguishing measurement was never taken (basin fill is uninstrumented; no
+# column in ``conditions`` records it). Both produce the same reading and both
+# want the same response, so the classifier tests what it can see: how far the PV
+# sat from the command, for how long, and on which side.
 
 #: Sustained |PV − SP| worth saying out loud (%RH).
 DEFAULT_RH_WARN_PCT = 3.0
-#: Deviation beyond the known floor effect — a real problem (%RH).
-DEFAULT_RH_FAULT_PCT = 10.0
+#: Sustained |PV − SP| worth waking someone for (%RH). Symmetric with the warn
+#: band and strictly outside it. An operator judgement about how far off command
+#: is loud — **not** a magnitude fitted to any run: a deviation band fitted to the
+#: 2026-08-11 data would encode that morning's basin fill, which the planned
+#: plumbing change designs away.
+DEFAULT_RH_FAULT_PCT = 5.0
 #: Long **on purpose**: a humidity loop settling over minutes is normal, and a
 #: short grace would produce alerts an operator learns to ignore — which is the
 #: failure this whole mechanism exists to prevent.
@@ -661,32 +695,49 @@ DEFAULT_RH_POLL_S = 60.0
 #: PV outside the band, but the hold is young or still trending in. An ordinary
 #: approach: say nothing.
 RH_CONVERGING = "converging"
-#: PV sustained **above** SP beyond tolerance. The setpoint is unattainable at
-#: this temperature. Alert, record — and **keep holding**.
-RH_FLOOR_LIMITED = "floor_limited"
-#: Beyond the fault band, or sustained *below* SP, or no readable PV at all.
+#: PV sustained off SP beyond ``warn_pct`` but inside ``fault_pct``, **in either
+#: direction**. Alert at ``WARNING``, record — and keep holding.
+RH_OFF_SETPOINT_SUSTAINED = "off_setpoint_sustained"
+#: Sustained beyond ``fault_pct`` in either direction, or no readable PV at all.
+#: Inside an anneal this stops nothing — see :func:`run_anneal_hold`.
 RH_FAULT = "fault"
 
-#: ``Alert.kind`` for the floor-limited finding. Spelled apart from
-#: :data:`RH_FLOOR_LIMITED` because alert kinds are one flat namespace shared with
-#: ``park`` and ``reservoir``, where a bare "floor_limited" says nothing about
-#: which axis found a floor.
-ALERT_RH_FLOOR_LIMITED = "rh_floor_limited"
+#: ``Alert.kind`` for the sustained-off-setpoint finding. Spelled apart from
+#: :data:`RH_OFF_SETPOINT_SUSTAINED` for two reasons, and the second is now the
+#: stronger. Alert kinds are one flat namespace shared with ``park`` and
+#: ``reservoir``, where a bare "off_setpoint_sustained" says nothing about which
+#: axis went off setpoint. And this value is **persisted** (``alerts.kind``,
+#: written by ``DataStore.record_alert``, read back by ``query_alerts``), so it is
+#: **frozen** at its original spelling: changing it would silently orphan every
+#: historical row from any query written afterwards. A reviewer who wants the
+#: value to match the identifier must own that migration deliberately.
+ALERT_RH_OFF_SETPOINT = "rh_floor_limited"
+#: ``Alert.kind`` for a humidity fault that did **not** stop the hold.
+ALERT_RH_FAULT = "rh_fault"
+
+#: The states worth announcing. Named once so :func:`alert_rh_verdict` and
+#: :class:`RHHoldWatch`'s once-per-state throttle cannot disagree about which
+#: findings get announced — a disagreement would silently drop one.
+_RH_ANNOUNCED_STATES = frozenset({RH_OFF_SETPOINT_SUSTAINED, RH_FAULT})
 
 
 @dataclass(frozen=True)
 class RHHoldVerdict:
     """What the humidity did during a watched hold, in three states rather than two.
 
-    A binary in-band check would report :data:`RH_FLOOR_LIMITED` as a fault and
-    park an overnight run on a plumbing fact. It is the expected outcome of
-    asking for 15 %RH at 85 °C, it is information rather than damage, and parking
-    on it at 3 a.m. is the failure mode the autonomy work exists to prevent — the
-    same posture the settle phase takes toward ``ceiling``.
+    The third state earns its place on **operator attention**, not on plumbing: a
+    sustained excursion that has not reached the fault band is still worth
+    announcing without stopping anything. Ten minutes at 3 %RH off command is a
+    fact an operator should have; it is not a fact that should carry ``CRITICAL``
+    or mark a sample's provenance. Collapsing to two states forces every excursion
+    into either silence or the loud severity, and both are wrong for the middle
+    band. That argument is indifferent to *why* the humidity is off command, which
+    is the property the original floor/basin warrant lacked.
 
-    ``PV below SP`` is a fault deliberately: the basin can only push humidity
-    **up**, so an undershoot is not the known plumbing effect and must not be
-    absorbed by the same excuse.
+    Both bands are **symmetric**: over- and undershoot are graded identically and
+    nested, ``warn_pct < fault_pct``. The earlier asymmetry — undershoot faulting
+    at the warn band because "the basin can only push humidity up" — rested on a
+    mechanism the record does not settle, and was removed with it.
     """
 
     state: str
@@ -698,8 +749,9 @@ class RHHoldVerdict:
     reason: str = ""
 
     @property
-    def parks(self) -> bool:
-        """Only a fault stops the run. This is the central behaviour."""
+    def is_fault(self) -> bool:
+        """Classification only. What a fault *costs* is the caller's decision:
+        the anneal records it and holds on; the settle path may choose otherwise."""
         return self.state == RH_FAULT
 
     def describe(self) -> str:
@@ -711,9 +763,12 @@ class RHHoldVerdict:
                 else "no readable PV")
         head = (f"RH commanded {self.setpoint_pct:.1f} %RH, measured {seen}{at} "
                 f"over {self.n_samples} sample(s)")
-        if self.state == RH_FLOOR_LIMITED:
-            return (f"{head}: the setpoint is below what this enclosure delivers "
-                    f"at this temperature. Recorded; the hold continues.")
+        if self.state == RH_OFF_SETPOINT_SUSTAINED:
+            # Above and below the command are different findings to an operator
+            # even when they are one state to the classifier.
+            side = "below" if self.deviation_pct < 0 else "above"
+            return (f"{head}: the humidity stayed sustained {side} the command "
+                    f"for the whole grace window. Recorded; the hold continues.")
         if self.state == RH_FAULT:
             return f"{head}: {self.reason or 'humidity fault'}."
         return f"{head}: within band or still approaching."
@@ -756,12 +811,17 @@ def classify_rh_hold(
     temperature_C: float = float("nan"),
     poll_interval_s: float | None = None,   # accepted so **rh_watchdog_config() fits
 ) -> RHHoldVerdict:
-    """Grade a ``(t, %RH)`` series into :data:`RH_CONVERGING` / :data:`RH_FLOOR_LIMITED`
-    / :data:`RH_FAULT`.
+    """Grade a ``(t, %RH)`` series into :data:`RH_CONVERGING` /
+    :data:`RH_OFF_SETPOINT_SUSTAINED` / :data:`RH_FAULT`.
 
     Every excursion question is asked of :func:`sustained_above` — the same
     grace-windowed, one-sided test the equilibration overshoot guard uses — so a
     transient ramp through the band cannot trip any of them.
+
+    Four branches, three states, and **the order is load-bearing**: a series
+    beyond ``fault_pct`` is also beyond ``warn_pct``, so each sign's fault test
+    must precede its warn test. The bands are symmetric and nested
+    (``warn_pct < fault_pct``); the two signs are graded identically.
     """
     del poll_interval_s
     finite = [(t, v) for t, v in series
@@ -779,15 +839,22 @@ def classify_rh_hold(
     )
     if sustained_above(series, sp, float(fault_pct), grace_s):
         return RHHoldVerdict(
-            RH_FAULT, reason=f"sustained more than {float(fault_pct):g} %RH above "
-                             f"the setpoint, beyond the known floor effect", **common)
+            RH_FAULT, reason=f"sustained more than {float(fault_pct):g} %RH ABOVE "
+                             f"the setpoint", **common)
+    if sustained_below(series, sp, float(fault_pct), grace_s):
+        return RHHoldVerdict(
+            RH_FAULT, reason=f"sustained more than {float(fault_pct):g} %RH BELOW "
+                             f"the setpoint", **common)
+    if sustained_above(series, sp, float(warn_pct), grace_s):
+        return RHHoldVerdict(
+            RH_OFF_SETPOINT_SUSTAINED,
+            reason=f"sustained more than {float(warn_pct):g} %RH above the setpoint",
+            **common)
     if sustained_below(series, sp, float(warn_pct), grace_s):
         return RHHoldVerdict(
-            RH_FAULT, reason=f"sustained more than {float(warn_pct):g} %RH BELOW the "
-                             f"setpoint; the basin can only push humidity up, so "
-                             f"this is not the floor effect", **common)
-    if sustained_above(series, sp, float(warn_pct), grace_s):
-        return RHHoldVerdict(RH_FLOOR_LIMITED, reason="floor-limited", **common)
+            RH_OFF_SETPOINT_SUSTAINED,
+            reason=f"sustained more than {float(warn_pct):g} %RH below the setpoint",
+            **common)
     return RHHoldVerdict(RH_CONVERGING, reason="converging", **common)
 
 
@@ -798,20 +865,36 @@ def alert_rh_verdict(
     run_id: str | None = None,
     instrument: str = "rh_controller",
 ) -> None:
-    """Raise the floor-limited alert through the existing alert path. Never raises.
+    """Announce a humidity finding through the existing alert path. Never raises.
 
-    Only :data:`RH_FLOOR_LIMITED` is announced here; a fault travels as a
-    :class:`SafetyError` and is announced by the machinery that parks on it.
+    **Both** non-converging states are announced here, and the fault is the louder
+    of the two. Before the demotion a fault travelled as a :class:`SafetyError`
+    and was announced by the machinery that parked on it — sound reasoning only
+    while the fault parked. Nothing parks on it now, so without this an 8 h cure
+    at a badly wrong humidity would run to completion and report clean, and the
+    operator's first evidence would be the σ.
+
+    The fault takes ``CRITICAL`` deliberately. A park is self-announcing: the
+    operator finds a stopped rig and goes looking for the reason. A demoted fault
+    is the opposite — the run completes, the samples get measured, and the data
+    enters the record looking ordinary — so it needs the loud severity *more*
+    than the park does, not less. ``raise_alert`` never raises, so promoting a
+    fault into it cannot reintroduce a stop by the back door.
     """
-    if verdict.state != RH_FLOOR_LIMITED:
+    if verdict.state not in _RH_ANNOUNCED_STATES:
         return
-    from softae.core.alerts import WARNING, Alert, raise_alert
+    from softae.core.alerts import CRITICAL, WARNING, Alert, raise_alert
+
+    kind, severity = (
+        (ALERT_RH_FAULT, CRITICAL) if verdict.is_fault
+        else (ALERT_RH_OFF_SETPOINT, WARNING)
+    )
 
     raise_alert(
         Alert(
-            kind=ALERT_RH_FLOOR_LIMITED,
+            kind=kind,
             message=verdict.describe(),
-            severity=WARNING,
+            severity=severity,
             run_id=run_id,
             details={
                 "instrument": instrument,
@@ -830,8 +913,17 @@ class RHHoldWatch:
 
     Rides the temperature poll rather than opening a second loop (``get_TH``
     returns both in one transaction), throttled to its own
-    ``rh_poll_interval_s``. The floor-limited alert fires **once** per hold: a
-    verdict that is true for eight hours is one finding, not four hundred.
+    ``rh_poll_interval_s``.
+
+    The alert throttle is **per state**, not per hold: a verdict that is true for
+    eight hours is one finding, not four hundred — but two different findings are
+    two findings. A hold that goes off-setpoint at hour 1 and degrades to a fault
+    at hour 4 must announce both; a single per-hold flag would swallow the second,
+    which is exactly the silent 8 h cure the demotion exists to prevent. Worst
+    case is two alerts per hold.
+
+    **It keeps the verdict; it does not act on it.** There is deliberately no
+    abort composition and no raise here — see :func:`run_anneal_hold`.
     """
 
     def __init__(
@@ -859,7 +951,7 @@ class RHHoldWatch:
         self.verdict = RHHoldVerdict(
             RH_CONVERGING, self._setpoint_pct,
             temperature_C=self._fallback_C, reason="not yet sampled")
-        self._alerted = False
+        self._alerted: set[str] = set()
         self._last_sample_t: float | None = None
 
     # ── sampling ─────────────────────────────────────────────────────────────
@@ -898,32 +990,11 @@ class RHHoldWatch:
             self.series, self._setpoint_pct, temperature_C=self.temperature_C,
             **{k: v for k, v in self._cfg.items() if k != "poll_interval_s"},
         )
-        if self.verdict.state == RH_FLOOR_LIMITED and not self._alerted:
-            self._alerted = True
+        state = self.verdict.state
+        if state in _RH_ANNOUNCED_STATES and state not in self._alerted:
+            self._alerted.add(state)
             alert_rh_verdict(self.verdict, data_store=self._data_store,
                              run_id=self._run_id, instrument=self._instrument)
-
-    # ── consequence ──────────────────────────────────────────────────────────
-
-    def wrap_abort(self, should_abort: Any) -> Any:
-        """Compose the caller's abort signal with "an RH fault has been seen"."""
-
-        def _abort() -> bool:
-            if should_abort is not None and should_abort():
-                return True
-            return self.verdict.parks
-
-        return _abort
-
-    def raise_if_fault(self) -> None:
-        if not self.verdict.parks:
-            return
-        raise SafetyError(
-            f"Anneal hold aborted on humidity: {self.verdict.describe()}",
-            instrument=self._instrument,
-            requested=self.verdict.setpoint_pct,
-            limit=float(self._cfg.get("fault_pct", DEFAULT_RH_FAULT_PCT)),
-        )
 
 
 def _read_rh(reader: Any) -> tuple[float, float]:

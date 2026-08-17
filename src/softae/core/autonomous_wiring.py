@@ -149,8 +149,18 @@ SETTLE_CIRCUIT_MODEL = "simpleSalt"
 _SETTLE_FIELDS = (
     "round_period_s", "min_hold_s", "max_hold_s",
     "settle_tol_rel", "settle_n_rounds", "settle_min_channels",
+    "rh_stability_pct",
 )
 _SETTLE_REQUIRED = ("round_period_s", "min_hold_s", "max_hold_s")
+
+#: Consecutive RH-decided equilibrate phases that park the campaign. Three, to
+#: match the streak :class:`~softae.core.autonomous_loop.AutonomousLoop` already
+#: parks on (``max_consecutive_failures = 3``) — a second streak limit at a
+#: different K in the same loop would be an unexplained inconsistency. ``0``
+#: disables the escalation and leaves the per-trial behaviour (refuse to certify,
+#: run to the ceiling, continue) exactly as it is. Overridable as
+#: ``[safety] rh_ceiling_park_after_trials``.
+DEFAULT_RH_CEILING_PARK_AFTER_TRIALS = 3
 
 #: Workflow-metadata key carrying ``{step_name: tags}`` for the steps built to
 #: *measure*. Loop closure is tag-based (T1.5): the objective extractors receive
@@ -311,6 +321,12 @@ class CampaignSpec:
     settle_tol_rel: float = SPEC_UNSET       # type: ignore[assignment]
     settle_n_rounds: int = SPEC_UNSET        # type: ignore[assignment]
     settle_min_channels: int = SPEC_UNSET    # type: ignore[assignment]
+    #: How far the room may move across a judged settle window (%RH). Unset →
+    #: :data:`~softae.analysis.equilibration.DEFAULT_RH_STABILITY_PCT`, i.e. the
+    #: gate is ON; pass ``None`` explicitly to switch it off. Unlike the three
+    #: durations this one has a defensible default, so it stays out of
+    #: :data:`_SETTLE_REQUIRED`.
+    rh_stability_pct: float | None = SPEC_UNSET  # type: ignore[assignment]
     #: Optional explicit run plan (phase ordering). ``None`` → the engine's legacy
     #: pointwise layout (per-channel deposit + EIS). Set :meth:`RunPlan.batch` to
     #: defer anneal/measurement into whole-plate blocks (formulate-all →
@@ -1597,6 +1613,104 @@ def _report_r1(report: Any) -> float | None:
     return r1 if math.isfinite(r1) else None
 
 
+class RHCeilingEscalation:
+    """Counts *consecutive* RH-decided equilibrate phases; parks the run at K.
+
+    Per trial nothing happens — a phase that cannot certify holds to
+    ``max_hold_s``, records ``ceiling`` (or ``not_evaluable``) and the campaign
+    continues. What is new is across trials: K in a row and the room, not the
+    film, is running this campaign, and somebody should be told before another
+    twenty electrodes are spent proving it.
+
+    Three transitions, each deliberate:
+
+    ============================================  ==========================
+    phase                                         effect
+    ============================================  ==========================
+    ``rh_limited`` **or** ``rh_unreadable``       increment
+    settled, or a ceiling with both false         **reset to zero**
+    gate off (``rh_stability_pct is None``)       neither
+    ============================================  ==========================
+
+    *Both booleans feed one counter, deliberately.* ``rh_unreadable`` is a dead
+    sensor rather than moving humidity, but it is the same shape of problem —
+    *the RH channel, not the film, decided this phase* — and it burns a campaign
+    faster, since with the gate on it makes every phase ``not_evaluable``. They
+    stay separate in the record so the park message can say which occurred.
+
+    *A slow-film ceiling resets.* That is the whole load-bearing distinction: it
+    is the most ordinary outcome this system produces, and a counter that
+    included it would reach K on healthy campaigns.
+
+    *A non-observation neither increments nor resets.* Zeroing on a phase whose
+    gate was off would be the same error as counting it — the room was not
+    judged, and that is no more evidence of health than of fault.
+
+    Deliberately holds no loop and no store: *park* is injected, so the whole
+    rule is testable against fabricated :class:`SettleOutcome` objects.
+    """
+
+    def __init__(
+        self,
+        *,
+        limit: int,
+        park: Callable[[str], None],
+        on_streak: Callable[[int, "SettleOutcome"], None] | None = None,
+        streak: int = 0,
+    ) -> None:
+        self.limit = max(0, int(limit))
+        self.streak = max(0, int(streak))
+        self.parked = False
+        self._park = park
+        self._on_streak = on_streak
+
+    def note(self, outcome: "SettleOutcome") -> bool:
+        """Record one phase's verdict; ``True`` when it parked the campaign."""
+        if self.parked or outcome.rh_stability_pct is None:
+            # A campaign parks once. The loop is already winding down, and a
+            # second park would fire a second safe_park and a second CRITICAL
+            # alert for one fault.
+            return False
+        if not (outcome.rh_limited or outcome.rh_unreadable):
+            self.streak = 0
+            return False
+        self.streak += 1
+        if self._on_streak is not None:
+            self._on_streak(self.streak, outcome)
+        if self.limit <= 0 or self.streak < self.limit:
+            return False
+        cause = ("the humidity moved" if outcome.rh_limited
+                 else "the RH channel could not be read")
+        self.parked = True
+        self._park(
+            f"{self.streak} consecutive equilibrate phases decided by the RH "
+            f"channel and not by the film ({cause}); every σ since is a claim "
+            f"about a room this campaign cannot certify"
+        )
+        return True
+
+
+def rh_ceiling_park_after_trials() -> int:
+    """K — consecutive RH-decided equilibrate phases that park a campaign.
+
+    Resolved from ``[safety] rh_ceiling_park_after_trials`` **here** rather than
+    through :func:`~softae.drivers.contracts.rh_watchdog_config`: that resolver's
+    output is splatted straight into ``classify_rh_hold``, which would then need a
+    second ``del``-style absorber to swallow a key it has no use for — and
+    ``RHHoldWatch`` has no business knowing a campaign-level streak limit.
+
+    Missing or unreadable → :data:`DEFAULT_RH_CEILING_PARK_AFTER_TRIALS`.
+    """
+    try:
+        from softae.config.loader import safety
+
+        value = safety().get("rh_ceiling_park_after_trials")
+        return (DEFAULT_RH_CEILING_PARK_AFTER_TRIALS if value is None
+                else max(0, int(value)))
+    except Exception:
+        return DEFAULT_RH_CEILING_PARK_AFTER_TRIALS
+
+
 def settle_r1_bound_ohms() -> float | None:
     """The R₁ lower bound the campaign's own fits rest against, or ``None``.
 
@@ -1633,6 +1747,20 @@ class SettleOutcome:
     noise_floor_rel: float | None = None
     tolerance_achievable: bool | None = None
     endorsement: str = ""
+    #: The RH spread this phase's last judged window achieved, and the tolerance
+    #: it was judged against. Recorded on **every** phase so the provisional
+    #: default self-calibrates from real campaigns at their own q — and so a park
+    #: raised by a mis-tuned tolerance is diagnosable at all.
+    rh_spread_pct: float | None = None
+    rh_stability_pct: float | None = None
+    #: The two booleans the campaign-level escalation counts, and **the only
+    #: route to it**. They cannot be derived after the fact: this class carries no
+    #: reason field, ``SettleTracker.outcome()`` discards the cause, and
+    #: :attr:`rh_spread_pct` describes only the last window while the binding one
+    #: may have been earlier. Drop them as "nice-to-have" and the escalation
+    #: silently stops working while still appearing to be wired.
+    rh_limited: bool = False       # would have certified but for moving humidity
+    rh_unreadable: bool = False    # the RH channel could not be judged at all
 
     @property
     def settled(self) -> bool:
@@ -1651,13 +1779,31 @@ class SettleOutcome:
             "noise_floor_rel": self.noise_floor_rel,
             "tolerance_achievable": self.tolerance_achievable,
             "endorsement": self.endorsement,
+            "rh_spread_pct": self.rh_spread_pct,
+            "rh_stability_pct": self.rh_stability_pct,
+            "rh_limited": self.rh_limited,
+            "rh_unreadable": self.rh_unreadable,
         }
 
     def describe(self) -> str:
-        """One line an operator can read at the bench."""
-        return (f"{self.outcome}: {self.n_rounds} round(s) over "
+        """One line an operator can read at the bench.
+
+        The RH cause is named here rather than left in the sidecar: an operator
+        reading ``ceiling`` in a log should not have to open ``settle.json`` to
+        learn it was the room.
+        """
+        line = (f"{self.outcome}: {self.n_rounds} round(s) over "
                 f"{self.held_s:.0f}s, {len(self.participating)} channel(s) "
                 f"participating, {len(self.excluded)} excluded")
+        if self.rh_stability_pct is not None:
+            spread = ("unreadable" if self.rh_spread_pct is None
+                      else f"{self.rh_spread_pct:.2f}%RH")
+            line += f", RH spread {spread} vs {self.rh_stability_pct:.2f}%RH"
+        if self.rh_limited:
+            line += " — the room moved, not the film"
+        elif self.rh_unreadable:
+            line += " — the RH channel could not be judged"
+        return line
 
 
 async def drive_settle_phase(
@@ -1667,6 +1813,7 @@ async def drive_settle_phase(
     measure_round: Callable[[int], Awaitable[Mapping[int, Any]]],
     fits_from: Callable[[Mapping[int, Any]], Sequence["RoundFit"]],
     r1_bound_ohms: float | None,
+    rh_for_round: Callable[[int], float | None] | None = None,
     sleep: Callable[[float], Awaitable[None]] | None = None,
     now: Callable[[], float] | None = None,
     on_round: Callable[[int, Any], None] | None = None,
@@ -1689,11 +1836,26 @@ async def drive_settle_phase(
 
     Returns the outcome and the **last round's raw results**, which is the
     reading taken closest to equilibrium and therefore the one worth recording.
+
+    ``rh_for_round(index)`` supplies that round's median %RH — the *stability*
+    half of the criterion. It is required whenever ``plan.rh_stability_pct`` is
+    set, and refused loudly rather than defaulted: ``observe``'s ``None`` means
+    "unreadable", so a missing wire would burn every phase to the ceiling
+    reporting a dead sensor that is not dead.
     """
     import asyncio
     import time
 
-    from softae.analysis.equilibration import SettleTracker
+    from softae.analysis.equilibration import SETTLE_NOT_EVALUABLE, SettleTracker
+
+    if plan.rh_stability_pct is not None and rh_for_round is None:
+        raise ValueError(
+            f"rh_stability_pct={plan.rh_stability_pct:g} is configured but no "
+            f"rh_for_round supplier was wired; every window would report "
+            f"'rh_unreadable' and the phase would burn to max_hold_s for a "
+            f"reason that is not true. Wire the supplier or set "
+            f"rh_stability_pct=None."
+        )
 
     sleep = sleep or asyncio.sleep
     now = now or time.monotonic
@@ -1706,6 +1868,7 @@ async def drive_settle_phase(
         # fits railed on the R₁ floor reports the same σ every round and settles
         # on round three, under-conditioning the entire campaign.
         r1_bound_ohms=r1_bound_ohms,
+        rh_stability_pct=plan.rh_stability_pct,
     )
 
     start = now()
@@ -1720,7 +1883,11 @@ async def drive_settle_phase(
         n_rounds += 1
         if raws:
             last_raws = raws
-        check = tracker.observe(fits_from(raws))
+        check = tracker.observe(
+            fits_from(raws),
+            rh_median_pct=(None if rh_for_round is None
+                           else rh_for_round(n_rounds - 1)),
+        )
         if on_round is not None:
             on_round(n_rounds - 1, check)
         if tracker.settled:
@@ -1732,8 +1899,9 @@ async def drive_settle_phase(
         await sleep(min(float(plan.round_period_s), remaining))
 
     endorsed, endorsement, noise_floor_rel = tracker.endorsement()
+    verdict = tracker.outcome(stopped_early=settled_early)
     outcome = SettleOutcome(
-        outcome=tracker.outcome(stopped_early=settled_early),
+        outcome=verdict,
         n_rounds=n_rounds,
         held_s=now() - start,
         participating=tracker.participating,
@@ -1742,6 +1910,16 @@ async def drive_settle_phase(
         noise_floor_rel=noise_floor_rel,
         tolerance_achievable=endorsed,
         endorsement=endorsement,
+        rh_spread_pct=tracker.rh_spread_pct,
+        rh_stability_pct=tracker.rh_stability_pct,
+        # Set explicitly at the moment each was the *binding* constraint, never
+        # inferred here from the spread — the binding window may have been an
+        # earlier one than the spread describes. `rh_unreadable` is additionally
+        # conditioned on the phase actually ending not_evaluable, so a phase that
+        # lost the RH channel early and recovered reports the ceiling it earned.
+        rh_limited=tracker.rh_blocked_settle,
+        rh_unreadable=bool(tracker.rh_unreadable
+                           and verdict == SETTLE_NOT_EVALUABLE),
     )
     logger.info("campaign_settle_verdict", channels=list(channels),
                 **outcome.as_dict())
@@ -3036,6 +3214,10 @@ async def run_autonomous_campaign(
                     continue
             return found
 
+        #: Wall-clock bounds of each settle round, so the round's own RH can be
+        #: read back off the ``conditions`` rows it wrote. Keyed by round index.
+        settle_round_window: dict[int, tuple[str, str]] = {}
+
         async def _settle_round(
             round_channels: list[int], round_index: int
         ) -> dict[int, Any]:
@@ -3043,6 +3225,7 @@ async def run_autonomous_campaign(
             wf = build_settle_round_workflow(spec, round_channels, round_index)
             if wf is None:
                 return {}
+            from softae.core.data_store import _now_iso
             from softae.workflows.workflow_executor import WorkflowExecutor
 
             # One sample, several measurements: the rounds re-read the films the
@@ -3054,9 +3237,53 @@ async def run_autonomous_campaign(
             executor.on_step_complete = (
                 lambda step, idx, total, result, *_: captured.update(
                     {step.name: result}))
-            await executor.run(wf)
+            started = _now_iso()
+            try:
+                await executor.run(wf)
+            finally:
+                # Bounded even on failure: a round that died halfway still wrote
+                # whatever conditions rows it got to, and those are the honest
+                # evidence of what the room did while it ran.
+                settle_round_window[int(round_index)] = (started, _now_iso())
             return {ch: captured.get(settle_step_name(ch, round_index))
                     for ch in round_channels}
+
+        #: The RH the room actually held during one settle round. Rows only —
+        #: **no new instrument read**: the EIS router already snapshots the
+        #: environment at measurement time, and it routes on ``step.method``,
+        #: which a settle round copies verbatim from the modality's own measure
+        #: step. The ``measurement="settle"`` tag governs objective eligibility,
+        #: never routing, so a settle round records a ``conditions`` row exactly
+        #: as a measure round does.
+        _SETTLE_RH_SQL = (
+            "SELECT rh_pv_pct FROM conditions "
+            "WHERE run_id = ? AND timestamp BETWEEN ? AND ? "
+            "AND rh_pv_pct IS NOT NULL"
+        )
+
+        def _settle_round_rh(round_index: int) -> float | None:
+            """This round's median %RH, or ``None`` if the room was not observed.
+
+            Both absences collapse to ``None``, and must: no row at all (capture
+            found nothing to write) and a row with a NULL ``rh_pv_pct`` (the RH
+            controller unreadable while the stage thermometer answered) are
+            equally *the room was not observed*. **A round with no RH reading is
+            not a round with stable RH** — the window it falls in becomes
+            non-evaluable rather than silently passing.
+            """
+            from softae.analysis.equilibration import round_rh_median
+
+            bounds = settle_round_window.get(int(round_index))
+            if bounds is None:
+                return None
+            try:
+                rows = data_store._conn.execute(
+                    _SETTLE_RH_SQL, (run_id, bounds[0], bounds[1])).fetchall()
+            except Exception:
+                logger.warning("settle_rh_readback_failed", run_id=run_id,
+                               settle_round=round_index, exc_info=True)
+                return None
+            return round_rh_median([row[0] for row in rows])
 
         def _record_settle(outcome: SettleOutcome, round_channels: list[int]) -> None:
             """Say which of the three outcomes this was — and keep saying it.
@@ -3077,6 +3304,38 @@ async def run_autonomous_campaign(
                                 encoding="utf-8")
             except Exception:
                 logger.warning("settle_sidecar_failed", run_id=run_id, exc_info=True)
+
+        def _park_on_rh_streak(reason: str) -> None:
+            """Stop the campaign, and mean it.
+
+            **Park, never raise.** A ``SafetyError`` here would be classified a
+            hard fault by ``AutonomousLoop._is_hard_fault`` and abort the trial
+            immediately — the mid-batch stop this whole design exists to avoid.
+            ``_park`` records the reason, fires ``on_park`` (safe_park plus a
+            durable CRITICAL alert) and asks for ``LoopState.STOPPED``.
+            """
+            loop._park(reason)
+            # Asking is not enough, and this second line is not belt-and-braces.
+            # This runs inside `AutonomousLoop._post_measure`, and the very next
+            # statement on every round path is `_set_state(ANALYZING)`, which
+            # overwrites STOPPED — the loop would otherwise run on. Every
+            # *existing* `_park` call site is followed by an immediate `break`;
+            # this one has no such lever, so it closes the budget instead and the
+            # loop's own top-of-round check ends the run at this trial boundary,
+            # with the current batch cast, measured and recorded. (The tidier fix
+            # belongs in AutonomousLoop, whose `_set_state` should refuse to leave
+            # a terminal state; that file is not this change's to edit.)
+            loop._max_iterations = loop.iteration
+
+        rh_escalation = RHCeilingEscalation(
+            limit=rh_ceiling_park_after_trials(),
+            park=_park_on_rh_streak,
+            on_streak=lambda streak, outcome: emit(
+                "rh_ceiling_streak", streak=streak, limit=rh_escalation.limit,
+                rh_limited=outcome.rh_limited,
+                rh_unreadable=outcome.rh_unreadable,
+                rh_spread_pct=outcome.rh_spread_pct),
+        )
 
         async def _equilibrate(step_results: dict[str, Any]) -> dict[str, Any]:
             """Hold until σ stops moving, then hand back the settled reading.
@@ -3099,12 +3358,18 @@ async def run_autonomous_campaign(
                 fits_from=lambda raws: settle_round_fits(
                     raws, round_channels, thickness_for=_thickness_for),
                 r1_bound_ohms=settle_r1_bound_ohms(),
+                rh_for_round=_settle_round_rh,
             )
             for channel, name in targets.items():
                 raw = last_raws.get(channel)
                 if raw is not None:
                     step_results[name] = raw
             _record_settle(outcome, round_channels)
+            # Last, and it matters: the park this may raise must land *after* the
+            # batch is measured and its verdict written, which is what siting the
+            # check here — on `on_trial_measured`, after `_record_settle` — buys
+            # for free. Nothing in flight is lost.
+            rh_escalation.note(outcome)
             return step_results
 
         async def _equilibrate_then_label(
@@ -3142,6 +3407,16 @@ async def run_autonomous_campaign(
             # check then stops at the right total, and checkpoint iteration
             # numbers stay monotonic across restarts instead of rewinding.
             loop._iteration = resume_plan.iteration
+            # The RH streak is per-campaign and must survive the restart, unlike
+            # `_consecutive_failures`, which resets defensibly: a resume there
+            # follows a park an operator has just been to the rig to address, so
+            # the slate is genuinely clean. This streak parks nothing until it
+            # reaches K, so a restart can land mid-streak for entirely unrelated
+            # reasons — a different park, a crash, an overnight shutdown — and
+            # zeroing would hand a chronic fault a fresh K trials, which is the
+            # exact case the escalation exists for.
+            _saved = data_store.campaign_checkpoint(spec.name) or {}
+            rh_escalation.streak = int(_saved.get("rh_ceiling_streak") or 0)
 
         def on_suggestion(iteration: int, params: dict[str, Any]) -> None:
             last_params.clear()
@@ -3246,6 +3521,11 @@ async def run_autonomous_campaign(
                 board_id=data_store.current_board_id(),
                 spec_json=serialize_campaign_spec(spec),
                 optimizer_json=json.dumps(optimizer.to_dict()),
+                # Deliberately a column and not a key inside `spec_json`: that
+                # blob is fingerprint-verified *spec identity*, and a counter that
+                # changes every iteration does not belong inside the thing whose
+                # stability proves the resume is legitimate.
+                rh_ceiling_streak=rh_escalation.streak,
             )
 
         loop.on_checkpoint = _on_checkpoint

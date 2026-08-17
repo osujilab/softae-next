@@ -40,6 +40,7 @@ from enum import Enum
 from typing import Any, Mapping
 
 from softae.analysis.equilibration import (
+    DEFAULT_RH_STABILITY_PCT,
     DEFAULT_SETTLE_MIN_CHANNELS,
     DEFAULT_SETTLE_N_ROUNDS,
     DEFAULT_SETTLE_TOL_REL,
@@ -112,12 +113,18 @@ class SettlePlan:
     * ``max_hold_s`` is the ceiling that guarantees the phase terminates at all;
     * ``round_period_s`` is instrument time spent per sample.
 
-    The three settle parameters default to the values measured on
+    The four settle parameters default to the values measured on
     ``20260811T023757Z_equilibration_characterization`` and are imported from
     :mod:`softae.analysis.equilibration` rather than restated, so a criterion
     retuned there moves the phase defaults with it. Notably
     ``settle_tol_rel = 0.10``: the measured noise floor on that run was 5.98 %,
     so a 2 % band is unsatisfiable by any hold length.
+
+    The fourth, ``rh_stability_pct``, is the only one that judges the *room*
+    rather than the sample. It belongs here and not in ``[safety]`` because it is
+    a spread over **this window** — a tolerance coupled to ``settle_n_rounds``
+    and ``round_period_s``, which a key in another file would be retuned
+    independently of — and because it parks nothing.
     """
 
     round_period_s: float
@@ -126,6 +133,20 @@ class SettlePlan:
     settle_tol_rel: float = DEFAULT_SETTLE_TOL_REL
     settle_n_rounds: int = DEFAULT_SETTLE_N_ROUNDS
     settle_min_channels: int = DEFAULT_SETTLE_MIN_CHANNELS
+    #: How far the chamber's %RH may move across the judged window and still let
+    #: the phase certify ``settled``. A **stability** tolerance, not a tracking
+    #: one: it is compared against the spread of the PV about itself and no
+    #: setpoint is read, which is why it lives here beside the window it
+    #: describes rather than in ``[safety]`` beside the ``rh_deviation_*``
+    #: tracking bands. It parks nothing — the streak limit that does
+    #: (``rh_ceiling_park_after_trials``) is a different quantity in a different
+    #: file. ``None`` switches the gate off.
+    #:
+    #: **On by default.** The failure mode of ON is *"held longer, recorded
+    #: ceiling"*; the failure mode of OFF is *"measured under moving humidity"*.
+    #: The gate can only ever make settling harder, never earlier, so it cannot
+    #: produce the early-measurement hazard that made settle itself opt-in.
+    rh_stability_pct: float | None = DEFAULT_RH_STABILITY_PCT
 
     def __post_init__(self) -> None:
         if self.round_period_s < 0 or self.min_hold_s < 0:
@@ -141,6 +162,10 @@ class SettlePlan:
         if self.settle_tol_rel <= 0:
             raise ValueError("settle_tol_rel must be positive; a zero band can "
                              "never be satisfied")
+        if self.rh_stability_pct is not None and self.rh_stability_pct <= 0:
+            raise ValueError("rh_stability_pct must be positive; a zero band can "
+                             "never be satisfied — use None to switch the RH "
+                             "stability gate off")
 
     def label(self) -> str:
         """``'≤2h, ≥30min, every 2min'`` — the three durations, in one glance."""

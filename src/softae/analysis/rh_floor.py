@@ -1,13 +1,31 @@
-"""The enclosure's attainable RH floor, read out of data the rig already has.
+"""The lowest %RH this chamber has been *observed* to reach, read out of data the
+rig already has.
 
-A setpoint below what the chamber can deliver hot saturates the humidity PID: the
-PV sits above the command indefinitely with nothing broken, because the flush
-basin holds water inside the heated enclosure. ``drivers.contracts`` grades that
-state live (:data:`~softae.drivers.contracts.RH_FLOOR_LIMITED`) and refuses to
-park a run on it. That is the safety net. **This module is the durable fix's
-first half:** the floor as a function of chamber temperature is already latent in
-``conditions``, which stores ``rh_sp_pct`` and ``rh_pv_pct`` beside the resolved
-temperature at every EIS measurement. It needs a query, not an experiment.
+A setpoint below what the chamber delivers hot leaves the humidity PID saturated:
+the PV sits above the command indefinitely with nothing broken.
+``drivers.contracts`` grades that state live
+(:data:`~softae.drivers.contracts.RH_OFF_SETPOINT_SUSTAINED`) and refuses to park
+a run on it. That is the safety net. **This module is the durable fix's first
+half:** the lowest attained %RH as a function of chamber temperature is already
+latent in ``conditions``, which stores ``rh_sp_pct`` and ``rh_pv_pct`` beside the
+resolved temperature at every EIS measurement. It needs a query, not an
+experiment.
+
+.. warning::
+
+   **"Floor" names an observation here, not a mechanism — and the mechanism is
+   now in question.** This module was written on the model that the flush basin
+   holds water inside the heated enclosure, so the attainable minimum rises with
+   temperature as a property of the *enclosure*. The operator reports the basin
+   instead evaporating into the chamber and likely drying out over a long run,
+   and the plan is to vent it to ambient. Under that reading these numbers are a
+   property of one basin's **fill level** during whichever runs populated each
+   bin: a ``MIN`` taken across runs that started with different water levels is
+   not a floor, and a refilled — or vented — basin need not reproduce it. Basin
+   fill is uninstrumented (no ``conditions`` column records it and no code asks),
+   so this module cannot tell the two explanations apart. Read each bin as *the
+   driest this chamber has been seen to get here*, and do not fit an absolute
+   threshold to it.
 
 Two properties, deliberate:
 
@@ -16,12 +34,14 @@ on this handle, and :class:`~softae.core.data_store.DataStore` is never
 constructed — its ``__init__`` runs DDL and eight migrations, and idempotent is
 not read-only.
 
-**A ``MIN(rh_pv_pct)`` is not automatically a floor.** It is a floor only where a
-setpoint at or below it was actually *commanded* and the controller still failed
-to reach it. A bin whose lowest commanded setpoint was 40 %RH says nothing about
-how dry the enclosure could get — it says the operator never asked. That
-distinction is :attr:`TemperatureBin.saturated`, and without it the naive query
-reads room humidity as a hard physical limit.
+**A ``MIN(rh_pv_pct)`` is not automatically a floor.** It is a candidate floor
+only where a setpoint at or below it was actually *commanded* and the controller
+still failed to reach it. A bin whose lowest commanded setpoint was 40 %RH says
+nothing about how dry the enclosure could get — it says the operator never asked.
+That distinction is :attr:`TemperatureBin.saturated`, and without it the naive
+query reads room humidity as a hard physical limit. Note that it is a *necessary*
+condition, not a sufficient one: per the warning above, an unmet setpoint is
+equally consistent with a basin that still had water in it that morning.
 
 The temperature binned on is ``conditions.temperature_C``, the answer
 :func:`~softae.analysis.conditions.resolve_temperature_C` recorded at write time.
@@ -66,9 +86,12 @@ class TemperatureBin:
     def saturated(self) -> bool:
         """True when the controller was asked for less than it delivered.
 
-        Only then is :attr:`rh_floor_pct` a measurement of the enclosure's limit.
-        False means the setpoint was met and the real floor is somewhere at or
-        below this number, unprobed.
+        False means the setpoint was met and the real minimum is somewhere at or
+        below this number, unprobed. True is the weaker claim it looks like: the
+        controller failed to reach what was asked, which is *necessary* for
+        :attr:`rh_floor_pct` to bound the enclosure but not sufficient for it to
+        be a property of the enclosure at all — see the module warning on basin
+        fill.
         """
         return self.rh_floor_pct > self.rh_setpoint_min_pct
 

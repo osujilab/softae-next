@@ -349,15 +349,23 @@ CREATE TABLE IF NOT EXISTS rig_state (
 -- optimizer: a crash between casting a well and checkpointing then costs one
 -- data point, whereas the reverse ordering would claim an observation for a well
 -- that was never actually cast. Losing data is recoverable; fabricating it is not.
+-- `rh_ceiling_streak` is the one per-campaign counter that must survive a
+-- restart: it parks nothing until it reaches its limit, so a restart can land
+-- mid-streak for reasons unrelated to it, and zeroing there would hand a chronic
+-- humidity fault a fresh allowance of trials. Legacy stores gain the column
+-- through `_migrate_campaign_checkpoint_rh_streak` — this CREATE is a no-op on
+-- them, so the DDL alone would be correct on a fresh store and silently broken
+-- on every store that already exists.
 CREATE TABLE IF NOT EXISTS campaign_checkpoints (
-    campaign       TEXT PRIMARY KEY,
-    run_id         TEXT,
-    iteration      INTEGER NOT NULL,
-    loop_state     TEXT,
-    board_id       INTEGER,
-    spec_json      TEXT,
-    optimizer_json TEXT,
-    updated_at     TEXT    NOT NULL
+    campaign          TEXT PRIMARY KEY,
+    run_id            TEXT,
+    iteration         INTEGER NOT NULL,
+    loop_state        TEXT,
+    board_id          INTEGER,
+    spec_json         TEXT,
+    optimizer_json    TEXT,
+    rh_ceiling_streak INTEGER NOT NULL DEFAULT 0,
+    updated_at        TEXT    NOT NULL
 );
 
 -- Durable operator-facing alerts (a parked campaign, a depleted reservoir, a
@@ -621,6 +629,8 @@ class DataStore:
         # Tier 2 component 6: the sample-identity spine's other two anchors.
         self._migrate_formulation_sample_uuid()
         self._migrate_doe_outcome()
+        # The per-campaign RH-ceiling streak, which the resume path reads by name.
+        self._migrate_campaign_checkpoint_rh_streak()
         # LAST, always: the ledger records the epochs every migration above has
         # just finished establishing, so it must not claim them before they hold.
         self._migrate_schema_version()
@@ -1487,6 +1497,7 @@ class DataStore:
         board_id: int | None = None,
         spec_json: str | None = None,
         optimizer_json: str | None = None,
+        rh_ceiling_streak: int = 0,
     ) -> None:
         """Record (or replace) the resume point for *campaign*.
 
@@ -1494,14 +1505,22 @@ class DataStore:
         leaves the previous checkpoint intact rather than a half-updated one.
         Call it **after** the iteration's observation has been told to the
         optimizer — see the schema note on ordering.
+
+        ``rh_ceiling_streak`` is the campaign's run of consecutive RH-decided
+        equilibrate phases. It defaults to ``0`` and the write replaces the whole
+        row, so a caller that tracks the streak must pass it on **every** call or
+        the count is lost — which is the same contract every other column here
+        already has.
         """
         self._conn.execute(
             "INSERT OR REPLACE INTO campaign_checkpoints "
             "(campaign, run_id, iteration, loop_state, board_id, spec_json, "
-            " optimizer_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " optimizer_json, rh_ceiling_streak, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (str(campaign), run_id, int(iteration), loop_state,
              None if board_id is None else int(board_id),
-             spec_json, optimizer_json, _now_iso()),
+             spec_json, optimizer_json, max(0, int(rh_ceiling_streak)),
+             _now_iso()),
         )
         self._conn.commit()
 
@@ -1509,14 +1528,14 @@ class DataStore:
         """The saved resume point for *campaign*, or ``None``."""
         row = self._conn.execute(
             "SELECT campaign, run_id, iteration, loop_state, board_id, "
-            "spec_json, optimizer_json, updated_at "
+            "spec_json, optimizer_json, rh_ceiling_streak, updated_at "
             "FROM campaign_checkpoints WHERE campaign = ?",
             (str(campaign),),
         ).fetchone()
         if row is None:
             return None
         keys = ("campaign", "run_id", "iteration", "loop_state", "board_id",
-                "spec_json", "optimizer_json", "updated_at")
+                "spec_json", "optimizer_json", "rh_ceiling_streak", "updated_at")
         return dict(zip(keys, row))
 
     def campaign_checkpoints(self) -> list[dict[str, Any]]:
@@ -2050,6 +2069,30 @@ class DataStore:
         if "stage_temp_pv_C" not in cols:
             self._conn.execute(
                 "ALTER TABLE conditions ADD COLUMN stage_temp_pv_C REAL"
+            )
+            self._conn.commit()
+
+    def _migrate_campaign_checkpoint_rh_streak(self) -> None:
+        """Add ``rh_ceiling_streak`` to ``campaign_checkpoints`` if missing.
+
+        The table's DDL is a bare ``CREATE TABLE IF NOT EXISTS``, so an existing
+        database never gains a column from it. Without this every real store —
+        which is every store that already exists — would fail the resume read
+        with ``no such column``.
+
+        Existing checkpoints get ``0``, which is the honest value: no campaign
+        written before this column existed had ever counted an RH-decided phase.
+        """
+        cols = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(campaign_checkpoints)"
+            ).fetchall()
+        }
+        if "rh_ceiling_streak" not in cols:
+            self._conn.execute(
+                "ALTER TABLE campaign_checkpoints "
+                "ADD COLUMN rh_ceiling_streak INTEGER NOT NULL DEFAULT 0"
             )
             self._conn.commit()
 

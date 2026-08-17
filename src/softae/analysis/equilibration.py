@@ -959,13 +959,22 @@ def _finite_or_none(value: float) -> float | None:
 # must never be got wrong here is *which channels count as evidence* and that is
 # not a decision worth needing a rig to test.
 #
-# **The criterion is on σ only, never on the environment PV.** The chamber
-# demonstrably cannot reach 15 %RH at 65 or 85 °C — 4 of 16 approaches in the
-# production run hit the 30-minute timeout without reaching tolerance — so a rule
-# that waited for RH-in-band would never fire at precisely the setpoints where
-# the hold length matters most, and the run would degenerate to the ceiling
-# everywhere. σ is what the campaign configures a hold time from; σ is what is
-# graded. Do not "fix" this by adding a PV gate.
+# **The σ criterion never reads a setpoint, and no gate here may make σ wait on
+# the PV *reaching* one.** In the 2026-08-11 run the chamber took ~5000 s to
+# bring 85 °C down to its commanded 15 %RH — it arrives (min PV 13.63 there), but
+# far outside the 1800 s `rh_approach_timeout_s`, so 4 of 16 approaches timed
+# out. A rule that waited for RH-in-band would therefore fire late or never at
+# exactly the setpoints where hold length matters, and the run would degenerate
+# to the ceiling. σ is what the campaign configures a hold time from; σ is what
+# is graded.
+#
+# A **stability** test is a different thing and is permitted: `rh_window_spread`
+# compares the PV series *to itself* over the judged window and is given no
+# setpoint to read. Under a chamber pinned above its command but steady, a
+# tracking gate never fires and this one fires immediately. What it withholds is
+# `settled` while the environment is genuinely still moving, which is the
+# intended behaviour. **If a later edit hands this function a setpoint, the
+# prohibition above is back in force.**
 
 #: The setpoint stopped because σ stopped moving.
 SETTLE_SETTLED = "settled"
@@ -1003,11 +1012,33 @@ DEFAULT_MIN_HOLD_S = 600.0
 #: rather than exactly on it, so an equality test would miss most railed fits.
 RAILED_R1_TOL_REL = 1e-3
 
+#: Range of the per-round RH medians a settle window may span and still count as
+#: a *still* room. Measured on ``20260811T023757Z_equilibration_characterization``
+#: over 3-round windows with 12 samples per round: steady windows cluster below
+#: 1.0 %RH (93 % of 106) and genuine drift windows sit above 1.5, with ~1 % of
+#: windows in the band between — so the threshold goes in the gap.
+#:
+#: **Provisional for small q.** At a campaign's q = 4 the per-round median is
+#: taken over 4 samples rather than 12, so the window spread runs somewhat
+#: larger. ``SettleOutcome.rh_spread_pct`` records the achieved spread on every
+#: phase precisely so this number re-derives itself from real campaigns instead
+#: of staying an assertion — the same posture :func:`window_noise_floor` and
+#: :func:`endorse_tolerance` already take toward ``settle_tol_rel``.
+DEFAULT_RH_STABILITY_PCT = 1.5
+
 #: Why a channel was left out of a settle window.
 EXCLUDED_ABSENT = "absent"
 EXCLUDED_SIGMA_NULL = "sigma_null"
 EXCLUDED_RAILED = "railed_R1"
 EXCLUDED_ZERO_MEAN = "zero_mean"
+
+#: Why an RH window could not certify. These two must never collapse into one:
+#: :data:`RH_MOVED` is a **verdict** — the room was observed and it moved — while
+#: :data:`EXCLUDED_RH_UNREADABLE` is an **absence**, and absence of evidence is
+#: not evidence. The first leaves the window evaluable and saying "no"; the
+#: second makes it non-evaluable, mirroring the ``min_channels`` shortfall.
+RH_MOVED = "rh_moved"
+EXCLUDED_RH_UNREADABLE = "rh_unreadable"
 
 
 @dataclass(frozen=True)
@@ -1192,6 +1223,54 @@ def window_noise_floor(
     return float(np.median(floors)) if floors else None
 
 
+def round_rh_median(samples: Sequence[Any] | None) -> float | None:
+    """The %RH this round stood at — median over its samples, or ``None``.
+
+    The **median**, not the mean, because the PID loop and the sensor together
+    put ~1.4 %RH of ripple across a round's channels on the reference run, and
+    ripple is not environmental change.
+
+    ``None`` — and never ``0.0`` — for an empty or all-non-finite sample list: a
+    plausible-looking humidity is worse than an admitted absence. Non-finite
+    entries are dropped, but the *count* is deliberately not judged here. "Two
+    channels reported RH" and "twelve did" are different confidence claims and
+    only the caller can weigh them.
+    """
+    values: list[float] = []
+    for sample in samples or []:
+        try:
+            value = float(sample)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(value):
+            values.append(value)
+    return float(np.median(values)) if values else None
+
+
+def rh_window_spread(round_medians: Sequence[float | None]) -> float | None:
+    """Range of the per-round medians across a window — ``None`` if any is missing.
+
+    Step 2 of the stability test, and the step a per-round range test cannot do.
+    Within one round the ~5000 s approach measured on the reference run
+    contributes ~0.2 %RH, buried under the ripple, so a round-local test rejects
+    oscillation and is **blind to drift**; across the window that same drift is
+    the whole signal. A draining basin walking the PV down a few tenths per round
+    is exactly this shape.
+
+    **Given no setpoint, and it must never be given one.** It compares the series
+    to itself, which is the entire reason it is permitted beside the σ criterion
+    — see the note above :data:`SETTLE_SETTLED`.
+
+    ``None`` when any round in the window lacks a median: a window with a hole in
+    it has not been *observed* to be stable.
+    """
+    medians = list(round_medians)
+    if not medians or any(m is None for m in medians):
+        return None
+    values = [float(m) for m in medians]  # type: ignore[arg-type]
+    return float(max(values) - min(values))
+
+
 class SettleTracker:
     """Accumulates a setpoint's rounds and answers "may this setpoint stop?".
 
@@ -1208,30 +1287,113 @@ class SettleTracker:
         n_rounds: int = DEFAULT_SETTLE_N_ROUNDS,
         min_channels: int = DEFAULT_SETTLE_MIN_CHANNELS,
         r1_bound_ohms: float | None = None,
+        rh_stability_pct: float | None = None,
     ) -> None:
         self.enabled = bool(enabled)
         self.tol_rel = float(tol_rel)
         self.n_rounds = max(2, int(n_rounds))
         self.min_channels = max(1, int(min_channels))
         self.r1_bound_ohms = r1_bound_ohms
+        #: How far the room may move across the judged window and still count as
+        #: still. ``None`` — the default — is the gate off, so every existing
+        #: caller keeps today's verdicts exactly.
+        self.rh_stability_pct = (None if rh_stability_pct is None
+                                 else float(rh_stability_pct))
         self.rounds: list[list[RoundFit]] = []
+        #: One per round, aligned with :attr:`rounds`. ``None`` = this round's RH
+        #: was never observed, which is not the same as "was steady".
+        self.rh_medians: list[float | None] = []
         self.last: SettleCheck | None = None
+        #: Achieved spread of the **last** judged window, for the record. It is
+        #: deliberately not the discriminator below: the binding window may have
+        #: been an earlier one.
+        self.rh_spread_pct: float | None = None
         #: Was the criterion ever evaluable at this setpoint? The difference
         #: between CEILING and NOT_EVALUABLE, and it must survive a later window
         #: that happened to lose a channel.
         self.ever_evaluable = False
+        #: *"This phase would have certified but for the humidity."* Set at the
+        #: one moment the RH clause is the **binding** constraint — σ said yes and
+        #: RH overrode it — and never inferred from :attr:`rh_spread_pct`, which
+        #: records the last window rather than the binding one. A window already
+        #: failing on σ must leave it alone, or the discriminator degrades into
+        #: "RH was imperfect at some point", which is true of nearly every phase.
+        self.rh_blocked_settle = False
+        #: The room could not be judged at all in a window that was otherwise
+        #: evaluable. Same binding-constraint discipline as
+        #: :attr:`rh_blocked_settle`: a window already short on channels says
+        #: nothing about the RH channel's health.
+        self.rh_unreadable = False
 
-    def observe(self, fits: Sequence[RoundFit]) -> SettleCheck | None:
-        """Record one round; return the verdict on the trailing window, if any."""
+    def observe(
+        self, fits: Sequence[RoundFit], *, rh_median_pct: float | None = None
+    ) -> SettleCheck | None:
+        """Record one round; return the verdict on the trailing window, if any.
+
+        *rh_median_pct* is this round's :func:`round_rh_median` and defaults to
+        ``None`` so every pre-existing caller compiles unchanged. **The default
+        is also the value that means "unreadable"**, which is why
+        :func:`~softae.core.autonomous_wiring.drive_settle_phase` refuses at entry
+        to run a configured tolerance with no supplier wired: a missing wire and a
+        dead sensor are otherwise indistinguishable at the point of harm.
+        """
         self.rounds.append(list(fits))
+        self.rh_medians.append(
+            None if rh_median_pct is None else float(rh_median_pct))
         self.last = None
         if not self.enabled or len(self.rounds) < self.n_rounds:
             return None
         self.last = settle_check(
             self.rounds[-self.n_rounds:], tol_rel=self.tol_rel,
             min_channels=self.min_channels, r1_bound_ohms=self.r1_bound_ohms)
+        self._apply_rh_clause(self.last)
+        # After the clause, never before: a window the room made non-evaluable
+        # must not be counted as evidence that the criterion was ever evaluable.
         self.ever_evaluable = self.ever_evaluable or self.last.evaluable
         return self.last
+
+    def _apply_rh_clause(self, check: SettleCheck) -> None:
+        """Was the room still across this window? Mutates *check* in place.
+
+        A **stability** test, never a tracking test: no setpoint is read here or
+        anywhere below it. Three outcomes, and the third is the one that is easy
+        to get wrong —
+
+        =========================  ==========================================
+        window RH state            result
+        =========================  ==========================================
+        spread ≤ tolerance         unchanged; the environment held still
+        spread > tolerance         ``settled=False``, reason gains ``rh_moved``
+        any round's median missing ``evaluable=False``, ``settled=False``
+        =========================  ==========================================
+
+        A window already non-evaluable on σ is left entirely alone: the σ
+        shortfall was checked first and owns the reason, and neither
+        :attr:`rh_blocked_settle` nor :attr:`rh_unreadable` may be set off it.
+        """
+        if self.rh_stability_pct is None:
+            return
+        spread = rh_window_spread(self.rh_medians[-self.n_rounds:])
+        self.rh_spread_pct = spread
+        if not check.evaluable:
+            return
+        if spread is None:
+            self.rh_unreadable = True
+            check.evaluable = False
+            check.settled = False
+            check.reason = (f"{EXCLUDED_RH_UNREADABLE}: no RH reading for at "
+                            f"least one of the last {self.n_rounds} round(s); "
+                            f"the room was not observed, so it cannot be called "
+                            f"still")
+            return
+        if spread > self.rh_stability_pct:
+            if check.settled:
+                self.rh_blocked_settle = True
+            check.settled = False
+            check.reason = (f"{check.reason}; {RH_MOVED}: RH spread "
+                            f"{spread:.2f}%RH over the window exceeds "
+                            f"{self.rh_stability_pct:.2f}%RH — σ flat under a "
+                            f"moving room is not evidence")
 
     @property
     def settled(self) -> bool:

@@ -57,8 +57,14 @@ SPACE = {
 
 
 def _plan(**over) -> SettlePlan:
+    # `rh_stability_pct=None` — the RH stability gate is OFF for every test in
+    # this file. These tests are about σ, the floor, the ceiling and the R₁
+    # bound; the gate that also watches the room is `SettlePlan`'s shipped
+    # default (pinned below) and is exercised end to end in
+    # `test_rh_equilibrate_stability_gate.py`.
     base = dict(round_period_s=50.0, min_hold_s=100.0, max_hold_s=10_000.0,
-                settle_n_rounds=3, settle_min_channels=3)
+                settle_n_rounds=3, settle_min_channels=3,
+                rh_stability_pct=None)
     base.update(over)
     return SettlePlan(**base)
 
@@ -196,6 +202,9 @@ def test_settle_defaults_come_from_the_measured_run_not_from_here():
     assert plan.settle_tol_rel == pytest.approx(0.10)
     assert plan.settle_n_rounds == 3
     assert plan.settle_min_channels == 3
+    # And the RH stability gate ships ON: its failure mode is "held longer,
+    # recorded ceiling", while OFF's is "measured under moving humidity".
+    assert plan.rh_stability_pct == pytest.approx(1.5)
 
 
 def test_the_phase_names_its_own_durations_in_the_plan_summary():
@@ -458,9 +467,12 @@ async def test_a_ceiling_does_not_park_the_campaign(
 
     store = DataStore(tmp_path / "proj")
     events: list[dict] = []
+    # RH gate off: with no workflow there are no `conditions` rows either, so the
+    # gate would (correctly) report `not_evaluable` and this test would stop
+    # being about the σ ceiling it was written for.
     result = await wiring.run_autonomous_campaign(
-        _fast_settle_spec(), manager=connected, data_store=store,
-        on_event=events.append,
+        _fast_settle_spec(rh_stability_pct=None), manager=connected,
+        data_store=store, on_event=events.append,
     )
 
     verdicts = [e for e in events if e["type"] == "settle_verdict"]

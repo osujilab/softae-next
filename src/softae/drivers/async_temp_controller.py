@@ -280,10 +280,15 @@ class AsyncTempController(BaseInstrument):
             from softae.drivers.contracts import run_anneal_hold
 
             report = run_anneal_hold(self, hold_time_s, target_temp_C)
+            # ``rh`` is always None on this path today: the call above passes no
+            # ``rh_reader``, so the humidity watchdog is production-dead until that
+            # wiring lands as its own task.  Logged anyway -- this line is what
+            # makes the verdict observable the day it does.
             logger.info(
                 "anneal_hold_done", held_s=round(report.held_s, 1),
                 n_samples=report.n_samples, excursion_C=report.excursion_C,
                 n_warn=report.n_warn, aborted=report.aborted,
+                rh=report.rh.state if report.rh else None,
             )
         finally:
             logger.info("anneal_return", original_sp=original_sp)

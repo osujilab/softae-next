@@ -30,7 +30,11 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
-# Severity levels, ordered.  "critical" means the rig stopped and needs a human.
+# Severity levels, ordered.  "critical" means a human is needed -- whether or not
+# the rig stopped.  A park is self-announcing: the operator finds a halted rig and
+# goes looking for the reason.  A demoted RH fault is the opposite -- the hold runs
+# to completion, the samples get measured, and the data enters the record looking
+# ordinary -- so it needs the loud severity more than a park does, not less.
 INFO = "info"
 WARNING = "warning"
 CRITICAL = "critical"

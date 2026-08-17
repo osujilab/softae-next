@@ -369,23 +369,48 @@ anneal_poll_interval_s   = 30.0
 # write time and never looks again — so through a multi-hour hot hold nothing watches
 # what the humidity actually did.
 #
-# The failure mode is NOT drift: the loop is PID-controlled and effective. It is that
-# the attainable RH floor RISES with chamber temperature, because the flush basin holds
-# water inside the heated enclosure. A setpoint below that floor saturates the
-# controller — the PV sits above the command indefinitely with nothing broken.
-# Measured 2026-08-11: 15 %RH commanded returned 16.9–20.4 at 65 C and 19.5–23.2 at
-# 85 C. That state is graded `floor_limited`: it ALERTS AND KEEPS HOLDING. Parking an
-# 8 h unattended cure at 3 a.m. on a plumbing fact is the failure P0–P1 exists to
-# prevent. A PV sustained *below* the setpoint is a fault instead — the basin can only
-# push humidity up, so an undershoot is not the known effect.
+# The failure mode is NOT drift: the loop is PID-controlled and effective. It is a PV
+# that sits away from the command for hours. Measured 2026-08-11: 15 %RH commanded
+# returned 16.9–20.4 at 65 C and 19.5–23.2 at 85 C.
+#
+# INSIDE A TEMPERATURE HOLD NO HUMIDITY VERDICT STOPS ANYTHING. An elevated-temperature
+# polymer cure is dominated by its thermal history; humidity modulates the result rather
+# than defining it, and part of the RH trajectory through a long cure is a consumable
+# draining rather than a process going wrong. Killing an 8 h cure at 3 a.m. on a
+# secondary variable trades a certain loss for an uncertain one. Both bands therefore
+# ALERT AND KEEP HOLDING — warn at WARNING, fault at CRITICAL — and the verdict is
+# carried out on the hold report. Temperature stays blocking, unchanged.
+#
+# The bands are SYMMETRIC: over- and undershoot are graded identically, and warn is
+# nested strictly inside fault. The earlier asymmetry (undershoot faulting at the warn
+# band, because "the basin can only push humidity up") rested on a mechanism the record
+# does not settle — an enclosure floor and a still-evaporating flush basin both fit the
+# 2026-08-11 data, and basin fill is uninstrumented — so it was removed with it.
+#
+# fault_pct is an OPERATOR JUDGEMENT about how far off command is worth waking someone
+# for, NOT a value fitted to any run. No band expressed as an absolute deviation may be
+# fitted to pre-plumbing-change data: it would encode that morning's basin fill, which
+# the planned change designs away. Expect the ordinary hot approach (85 C, SP 15) to
+# reach the fault band for ~25 min while it descends. That alert is correct and is
+# accepted; do NOT lengthen grace_s to suppress it, which would equally blind the
+# watchdog to a real eight-hour excursion.
 #
 # grace_s is long ON PURPOSE. A humidity loop settling over minutes is normal, and a
 # short grace produces alerts an operator learns to ignore — the exact failure this
 # whole mechanism exists to prevent.
 rh_deviation_warn_pct    = 3.0      # sustained |PV-SP| that is worth saying out loud
-rh_deviation_fault_pct   = 10.0     # beyond the known floor effect; a real problem
+rh_deviation_fault_pct   = 5.0      # sustained |PV-SP| worth waking someone for
 rh_deviation_grace_s     = 600.0    # long: the loop is slow and a hold is hours
 rh_poll_interval_s       = 60.0
+
+# Equilibrate/settle side (workflows/equilibration.py), which takes the OPPOSITE policy
+# to the anneal above: there humidity IS the variable under test, so an unmet setpoint
+# is the primary result rather than a secondary one. How many CONSECUTIVE settle phases
+# may end RH-decided (ceiling-limited, or not evaluable because RH was unreadable)
+# before the campaign parks. Matches `AutonomousLoop.max_consecutive_failures = 3`: a
+# second streak limit at a different K would be an unexplained inconsistency in the same
+# loop. Two in a row already implies something persistent; three is diagnostic.
+rh_ceiling_park_after_trials = 3
 
 # --- Anti-clog purge (core/purge.py) ---
 
