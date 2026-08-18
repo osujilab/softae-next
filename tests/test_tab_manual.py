@@ -286,28 +286,27 @@ class TestManualCorrectionAndSyringeReadout:
         assert tab._pump_widgets[2]["count_lbl"].text().endswith("3")
 
     def test_poll_worker_propagates_parallel_map_from_status(self, manager):
+        """One poll, asserted directly.
+
+        This used to run the worker's whole loop on the test thread and escape it
+        by patching ``msleep`` to raise the stop flag — so the assertion about
+        what a poll *reports* was pinned to how the loop *waits*, and changing the
+        wait to something interruptible turned the test into an infinite loop.
+        ``poll_once`` is the reading; the loop is not part of this question.
+        """
         worker = _ManualPollingWorker(manager)
-        emitted: list[dict] = []
-        worker.poll_done.connect(lambda payload: emitted.append(payload))
 
         syr = manager.get("syringe")
         original_status = syr.status
-        original_msleep = worker.msleep
-
         syr.status = MagicMock(return_value={
             "parallel_syringes": 1,
             "parallel_syringes_by_pump": {0: 2, 1: 1, 2: 2},
         })
-        worker.msleep = lambda _ms: setattr(worker, "_stop", True)
-
         try:
-            worker.run()
+            payload = worker.poll_once()
         finally:
             syr.status = original_status
-            worker.msleep = original_msleep
 
-        assert emitted
-        payload = emitted[-1]
         assert payload["parallel_syringes"] == 1
         assert payload["parallel_syringes_by_pump"] == {0: 2, 1: 1, 2: 2}
 
@@ -317,6 +316,21 @@ class TestManualTabCleanup:
         assert tab._pv_worker.isRunning()
         tab.cleanup()
         assert not tab._pv_worker.isRunning()
+
+    def test_manual_tab_cleanup_does_not_block_for_the_poll_interval(self, tab):
+        """``cleanup()`` runs on the main thread, so its cost is a GUI freeze.
+
+        The poll waited with ``msleep``, which cannot be interrupted, so a stop
+        arriving just after a poll joined for the remaining ~2 s — every tab
+        close, and every window close. The bound is deliberately loose (a third
+        of the interval) so this measures the wake, not the machine.
+        """
+        import time
+
+        assert tab._pv_worker.isRunning()
+        t0 = time.monotonic()
+        tab.cleanup()
+        assert time.monotonic() - t0 < 0.7, "the poll sleep was not woken"
 
     def test_manual_tab_cleanup_safe_with_no_eis_thread(self, tab):
         assert tab._eis_thread is None

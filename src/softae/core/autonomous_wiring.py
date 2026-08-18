@@ -31,6 +31,7 @@ import math
 import os
 import tempfile
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Sequence
 
@@ -82,6 +83,7 @@ from softae.core.measurement_spec import (
 # module exclusively inside functions, so its module body never reaches back
 # here. Keep it that way — see `modality_registry`'s "Import discipline".
 from softae.core.modality_registry import ObjectiveSpec, get_modality
+from softae.core.run_lock import held_run_lock, rig_is_simulated
 from softae.core.run_plan import RunPlan, SettlePlan
 from softae.core.alerts import CRITICAL, Alert, raise_alert
 from softae.core.safe_park import safe_park
@@ -2727,6 +2729,10 @@ async def run_autonomous_campaign(
 
     run_id: str | None = None
     run_finalized = False
+    # The rig claim is entered once the run has an identity and closed last of
+    # all, so it spans everything between — including the gaps between trials
+    # where the per-workflow lock used to disappear.
+    rig_claim = ExitStack()
 
     def _finalize_run(status: str) -> None:
         """Close the run row exactly once (idempotent, never raises).
@@ -2760,6 +2766,35 @@ async def run_autonomous_campaign(
             campaign=spec.name,
             config_hash=config_hash,
         )
+        # ── The rig is claimed for the whole campaign, not for each trial ────
+        # `WorkflowExecutor.run` takes the lock per workflow and drops it in its
+        # `finally`, and one trial is one `executor.run`. So between trials —
+        # during the BO fit and suggest, the checkpoint write, the settle sidecar
+        # — the lock file did not exist, and anything that asked `read_run_lock()`
+        # was told the rig was free while a campaign was mid-round. A lock that is
+        # absent for part of every round is worse than no lock, because it is
+        # believed.
+        #
+        # Claiming here makes the answer true for the run's whole length and says
+        # *which* campaign holds it: `what` carries `campaign:<name>:<run_id>` and
+        # `log_path` the run directory, so a second process can name the owner
+        # rather than guess at it. This is for **telling the truth about
+        # ownership**, not for refusing anyone — the operator at the bench keeps
+        # manual control regardless of what this file says.
+        #
+        # Sited after `start_run` because the run id is half of that identity, and
+        # nothing has actuated yet: the only thing between is a database insert.
+        # Sited *before* `run_started` because that event is where a watcher begins
+        # watching, and it must not be able to see the rig unclaimed on the very
+        # first thing it is told. Simulated rigs stay exempt for the same reason
+        # the executor exempts them — a mock run holding the lock turns a dry run
+        # into an outage for a real one.
+        if not rig_is_simulated(manager):
+            rig_claim.enter_context(held_run_lock(
+                what=f"campaign:{spec.name}:{run_id}",
+                log_path=str(data_store.run_dir(run_id)),
+            ))
+
         emit("run_started", run_id=run_id, spec=spec.name)
 
         # Let the modality prepare whatever its measurement steps will read,
@@ -3626,10 +3661,17 @@ async def run_autonomous_campaign(
         raise
 
     finally:
-        # Must run before the store closes.  A no-op if already finalized above;
-        # this catches any exit path that bypassed both branches.
-        _finalize_run("error")
-        if owns_store:
-            data_store.close()
-        if owns_manager:
-            await manager.disconnect_all()
+        try:
+            # Must run before the store closes.  A no-op if already finalized
+            # above; this catches any exit path that bypassed both branches.
+            _finalize_run("error")
+            if owns_store:
+                data_store.close()
+            if owns_manager:
+                await manager.disconnect_all()
+        finally:
+            # Last, and in its own `finally` so a failing teardown cannot strand
+            # the claim: disconnecting drives hardware, and handing the rig to
+            # someone else before that finishes is the window the lock exists to
+            # close.
+            rig_claim.close()

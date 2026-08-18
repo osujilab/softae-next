@@ -251,15 +251,27 @@ class WorkflowExecutor:
         from softae.core.run_lock import (
             RunLockHeld,
             acquire_run_lock,
+            read_run_lock,
             release_run_lock,
             rig_is_simulated,
         )
 
         self._lock_taken = False
         if not rig_is_simulated(self.manager):
+            # Whether the rig was *already* ours decides who gets to give it back.
+            # `acquire_run_lock` is re-entrant: asked by the process that already
+            # holds the lock it hands back the existing claim rather than raising.
+            # Releasing that in the `finally` below would free a claim this call
+            # never made — and a campaign now holds one for its whole length, one
+            # lock across many trials, so the first trial's teardown would have
+            # dropped it and left every later trial running on a rig the lock file
+            # said was free. Same `mine_already` discipline as `held_run_lock`
+            # (run_lock.py) and for exactly the same reason.
+            before = read_run_lock()
+            mine_already = before is not None and before.is_mine()
             try:
                 acquire_run_lock(what=f"workflow '{workflow.name}'")
-                self._lock_taken = True
+                self._lock_taken = not mine_already
             except RunLockHeld as exc:
                 raise WorkflowError(
                     f"refusing to execute '{workflow.name}': {exc}\n"

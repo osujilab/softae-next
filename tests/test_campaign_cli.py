@@ -283,20 +283,41 @@ class TestCLI:
                                                       monkeypatch):
         """A wrong head belief costs one wrong flip; it is never guessed."""
         monkeypatch.setattr(cli.sys, "stdin", None)
-        rc = cli.main(["run", str(_write(tmp_path, DEMO)), "--mock", "--yes"])
+        rc = cli.main(["run", str(_write(tmp_path, DEMO)), "--mock", "--yes",
+                       "--project", str(tmp_path / "proj")])
 
         assert rc == cli.EXIT_DECLINED
         assert "Head position unknown" in capsys.readouterr().out
 
     def test_resume_is_an_alias_for_run_resume(self, tmp_path):
         args = cli.build_parser().parse_args(
-            ["resume", str(_write(tmp_path, DEMO))])
+            ["resume", str(_write(tmp_path, DEMO)),
+             "--project", str(tmp_path / "proj")])
         assert args.command == "resume"
 
     def test_the_parser_rejects_contradictory_head_flags(self, tmp_path):
         with pytest.raises(SystemExit):
             cli.build_parser().parse_args(
-                ["run", "s.toml", "--head-up", "--head-down"])
+                ["run", "s.toml", "--project", "p",
+                 "--head-up", "--head-down"])
+
+    def test_running_without_a_project_is_refused_by_the_parser(self, tmp_path):
+        """A run with no store records nothing and cannot be resumed.
+
+        The measurements, the checkpoint and the run directory all live in the
+        DataStore, so `--project` is not bookkeeping — it is where the campaign's
+        evidence goes. It used to be optional, and a run started without it did
+        the physical work and kept none of it.
+        """
+        with pytest.raises(SystemExit):
+            cli.build_parser().parse_args(["run", "s.toml", "--mock"])
+        with pytest.raises(SystemExit):
+            cli.build_parser().parse_args(["resume", "s.toml"])
+
+    def test_check_still_runs_without_a_project_because_it_runs_nothing(self,
+                                                                        tmp_path):
+        args = cli.build_parser().parse_args(["check", "s.toml"])
+        assert args.project is None
 
 
 class TestHeadlessPurgeAttachment:

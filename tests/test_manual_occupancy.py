@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -10,40 +9,31 @@ import pytest
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtWidgets import QApplication
-
 from softae.core.data_store import DataStore
 from softae.core.deposition_steps import deposition_positions
 from softae.drivers.mock_factory import create_mock_manager
 from softae.gui.tabs.tab_manual import ManualControlTab
-from softae.gui.widgets import occupancy_guard
+from softae.gui.widgets import occupancy_guard, rig_owner
 from softae.gui.widgets.occupancy_guard import BoardReplacedDecision
 
 
-@pytest.fixture(scope="session")
-def qapp():
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication([])
-    yield app
-
-
 @pytest.fixture
-def env(qapp, tmp_path: Path):
+def env(qapp, tmp_path: Path, monkeypatch):
+    # Occupancy has nothing to say about rig ownership, but the tab now polls it
+    # on a 2 s timer. Pinning the answer keeps the banner out of these tests and
+    # keeps them off the lock file entirely.
+    monkeypatch.setattr(rig_owner, "foreign_rig_lock", lambda: None)
     manager = create_mock_manager(config={})
     ds = DataStore(tmp_path / "proj")
     tab = ManualControlTab(manager, data_store=ds)
     yield tab, manager, ds
-    pv = getattr(tab, "_pv_worker", None)
-    if pv is not None and pv.isRunning():
-        pv.stop_worker()
     pos_map = getattr(tab, "_pos_map", None)
     if pos_map is not None:
         w = getattr(pos_map, "_pos_worker", None)
         if w is not None and w.isRunning():
             w.requestInterruption()
             w.wait(2000)
-    tab.close()
+    tab.close()          # -> closeEvent -> cleanup(): PV worker, EIS thread, timer
     ds.close()
 
 
@@ -56,14 +46,6 @@ def _place_over_e1(manager, *, head_down: bool):
     manager.get("syringe").set_head_state(not head_down)  # is_up = not head_down
     ox, oy = _origin()
     manager.get("stage").live_position = lambda: (ox, oy, 0.0)
-
-
-def _wait_until(cond, timeout=3.0):
-    t0 = time.monotonic()
-    while not cond() and (time.monotonic() - t0) < timeout:
-        QApplication.processEvents()
-        time.sleep(0.02)
-    return cond()
 
 
 # ── _pending_cast_target (which well would this pump occupy?) ───────────────
@@ -92,23 +74,23 @@ def test_head_down_away_from_wells_is_none(env):
 # ── _on_infuse recording + guard ───────────────────────────────────────────
 
 
-def test_infuse_records_occupancy_when_casting(env):
+def test_infuse_records_occupancy_when_casting(env, settle_qt):
     tab, manager, ds = env
     _place_over_e1(manager, head_down=True)
     tab._on_infuse(0)
-    assert _wait_until(lambda: ds.occupied_electrodes(0) == {1})
+    settle_qt(tab)
+    assert ds.occupied_electrodes(0) == {1}
 
 
-def test_infuse_head_up_records_nothing(env):
+def test_infuse_head_up_records_nothing(env, settle_qt):
     tab, manager, ds = env
     _place_over_e1(manager, head_down=False)
     tab._on_infuse(0)
-    # Let the pump worker finish, then confirm no well was marked.
-    _wait_until(lambda: False, timeout=0.5)
+    settle_qt(tab)  # the pump ran to completion; it simply marked nothing
     assert ds.occupied_electrodes(0) == set()
 
 
-def test_infuse_into_occupied_cancel_does_not_pump(env, monkeypatch):
+def test_infuse_into_occupied_cancel_does_not_pump(env, monkeypatch, settle_qt):
     tab, manager, ds = env
     ds.record_electrode_cast(0, 1)  # E1 already used
     _place_over_e1(manager, head_down=True)
@@ -118,12 +100,12 @@ def test_infuse_into_occupied_cancel_does_not_pump(env, monkeypatch):
         occupancy_guard, "prompt_board_replaced", lambda *a, **k: BoardReplacedDecision.CANCEL
     )
     tab._on_infuse(0)
-    _wait_until(lambda: False, timeout=0.3)
+    settle_qt(tab)  # no worker was started; this proves it rather than assuming it
     spy.assert_not_called()
     assert tab._pump_widgets[0]["btn"].isEnabled()  # never disabled
 
 
-def test_infuse_into_occupied_fresh_records_on_new_board(env, monkeypatch):
+def test_infuse_into_occupied_fresh_records_on_new_board(env, monkeypatch, settle_qt):
     tab, manager, ds = env
     ds.record_electrode_cast(0, 1)
     _place_over_e1(manager, head_down=True)
@@ -131,13 +113,22 @@ def test_infuse_into_occupied_fresh_records_on_new_board(env, monkeypatch):
         occupancy_guard, "prompt_board_replaced", lambda *a, **k: BoardReplacedDecision.FRESH
     )
     tab._on_infuse(0)
-    assert _wait_until(lambda: ds.occupied_electrodes(1) == {1})  # fresh board id
+    settle_qt(tab)
+    assert ds.occupied_electrodes(1) == {1}  # fresh board id
     assert ds.occupied_electrodes(0) == {1}  # retired board untouched
     assert ds.current_board_id() == 1        # pointer advanced durably
 
 
-def test_infuse_fresh_board_pointer_persists_even_if_pump_fails(env, monkeypatch):
-    """The swap is recorded up-front, so a failed dispense cannot lose it."""
+def test_infuse_fresh_board_pointer_persists_even_if_pump_fails(
+        env, monkeypatch, settle_qt):
+    """The swap is recorded up-front, so a failed dispense cannot lose it.
+
+    The failure is driven to completion *inside* the test rather than left in
+    flight. A queued ``failed`` signal is a real ``QMessageBox.warning``, and one
+    abandoned here is delivered during pytest-qt's post-teardown ``processEvents``
+    — after ``monkeypatch`` has restored the real modal — where it blocks the whole
+    session on a dialog nothing can dismiss.
+    """
     tab, manager, ds = env
     ds.record_electrode_cast(0, 1)
     _place_over_e1(manager, head_down=True)
@@ -149,16 +140,22 @@ def test_infuse_fresh_board_pointer_persists_even_if_pump_fails(env, monkeypatch
     monkeypatch.setattr(
         occupancy_guard, "prompt_board_replaced", lambda *a, **k: BoardReplacedDecision.FRESH
     )
-    # Swallow the error dialog the failed worker raises.
+    warned: list[tuple] = []
     monkeypatch.setattr(
-        "softae.gui.tabs.tab_manual.QMessageBox.warning", lambda *a, **k: None
+        "softae.gui.tabs.tab_manual.QMessageBox.warning",
+        lambda *a, **k: warned.append(a),
     )
     tab._on_infuse(0)
-    assert _wait_until(lambda: ds.current_board_id() == 1)
+    settle_qt(tab)
+
+    assert ds.current_board_id() == 1
     assert ds.occupied_electrodes(1) == set()  # nothing cast — pump failed
+    assert warned, "a failed dispense must tell the operator"
+    assert tab._pump_widgets[0]["btn"].isEnabled()  # and must not leave it dead
 
 
-def test_infuse_into_occupied_cast_anyway_stays_on_same_board(env, monkeypatch):
+def test_infuse_into_occupied_cast_anyway_stays_on_same_board(
+        env, monkeypatch, settle_qt):
     tab, manager, ds = env
     ds.record_electrode_cast(0, 1)
     _place_over_e1(manager, head_down=True)
@@ -169,6 +166,7 @@ def test_infuse_into_occupied_cast_anyway_stays_on_same_board(env, monkeypatch):
         lambda *a, **k: BoardReplacedDecision.CAST_ANYWAY,
     )
     tab._on_infuse(0)
-    assert _wait_until(lambda: spy.called)
+    settle_qt(tab)
+    assert spy.called
     assert ds.occupied_electrodes(0) == {1}  # same board, re-affirmed
     assert ds.occupied_electrodes(1) == set()  # no fresh board created

@@ -14,7 +14,16 @@ from typing import TYPE_CHECKING
 
 from .tab_manual_workers import _CommandWorker
 
-from PySide6.QtCore import QObject, QThread, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import (
+    QMutex,
+    QObject,
+    QThread,
+    Qt,
+    QTimer,
+    QWaitCondition,
+    Signal,
+    Slot,
+)
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -43,6 +52,7 @@ if TYPE_CHECKING:
     from softae.analysis.circuit_fitting import FitResult
     from softae.analysis.eis_data import EISResult
     from softae.core.data_store import DataStore
+    from softae.core.run_lock import RunLock
     from softae.gui.widgets.camera_worker import CameraWorker
     from softae.server.manager import InstrumentManager
 
@@ -215,45 +225,69 @@ class _ManualPollingWorker(StoppableWorker):
         super().__init__(parent)
         self._manager = manager
         self._stop = False
+        self._mutex = QMutex()
+        self._condition = QWaitCondition()
 
     def run(self) -> None:
-        import math
         self._stop = False
         while not self._stop:
-            out: dict = {}
-            try:
-                tc = self._manager.get("temp_controller")
-                out["temp_sp"] = tc.get_sp()
-                out["temp_pv"] = tc.get_pv()
-            except Exception:
-                pass
-            try:
-                rh = self._manager.get("rh_controller")
-                h = rh.get_H()
-                if not math.isnan(h):
-                    out["rh"] = h
-            except Exception:
-                pass
-            try:
-                stage = self._manager.get("stage")
-                pos = stage.live_position()
-                out["pos"] = pos
-            except Exception:
-                pass
-            try:
-                syr = self._manager.get("syringe")
-                status = syr.status()
-                out["parallel_syringes"] = int(status.get("parallel_syringes", 1))
-                counts_by_pump = status.get("parallel_syringes_by_pump")
-                if isinstance(counts_by_pump, dict):
-                    out["parallel_syringes_by_pump"] = dict(counts_by_pump)
-            except Exception:
-                pass
-            self.poll_done.emit(out)
-            self.msleep(2000)
+            self.poll_done.emit(self.poll_once())
+            # A *wakeable* wait rather than ``msleep``: an msleep cannot be
+            # interrupted, so a stop arriving just after a poll blocked the
+            # **caller** — the main thread, inside ``cleanup()`` — for the rest of
+            # the interval. Closing the tab or the window froze the GUI for up to
+            # 2 s for no reason. The flag is re-checked under the mutex so a stop
+            # landing between the poll and the wait cannot lose its wake-up.
+            self._mutex.lock()
+            if not self._stop:
+                self._condition.wait(self._mutex, 2000)
+            self._mutex.unlock()
+
+    def poll_once(self) -> dict:
+        """One sweep of the instruments, as the payload ``poll_done`` carries.
+
+        Separate from :meth:`run` so the reading can be asserted without starting
+        a thread or standing in for a sleep: what a poll *reports* and how often
+        it repeats are two different questions, and a test of the first should not
+        have to answer the second.
+        """
+        import math
+
+        out: dict = {}
+        try:
+            tc = self._manager.get("temp_controller")
+            out["temp_sp"] = tc.get_sp()
+            out["temp_pv"] = tc.get_pv()
+        except Exception:
+            pass
+        try:
+            rh = self._manager.get("rh_controller")
+            h = rh.get_H()
+            if not math.isnan(h):
+                out["rh"] = h
+        except Exception:
+            pass
+        try:
+            stage = self._manager.get("stage")
+            out["pos"] = stage.live_position()
+        except Exception:
+            pass
+        try:
+            syr = self._manager.get("syringe")
+            status = syr.status()
+            out["parallel_syringes"] = int(status.get("parallel_syringes", 1))
+            counts_by_pump = status.get("parallel_syringes_by_pump")
+            if isinstance(counts_by_pump, dict):
+                out["parallel_syringes_by_pump"] = dict(counts_by_pump)
+        except Exception:
+            pass
+        return out
 
     def _request_stop(self) -> None:
+        self._mutex.lock()
         self._stop = True
+        self._condition.wakeAll()
+        self._mutex.unlock()
 
 
 class ManualControlTab(QWidget):
@@ -277,6 +311,14 @@ class ManualControlTab(QWidget):
         self._manual_dispense_count_by_pump: dict[int, int] = {0: 0, 1: 0, 2: 0}
         self._build_ui()
         self._start_pv_polling()
+        # A campaign can start (or end) in another process while this tab sits
+        # open, so ownership is polled rather than read once. 2 s matches the Init
+        # tab's cadence, so the two views cannot be more than one tick apart.
+        self._rig_owner_timer = QTimer(self)
+        self._rig_owner_timer.setInterval(2000)
+        self._rig_owner_timer.timeout.connect(self.refresh_rig_owner)
+        self._rig_owner_timer.start()
+        self.refresh_rig_owner()
         # Reflect the driver's registered head belief (may already have been set
         # by the launch-time verification prompt before this tab is shown).
         self.refresh_head_label()
@@ -284,6 +326,14 @@ class ManualControlTab(QWidget):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
+
+        # Who owns the rig, stated before any control that could reach it.  Hidden
+        # while the rig is free or ours, so the ordinary session is unchanged.
+        self._lbl_rig_owner = QLabel("")
+        self._lbl_rig_owner.setWordWrap(True)
+        self._lbl_rig_owner.setVisible(False)
+        layout.addWidget(self._lbl_rig_owner)
+
         top = QHBoxLayout()
 
         # --- Stage section ---
@@ -846,6 +896,82 @@ class ManualControlTab(QWidget):
             correction.commanded([max(0.0, target_uL)], run_index=run_index)[0]
         )
 
+    # --- Rig ownership: awareness, never enforcement --------------------------
+
+    def refresh_rig_owner(self) -> "RunLock | None":
+        """Show who owns the rig, if it is not this process. Returns that lock.
+
+        The banner is the *whole* of this tab's response to a foreign owner. It
+        does not disable a control, refuse a command, or offer to take the rig
+        over, and that is a decision rather than an omission: the operator at the
+        bench reaches for manual control precisely when something has gone wrong,
+        and a lockout at that moment is the failure, not the protection.
+
+        Stopping a run is a designated control with a scope of its own — rig-scale
+        (the E-Stop already on the main toolbar), campaign-scale and terminal
+        (Abort), campaign-scale and resumable (Pause). Each belongs to the
+        container that surfaces the run, so this banner **routes to them rather
+        than duplicating them**: the owner named here is another *process*, and a
+        Pause button wired to nothing would be worse than no button. It reports
+        and points; it does not promise what it cannot honour.
+        """
+        from softae.gui.widgets.rig_owner import (
+            OCCUPIED,
+            campaign_identity,
+            foreign_rig_lock,
+            owner_line,
+        )
+
+        lock = foreign_rig_lock()
+        if lock is None:
+            self._lbl_rig_owner.setVisible(False)
+            self._lbl_rig_owner.setText("")
+            self._lbl_rig_owner.setToolTip("")
+            return None
+
+        identity = campaign_identity(lock)
+        subject = (
+            f"Campaign '{identity[0]}' (run {identity[1]})" if identity
+            else "Another process"
+        )
+        self._lbl_rig_owner.setText(
+            f"<b style='color:#8e24aa'>{OCCUPIED}</b> — {subject} is driving this "
+            f"rig: {owner_line(lock)}.<br>"
+            f"Manual commands here still work and are <b>not</b> blocked — they "
+            f"will interleave with that run. To quiet the rig first: pause or "
+            f"abort the campaign from the process that owns it, or use the "
+            f"E-Stop on the main toolbar to park the whole rig."
+        )
+        self._lbl_rig_owner.setToolTip(lock.describe())
+        self._lbl_rig_owner.setVisible(True)
+        return lock
+
+    def _note_manual_actuation(self, action: str) -> "RunLock | None":
+        """Record — and never refuse — a manual *action* issued over a live run.
+
+        Returns the foreign lock when there was one, so a caller can annotate its
+        own status line. **The caller proceeds either way.** This exists so that a
+        collision, if one happens, is in the log with a timestamp and an owner
+        beside it rather than being reconstructed afterwards from a ruined board.
+        """
+        lock = self.refresh_rig_owner()
+        if lock is None:
+            return None
+        import structlog
+
+        structlog.get_logger(__name__).warning(
+            "manual_actuation_during_foreign_run",
+            action=action, owner_pid=lock.pid, owner_what=lock.what,
+            owner_started_at=lock.started_at,
+            msg="manual control was used while another process held the rig — "
+                "allowed deliberately; the operator at the bench decides",
+        )
+        self._lbl_last_command.setText(
+            f"Last command: {action} — issued while {lock.what or 'another run'} "
+            f"(PID {lock.pid}) holds the rig"
+        )
+        return lock
+
     # --- Slots ----------------------------------------------------------------
 
     def _safe_run(self, fn, error_title: str = "Error") -> None:
@@ -856,6 +982,7 @@ class ManualControlTab(QWidget):
             QMessageBox.warning(self, error_title, str(exc))
 
     def _on_goto(self) -> None:
+        self._note_manual_actuation("stage go-to")
         x, y = self._spin_x.value(), self._spin_y.value()
         self._btn_goto.setEnabled(False)
 
@@ -873,6 +1000,7 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_jog(self, dx: float, dy: float) -> None:
+        self._note_manual_actuation("stage jog")
         step = self._spin_jog_step.value()
         for b in self._jog_buttons:
             b.setEnabled(False)
@@ -895,6 +1023,7 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_set_temp(self) -> None:
+        self._note_manual_actuation("temperature setpoint")
         sp = self._spin_temp.value()
         self._btn_set_temp.setEnabled(False)
 
@@ -911,6 +1040,7 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_ramp(self) -> None:
+        self._note_manual_actuation("temperature ramp")
         end = self._spin_ramp_end.value()
         rate = self._spin_ramp_rate.value()
         self._btn_ramp.setEnabled(False)
@@ -933,6 +1063,7 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_set_rh(self) -> None:
+        self._note_manual_actuation("humidity setpoint")
         sp = self._spin_rh.value()
         self._btn_set_rh.setEnabled(False)
 
@@ -948,6 +1079,7 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_rh_start(self) -> None:
+        self._note_manual_actuation("humidity control start")
         sp = self._spin_rh.value()
         self._btn_rh_start.setEnabled(False)
 
@@ -964,6 +1096,7 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_rh_stop(self) -> None:
+        self._note_manual_actuation("humidity control stop")
         self._btn_rh_stop.setEnabled(False)
 
         def _do():
@@ -978,6 +1111,7 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_head_retract(self) -> None:
+        self._note_manual_actuation("dispenser head retract")
         self._btn_head_retract.setEnabled(False)
 
         def _do():
@@ -994,6 +1128,7 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_head_descend(self) -> None:
+        self._note_manual_actuation("dispenser head descend")
         self._btn_head_descend.setEnabled(False)
 
         def _do():
@@ -1162,6 +1297,10 @@ class ManualControlTab(QWidget):
                         )
                 # CAST_ANYWAY: keep (board_id, electrode) — deliberate re-cast.
 
+        # Noted here rather than at the top of the slot: everything above can
+        # still decline, and the log line should mean "fluid was commanded", not
+        # "a button was pressed".
+        self._note_manual_actuation(f"pump {pump_id} dispense")
         btn.setEnabled(False)
 
         def _do():
@@ -1199,6 +1338,7 @@ class ManualControlTab(QWidget):
     def _on_piezo_a_on(self) -> None:
         if not self._piezo_enabled_cfg:
             return
+        self._note_manual_actuation("piezo channel A on")
         self._ensure_piezo_capability_status()
         self._btn_piezo_a_on.setEnabled(False)
         self._btn_piezo_a_off.setEnabled(False)
@@ -1222,6 +1362,7 @@ class ManualControlTab(QWidget):
     def _on_piezo_a_off(self) -> None:
         if not self._piezo_enabled_cfg:
             return
+        self._note_manual_actuation("piezo channel A off")
         self._ensure_piezo_capability_status()
         self._btn_piezo_a_on.setEnabled(False)
         self._btn_piezo_a_off.setEnabled(False)
@@ -1245,6 +1386,7 @@ class ManualControlTab(QWidget):
     def _on_piezo_apply_settings(self) -> None:
         if not self._piezo_enabled_cfg:
             return
+        self._note_manual_actuation("piezo profile")
         self._ensure_piezo_capability_status()
         if not self._piezo_config_supported:
             self._lbl_piezo_status.setText("Profile settings unavailable on legacy piezo firmware.")
@@ -1326,6 +1468,7 @@ class ManualControlTab(QWidget):
         except ValueError as exc:
             self._lbl_eis_status.setText(f"Routing error: {exc}")
             return
+        self._note_manual_actuation("manual EIS")
         preset = self._combo_eis_preset.currentText()
         auto_fit = self._chk_autofit.isChecked()
         fit_model = self._combo_fit_model.currentText()
@@ -1523,12 +1666,16 @@ class ManualControlTab(QWidget):
             self._lbl_cam_image.setPixmap(pixmap)
 
     def _on_lamp_on(self) -> None:
+        self._note_manual_actuation("lamp on")
+
         def go():
             lamp = self._manager.get("lamp")
             lamp.on()
         self._safe_run(go, "Lamp Error")
 
     def _on_lamp_off(self) -> None:
+        self._note_manual_actuation("lamp off")
+
         def go():
             lamp = self._manager.get("lamp")
             lamp.off()
@@ -1536,6 +1683,9 @@ class ManualControlTab(QWidget):
 
     def cleanup(self) -> None:
         """Stop this tab's worker threads (idempotent)."""
+        timer = getattr(self, "_rig_owner_timer", None)
+        if timer is not None:
+            timer.stop()
         if self._pv_worker is not None and self._pv_worker.isRunning():
             self._pv_worker.stop_worker()
         eis = getattr(self, "_eis_thread", None)
@@ -1557,11 +1707,15 @@ class ManualControlTab(QWidget):
     def hideEvent(self, event) -> None:
         if self._pv_worker is not None and self._pv_worker.isRunning():
             self._pv_worker.stop_worker()
+        self._rig_owner_timer.stop()
         super().hideEvent(event)
 
     def showEvent(self, event) -> None:
         if self._pv_worker is not None and not self._pv_worker.isRunning():
             self._pv_worker.start()
+        # Who owns the rig may have changed entirely while this tab was hidden.
+        self._rig_owner_timer.start()
+        self.refresh_rig_owner()
         # A start-gate on another tab may have changed the head belief while
         # this tab was hidden; re-sync the label when it becomes visible.
         self.refresh_head_label()

@@ -19,3 +19,59 @@ def qapp():
     if app is None:
         app = QApplication([])
     yield app
+
+
+@pytest.fixture(scope="session", autouse=True)
+def rig_lock_scope(tmp_path_factory):
+    """No test may see — or delete — the operator's real ``~/.softae/rig.lock``.
+
+    :func:`softae.core.run_lock.read_run_lock` **unlinks a stale lock as a side
+    effect**, deliberately, so that every caller who asks the question also
+    repairs the answer. That is right on the rig and wrong in a test suite: the
+    GUI runs on this machine while the suite does, and any widget that merely
+    *renders* ownership (the Manual tab's banner polls on a 2 s timer) reaches
+    the default scope without anyone writing a line of lock code.
+
+    Redirecting :data:`~softae.core.run_lock.DEFAULT_SCOPE` at a session tmp dir
+    closes that whole class at the root rather than one fixture at a time.
+    ``tests/test_run_lock.py`` binds ``DEFAULT_SCOPE`` by value at import — before
+    any fixture runs — so its assertion about the real home path still holds, and
+    tests that want their own scope keep overriding this with ``monkeypatch``.
+    """
+    from _pytest.monkeypatch import MonkeyPatch
+    from softae.core import run_lock
+
+    mp = MonkeyPatch()
+    mp.setattr(run_lock, "DEFAULT_SCOPE", tmp_path_factory.mktemp("rig_lock_scope"))
+    yield
+    mp.undo()
+
+
+@pytest.fixture
+def settle_qt():
+    """Join a widget's one-shot command workers, then deliver what they emitted.
+
+    A GUI test that asserts a driver was called has to synchronise on the *thread*
+    that calls it. Polling ``button.isEnabled()`` with ``time.sleep`` synchronises
+    on the clock instead, which buys both a race and a test whose cost is its
+    timeout rather than its work; ``QThread.wait`` is exact and costs only as long
+    as the command.
+
+    Draining the queued signals afterwards is not cosmetic. ``_on_infuse`` wires
+    ``failed`` to ``QMessageBox.warning``; an undelivered ``failed`` outlives the
+    test that started it and is delivered by pytest-qt's post-teardown
+    ``processEvents`` — *after* ``monkeypatch`` has put the real modal back — where
+    it opens a dialog no test can dismiss and wedges the run indefinitely.
+
+    Only :class:`_CommandWorker` is joined. The tab's PV-polling worker runs until
+    stopped, so waiting on every :class:`QThread` child would block for the full
+    timeout by design.
+    """
+    from softae.gui.tabs.tab_manual_workers import _CommandWorker
+
+    def _settle(widget, timeout_ms: int = 5000) -> None:
+        for worker in widget.findChildren(_CommandWorker):
+            worker.wait(timeout_ms)
+        QApplication.processEvents()
+
+    return _settle

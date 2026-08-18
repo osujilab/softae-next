@@ -313,9 +313,10 @@ def _cmd_run(args) -> int:
 
     manager = create_manager(mock=True if args.mock else False)
 
-    store = DataStore(args.project) if args.project else None
-    if store is not None:
-        attach_reservoir_ledger(manager, store)
+    # `--project` is required by the parser for `run`/`resume`, so the store is
+    # never None here — the campaign always has somewhere to record what it did.
+    store = DataStore(args.project)
+    attach_reservoir_ledger(manager, store)
 
     # Same choke point as the stock ledger, for the same reason: every dispense
     # the campaign makes must reset that line's purge timer, or the harness pays
@@ -357,8 +358,7 @@ def _cmd_run(args) -> int:
               "`softae-campaign resume`.")
         return EXIT_FAILED
     finally:
-        if store is not None:
-            store.close()
+        store.close()
 
     print()
     print(f"{result.final_state}: {result.n_trials} trial(s)")
@@ -376,14 +376,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="command", required=True)
 
-    def _common(sp):
+    def _common(sp, *, project_required: bool):
         sp.add_argument("spec", help="campaign spec (.toml)")
-        sp.add_argument("--project", help="project directory for the data store")
+        # Required to *run*, optional to `check`. A campaign without a store
+        # records no measurements, writes no checkpoint, and so cannot be
+        # resumed — the run happens and the evidence of it does not. `check`
+        # runs nothing and so needs nowhere to put it.
+        sp.add_argument("--project", required=project_required,
+                        help="project directory for the data store"
+                             + ("" if project_required else " (optional)"))
         return sp
 
-    _common(sub.add_parser("check", help="parse and project; run nothing"))
+    _common(sub.add_parser("check", help="parse and project; run nothing"),
+            project_required=False)
 
-    run = _common(sub.add_parser("run", help="run the campaign"))
+    run = _common(sub.add_parser("run", help="run the campaign"),
+                  project_required=True)
     run.add_argument("--yes", "-y", action="store_true",
                      help="pre-approve prompts (required when not on a terminal)")
     run.add_argument("--resume", action="store_true",
@@ -396,7 +404,8 @@ def build_parser() -> argparse.ArgumentParser:
     head.add_argument("--head-down", action="store_true",
                       help="dispenser head is lowered")
 
-    res = _common(sub.add_parser("resume", help="alias for `run --resume`"))
+    res = _common(sub.add_parser("resume", help="alias for `run --resume`"),
+                  project_required=True)
     res.add_argument("--yes", "-y", action="store_true")
     res.add_argument("--mock", action="store_true")
     rhead = res.add_mutually_exclusive_group()

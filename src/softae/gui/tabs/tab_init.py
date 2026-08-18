@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from softae.server.manager import InstrumentManager
 
 from softae.gui.widgets.position_map import PositionMapWidget
+from softae.gui.widgets.rig_owner import OCCUPIED
 from softae.gui.widgets.worker_thread import StoppableWorker
 
 
@@ -136,14 +137,14 @@ def _read_rig_lock():
 def _owner_line(rig_lock) -> str:
     """One-line owner summary for a table cell — ``describe()`` is multi-line.
 
-    Names the PID, the run and the start time rather than just "busy", because PID
-    reuse means the lock can read as live when its owner is long gone (see
-    :mod:`softae.core.run_lock`). A person can tell "commissioning blank_short, started
-    14:02" from a stale number; a check cannot.
+    Delegates to :func:`softae.gui.widgets.rig_owner.owner_line`: the Manual
+    Control banner renders the same fact, and two spellings of one lock file is
+    how an operator ends up comparing "OCCUPIED" here against something else
+    there and having to decide which to believe.
     """
-    what = rig_lock.what or "unnamed run"
-    when = rig_lock.started_at or "unknown time"
-    return f"held by PID {rig_lock.pid} — {what}, started {when}"
+    from softae.gui.widgets.rig_owner import owner_line
+
+    return owner_line(rig_lock)
 
 
 def _compose_state(state: str, *, busy: bool = False, rig_lock=None) -> str:
@@ -165,7 +166,7 @@ def _compose_state(state: str, *, busy: bool = False, rig_lock=None) -> str:
         running, and that ambiguity is what this replaces.
     """
     if rig_lock is not None and not rig_lock.is_mine():
-        return "OCCUPIED"
+        return OCCUPIED
     if state == "CONNECTED":
         return "CONNECTED · ACTIVE" if busy else "CONNECTED · IDLE"
     return state

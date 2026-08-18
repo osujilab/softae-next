@@ -83,7 +83,13 @@ class TestScopeIsTheMachineNotTheProject:
     def test_two_project_dirs_share_one_default_lock(self):
         # Not parameterised on any project argument at all: there is nothing to differ.
         assert lock_path() == lock_path()
-        assert "softae" in str(lock_path()).lower()
+        # Stated against the scope itself rather than by looking for "softae" in the
+        # string: the claim is "the default path is the scope's lock and nothing
+        # else", which holds wherever the scope points. That the scope *is*
+        # ``~/.softae`` is the sibling test's job, and it reads the real constant.
+        from softae.core import run_lock
+
+        assert lock_path() == run_lock.DEFAULT_SCOPE / "rig.lock"
 
 
 class _EmptyManager:
