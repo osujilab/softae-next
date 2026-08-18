@@ -117,6 +117,7 @@ softae-commission = "softae.tools.commission:main"
 softae-shadow = "softae.tools.shadow_review:main"
 softae-thickness = "softae.tools.thickness:main"
 softae-equilibration = "softae.tools.equilibration:main"
+softae-eis-timing = "softae.tools.eis_timing:main"
 
 [project.entry-points."gui_scripts"]
 softae = "softae.gui.__main__:main"
