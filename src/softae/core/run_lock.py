@@ -295,6 +295,76 @@ def break_run_lock(scope: str | Path | None = None) -> RunLock | None:
     return lock
 
 
+# ── Liveness, for callers deciding whether to start ──────────────────────────
+#
+# This is the *liveness* half of a pair, and the pair must not be confused. A run
+# lock answers "is something driving the rig **right now**"; an unfinished run row
+# (:mod:`softae.core.shutdown`) answers "did something **die**". Each is useless at
+# the other's job, in opposite directions:
+#
+# * the lock cannot be a recovery marker — :func:`read_run_lock` unlinks a stale
+#   lock and returns ``None``, so "no lock" and "a crashed run whose lock I just
+#   deleted" are the same answer;
+# * the row cannot be a liveness check — a live run's row and a crashed run's row
+#   are identical, so treating a row as evidence of death marks a **running**
+#   campaign ``interrupted`` and parks the rig underneath it.
+#
+# So every caller that does both asks *this* first. See the ordering comments in
+# ``tools/campaign.py`` and ``gui/widgets/unclean_shutdown.py``.
+
+def foreign_run_lock(scope: str | Path | None = None) -> RunLock | None:
+    """The rig claim if a **live, other** process holds it, else ``None``.
+
+    Composed from the two predicates that already exist rather than adding a
+    third: :func:`read_run_lock` supplies liveness (it returns only locks whose
+    owner is still alive, clearing stale ones as it goes) and
+    :meth:`RunLock.is_mine` supplies foreignness.
+
+    A lock this process owns is deliberately **not** foreign. A GUI running its
+    own sequence, or a campaign re-entering its own claim, is not a second owner
+    of anything, and reporting it as one would refuse the ordinary case.
+    """
+    lock = read_run_lock(scope)
+    if lock is None or lock.is_mine():
+        return None
+    return lock
+
+
+#: The holder may be **wedged rather than dead**, and the two need different
+#: answers. Staleness self-clears — a dead owner's lock is gone the next time
+#: anyone reads it — but a hung process stays alive to the OS and holds the rig
+#: indefinitely. The override for that already exists and is deliberately manual
+#: (:func:`break_run_lock`, surfaced as the Calibration Launcher's "Take the rig?"
+#: confirmation), because PID reuse means no automatic check can tell a wedged
+#: owner from a live one. Nothing here takes the rig on its own.
+WEDGED_HOLDER_ADVICE = (
+    "If that process is wedged rather than working — no output, no CPU — take "
+    "the rig from it deliberately in the GUI's Calibration Launcher "
+    '("Take the rig?"). Do that only once you are sure it is not still driving '
+    "the hardware: two processes on one rig is what this check exists to prevent."
+)
+
+
+def busy_rig_message(lock: RunLock, *, action: str) -> str:
+    """Why *action* is refused, who holds the rig, and what to do about it.
+
+    Never a bare "busy". The operator's only recourse against an anonymous
+    refusal is to start deleting files, so the holder is named — PID, what it is
+    running, since when — via :meth:`RunLock.describe`, and every exit from the
+    situation is spelled out.
+    """
+    return (
+        f"{action} would drive the same rig, and {lock.describe()}\n"
+        "\nWhat to do:\n"
+        "  - let it finish, then start this one;\n"
+        "  - or stop it at its own terminal (Ctrl-C parks the rig and keeps the "
+        "checkpoint, so `softae-campaign resume` continues it);\n"
+        f"  - {WEDGED_HOLDER_ADVICE}\n"
+        "\nThis refusal is scoped to starting a second automated run. Manual "
+        "control at the rig is never refused."
+    )
+
+
 def rig_is_simulated(manager: Any) -> bool:
     """Whether nothing physical is at stake, so the lock may be skipped.
 

@@ -95,7 +95,26 @@ class TestStartupCheck:
             mgr.get.return_value.is_connected = True
 
         assert check_unclean_shutdown(None, mgr, store) is True
-        mgr.get.return_value.head_retract.assert_called()
+        assert mgr.get.return_value.halt_pump.call_count == 3
+
+    def test_the_recovery_park_does_not_move_the_head(self, qapp, store,
+                                                      monkeypatch):
+        """The sharpest case for the policy, and this dialog already argues it.
+
+        The belief here comes from a session that was *killed*: the dialog's own
+        text says the head "may have been left LOWERED over an electrode". A
+        conditional flip on that belief is a coin toss, and one face of it drives
+        the head down. So the recovery park commands no head motion and the
+        operator's own inspection — which the dialog demands — is the sensor.
+        """
+        store.start_run("wf")
+        _patch_dialog(monkeypatch, "Park now")
+        mgr = MagicMock()
+        mgr.get.return_value.is_connected = True
+
+        assert check_unclean_shutdown(None, mgr, store) is True
+        mgr.get.return_value.head_retract.assert_not_called()
+        mgr.get.return_value.head_flip.assert_not_called()
 
     def test_no_park_when_declined(self, qapp, store, monkeypatch):
         store.start_run("wf")

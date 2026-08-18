@@ -21,6 +21,12 @@ window to raise a dialog in. Every one of them defaults to the **safe** answer:
 * **Board exchange** cancels: swapping a plate is physical, and nobody is there.
 * **Board freshness** resumes past used wells, never re-casting them.
 * A **projected stock shortfall** stops the run unless ``--yes`` is given.
+
+Stopping is a CLI concern for the same reason. There is no window to close, so
+:mod:`softae.core.shutdown` installs SIGINT/SIGTERM/SIGBREAK handlers that drive
+the rig safe **while the instruments are still connected** — the teardown that
+disconnects them is what makes a later park impossible — and the next launch
+picks up whatever a hard kill left behind, via the unfinished run row.
 """
 
 from __future__ import annotations
@@ -64,6 +70,22 @@ def _emit(event: dict[str, Any]) -> None:
                    "step_skipped", "step_recovered"):
         print(f"   {etype}: "
               f"{ {k: v for k, v in event.items() if k != 'type'} }", flush=True)
+
+
+def _report_park(reason: str, result) -> None:
+    """Say what the shutdown park did, on the terminal and in the log.
+
+    Printed rather than only logged because the operator who pressed Ctrl-C is
+    looking at this terminal, and "which subsystems refused to go safe" is the
+    one thing they need before walking away from the rig.
+
+    ``result.describe()`` rather than a verdict: it separates what was
+    *commanded* from what was *verified* (nothing, on this rig) and names the
+    head as unverifiable. A shutdown park does not move the head, so "the rig is
+    safe" is the one sentence this must not print.
+    """
+    print(f"\n!! PARKING ({reason})", flush=True)
+    print(result.describe(), flush=True)
 
 
 def _fmt(params: Any) -> str:
@@ -302,6 +324,19 @@ def _cmd_run(args) -> int:
     from softae.core.autonomous_wiring import run_autonomous_campaign
     from softae.core.data_store import DataStore
     from softae.core.reservoir import attach_reservoir_ledger
+    from softae.core.run_lock import (
+        busy_rig_message,
+        foreign_run_lock,
+        rig_is_simulated,
+    )
+
+    from softae.core.shutdown import (
+        ParkGuard,
+        detect_unfinished_runs,
+        install_signal_park,
+        park_on_shutdown,
+        recover_from_unclean_shutdown,
+    )
 
     # `InstrumentManager.from_config()` never existed — this raised AttributeError on
     # every non-mock invocation, so `softae-campaign run` has only ever worked with
@@ -313,6 +348,26 @@ def _cmd_run(args) -> int:
 
     manager = create_manager(mock=True if args.mock else False)
 
+    # ── Liveness BEFORE recovery. This ordering is the fix — do not reorder. ──
+    #
+    # `detect_unfinished_runs` (below) is project-wide and cannot tell a *live*
+    # run's row from a crashed one. Asked while another campaign is genuinely
+    # running, it reads that campaign's own row, marks it `interrupted` and parks
+    # the rig underneath it — killing the run it was meant to protect. Asking who
+    # holds the rig first is what makes that unreachable: a live holder is
+    # refused here and never reaches the recovery path at all.
+    holder = foreign_run_lock()
+
+    # Refused only when this run would itself claim the rig. `run_autonomous_campaign`
+    # takes the lock under exactly this predicate (`autonomous_wiring.py`, "the rig is
+    # claimed for the whole campaign"), so contention is defined in one place rather
+    # than guessed at twice — and a `--mock` run, which claims nothing and moves
+    # nothing, is not refused over hardware it will never touch.
+    if holder is not None and not rig_is_simulated(manager):
+        print(f"\n!! NOT STARTING '{spec.name}'\n\n"
+              f"{busy_rig_message(holder, action='This campaign')}", flush=True)
+        return EXIT_DECLINED
+
     # `--project` is required by the parser for `run`/`resume`, so the store is
     # never None here — the campaign always has somewhere to record what it did.
     store = DataStore(args.project)
@@ -323,6 +378,8 @@ def _cmd_run(args) -> int:
     # the full idle rate for lines the run had just used itself.
     _attach_purge(manager, store)
 
+    guard = ParkGuard(manager, on_park=_report_park)
+
     try:
         if not _register_head_state(manager, args):
             return EXIT_DECLINED
@@ -330,12 +387,40 @@ def _cmd_run(args) -> int:
             return EXIT_DECLINED
         _calibration_advisory(spec)
 
+        # Queried before anything connects so the operator is told early, but
+        # acted on after (see `_go`): a park needs live sessions.
+        #
+        # Skipped outright while another process holds the rig. Only a *real* run
+        # is refused above, so this is reachable on the `--mock` path — where the
+        # rig is not at stake but the DataStore still is: `record_unclean_shutdown`
+        # would mark the live campaign's row `interrupted`, and a simulated run
+        # corrupts a real run's record just as thoroughly as a real one would.
+        #
+        # Deferring loses nothing. The unfinished row is durable and never clears
+        # itself, so a genuinely crashed run is still detected and parked at the
+        # next launch that is not racing a live campaign.
+        unfinished = None if holder is not None else detect_unfinished_runs(store)
+        if holder is not None:
+            print(f"\n   skipping unclean-shutdown recovery — {holder.describe()}\n"
+                  "   Unfinished runs are durable; they will be handled at the "
+                  "next launch.", flush=True)
+        if unfinished:
+            print(f"\n!! PREVIOUS SESSION DID NOT FINISH\n   "
+                  f"{unfinished.describe()}", flush=True)
+
         print(f"Starting '{spec.name}'"
               f"{' (resuming)' if args.resume else ''}...", flush=True)
 
         async def _go():
             await manager.connect_all()
             try:
+                if unfinished:
+                    # Sited here, not before `connect_all`, because `safe_park`
+                    # skips every instrument that is not `is_connected` — a
+                    # recovery park issued earlier would record four skips and
+                    # move nothing.
+                    recover_from_unclean_shutdown(
+                        manager, store, unfinished=unfinished, report=print)
                 return await run_autonomous_campaign(
                     spec,
                     manager=manager,
@@ -347,15 +432,27 @@ def _cmd_run(args) -> int:
                     on_board_check=None,
                     resume=bool(args.resume),
                 )
+            except BaseException:
+                # The campaign parks in its own catch-all, and the guard makes
+                # this a no-op when it did. It is here for the exits that never
+                # reached the campaign at all — a signal during `connect_all`,
+                # the recovery park raising — because the very next statement
+                # disconnects, and after that a park is impossible rather than
+                # merely late.
+                park_on_shutdown(manager, "campaign CLI unwinding")
+                raise
             finally:
+                # Last, always: `safe_park` needs these sessions open, so every
+                # park decision above has to have been made by now.
                 await manager.disconnect_all()
 
-        result = asyncio.run(_go())
+        with install_signal_park(guard):
+            result = asyncio.run(_go())
     except SpecLoadError:
         raise
     except KeyboardInterrupt:
-        print("\nInterrupted — the checkpoint is retained; resume with "
-              "`softae-campaign resume`.")
+        print(f"\nInterrupted — {guard.describe()}.")
+        print("The checkpoint is retained; resume with `softae-campaign resume`.")
         return EXIT_FAILED
     finally:
         store.close()
@@ -364,7 +461,22 @@ def _cmd_run(args) -> int:
     print(f"{result.final_state}: {result.n_trials} trial(s)")
     if result.best_params is not None:
         print(f"best {result.best_objective:.6g} at {_fmt(result.best_params)}")
-    return EXIT_OK if result.final_state in ("CONVERGED", "STOPPED") else EXIT_FAILED
+    if result.park_reason:
+        print(f"PARKED: {result.park_reason}")
+    # Zero means "ended on purpose", which a park is not. `_park` leaves the loop
+    # in STOPPED — the same state a clean stop leaves — so state alone reported a
+    # 3 a.m. hard-fault park as success and contradicted this CLI's own header.
+    #
+    # Character for character the predicate `run_autonomous_campaign` uses to
+    # decide whether to drop the checkpoint, so the CLI and the checkpoint cannot
+    # come to disagree about what "on purpose" means. That is why `park_reason`
+    # disqualifies a CONVERGED run too: a campaign that converged *and* parked
+    # keeps its checkpoint, and a run whose checkpoint was worth keeping did not
+    # finish.
+    ended_on_purpose = (
+        result.final_state in ("CONVERGED", "STOPPED") and not result.park_reason
+    )
+    return EXIT_OK if ended_on_purpose else EXIT_FAILED
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────

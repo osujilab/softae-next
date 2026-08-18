@@ -54,6 +54,21 @@ class LoopState(Enum):
     ERROR = auto()
 
 
+#: States the loop may not leave once entered.
+#:
+#: These are exactly the three states the main ``while`` in :meth:`AutonomousLoop.run`
+#: already treats as the end of the run, and exactly the three that
+#: ``autonomous_wiring`` maps to durable run statuses ("converged" / "stopped" /
+#: "error").  The guard in :meth:`AutonomousLoop._set_state` therefore introduces no
+#: new vocabulary — it enforces the one the loop had already written down in two
+#: places and relied on in neither.
+TERMINAL_STATES = frozenset({
+    LoopState.CONVERGED,
+    LoopState.STOPPED,
+    LoopState.ERROR,
+})
+
+
 class BoardDecision(Enum):
     """Outcome of a board-exchange prompt when an electrode plate fills."""
 
@@ -330,9 +345,56 @@ class AutonomousLoop:
     # ── State management ────────────────────────────────────────────────
 
     def _set_state(self, new: LoopState) -> None:
+        """Transition to *new*, **refusing to leave a terminal state**.
+
+        A terminal state is a decision the loop has already taken — stopped,
+        converged, or errored — and every route into one is something that
+        wanted the run to end.  Letting an ordinary transition overwrite it is
+        how :meth:`stop` used to be discarded: the request lands while the loop
+        is ``EXECUTING``, and the next statement on every round path is
+        ``_set_state(ANALYZING)``, so the ``while`` never saw ``STOPPED`` and the
+        run carried on with no error and nothing in the log but an ordinary
+        state-change line.  Every ``_park`` site survived only because a
+        hand-placed ``break`` followed it; the guard makes that structural rather
+        than a property each call site has to remember.
+
+        The refusal is **logged at warning**, never silent.  A swallowed state
+        change is the hardest kind of defect to see from a log file, and a quiet
+        guard would merely trade one invisible discard for another.  Use
+        :meth:`_clear_terminal` to reopen the machine deliberately.
+        """
         old = self._state
+        if old in TERMINAL_STATES and new is not old:
+            logger.warning(
+                "loop_state_change_refused",
+                current=old.name,
+                attempted=new.name,
+                msg="loop is in a terminal state — transition discarded",
+            )
+            return
         self._state = new
         logger.info("loop_state_change", old=old.name, new=new.name)
+        if self.on_state_change:
+            self.on_state_change(old, new)
+
+    def _clear_terminal(self, new: LoopState = LoopState.IDLE) -> None:
+        """Deliberately reopen a loop that has reached a terminal state.
+
+        The guard in :meth:`_set_state` is a latch, and a latch with no release
+        is a trap for whoever first tries to restart a loop object: their
+        transition would simply vanish, which is the exact failure the guard
+        exists to end.  Nothing in production restarts a loop today — each
+        campaign builds a fresh one — so this is the explicit, logged door for
+        the restartable loop rather than a facility in current use.
+
+        ``park_reason`` is cleared with the state: a reopened loop that still
+        reported why it parked would make the *next* run look parked, and the
+        CLI's exit code reads exactly that pair (state plus ``park_reason``).
+        """
+        old = self._state
+        self._state = new
+        self._park_reason = None
+        logger.warning("loop_terminal_cleared", old=old.name, new=new.name)
         if self.on_state_change:
             self.on_state_change(old, new)
 
@@ -343,7 +405,12 @@ class AutonomousLoop:
         self._approval_event.set()
 
     def stop(self) -> None:
-        """Request the loop to stop after the current cycle."""
+        """Request the loop to stop after the current cycle.
+
+        ``STOPPED`` is terminal (see :meth:`_set_state`), so the request holds
+        even when it lands mid-trial: the round finishes analysing what it
+        already cast, and no further suggestion is made.
+        """
         self._set_state(LoopState.STOPPED)
 
     # ── Main loop ───────────────────────────────────────────────────────
@@ -355,7 +422,7 @@ class AutonomousLoop:
         """
         self._set_state(LoopState.SUGGESTING)
 
-        while self._state not in (LoopState.STOPPED, LoopState.ERROR, LoopState.CONVERGED):
+        while self._state not in TERMINAL_STATES:
             # 0. BUDGET
             if self._max_iterations is not None and self._iteration >= self._max_iterations:
                 logger.info("loop_budget_reached", iteration=self._iteration)
@@ -461,7 +528,10 @@ class AutonomousLoop:
                 break
 
         best = self._optimizer.best()
-        if self._state not in (LoopState.CONVERGED, LoopState.STOPPED):
+        # Only a non-terminal exit (budget reached, optimizer exhausted) needs a
+        # closing state. Asking for STOPPED from ERROR would now be refused, and
+        # the refusal would be logged as a defect it is not.
+        if self._state not in TERMINAL_STATES:
             self._set_state(LoopState.STOPPED)
         return best
 

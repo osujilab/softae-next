@@ -371,6 +371,54 @@ class TestExecutor:
         assert len(completed) == 2
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("continue_on_error", [False, True])
+    async def test_abort_during_pause_runs_no_further_step(
+        self, connected_manager, continue_on_error
+    ):
+        """Pause → Abort must execute **zero** further steps, in both executors.
+
+        The operator's sequence is Pause → inspect → Abort, and it is issued in
+        the belief that the rig is quiescent. The abort check used to sit *before*
+        the pause loop, so the abort that released the loop also let one more step
+        through — on this rig a dispense or a stage move.
+
+        ``continue_on_error`` selects the executor: ``False`` → ``_run_tiers``,
+        ``True`` (with a linear workflow) → ``_run_linear_with_recovery``.
+        """
+        wf = Workflow(
+            name="pause_then_abort",
+            setup=[
+                WorkflowStep("s1", "stage", "move_to", params={"x": 0, "y": 0}),
+                WorkflowStep("s2", "stage", "move_to", params={"x": 1, "y": 1}),
+                WorkflowStep("s3", "stage", "move_to", params={"x": 2, "y": 2}),
+            ],
+        )
+
+        executor = WorkflowExecutor(
+            connected_manager, continue_on_error=continue_on_error
+        )
+        completed: list[str] = []
+
+        def on_complete(step, idx, total, result, elapsed=0.0):
+            completed.append(step.name)
+            if idx == 0:
+                executor.pause()
+
+        executor.on_step_complete = on_complete
+
+        async def abort_once_paused():
+            while executor.state is not ExecutorState.PAUSED:
+                await asyncio.sleep(0.01)
+            executor.abort()
+
+        with pytest.raises(AbortedError):
+            await asyncio.gather(executor.run(wf), abort_once_paused())
+
+        assert executor.state is ExecutorState.ABORTED
+        # s1 ran before the pause; nothing may run after the abort.
+        assert completed == ["s1"]
+
+    @pytest.mark.asyncio
     async def test_state_callbacks(self, connected_manager):
         """Verify state change callbacks fire."""
         wf = Workflow(

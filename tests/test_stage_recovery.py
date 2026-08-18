@@ -20,7 +20,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from softae.drivers.mock_factory import create_mock_manager
-from softae.errors import CommunicationError, SafetyError, WorkflowError
+from softae.errors import (
+    AbortedError,
+    CommunicationError,
+    SafetyError,
+    WorkflowError,
+)
 from softae.workflows.workflow_executor import ExecutorState, WorkflowExecutor
 from softae.workflows.workflow_model import Workflow, WorkflowStep
 
@@ -308,3 +313,200 @@ class TestExecutorRecovery:
         with pytest.raises(WorkflowError):
             run(ex.run(wf))
         assert ex.state is ExecutorState.ERROR
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 4. The mechanical ceiling: skipped-channel record + prompt-and-hold
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _move(ch: str, xy: float) -> WorkflowStep:
+    """One channel-tagged stage move — the smallest wedgeable channel."""
+    return WorkflowStep(
+        name=f"move_ch{ch}", instrument="stage", method="move_to",
+        params={"x": xy, "y": xy}, tags={"channel": ch, "phase": "eis"},
+    )
+
+
+class TestSkippedChannelRecord:
+    """The executor counts what it abandons, so the run row can say so."""
+
+    def _mgr(self, config=None):
+        m = create_mock_manager(config=config or {})
+        run(m.connect_all())
+        return m
+
+    def test_every_abandoned_channel_is_recorded_once(self):
+        mgr = self._mgr({"stage": {"fail_next_n": 99}})
+        wf = Workflow(name="wedged",
+                      setup=[_move("5", 5.0), _move("6", 6.0), _move("7", 7.0)])
+        ex = WorkflowExecutor(mgr, continue_on_error=True, max_channel_retries=1)
+        run(ex.run(wf))
+        assert ex.state is ExecutorState.COMPLETED
+        assert ex.skipped_channels == ["5", "6", "7"]
+
+    def test_a_clean_run_records_an_empty_list_not_a_missing_one(self):
+        mgr = self._mgr()
+        wf = Workflow(name="clean", setup=[_move("5", 5.0)])
+        ex = WorkflowExecutor(mgr, continue_on_error=True)
+        run(ex.run(wf))
+        assert ex.skipped_channels == []
+
+    def test_the_record_describes_one_run_not_the_executor_lifetime(self):
+        mgr = self._mgr({"stage": {"fail_next_n": 99}})
+        ex = WorkflowExecutor(mgr, continue_on_error=True)
+        run(ex.run(Workflow(name="first", setup=[_move("5", 5.0)])))
+        assert ex.skipped_channels == ["5"]
+        mgr.get("stage").reset_session()          # the wedge clears
+        run(ex.run(Workflow(name="second", setup=[_move("6", 6.0)])))
+        assert ex.skipped_channels == []
+
+
+class TestConsecutiveFailureCeiling:
+    """Prompt-and-hold, never an automatic park while someone may be watching."""
+
+    def _mgr(self, config=None):
+        m = create_mock_manager(config=config or {})
+        run(m.connect_all())
+        return m
+
+    def _wedged(self, **kwargs):
+        mgr = self._mgr({"stage": {"fail_next_n": 99}})
+        wf = Workflow(name="wedged",
+                      setup=[_move("5", 5.0), _move("6", 6.0), _move("7", 7.0)])
+        ex = WorkflowExecutor(
+            mgr, continue_on_error=True, max_channel_retries=1, **kwargs
+        )
+        return mgr, wf, ex
+
+    def test_failures_below_the_ceiling_never_interrupt_the_plate(self):
+        """One bad well must still not cost a plate."""
+        _, wf, ex = self._wedged(max_consecutive_channel_failures=4)
+        holds: list[tuple] = []
+        ex.on_channel_failure_hold = lambda *a: holds.append(a)
+        run(ex.run(wf))
+        assert holds == []
+        assert ex.state is ExecutorState.COMPLETED
+
+    def test_the_ceiling_pauses_and_asks_rather_than_parking(self):
+        _, wf, ex = self._wedged(max_consecutive_channel_failures=2)
+        holds: list[tuple] = []
+
+        def _answer(channel, consecutive, timeout_s):
+            holds.append((channel, consecutive, ex.state))
+            ex.resume()                      # the operator says "carry on"
+
+        ex.on_channel_failure_hold = _answer
+        run(ex.run(wf))
+
+        # Asked on the 2nd consecutive failure, with the run ALREADY paused — so a
+        # synchronous answer is never dropped — and the plate continued after it.
+        assert holds == [("6", 2, ExecutorState.PAUSED)]
+        assert ex.state is ExecutorState.COMPLETED
+        assert ex.skipped_channels == ["5", "6", "7"]
+
+    def test_a_completed_channel_resets_the_streak(self):
+        """Consecutive means consecutive: a good well breaks the chain."""
+        mgr = self._mgr({"stage": {"fail_next_n": 2}})   # only channel 5 wedges
+        stage = mgr.get("stage")
+        wf = Workflow(name="intermittent",
+                      setup=[_move("5", 5.0), _move("6", 6.0), _move("7", 7.0)])
+        ex = WorkflowExecutor(mgr, continue_on_error=True, max_channel_retries=1,
+                              max_consecutive_channel_failures=2)
+        holds: list[tuple] = []
+        ex.on_channel_failure_hold = lambda *a: holds.append(a)
+        # Re-arm the wedge once channel 6 is through, so 5 and 7 fail and 6 does
+        # not: without the reset that is a streak of 2 and a spurious hold.
+        ex.on_step_complete = lambda s, *a: (
+            setattr(stage, "_fail_next_n", 2) if s.name == "move_ch6" else None
+        )
+
+        run(ex.run(wf))
+
+        assert ex.skipped_channels == ["5", "7"]
+        assert holds == []
+
+    def test_an_operator_abort_from_the_hold_stops_the_plate(self):
+        """The prompt is never a lockout — abort is honoured immediately."""
+        _, wf, ex = self._wedged(max_consecutive_channel_failures=2)
+        ex.on_channel_failure_hold = lambda *a: ex.abort()
+
+        with pytest.raises(AbortedError):
+            run(ex.run(wf))
+
+        assert ex.state is ExecutorState.ABORTED
+        assert "7" not in ex.skipped_channels     # channel 7 was never attempted
+
+    def test_an_unanswered_hold_parks_and_stops_the_run(self, monkeypatch):
+        """Nobody answered, so the run is unattended whatever the design assumed."""
+        import softae.core.safe_park as safe_park_mod
+
+        parked: list[str] = []
+
+        async def _fake_park(manager, *, reason="", **kwargs):
+            parked.append(reason)
+            return safe_park_mod.SafeParkResult(commanded=["pump 0 halted"])
+
+        monkeypatch.setattr(safe_park_mod, "safe_park_async", _fake_park)
+
+        _, wf, ex = self._wedged(
+            max_consecutive_channel_failures=2, channel_hold_timeout_s=0.05,
+        )
+        prompted: list[tuple] = []
+        ex.on_channel_failure_hold = lambda *a: prompted.append(a)
+
+        with pytest.raises(AbortedError):
+            run(ex.run(wf))
+
+        assert len(prompted) == 1                 # it asked first
+        assert len(parked) == 1                   # …then parked on silence
+        assert "no operator answered" in parked[0]
+        assert ex.state is ExecutorState.ABORTED
+
+    def test_a_park_failure_still_stops_the_run(self, monkeypatch):
+        """A stop that fails must not leave the plate running on."""
+        import softae.core.safe_park as safe_park_mod
+
+        async def _boom(manager, **kwargs):
+            raise RuntimeError("serial port gone")
+
+        monkeypatch.setattr(safe_park_mod, "safe_park_async", _boom)
+
+        _, wf, ex = self._wedged(
+            max_consecutive_channel_failures=2, channel_hold_timeout_s=0.05,
+        )
+        with pytest.raises(AbortedError):
+            run(ex.run(wf))
+        assert ex.state is ExecutorState.ABORTED
+
+    def test_the_ceiling_is_opt_in_not_on_by_default(self):
+        """`AutonomousLoop._run_workflow` builds an executor with
+        ``continue_on_error=True`` and wires no prompt. On by default, the ceiling
+        would give an unattended campaign a silent hour-long stall instead of a
+        question nobody is present to answer — so the default is off and the HT
+        tab, the caller this was specified for, asks for it explicitly.
+        """
+        mgr = self._mgr({"stage": {"fail_next_n": 99}})
+        wf = Workflow(name="wedged",
+                      setup=[_move("5", 5.0), _move("6", 6.0), _move("7", 7.0)])
+        ex = WorkflowExecutor(mgr, continue_on_error=True, max_channel_retries=1)
+        assert ex.max_consecutive_channel_failures == 0
+        holds: list[tuple] = []
+        ex.on_channel_failure_hold = lambda *a: holds.append(a)
+
+        run(ex.run(wf))
+
+        assert holds == []                                  # never held
+        assert ex.skipped_channels == ["5", "6", "7"]       # still recorded
+
+    def test_the_ceiling_is_off_for_the_fail_fast_executor(self):
+        """Without continue_on_error there is no skip path to count."""
+        mgr = self._mgr({"stage": {"fail_next_n": 99}})
+        wf = Workflow(name="ff", setup=[_move("5", 5.0)])
+        ex = WorkflowExecutor(mgr, continue_on_error=False)
+        holds: list[tuple] = []
+        ex.on_channel_failure_hold = lambda *a: holds.append(a)
+        with pytest.raises(WorkflowError):
+            run(ex.run(wf))
+        assert holds == []
+        assert ex.skipped_channels == []

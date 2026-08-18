@@ -11,6 +11,11 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from softae.drivers.async_syringe import (
+    HALT_RATE_UL_PER_MIN,
+    HALT_SVOLUME_ML,
+    HALT_VOLUME_UL,
+)
 from softae.drivers.contracts import ParallelSyringeMixin
 from softae.server.base_instrument import BaseInstrument, InstrumentState
 
@@ -38,6 +43,9 @@ class MockSyringe(ParallelSyringeMixin, BaseInstrument):
         self._init_parallel_syringes(self.config)
         self._is_up: bool = True  # head retracted
         self._dispensed: dict[int, float] = {0: 0.0, 1: 0.0, 2: 0.0}  # uL per pump
+        #: Pump IDs passed to :meth:`halt_pump`, in order — the mock's record of
+        #: what a park actually stopped.
+        self._halted: list[int] = []
         # --- Fault injection (tests only) ---
         # Fail the next N single_pump calls with a simulated timeout, to exercise
         # the *committed*-dispense skip path (a pump failure means elution was
@@ -101,6 +109,24 @@ class MockSyringe(ParallelSyringeMixin, BaseInstrument):
         time.sleep(min(delay, 0.1))  # capped
         self._dispensed[ID] = self._dispensed.get(ID, 0.0) + hw_vol
         logger.debug("mock_pump", ID=ID, rate=rate, vol=hw_vol, requested_vol=dispense_vol)
+
+    def halt_pump(self, ID: int) -> None:
+        """Stop pump *ID* now — the mock half of :meth:`AsyncSyringe.halt_pump`.
+
+        Mirrors the real driver's semantics rather than its bytes: **no**
+        validation, **no** reservoir check or debit, **no** no-op filter. A halt
+        that a stock interlock can refuse is the defect this method exists to fix,
+        so the mock must be un-refusable too or the tests would pass against a
+        driver that still had the hole.
+
+        It also does not accrue ``_dispensed``: the near-zero volume is a trigger
+        for a fresh pump program, not fluid anybody wanted moved.
+        """
+        pump_id = int(ID)
+        self._halted.append(pump_id)
+        logger.debug("mock_syringe_halt", ID=pump_id,
+                     rate=HALT_RATE_UL_PER_MIN, vol=HALT_VOLUME_UL,
+                     svolume_mL=HALT_SVOLUME_ML)
 
     def head_flip(self) -> None:
         """Toggle head position."""

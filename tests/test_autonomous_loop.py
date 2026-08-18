@@ -574,6 +574,108 @@ class TestAutonomousLoop:
         assert LoopState.CONVERGED.name == "CONVERGED"
 
 
+# ── Terminal-state guard ────────────────────────────────────────────────────
+
+
+class TestTerminalStateGuard:
+    """A stop that lands mid-trial must stick.
+
+    ``stop()`` sets ``STOPPED``; before the guard, the next statement on every
+    round path was ``_set_state(ANALYZING)``, which overwrote it. The request was
+    discarded with no error and nothing in the log but an ordinary state-change
+    line — the loop simply ran on.
+    """
+
+    def _idle_loop(self, store_with_run, manager):
+        from softae.workflows.workflow_model import Workflow
+
+        store, run_id = store_with_run
+        return AutonomousLoop(
+            optimizer=RandomSearchOptimizer(SIMPLE_SPACE, n_trials=100, seed=7),
+            workflow_template=Workflow(name="trial"),
+            manager=manager, data_store=store, run_id=run_id,
+            objective_extractor=lambda r: 1.0, auto_approve=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_during_executing_is_not_overwritten_by_analyzing(
+        self, store_with_run
+    ):
+        """Asserted through ``stop()``, not ``_set_state`` — the behaviour, not the guard."""
+        manager = _make_mock_manager()
+        await manager.connect_all()
+
+        loop = self._idle_loop(store_with_run, manager)
+        seen: list[LoopState] = []
+
+        def on_state_change(old, new):
+            seen.append(new)
+            if new is LoopState.EXECUTING and not any(
+                s is LoopState.STOPPED for s in seen
+            ):
+                loop.stop()
+
+        loop.on_state_change = on_state_change
+        await loop.run()
+
+        assert loop.state is LoopState.STOPPED
+        # The trial in flight finishes analysing what it already cast, and no
+        # second suggestion is made. Without the guard the optimizer would run
+        # to exhaustion, since every round re-set ANALYZING over the stop.
+        assert loop.iteration == 1
+        assert LoopState.ANALYZING not in seen
+
+        await manager.disconnect_all()
+
+    def test_set_state_logs_a_refused_transition(self, store_with_run):
+        """The refusal is never silent — a swallowed transition is undebuggable."""
+        import structlog
+
+        manager = _make_mock_manager()
+        loop = self._idle_loop(store_with_run, manager)
+
+        loop.stop()
+        with structlog.testing.capture_logs() as logs:
+            loop._set_state(LoopState.ANALYZING)
+
+        refusals = [e for e in logs if e["event"] == "loop_state_change_refused"]
+        assert len(refusals) == 1
+        assert refusals[0]["log_level"] == "warning"
+        assert refusals[0]["current"] == "STOPPED"
+        assert refusals[0]["attempted"] == "ANALYZING"
+        assert loop.state is LoopState.STOPPED
+
+    def test_park_from_a_hook_needs_no_break_to_hold(self, store_with_run):
+        """The guard is what makes a park structural rather than per-call-site.
+
+        ``CONVERGED`` and ``ERROR`` latch for the same reason ``STOPPED`` does:
+        all three are how the loop's own ``while`` spells "the run is over".
+        """
+        manager = _make_mock_manager()
+        loop = self._idle_loop(store_with_run, manager)
+
+        for terminal in (LoopState.STOPPED, LoopState.CONVERGED, LoopState.ERROR):
+            loop._state = terminal
+            loop._set_state(LoopState.ANALYZING)
+            assert loop.state is terminal
+
+    def test_clear_terminal_reopens_the_loop(self, store_with_run):
+        """A latch with no release is a trap for the next restartable loop."""
+        manager = _make_mock_manager()
+        loop = self._idle_loop(store_with_run, manager)
+
+        loop._park("bench test")
+        assert loop.state is LoopState.STOPPED
+        assert loop.park_reason == "bench test"
+
+        loop._clear_terminal()
+        assert loop.state is LoopState.IDLE
+        assert loop.park_reason is None      # else the next run reads as parked
+
+        loop._set_state(LoopState.SUGGESTING)
+        assert loop.state is LoopState.SUGGESTING
+
+
 # ── Round width: budget and board, not a fixed q ────────────────────────────
 
 

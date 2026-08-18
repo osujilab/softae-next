@@ -72,6 +72,50 @@ PURGE_WINDOW_TAG = "purge_window"
 #: so this only needs to be short relative to the purge interval.
 PURGE_WINDOW_POLL_S = 30.0
 
+#: Consecutive abandoned channels after which the run stops and asks a human.
+#:
+#: Derived from the retry arithmetic, not by analogy. A wedged stage raises
+#: ``CommunicationError`` / ``StepTimeoutError``, both of which
+#: :meth:`WorkflowExecutor._recoverable_cause` calls retryable, so with the
+#: shipped ``max_channel_retries = 1`` each channel costs *initial + 1 replay* =
+#: **2** stage attempts. Unbounded, a 32-channel plate therefore drives an
+#: obstruction **64** times.
+#:
+#: At 3 the ceiling costs 3 × 2 = **6** attempts — under a tenth of that — while
+#: still leaving 29 channels unattempted, so a plate is salvageable if the
+#: operator frees the stage. Below 3 the ceiling would fight the policy it sits
+#: inside: one bad well must not cost a plate, and two bad wells on a 32-channel
+#: board is ordinary. Above 3 it buys nothing but attempts, since every one of
+#: these channels already had its stage session reset by ``on_step_recover``
+#: between attempts — three consecutive channels failing *after* a reset each is
+#: no longer a story about wells.
+#:
+#: ``0`` disables the ceiling, restoring the previous unbounded behaviour — and
+#: ``0`` is the **constructor default**, so this is opt-in per host rather than
+#: on for everyone. The other host of the recovery path is
+#: ``AutonomousLoop._run_workflow``, which builds its executor with
+#: ``continue_on_error=True`` and wires **no** prompt callback: defaulting the
+#: ceiling on would give an unattended campaign a silent hour-long stall in place
+#: of a question nobody is there to hear — the exact "appears to be working all
+#: night" failure this mechanism exists to prevent — and it would do so on top of
+#: the campaign's own fault classification and park path, which already covers it.
+#: The HT tab passes this value explicitly; that is the caller prompt-and-hold was
+#: specified for.
+DEFAULT_MAX_CONSECUTIVE_CHANNEL_FAILURES = 3
+
+#: Ceiling (s) on the prompt-and-hold wait before the run parks itself.
+#:
+#: Modelled on ``autonomous_loop.DEFAULT_GATE_TIMEOUT_S`` (3600.0) and on the
+#: reasoning ``_await_gate`` records: an unbounded wait is what turns "nobody
+#: answered the prompt" into a run that appears to be working all night. "HT is
+#: attended" and "HT is attended at hour four" are different claims; a plate runs
+#: for hours and a failing channel surfaces only as a coloured table row.
+DEFAULT_CHANNEL_HOLD_TIMEOUT_S = 3600.0
+
+#: Poll interval (s) of the hold loop. Matches the pause loop's, so a resume or
+#: an abort is picked up just as fast from a hold as from an ordinary pause.
+CHANNEL_HOLD_POLL_S = 0.05
+
 
 def _extract_iter_suffix(name: str) -> int | None:
     """Extract iteration index from a step name like ``'deposit__iter2'``."""
@@ -118,6 +162,8 @@ class WorkflowExecutor:
         continue_on_error: bool = False,
         max_channel_retries: int = 1,
         routers: list[ResultRouter] | None = None,
+        max_consecutive_channel_failures: int = 0,
+        channel_hold_timeout_s: float = DEFAULT_CHANNEL_HOLD_TIMEOUT_S,
     ) -> None:
         self.manager = manager
         self.experiment_logger = experiment_logger
@@ -164,6 +210,21 @@ class WorkflowExecutor:
         self.continue_on_error = continue_on_error
         self.max_channel_retries = max_channel_retries
 
+        # --- Mechanical ceiling on abandoned channels ---
+        # Skipping is the intended behaviour and stays; what had no bound was how
+        # many channels may be abandoned in a row, which is the difference between
+        # "one bad well" and "driving the stage into an obstruction all afternoon".
+        self.max_consecutive_channel_failures = max_consecutive_channel_failures
+        self.channel_hold_timeout_s = channel_hold_timeout_s
+        self._consecutive_channel_failures = 0
+
+        # Public, per-run: every channel abandoned by `_skip_channel`, in the
+        # order they were given up on. Reset at the start of each run, so it
+        # always describes one run. Its purpose is durable: the host writes it to
+        # the run row so that "which wells on this plate are real?" is answerable
+        # next month, when the results table that showed it live is long gone.
+        self.skipped_channels: list[str] = []
+
         self._state = ExecutorState.IDLE
         self._current_step: WorkflowStep | None = None
         self._current_index: int = 0
@@ -179,6 +240,13 @@ class WorkflowExecutor:
         # abandoned (``on_step_skipped(step, index, total, reason)``).
         self.on_step_recover: Callable[..., Any] | None = None
         self.on_step_skipped: Callable[..., Any] | None = None
+        # Fired when consecutive channel failures hit the ceiling, immediately
+        # *after* the executor has paused itself
+        # (``on_channel_failure_hold(channel, consecutive, timeout_s)``). The
+        # host's job is to make the question audible — the executor only holds.
+        # The run is already stopped when this fires, so a host that answers
+        # synchronously is answering a hold that exists.
+        self.on_channel_failure_hold: Callable[..., Any] | None = None
 
         # --- Concurrent purge windows (P8) ---
         # ``on_purge_window(step) -> None`` is run as a task *alongside* a step
@@ -283,6 +351,8 @@ class WorkflowExecutor:
         self._workflow = workflow
         self._current_index = 0
         self.measurement_results = []
+        self.skipped_channels = []
+        self._consecutive_channel_failures = 0
         self._set_state(ExecutorState.RUNNING)
 
         # Build the step list WITHOUT teardown — teardown runs in `finally`.
@@ -486,15 +556,19 @@ class WorkflowExecutor:
         a tier. The first unrecoverable step error aborts the run."""
         step_index = 0
         for tier in tiers:
-            # --- Check abort before tier ---
+            # --- Pause loop, THEN check abort ---
+            # Order matters: `abort()` accepts PAUSED, so an executor held here is
+            # released by the very state change that must stop it. Checking abort
+            # before the pause loop let the released iteration fall straight into
+            # `_run_step` — one more dispense or stage move after the operator
+            # aborted a rig they believed quiescent.
+            while self._state is ExecutorState.PAUSED:
+                await asyncio.sleep(0.05)
+
             if self._state is ExecutorState.ABORTED:
                 raise AbortedError(
                     f"Workflow aborted before step '{tier[0].name}'"
                 )
-
-            # --- Pause loop ---
-            while self._state is ExecutorState.PAUSED:
-                await asyncio.sleep(0.05)
 
             if len(tier) == 1:
                 # Single-step tier — sequential fast path
@@ -545,18 +619,28 @@ class WorkflowExecutor:
         channel_retries: dict[str, int] = {}
         i = 0
         while i < len(steps):
+            # Pause first, abort second — see `_run_tiers` for why the order is
+            # the fix: an abort issued while paused must not release one step.
+            while self._state is ExecutorState.PAUSED:
+                await asyncio.sleep(0.05)
+
             if self._state is ExecutorState.ABORTED:
                 raise AbortedError(
                     f"Workflow aborted before step '{steps[i].name}'"
                 )
-            while self._state is ExecutorState.PAUSED:
-                await asyncio.sleep(0.05)
 
             step = steps[i]
             self._current_index = i
             self._current_step = step
             try:
                 await self._run_step(step, i, total)
+                if self._channel_ends_here(steps, i):
+                    # A channel that finished every one of its steps breaks the
+                    # streak. Counting whole channels rather than steps is what
+                    # makes the ceiling mean "the rig is wedged" instead of "some
+                    # steps worked": a stage that fails only on the move still
+                    # completes the pump steps before it.
+                    self._consecutive_channel_failures = 0
                 i += 1
                 continue
             except WorkflowError as exc:
@@ -602,6 +686,7 @@ class WorkflowExecutor:
                     reason=reason,
                 )
                 i = self._skip_channel(steps, channel, i, total, reason)
+                await self._count_channel_failure(channel)
                 continue
 
     @staticmethod
@@ -641,6 +726,20 @@ class WorkflowExecutor:
             j -= 1
         return j
 
+    @staticmethod
+    def _channel_ends_here(steps: list[WorkflowStep], i: int) -> bool:
+        """Is step ``i`` the last step of its channel's contiguous block?
+
+        Mirrors :meth:`_channel_run_start` at the other end of the block, so both
+        the replay rewind and the streak reset agree on where a channel stops —
+        including under the deferred-measurement layout, where one channel owns
+        two blocks.
+        """
+        channel = steps[i].tags.get("channel")
+        if channel is None:
+            return False
+        return i + 1 >= len(steps) or steps[i + 1].tags.get("channel") != channel
+
     def _skip_channel(
         self,
         steps: list[WorkflowStep],
@@ -655,6 +754,14 @@ class WorkflowExecutor:
         :meth:`_run_step`; the trailing steps of the channel are surfaced as
         skipped. Returns the index of the next non-channel step.
         """
+        # Recorded once per channel, not once per skipped step: the question this
+        # answers is "is this well real?", which is asked of channels. A channel
+        # can be abandoned twice under the deferred-measurement layout (its cast
+        # block and its measure block are separate), and it is no less one well
+        # for it.
+        if channel not in self.skipped_channels:
+            self.skipped_channels.append(channel)
+
         j = from_i + 1
         while j < len(steps) and steps[j].tags.get("channel") == channel:
             skipped = steps[j]
@@ -673,6 +780,102 @@ class WorkflowExecutor:
                     logger.warning("on_step_skipped_failed", exc_info=True)
             j += 1
         return j
+
+    # ── Mechanical ceiling: prompt-and-hold ──────────────────────────────
+
+    async def _count_channel_failure(self, channel: str) -> None:
+        """Book one abandoned channel and hold the run if the streak hits the ceiling."""
+        self._consecutive_channel_failures += 1
+        ceiling = self.max_consecutive_channel_failures
+        if not ceiling or self._consecutive_channel_failures < ceiling:
+            return
+        await self._hold_for_operator(channel, self._consecutive_channel_failures)
+
+    async def _hold_for_operator(self, channel: str, consecutive: int) -> None:
+        """Pause and ask, rather than park — the operator is the better classifier.
+
+        Deliberately **not** an automatic park. ``_is_hard_fault`` recognises only
+        ``SafetyError`` and ``HardwareNotArmedError``, and a wedged stage is
+        neither; an operator standing at the rig can see in one glance what no
+        exception class encodes. Taking that decision away from them would be a
+        downgrade, so this stops the motion and hands them the question.
+
+        **A hold is never a lockout.** Resuming continues the plate, aborting
+        stops it, and both are picked up within :data:`CHANNEL_HOLD_POLL_S`. The
+        only thing this refuses is *silence*: if nobody answers within
+        ``channel_hold_timeout_s`` the run was unattended whatever the design
+        assumed, and it parks.
+        """
+        logger.error(
+            "channel_failure_ceiling",
+            channel=channel,
+            consecutive=consecutive,
+            ceiling=self.max_consecutive_channel_failures,
+            attempts_per_channel=1 + self.max_channel_retries,
+            timeout_s=self.channel_hold_timeout_s,
+        )
+        # Paused BEFORE the prompt is raised, not after. The prompt is an
+        # arbitrary host callable, and a host that answers synchronously — a test
+        # harness, a headless driver — would otherwise resume a run that had not
+        # yet paused, and its answer would be silently dropped by the pause that
+        # followed it. Pausing first makes both answers land whenever they arrive.
+        self.pause()
+        if self.on_channel_failure_hold is None:
+            # The hold still happens — stopping is the safety property and the
+            # dialog is only how it is asked — but a host that enabled the ceiling
+            # and wired no prompt has built a silent stall, and that is worth
+            # saying out loud in the one place that can see it.
+            logger.warning("channel_failure_hold_unprompted", channel=channel)
+        else:
+            try:
+                self.on_channel_failure_hold(
+                    channel, consecutive, self.channel_hold_timeout_s
+                )
+            except Exception:
+                # A prompt that fails to draw must not also cancel the hold: the
+                # stop is the safety property, the dialog is only how it is asked.
+                logger.warning("on_channel_failure_hold_failed", exc_info=True)
+
+        deadline = time.monotonic() + self.channel_hold_timeout_s
+        while self._state is ExecutorState.PAUSED:
+            if time.monotonic() >= deadline:
+                await self._park_unattended(channel, consecutive)
+                self.abort()
+                return
+            await asyncio.sleep(CHANNEL_HOLD_POLL_S)
+
+        # Answered (resumed, or aborted). A clean slate rather than a hair
+        # trigger: an operator who has just looked at the rig and said "carry on"
+        # should not be asked again by the very next failure.
+        self._consecutive_channel_failures = 0
+
+    async def _park_unattended(self, channel: str, consecutive: int) -> None:
+        """Nobody answered the hold — make the hardware safe.
+
+        Safe to call from here specifically: the executor is paused *between*
+        steps, so this is the one moment a park cannot interleave its writes with
+        a step's own serial I/O.
+
+        Never raises. A park that fails must still leave the abort to happen —
+        the alternative is a run that carries on because its stop failed.
+        """
+        from softae.core.safe_park import safe_park_async
+
+        reason = (
+            f"HT: {consecutive} consecutive channels abandoned (last: {channel}); "
+            f"no operator answered within {self.channel_hold_timeout_s:.0f}s"
+        )
+        try:
+            result = await safe_park_async(self.manager, reason=reason)
+            logger.error(
+                "channel_failure_park",
+                channel=channel,
+                consecutive=consecutive,
+                summary=result.summary(),
+            )
+        except Exception:
+            logger.error("channel_failure_park_failed", channel=channel,
+                         exc_info=True)
 
     # ── Internal ────────────────────────────────────────────────────────
 

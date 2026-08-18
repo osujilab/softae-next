@@ -518,6 +518,62 @@ class TestPurgeWiring:
         main_window.clear_park()
         assert main_window._park_reason() is None
 
+    def test_the_clear_park_control_is_hidden_until_there_is_a_park(
+        self, main_window
+    ):
+        """A stop control that is always visible is one an operator learns to press."""
+        assert main_window._clear_park_btn.isVisible() is False
+
+    def test_a_park_makes_the_clear_control_visible(self, main_window, qapp):
+        main_window.show()
+        main_window.notify_parked("hard fault")
+        qapp.processEvents()
+        assert main_window._clear_park_btn.isVisible() is True
+        assert "hard fault" in main_window._clear_park_btn.toolTip()
+
+    def test_clearing_hides_it_again(self, main_window, qapp):
+        main_window.show()
+        main_window.notify_parked("hard fault")
+        main_window.clear_park()
+        qapp.processEvents()
+        assert main_window._clear_park_btn.isVisible() is False
+
+    def test_the_clear_button_asks_before_clearing(self, main_window, monkeypatch):
+        """Clearing a park is a declaration that the hardware was checked."""
+        from PySide6.QtWidgets import QMessageBox
+
+        import softae.gui.main_window as mw_mod
+
+        monkeypatch.setattr(
+            mw_mod.QMessageBox, "question",
+            staticmethod(lambda *a, **k: QMessageBox.StandardButton.No),
+        )
+        main_window.notify_parked("hard fault")
+        main_window._on_clear_park()
+        assert main_window._park_reason() == "hard fault"
+
+        monkeypatch.setattr(
+            mw_mod.QMessageBox, "question",
+            staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes),
+        )
+        main_window._on_clear_park()
+        assert main_window._park_reason() is None
+
+    def test_a_campaign_park_surfaces_the_same_control(self, main_window, qapp):
+        """The unattended case — nothing calls ``notify_parked`` for it."""
+        main_window.show()
+        main_window._tab_bo_live.park_reason = lambda: "reservoir depleted"
+        main_window._on_purge_tick()
+        qapp.processEvents()
+        assert main_window._clear_park_btn.isVisible() is True
+
+    def test_clearing_does_not_speak_for_a_running_campaign(self, main_window):
+        """The toolbar owns the window's latch, not a loop's fault assessment."""
+        main_window._tab_bo_live.park_reason = lambda: "reservoir depleted"
+        main_window.notify_parked("operator emergency stop")
+        main_window.clear_park()
+        assert main_window._park_reason() == "reservoir depleted"
+
     def test_a_parked_rig_refuses_to_enter_idle_rest(self, main_window):
         main_window.notify_parked("hard fault")
         assert main_window.enter_idle_rest() is False

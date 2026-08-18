@@ -1649,3 +1649,90 @@ class TestArcColumns:
         assert store._conn.execute(
             "SELECT gate_log_json FROM fit_results WHERE fit_id = ?",
             (fid,)).fetchone()[0] == "[]"
+
+
+# ---------------------------------------------------------------------------
+# Skipped-channel provenance on the run row (halt/park Priority 4)
+# ---------------------------------------------------------------------------
+
+
+#: An `experiments` table as it stood before `skipped_channels` existed — i.e.
+#: the shape of every database now on disk.
+_LEGACY_EXPERIMENTS_DDL = """\
+CREATE TABLE experiments (
+    run_id               TEXT PRIMARY KEY,
+    started_at           TEXT NOT NULL,
+    finished_at          TEXT,
+    workflow_name        TEXT NOT NULL,
+    workflow_mode        TEXT NOT NULL DEFAULT 'unknown',
+    campaign             TEXT NOT NULL DEFAULT 'dev',
+    quality              TEXT NOT NULL DEFAULT 'explore',
+    pcb_name             TEXT,
+    eis_preset           TEXT,
+    config_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    config_hash          TEXT NOT NULL DEFAULT '',
+    annotation           TEXT NOT NULL DEFAULT '',
+    status               TEXT NOT NULL DEFAULT 'running'
+)"""
+
+
+class TestSkippedChannelProvenance:
+    """Three states, because "nobody counted" is not "nothing was skipped"."""
+
+    def test_finish_run_without_the_argument_leaves_the_column_null(
+            self, store_with_run) -> None:
+        # Every pre-existing caller (the campaign wiring, the Arrhenius tab) lands
+        # here, and none of them counts skips. NULL is the only honest value.
+        store, run_id = store_with_run
+        store.finish_run(run_id, "done")
+        assert store.run_skipped_channels(run_id) is None
+        assert store.query_runs()[0]["skipped_channels"] is None
+
+    def test_finish_run_with_an_empty_list_records_none_skipped(
+            self, store_with_run) -> None:
+        store, run_id = store_with_run
+        store.finish_run(run_id, "done", skipped_channels=[])
+        assert store.run_skipped_channels(run_id) == []
+
+    def test_finish_run_records_the_skipped_channels_as_ints(
+            self, store_with_run) -> None:
+        # Steps carry the channel as a tag, so it arrives as "3"/"7"; a reader
+        # asking which wells are real wants numbers.
+        store, run_id = store_with_run
+        store.finish_run(run_id, "partial", skipped_channels=["3", "7"])
+        assert store.run_skipped_channels(run_id) == [3, 7]
+        row = store.query_runs()[0]
+        assert row["status"] == "partial"
+        assert row["finished_at"] is not None
+
+    def test_run_skipped_channels_is_none_for_an_unknown_run(
+            self, store: DataStore) -> None:
+        assert store.run_skipped_channels("no_such_run") is None
+
+    def test_legacy_experiments_table_gains_the_column_with_rows_intact(
+            self, tmp_path: Path) -> None:
+        """The bare CREATE TABLE IF NOT EXISTS cannot add it — the migration must.
+
+        And the historical row must come back NULL: it was written `done` whether
+        it skipped nothing or half the plate, and nothing recovers which.
+        """
+        project = tmp_path / "legacy_experiments"
+        _build_legacy_conditions_db(
+            project,
+            _LEGACY_EXPERIMENTS_DDL,
+            "INSERT INTO experiments (run_id, started_at, finished_at, "
+            "workflow_name, status) VALUES ('old_run', '2026-01-01T00:00:00Z', "
+            "'2026-01-01T01:00:00Z', 'ht_experiment', 'done')",
+        )
+
+        with DataStore(project) as store:
+            cols = {
+                r[1] for r in
+                store._conn.execute("PRAGMA table_info(experiments)").fetchall()
+            }
+            assert "skipped_channels" in cols
+            rows = store.query_runs()
+            assert len(rows) == 1
+            assert rows[0]["run_id"] == "old_run"
+            assert rows[0]["skipped_channels"] is None
+            assert store.run_skipped_channels("old_run") is None

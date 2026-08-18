@@ -9,6 +9,7 @@ from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
+    QPushButton,
     QSizePolicy,
     QSplitter,
     QTabWidget,
@@ -415,6 +416,32 @@ class MainWindow(QMainWindow):
         self._estop.parked.connect(self.notify_parked)
         toolbar.addWidget(self._estop)
 
+        # The way out of a park. Hidden until there is one to clear — a control
+        # that is always visible is one an operator learns to press.
+        #
+        # It ships in the same change that routes more surfaces through the latch,
+        # deliberately: ``clear_park`` previously had no production caller at all,
+        # so the first automatic park would have stranded the rig with nothing to
+        # clear it and no indication that anything was latched.
+        self._clear_park_btn = QPushButton("⚠  PARKED — CLEAR")
+        self._clear_park_btn.setStyleSheet(
+            "QPushButton {"
+            "  background-color: #6a1b9a;"
+            "  color: white;"
+            "  font-weight: bold;"
+            "  padding: 8px 16px;"
+            "  border-radius: 6px;"
+            "}"
+            "QPushButton:hover { background-color: #4a148c; }"
+        )
+        self._clear_park_btn.setMinimumHeight(44)
+        self._clear_park_btn.clicked.connect(self._on_clear_park)
+        # Visibility is driven through the QWidgetAction the toolbar wraps it in,
+        # not through the widget: the toolbar re-shows its own child widgets on
+        # layout, so a bare setVisible(False) does not survive.
+        self._clear_park_action = toolbar.addWidget(self._clear_park_btn)
+        self._clear_park_action.setVisible(False)
+
         # Catalog editor — same QAction as the Catalogs menu entry.
         toolbar.addAction(self._edit_catalogs_action)
 
@@ -526,12 +553,65 @@ class MainWindow(QMainWindow):
         # A parked rig is not at idle rest, whatever it was doing before.
         self._idle_rest.mark_left()
         logger.info("gui_park_latched", reason=self._park_latch)
+        self._refresh_park_indicator()
 
     def clear_park(self) -> None:
         """Operator has resolved the fault; unattended actuation may resume."""
         if getattr(self, "_park_latch", None):
             logger.info("gui_park_cleared", reason=self._park_latch)
         self._park_latch = None
+        self._refresh_park_indicator()
+
+    def _refresh_park_indicator(self) -> None:
+        """Show the clear-park control exactly while a park is outstanding.
+
+        Reads :meth:`_park_reason`, not the latch, so a campaign that parked
+        itself overnight surfaces the same control — that is the case with nobody
+        watching, and it is the one where an invisible latch is worst.
+
+        Guarded because the latch exists before the toolbar does.
+        """
+        button = getattr(self, "_clear_park_btn", None)
+        action = getattr(self, "_clear_park_action", None)
+        if button is None or action is None:
+            return
+        reason = self._park_reason()
+        action.setVisible(bool(reason))
+        if reason:
+            button.setToolTip(
+                f"The rig is parked: {reason}\n\n"
+                "Unattended actuation (idle rest, anti-clog purging) stays "
+                "refused until this is cleared. Manual control is never blocked."
+            )
+
+    def _on_clear_park(self) -> None:
+        """Confirm, then clear. **Only the window's own latch** is clearable here.
+
+        A campaign's park belongs to the campaign; clearing it from the toolbar
+        would tell a running loop that a fault it detected is resolved, on no
+        evidence. If the reason survives this, the button stays visible — which is
+        the honest outcome, not a bug.
+        """
+        reason = self._park_reason()
+        if not reason:
+            self._refresh_park_indicator()
+            return
+        answer = QMessageBox.question(
+            self, "Clear park",
+            f"The rig parked: {reason}\n\n"
+            "Clear it only once you have checked the hardware — in particular "
+            "where the dispenser head actually is, which nothing on this rig can "
+            "sense.\n\nClear the park?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.clear_park()
+        still = self._park_reason()
+        self.statusBar().showMessage(
+            f"Park still outstanding: {still}" if still else "Park cleared", 8000
+        )
 
     def _park_reason(self) -> str | None:
         """Aggregate park state — the window latch, or a running campaign's."""
@@ -605,6 +685,10 @@ class MainWindow(QMainWindow):
         *when to ask*. Exceptions are swallowed because a background timer that
         can kill the GUI is worse than a missed purge.
         """
+        # Cheap, and the only periodic tick the window has: a campaign park sets
+        # no latch of its own, so without this the clear-park control would never
+        # appear for the unattended case it exists for.
+        self._refresh_park_indicator()
         if self._purge_runner is None:
             return
         try:

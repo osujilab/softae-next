@@ -43,11 +43,11 @@ formed its own independent view.
 Every spawned subagent is granted **full command-line access** (Bash and PowerShell), not just
 file-read and edit tools. Subagents run tests, invoke git, execute scripts, and inspect the
 environment themselves rather than reporting findings back for the orchestrator to act on. A
-subagent that needs to run a command runs it.
+subagent that needs to run a command runs it — with the four exceptions below.
 
 ##### Exception — commands that return to the orchestrator
 
-Three classes sit **outside** the grant. A subagent that needs one stops, reports the exact command
+Four classes sit **outside** the grant. A subagent that needs one stops, reports the exact command
 it intends to run and why, and waits for authorisation:
 
 1. **Destructive filesystem operations** — recursive deletes, overwriting or truncating files
@@ -59,9 +59,19 @@ it intends to run and why, and waits for authorisation:
    system controls physical instruments in the Osuji Lab. A stage move into an occupied well, or a
    dry pump fired at speed, has no undo and can destroy a board or the hardware itself. Dry-run and
    simulation paths (`actuate=false`, simulated backends, offline BO) remain inside the grant.
+4. **Terminating a process the subagent did not launch** — killing a process you started, by PID,
+   stays inside the grant; every other process escalates. **Killing by image name is never inside the
+   grant** — `taskkill /IM`, `pkill`, `killall`, `Get-Process <name> | Stop-Process` — because on this
+   machine the operator's GUI, the VS Code extension hosts and pytest all run the same interpreter
+   from the same virtualenv, so no name- or path-based filter can separate them. See "5. Process
+   Hygiene" for how to identify a process and what to capture before terminating it.
 
-The orchestrator may authorise class 2 on its own judgement. **Classes 1 and 3 go to the user** —
-the orchestrator does not self-authorise a destructive write or any motion of real equipment.
+The orchestrator may authorise class 2 on its own judgement, and class 4 when it can establish the
+process's provenance — it knows what it spawned and the subagent does not. **Classes 1 and 3 go to
+the user** — the orchestrator does not self-authorise a destructive write or any motion of real
+equipment — **and so does any class-4 kill whose target the orchestrator cannot identify**: an
+unidentified process may be the operator's GUI, whose consequence class is class 3's, so it gets
+class 3's treatment.
 
 ## Additional Guiding Principles
 
@@ -132,5 +142,56 @@ edit cannot reach. Three tiers, each with its own owner and its own gate:
   tests. It remains available for genuinely irreducible long-running tests, and `-m "not slow"` may
   then trim a tier-2 run — but only *after* the underlying cost has been investigated per the rule
   above.
+
+### 5. Process Hygiene
+
+**Path and image-name filtering cannot distinguish these processes.** The operator's instrument-control
+GUI, the VS Code extension hosts, and pytest all run the same interpreter out of the same virtualenv:
+
+```
+...softae-next\.venv\Scripts\python.exe -m pytest tests/test_...   <- a test run
+...softae-next\.venv\Scripts\python.exe "C:\Users\Osuji\Ap...      <- the operator's GUI
+...softae-next\.venv\Scripts\python.exe c:\Users\Osuji\.vsco...    <- VS Code extension host
+```
+
+Only the **command line** separates them. A rule phrased as "kill Python from the project venv" is
+therefore still lethal, which is why the weaker formulations of this section failed twice: two
+implementation subagents each ran `taskkill /F /IM python.exe /T` to clear a wedged pytest and took
+down the operator's live GUI, the extension hosts, and unrelated test runs with it. A force-killed
+GUI runs no `closeEvent`, so no `_safe_park_on_exit` — heater still at setpoint, lamp still on,
+dispenser head wherever it was. That is a hardware-safety event, not an inconvenience.
+
+| Rule | Practice |
+|---|---|
+| Never kill by image name | `taskkill /F /IM python.exe`, `pkill python`, `killall python`, `Get-Process python \| Stop-Process` and equivalents are **forbidden without exception** |
+| Kill only PIDs you started | Terminate by PID, and only a process you launched. Unclear provenance → stop and report to the orchestrator |
+| Verify before terminating | Read the command line first; a test process carries `-m pytest` |
+| Wedged ≠ slow | Decide by CPU measurement, not by wall clock |
+| Capture before you kill | Stack dump first — a killed process is not diagnosable |
+| Bound and reap | Timeout the run, then confirm *your* child is gone, by PID |
+
+- **Verify before terminating.**
+  `Get-CimInstance Win32_Process -Filter "Name like '%python%'" | Select ProcessId, CommandLine`.
+  If the command line does not clearly identify the process as your own test run, do not kill it.
+- **Distinguish wedged from slow, by measurement.** Sample CPU twice a few seconds apart: a frozen
+  counter is a hang, a rising one is work. Wall-clock elapsed alone proves nothing — a GUI test
+  suite is legitimately slow. This is the check that actually diagnosed the incident:
+  ```powershell
+  $p = Get-Process -Id <pid>; $before = $p.CPU
+  Start-Sleep -Seconds 6
+  $after = (Get-Process -Id <pid>).CPU
+  # delta ~0 over 6 s => wedged, not slow
+  ```
+- **Capture before you kill.** A wedged process is diagnosable and a killed one is not. Take a stack
+  dump first — `py-spy dump --pid <id>` if present, otherwise `faulthandler` — because a traceback
+  names the blocking call directly, which is the thing actually needed. Two rounds of
+  file-combination bisecting produced less information than one faulthandler trace.
+- **Bound test runs, and reap by PID.** Tiered runs (§4) are the processes this most often applies
+  to: give the run a timeout, then confirm afterwards that the specific child you started is gone —
+  by PID, never by name. A shell timeout on Windows frequently kills the wrapper and leaves the
+  Python child orphaned, which is the state that tempts an image-name kill.
+- **Assume the operator's GUI is live.** It usually is, it may be mid-experiment, and it owns the
+  instruments. Editing source is safe — a running process already imported it. Killing processes and
+  opening instrument sessions are not.
 
 ---

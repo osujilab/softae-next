@@ -152,8 +152,10 @@ class SafeExitButton(QPushButton):
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Question)
         box.setWindowTitle("Safe Exit")
-        box.setText("The dispenser head is currently **lowered**.")
+        box.setText("The dispenser head is recorded as **lowered**.")
         box.setInformativeText(
+            "Recorded, not sensed — the head has no position feedback, so this is "
+            "the last thing the software was told. Look at it before answering.\n\n"
             "Raise it before exiting, or leave it where it is?\n\n"
             "Leave it down if it is holding a position — an anneal hold, a paused "
             "cast, or a drop it is sitting in. Raising it will pull the tip clear."

@@ -24,6 +24,7 @@ import structlog
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -64,7 +65,11 @@ from softae.core.task_catalog import TaskCatalog
 from softae.gui.daemon_runner import DaemonRunnerMixin
 from softae.gui.widgets.copyable_table import PasteableTableWidget
 from softae.workflows.experiment_logger import ExperimentLogger
-from softae.workflows.workflow_executor import ExecutorState, WorkflowExecutor
+from softae.workflows.workflow_executor import (
+    DEFAULT_MAX_CONSECUTIVE_CHANNEL_FAILURES,
+    ExecutorState,
+    WorkflowExecutor,
+)
 from softae.workflows.workflow_model import Workflow, WorkflowStep
 
 if TYPE_CHECKING:
@@ -102,6 +107,7 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
     _sig_step_skipped = Signal(str, int, int, str)      # step_name, idx, total, reason
     _sig_state_change = Signal(str, str)                # old_state, new_state
     _sig_workflow_done = Signal(int)                    # exit_code (0=ok, 1=error)
+    _sig_channel_hold = Signal(str, int, float)         # channel, consecutive, timeout_s
     # Public signal: sidebar / external widgets listen to this.
     workflow_status_changed = Signal(str)               # human-readable status text
     catalogs_changed = Signal()                         # re-emitted when the editor saves catalogs
@@ -129,6 +135,9 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
         self._executor: WorkflowExecutor | None = None
         self._exp_logger: ExperimentLogger | None = None
         self._run_thread: threading.Thread | None = None
+        # The live consecutive-failure prompt, if one is open (see
+        # `_ui_channel_hold`) — held only so Qt does not collect it.
+        self._hold_box: QMessageBox | None = None
         self._results: list[dict[str, Any]] = []
         self._eis_results: list[EISResult] = []  # captured EIS data
         # Task catalog drives step generation (deposition recipes + EIS task
@@ -568,6 +577,7 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
         self._sig_step_skipped.connect(self._ui_step_skipped)
         self._sig_state_change.connect(self._ui_state_change)
         self._sig_workflow_done.connect(self._ui_workflow_done)
+        self._sig_channel_hold.connect(self._ui_channel_hold)
 
     # ── Formulation table ────────────────────────────────────────────────
 
@@ -1663,6 +1673,13 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
         except Exception:
             stage_cfg = {}
         max_retries = int(stage_cfg.get("max_channel_retries", 1))
+        # Per-channel retries are bounded; the number of channels allowed to fail
+        # was not. Read from the same section as the retry count because the two
+        # multiply: a wedged stage costs (1 + max_retries) attempts per channel.
+        max_consecutive = int(stage_cfg.get(
+            "max_consecutive_channel_failures",
+            DEFAULT_MAX_CONSECUTIVE_CHANNEL_FAILURES,
+        ))
         self._executor = WorkflowExecutor(
             self._manager,
             experiment_logger=self._exp_logger,
@@ -1670,6 +1687,7 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
             run_id=self._ds_run_id,
             continue_on_error=True,
             max_channel_retries=max_retries,
+            max_consecutive_channel_failures=max_consecutive,
         )
 
         # Waste accrual (P5.4) and in-run purge windows (P8), taken from the
@@ -1689,6 +1707,7 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
         self._executor.on_step_error = self._cb_step_error
         self._executor.on_step_recover = self._cb_step_recover
         self._executor.on_step_skipped = self._cb_step_skipped
+        self._executor.on_channel_failure_hold = self._cb_channel_hold
         self._executor.on_state_change = self._cb_state_change
 
         # UI state
@@ -1818,6 +1837,11 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
         self, step: WorkflowStep, index: int, total: int, reason: str
     ) -> None:
         self._sig_step_skipped.emit(step.name, index, total, reason)
+
+    def _cb_channel_hold(
+        self, channel: str, consecutive: int, timeout_s: float
+    ) -> None:
+        self._sig_channel_hold.emit(str(channel), int(consecutive), float(timeout_s))
 
     def _cb_state_change(self, old: ExecutorState, new: ExecutorState) -> None:
         self._sig_state_change.emit(old.name, new.name)
@@ -1951,13 +1975,84 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
             {"channel": ch, "step": display_name, "status": "skipped", "reason": reason}
         )
 
+    def _ui_channel_hold(
+        self, channel: str, consecutive: int, timeout_s: float
+    ) -> None:
+        """The executor hit its consecutive-failure ceiling and paused. Ask.
+
+        **Deliberately non-modal.** A modal dialog would take the tab's own Pause
+        and Abort buttons away at the exact moment the operator most needs them,
+        which is the "a pause must not be a lockout" rule inverted. This window
+        offers the two answers; every other control stays live, including doing
+        nothing and going to look at the rig.
+        """
+        QApplication.beep()
+        self._lbl_status.setText(
+            f"Held — {consecutive} channels failed in a row (last: {channel})"
+        )
+        self.workflow_status_changed.emit("Held — needs attention")
+        self._btn_pause.setText("▶  Resume")
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle("Run held — consecutive channel failures")
+        box.setText(
+            f"{consecutive} channels in a row were abandoned "
+            f"(most recently channel {channel}).\n\n"
+            "The run is paused. Nothing is moving."
+        )
+        box.setInformativeText(
+            "Repeated comms/timeout failures across consecutive channels usually "
+            "mean the stage is obstructed rather than the wells being bad — each "
+            "of these channels already had its stage session reset and failed "
+            "again.\n\nLook at the rig before continuing.\n\n"
+            f"If nobody answers within {timeout_s / 60:.0f} min the run parks "
+            "itself and stops."
+        )
+        continue_btn = box.addButton("Continue plate",
+                                     QMessageBox.ButtonRole.AcceptRole)
+        abort_btn = box.addButton("Abort run", QMessageBox.ButtonRole.RejectRole)
+        box.setWindowModality(Qt.WindowModality.NonModal)
+        box.finished.connect(
+            lambda _code: self._on_channel_hold_answer(box, continue_btn, abort_btn)
+        )
+        # Held so Qt does not collect the dialog the moment this slot returns.
+        self._hold_box = box
+        box.show()
+
+    def _on_channel_hold_answer(
+        self, box: QMessageBox, continue_btn, abort_btn
+    ) -> None:
+        """Apply the operator's answer — including "neither".
+
+        Closing the window without choosing is a third, legitimate answer: *I am
+        going to go and look*. It must not be read as an abort, so it leaves the
+        run exactly as the hold left it — paused, with the tab's own Pause/Abort
+        buttons live. The bounded hold still runs underneath, which is what stops
+        "going to look" from silently becoming "went home".
+        """
+        self._hold_box = None
+        if self._executor is None:
+            return
+        clicked = box.clickedButton()
+        if clicked is continue_btn:
+            self._executor.resume()
+            self._btn_pause.setText("⏸  Pause")
+        elif clicked is abort_btn:
+            self._executor.abort()
+
     def _ui_state_change(self, old_state: str, new_state: str) -> None:
         if new_state == "PAUSED":
             self._lbl_status.setText("Paused")
             self.workflow_status_changed.emit("Paused")
+            # The executor can pause itself (the consecutive-failure hold), and a
+            # button still reading "Pause" is then a button that says the opposite
+            # of what pressing it does.
+            self._btn_pause.setText("▶  Resume")
         elif new_state == "RUNNING":
             self._lbl_status.setText("Running…")
             self.workflow_status_changed.emit("Running")
+            self._btn_pause.setText("⏸  Pause")
         else:
             self._lbl_status.setText(f"State: {new_state}")
 
@@ -1967,8 +2062,19 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
         self._btn_pause.setText("⏸  Pause")
         self._btn_abort.setEnabled(False)
 
+        # `None` (no executor) and `[]` (an executor that skipped nothing) are
+        # different claims and stay different all the way to the column: the
+        # first is "nobody counted", the second is "counted, none skipped".
+        skipped = list(self._executor.skipped_channels) if self._executor else None
+
         if exit_code == 0:
-            self._lbl_status.setText("Completed ✓")
+            # A plate that abandoned channels did not "complete" — it completed
+            # around the wells it gave up on, and the operator is entitled to know
+            # how many before they walk away from the screen.
+            self._lbl_status.setText(
+                f"Completed with {len(skipped)} skipped" if skipped
+                else "Completed ✓"
+            )
             self._progress.setValue(self._progress.maximum())
             self.workflow_status_changed.emit("Idle")
         else:
@@ -1985,12 +2091,18 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
             try:
                 state = self._executor.state.name if self._executor else "ERROR"
                 if exit_code == 0:
-                    status = "done"
+                    # The record is the only surface that survives this window.
+                    # `done` on a plate with 31 skipped channels is the one lie
+                    # that accumulates: a later reader cannot tell it from a good
+                    # row, and no later fix recovers the rows already written.
+                    status = "partial" if skipped else "done"
                 elif state == "ABORTED":
                     status = "aborted"
                 else:
                     status = "error"
-                self._data_store.finish_run(self._ds_run_id, status=status)
+                self._data_store.finish_run(
+                    self._ds_run_id, status=status, skipped_channels=skipped,
+                )
             except Exception:
                 logger.exception("datastore_finish_run_error")
             self._ds_run_id = None

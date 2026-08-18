@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -114,7 +115,19 @@ CREATE TABLE IF NOT EXISTS experiments (
     config_snapshot_json TEXT   NOT NULL DEFAULT '{}',
     config_hash         TEXT    NOT NULL DEFAULT '',
     annotation          TEXT    NOT NULL DEFAULT '',
-    status              TEXT    NOT NULL DEFAULT 'running'
+    status              TEXT    NOT NULL DEFAULT 'running',
+    -- Which channels the graceful-recovery path abandoned, as a JSON array.
+    -- Declared here as well as in `_migrate_experiment_skipped_channels`, with
+    -- that migration's declaration verbatim, so a fresh install and an upgraded
+    -- one hold the same table (see the `fit_results` block for the same pairing).
+    --
+    -- NO DEFAULT, deliberately, and the three states are the whole point:
+    -- NULL means *never recorded* (the run predates this column, or its host
+    -- does not track skips), '[]' means *recorded as none skipped*, and a
+    -- populated array means *these wells are not real*. A DEFAULT '[]' would
+    -- stamp "nothing was skipped" onto every historical row, which is the exact
+    -- false claim this column exists to stop the store making.
+    skipped_channels    TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_experiments_started_at ON experiments(started_at);
@@ -415,6 +428,19 @@ def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
+def _as_channel(value: Any) -> Any:
+    """Normalise a channel identifier to ``int`` where it truly is one.
+
+    Workflow steps carry the channel as a *tag*, so it arrives as ``"7"``. A
+    reader asking "which wells are real?" wants ``7``. Anything not purely
+    numeric is passed through as a string rather than coerced or dropped — the
+    column records what was skipped, and a name it does not recognise is still
+    the honest answer.
+    """
+    text = str(value)
+    return int(text) if text.isdigit() else text
+
+
 def _safe_json(obj: Any) -> str:
     """Serialise *obj* to JSON, handling numpy arrays and other types."""
     if isinstance(obj, np.ndarray):
@@ -604,6 +630,8 @@ class DataStore:
         self._migrate_thermal_columns()
         # Migrate existing databases: add annotation column if missing.
         self._migrate_annotation()
+        # Migrate existing databases: record which channels a run abandoned.
+        self._migrate_experiment_skipped_channels()
         # Migrate existing databases: add pump2_uL to formulations if missing.
         self._migrate_formulation_pump2()
         # Migrate existing databases: add stage_temp_pv_C to conditions if missing.
@@ -727,14 +755,63 @@ class DataStore:
         logger.info("run_started", run_id=run_id)
         return run_id
 
-    def finish_run(self, run_id: str, status: str = "done") -> None:
-        """Mark *run_id* as finished with the given *status*."""
-        self._conn.execute(
-            "UPDATE experiments SET finished_at = ?, status = ? WHERE run_id = ?",
-            (_now_iso(), status, run_id),
-        )
+    def finish_run(
+        self,
+        run_id: str,
+        status: str = "done",
+        *,
+        skipped_channels: Sequence[Any] | None = None,
+    ) -> None:
+        """Mark *run_id* as finished with the given *status*.
+
+        ``skipped_channels`` is three-valued, and the caller decides which of the
+        three it is entitled to:
+
+        ``None`` (default)
+            Leave the column alone. A caller that does not track skips must not
+            claim there were none — every existing caller lands here.
+        ``[]``
+            Recorded as none skipped. Only a caller that *counted* may say this.
+        ``[3, 7]``
+            These channels were abandoned; the wells are not real.
+
+        The status vocabulary in use is ``running`` / ``done`` / ``partial`` /
+        ``aborted`` / ``error`` / ``interrupted`` (plus the campaign loop's
+        ``converged`` / ``stopped``). ``partial`` is what a plate that finished
+        every step it attempted but abandoned channels along the way is entitled
+        to: ``done`` overstates it and ``error`` understates it, and the run
+        genuinely produced usable wells.
+        """
+        if skipped_channels is None:
+            self._conn.execute(
+                "UPDATE experiments SET finished_at = ?, status = ? WHERE run_id = ?",
+                (_now_iso(), status, run_id),
+            )
+        else:
+            self._conn.execute(
+                "UPDATE experiments SET finished_at = ?, status = ?, "
+                "skipped_channels = ? WHERE run_id = ?",
+                (_now_iso(), status,
+                 json.dumps([_as_channel(c) for c in skipped_channels]), run_id),
+            )
         self._conn.commit()
-        logger.info("run_finished", run_id=run_id, status=status)
+        logger.info("run_finished", run_id=run_id, status=status,
+                    skipped_channels=skipped_channels)
+
+    def run_skipped_channels(self, run_id: str) -> list[Any] | None:
+        """Channels abandoned during *run_id* — ``None`` when never recorded.
+
+        The read side of :meth:`finish_run`'s three states, kept here rather than
+        left to every caller's own ``json.loads``: an empty list and a NULL mean
+        different things, and a decoder written per-caller is where that
+        distinction gets flattened.
+        """
+        row = self._conn.execute(
+            "SELECT skipped_channels FROM experiments WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return json.loads(row[0])
 
     # ── Path helpers ────────────────────────────────────────────────────
 
@@ -1927,6 +2004,34 @@ class DataStore:
         if "config_hash" not in cols:
             self._conn.execute(
                 "ALTER TABLE experiments ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''"
+            )
+            self._conn.commit()
+
+    def _migrate_experiment_skipped_channels(self) -> None:
+        """Add ``skipped_channels`` to ``experiments`` if it is missing (P4).
+
+        The table's DDL is a bare ``CREATE TABLE IF NOT EXISTS``, so the operator's
+        existing store — which is every store that already exists — never gains
+        the column from it. Without this, :meth:`finish_run` would fail with
+        ``no such column`` on the first HT plate that finished.
+
+        **No backfill and no new ``SCHEMA_EPOCHS`` row**, following
+        :meth:`_migrate_doe_outcome`. Historical rows keep ``NULL``, meaning *we
+        do not know which channels on this plate were real* — which is the exact
+        truth about them, and the reason this column exists. Every one of them was
+        written ``status='done'`` whether it skipped 0 channels or 31, and nothing
+        recoverable after the fact distinguishes the two. Writing ``'[]'`` into
+        them would manufacture the certainty the fix is meant to stop
+        manufacturing. This is a shape change, not a change of meaning, which is
+        the condition T2.3 set for skipping an epoch row.
+        """
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(experiments)").fetchall()
+        }
+        if "skipped_channels" not in cols:
+            self._conn.execute(
+                "ALTER TABLE experiments ADD COLUMN skipped_channels TEXT"
             )
             self._conn.commit()
 

@@ -1,9 +1,11 @@
 """Safe Exit — parking on purpose, with a say over the head.
 
-The behaviour worth protecting is narrow and easy to regress: **every automatic
-route out raises the head, and exactly one route does not** — an operator who was
-asked and said to leave it down. A test suite that only checked "safe_park retracts"
-would pass while the new choice silently did nothing.
+The behaviour worth protecting is narrow and easy to regress: **the head moves
+only when a human has just said which way it is pointing.** An automatic park
+adds no motion to an unknown; Safe Exit asks, and both of its answers are
+legitimate. A test suite that only checked "safe_park retracts" would pass while
+the choice silently did nothing — and, worse, would pin the old default in which
+an automatic park flipped a head it could not sense.
 """
 
 from __future__ import annotations
@@ -27,8 +29,13 @@ class _Syringe:
         self.retracted += 1
         self._up = True
 
-    def single_pump(self, _speed, pump_id, _vol, _rate) -> None:
+    def halt_pump(self, pump_id) -> None:
         self.pumps.append(int(pump_id))
+
+    def single_pump(self, _speed, pump_id, _vol, _rate) -> None:
+        # Present so a park that regressed to halting via a dispense is visible
+        # rather than merely absent from ``pumps``.
+        raise AssertionError("a park must not halt pumps with a dispense")
 
 
 class _Manager:
@@ -44,11 +51,16 @@ class _Manager:
 # ── The park itself ──────────────────────────────────────────────────────────
 
 class TestRetractHead:
-    def test_the_default_retracts_because_nobody_is_there_to_decide(self):
+    def test_the_default_adds_no_motion_to_an_unknown(self):
+        """Reversed deliberately. The old default retracted "because nobody is
+        there to decide" — sound about the *decision*, wrong about the
+        *capability*: with no feedback, ``head_retract`` is a conditional flip on
+        a belief, and on a stale belief it drives the head **down**."""
         syr = _Syringe(up=False)
         result = safe_park(_Manager(syr), reason="test")
-        assert syr.retracted == 1
-        assert "head retracted" in result.actions
+        assert syr.retracted == 0
+        assert syr.is_head_up() is False
+        assert any("head" in u.lower() for u in result.unverifiable)
 
     def test_declining_leaves_the_head_where_it_is(self):
         syr = _Syringe(up=False)
@@ -56,6 +68,13 @@ class TestRetractHead:
         assert syr.retracted == 0
         assert not syr.is_head_up()
         assert any("left lowered" in a for a in result.actions)
+
+    def test_an_operator_instruction_still_retracts(self):
+        """Never refusing the operator is the other half of the policy."""
+        syr = _Syringe(up=False)
+        result = safe_park(_Manager(syr), reason="test", retract_head=True)
+        assert syr.retracted == 1
+        assert any("head retract commanded" in a for a in result.actions)
 
     def test_the_choice_is_recorded_as_an_action_not_a_skip(self):
         """It is something the park *did*, and the log is the only durable trace of
@@ -80,7 +99,7 @@ class TestRetractHead:
             def head_retract(self):
                 raise RuntimeError("stage timeout")
 
-        result = safe_park(_Manager(Stubborn(up=False)))
+        result = safe_park(_Manager(Stubborn(up=False)), retract_head=True)
         assert not result.ok
         assert any("stage timeout" in e for e in result.errors)
 
@@ -158,7 +177,7 @@ def button(qtbot, monkeypatch):
         parked.append({"reason": reason, "retract_head": retract_head})
         if retract_head:
             syr.head_retract()
-        return SafeParkResult(actions=["parked"])
+        return SafeParkResult(commanded=["parked"])
 
     monkeypatch.setattr("softae.core.safe_park.safe_park", fake_park)
 
@@ -213,7 +232,7 @@ class TestTheButton:
 
         monkeypatch.setattr(
             "softae.core.safe_park.safe_park",
-            lambda *a, **k: SafeParkResult(actions=["parked"]))
+            lambda *a, **k: SafeParkResult(commanded=["parked"]))
 
         btn = mod.SafeExitButton(_Manager(_Syringe(up=True)))
         asked = []

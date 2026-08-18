@@ -30,6 +30,7 @@ Anti-patterns fixed vs. legacy
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any, Callable
 
@@ -40,6 +41,47 @@ from softae.errors import CommunicationError, ConnectionError_
 from softae.server.base_instrument import BaseInstrument, InstrumentState
 
 logger = structlog.get_logger(__name__)
+
+
+# ── Halt constants ───────────────────────────────────────────────────────────
+#
+# The pump chain exposes **no stop primitive**. What stops it is a *fresh
+# program*: on this hardware a new ``irun`` countermands whatever program was
+# running (observed on the bench by the operator; it is not in the firmware
+# manual, which is exactly why it is named here rather than left inline at the
+# call site as a magic dispense).
+#
+# Every value below is load-bearing and each one is a single config edit away
+# from silently deleting the halt. They are named, and pinned by tests, for that
+# reason — :meth:`AsyncSyringe.halt_pump` writes them directly and is never
+# routed through ``_validate_single_pump``.
+
+#: Infuse rate written by :meth:`AsyncSyringe.halt_pump` (µL/min).
+#:
+#: **Coupling, recorded deliberately.** As a *dispense* this value had to clear
+#: ``_validate_single_pump``'s ``min_rate`` floor, and the shipped rig runs
+#: ``[instruments.syringe] min_rate = 0.05`` (module default ``0.001``) — a
+#: margin of 2× that nobody chose with a park in mind. Raising ``min_rate``
+#: past 0.1 in config used to convert every park's pump halt into a
+#: ``SafetyError``. ``halt_pump`` does not validate, so the coupling is gone;
+#: the number is kept because it is the value observed to work.
+HALT_RATE_UL_PER_MIN = 0.1
+
+#: Target volume written by :meth:`AsyncSyringe.halt_pump` (µL).
+#:
+#: **Second recorded coupling.** As a dispense this survived
+#: :meth:`~softae.drivers.contracts.ParallelSyringeMixin._is_noop_pump_command`
+#: only because ``PUMP_NOOP_VOLUME_UL == 0.0`` — the comparison is ``<=``, so
+#: anyone raising that floor to a "sensible" small number deleted the halt
+#: outright and *nothing failed*: ``single_pump`` returned after logging
+#: ``syringe_pump_skip``. ``halt_pump`` does not consult the no-op filter.
+HALT_VOLUME_UL = 0.001
+
+#: Declared syringe volume (mL) sent with a halt — the firmware limit parameter,
+#: **not** stock on hand (see :meth:`AsyncSyringe.single_pump`). Deliberately an
+#: ``int``: the write is ``f"{ID} svolume {HALT_SVOLUME_ML} ml"``, and this
+#: reproduces the exact byte string the park has always sent.
+HALT_SVOLUME_ML = 1000
 
 
 class AsyncSyringe(ParallelSyringeMixin, BaseInstrument):
@@ -60,6 +102,8 @@ class AsyncSyringe(ParallelSyringeMixin, BaseInstrument):
         self._init_parallel_syringes(self.config)
         self._visa_inst = None
         self._rm = None
+        #: Serialises the multi-write VISA bursts. See :meth:`_write_pump_program`.
+        self._visa_lock = threading.RLock()
         self._is_up: bool = True  # head retracted by default
 
     # ── Lifecycle ────────────────────────────────────────────────────────
@@ -177,15 +221,7 @@ class AsyncSyringe(ParallelSyringeMixin, BaseInstrument):
 
         hw_vol = self.effective_per_syringe_volume(dispense_vol, ID)
 
-        self._visa_inst.write(f"{ID} svolume {res_vol} ml")
-        time.sleep(0.1)
-        self._visa_inst.write(f"{ID}diameter {float(self._diameter)}")
-        time.sleep(0.1)
-        self._visa_inst.write(f"{ID}irate {float(rate)} ul/min")
-        time.sleep(0.1)
-        self._visa_inst.write(f"{ID}tvolume {float(hw_vol)} ul")
-        time.sleep(0.1)
-        self._visa_inst.write(f"{ID}irun")
+        self._write_pump_program(ID, res_vol, rate, hw_vol)
         logger.info(
             "syringe_pump",
             pump_id=ID,
@@ -193,6 +229,89 @@ class AsyncSyringe(ParallelSyringeMixin, BaseInstrument):
             vol=dispense_vol,
             diameter=self._diameter,
         )
+
+    def _write_pump_program(
+        self, ID: int, res_vol: float, rate: float, hw_vol: float
+    ) -> None:
+        """Write one complete pump program, atomically with respect to other threads.
+
+        The five writes are a **parameter block followed by a trigger**, separated
+        by 100 ms settles. Interleaved, two callers produce a pump that runs a
+        volume neither of them commanded — one caller's ``tvolume`` against the
+        other's ``irate``, then whichever ``irun`` arrives first.
+
+        That is not hypothetical here. Normal actuation reaches this through
+        :meth:`~softae.server.base_instrument.BaseInstrument.execute`, which holds
+        an ``asyncio.Lock`` and dispatches the blocking call to the shared I/O
+        thread pool — but :func:`softae.core.safe_park.safe_park` calls the driver
+        **directly**, from the GUI's E-Stop ``QThread`` and (via the campaign's
+        ``_on_park``) from the event-loop thread. Two lock-free callers, both real.
+
+        **Why a threading lock in the driver rather than the manager's lock.**
+        The contention is between OS threads, and an ``asyncio.Lock`` excludes
+        coroutines on one loop — it cannot exclude a ``QThread`` that never enters
+        that loop, and the executor's own writes happen on a *pool* thread while
+        the loop merely awaits. Routing the park through ``execute`` instead would
+        mean the E-Stop **queues behind the step it is trying to pre-empt**: that
+        lock is held for a whole workflow step, so the stop would wait out the
+        dispense it exists to cancel. A stop that waits is not a stop.
+
+        This lock is held only for the ~0.4 s of one burst, so a halt pre-empts at
+        the granularity of a *program* rather than of a byte: the in-flight
+        program completes coherently, and the halt's fresh ``irun`` countermands
+        it immediately afterwards. Bounded, and correct in the only way the
+        hardware permits.
+        """
+        with self._visa_lock:
+            self._visa_inst.write(f"{ID} svolume {res_vol} ml")
+            time.sleep(0.1)
+            self._visa_inst.write(f"{ID}diameter {float(self._diameter)}")
+            time.sleep(0.1)
+            self._visa_inst.write(f"{ID}irate {float(rate)} ul/min")
+            time.sleep(0.1)
+            self._visa_inst.write(f"{ID}tvolume {float(hw_vol)} ul")
+            time.sleep(0.1)
+            self._visa_inst.write(f"{ID}irun")
+
+    def halt_pump(self, ID: int) -> None:
+        """Stop pump *ID* now. **Not a dispense** — never validated or ledgered as one.
+
+        The chain has no stop command; what stops it is a fresh program, because a
+        new ``irun`` countermands the running one (see the ``HALT_*`` constants).
+        The bytes are exactly what the park has always sent. What is new is the
+        path they travel.
+
+        **Why this is not** ``single_pump(1000, ID, 0.1, 0.001)``. That call runs
+        ``_validate_single_pump`` → ``ReservoirLedger.check_and_debit`` → ``check``,
+        which raises :class:`~softae.errors.SafetyError` when
+        ``remaining - dispense < hard_stop_uL``. At 0.001 µL the refusal fires
+        **exactly when the reservoir is at its hard stop** — and reservoir
+        depletion is itself a park trigger. The park's own halt was refused by the
+        interlock whose firing caused the park, on all three pumps, and the
+        refusals landed in ``SafeParkResult.errors``. Halting a pump is the one
+        action a stock interlock must never be able to block: refusing it protects
+        no stock and leaves a pump running.
+
+        It also stops charging the safety action to the budget the interlock
+        guards — a successful park used to debit 0.001 µL per pump. Small, and
+        wrong in principle.
+
+        **A** ``bypass_ledger=True`` **kwarg on** :meth:`single_pump` **was
+        rejected.** The interlock is sited in the shared validator precisely
+        because *every* dispense — HT, campaign, manual, CLI — passes through it;
+        a bypass flag punches a hole in that guarantee for every caller in order
+        to serve one, and the next caller wanting a hole would find one already
+        cut. A separate method is also the honest signature: this takes no volume
+        and no rate, because it does not dispense. ``tests/test_halt_pump.py``
+        pins the rejection.
+        """
+        pump_id = int(ID)
+        hw_vol = self.effective_per_syringe_volume(HALT_VOLUME_UL, pump_id)
+        self._write_pump_program(
+            pump_id, HALT_SVOLUME_ML, HALT_RATE_UL_PER_MIN, hw_vol
+        )
+        logger.warning("syringe_halt", pump_id=pump_id,
+                       rate=HALT_RATE_UL_PER_MIN, vol=HALT_VOLUME_UL)
 
     def head_flip(self) -> None:
         """Toggle the pneumatic dispenser head (retract ↔ descend).

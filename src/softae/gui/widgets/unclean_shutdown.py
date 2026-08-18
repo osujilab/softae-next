@@ -27,6 +27,9 @@ from typing import TYPE_CHECKING
 import structlog
 from PySide6.QtWidgets import QMessageBox, QWidget
 
+from softae.core.run_lock import foreign_run_lock
+from softae.core.shutdown import UNCLEAN_SHUTDOWN_MESSAGE
+
 if TYPE_CHECKING:
     from softae.core.data_store import DataStore
     from softae.server.manager import InstrumentManager
@@ -46,6 +49,39 @@ def check_unclean_shutdown(
     """
     if data_store is None:
         return False
+
+    # ── Liveness BEFORE recovery. This ordering is the fix — do not reorder. ──
+    #
+    # The mirror of the headless guard in `tools/campaign.py`, and it closes this
+    # collision from the other direction: opening the GUI while a headless campaign
+    # is running. `unfinished_runs()` is project-wide and a live run's row is
+    # indistinguishable from a crashed one's, so asking it first would read the
+    # *running* campaign's row, mark it `interrupted`, and offer to park the rig
+    # out from under it — turning a start-up courtesy into the thing that kills an
+    # unattended overnight run.
+    #
+    # Skipping defers rather than discards: the unfinished row is durable and never
+    # clears itself, so a genuinely crashed run is still caught at the next launch
+    # that is not racing a live campaign.
+    #
+    # An unreadable lock counts as "someone might be running". It is the only
+    # conservative reading here: this function must never stop the GUI opening
+    # (see the docstring), so raising is not an option, and guessing "free" would
+    # go on to consume a live campaign's row on exactly the evidence we just
+    # failed to obtain. Deferring costs a launch; guessing wrong costs the run.
+    try:
+        holder = foreign_run_lock()
+    except Exception:
+        logger.warning("rig_lock_unreadable_skipping_recovery", exc_info=True)
+        return False
+
+    if holder is not None:
+        logger.info("unclean_shutdown_check_skipped",
+                    holder_pid=holder.pid, holder_what=holder.what,
+                    msg="another process holds the rig — a live run's row must "
+                        "not be mistaken for a crashed one's")
+        return False
+
     try:
         stale = data_store.unfinished_runs()
     except Exception:
@@ -65,12 +101,11 @@ def check_unclean_shutdown(
         raise_alert(
             Alert(
                 kind="unclean_shutdown",
-                message=(
-                    f"{len(stale)} run(s) did not finish cleanly; the previous "
-                    "session ended without unwinding. The dispenser head holds "
-                    "position without power, so it may have been left lowered "
-                    "over an electrode — inspect before moving the stage."
-                ),
+                # One wording, defined in `core.shutdown`. This text was
+                # duplicated verbatim there and here; two copies of a sentence
+                # describing the same physical unknown is how the CLI and the
+                # GUI come to describe it differently after one of them is edited.
+                message=f"{len(stale)} {UNCLEAN_SHUTDOWN_MESSAGE}",
                 severity=WARNING,
                 run_id=stale[0]["run_id"],
                 details={

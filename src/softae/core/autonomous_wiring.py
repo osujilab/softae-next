@@ -87,6 +87,7 @@ from softae.core.run_lock import held_run_lock, rig_is_simulated
 from softae.core.run_plan import RunPlan, SettlePlan
 from softae.core.alerts import CRITICAL, Alert, raise_alert
 from softae.core.safe_park import safe_park
+from softae.core.shutdown import park_on_shutdown
 from softae.core.task_catalog import TaskCatalog
 from softae.optimizers import (
     BaseOptimizer,
@@ -575,6 +576,14 @@ class CampaignResult:
     final_state: str
     converged: bool
     history: list[tuple[dict[str, Any], float]]
+    #: Why the loop parked, or ``None`` if it did not. The loop has always known
+    #: this (``AutonomousLoop.park_reason``); until it was carried out here the
+    #: only surface that could see it was the event stream, which dies with the
+    #: process. A parked run reports ``final_state == "STOPPED"`` exactly like a
+    #: clean stop, so without this field a cron wrapper cannot tell a campaign
+    #: that finished from one that gave up at 3 a.m. — and the CLI returned 0 for
+    #: both. Defaulted so every existing constructor keeps working.
+    park_reason: str | None = None
 
 
 # ── Checkpoint serialization (P3.2) ──────────────────────────────────────────
@@ -2729,6 +2738,10 @@ async def run_autonomous_campaign(
 
     run_id: str | None = None
     run_finalized = False
+    # Set by `_on_park`: a campaign parks once, so a crash *after* the loop has
+    # already parked must not fire a second safe_park and a second CRITICAL
+    # alert for one fault.
+    loop_parked = False
     # The rig claim is entered once the run has an identity and closed last of
     # all, so it spans everything between — including the gaps between trials
     # where the per-workflow lock used to disappear.
@@ -3511,6 +3524,8 @@ async def run_autonomous_campaign(
             must not leave the head down, the heater at setpoint and the lamp on
             for however many hours pass before someone walks in.
             """
+            nonlocal loop_parked
+            loop_parked = True
             emit("park", reason=reason)
             try:
                 result = safe_park(manager, reason=reason)
@@ -3639,6 +3654,7 @@ async def run_autonomous_campaign(
             final_state=loop.state.name,
             converged=loop.state is LoopState.CONVERGED,
             history=list(optimizer.history),
+            park_reason=loop.park_reason,
         )
         status = _RUN_STATUS_BY_STATE.get(loop.state, "done")
         _finalize_run(status)
@@ -3654,10 +3670,58 @@ async def run_autonomous_campaign(
              status=status)
         return result
 
-    except BaseException:
+    except BaseException as exc:
         # Includes cancellation and KeyboardInterrupt: a run that dies must not
-        # be left looking like it is still executing.
-        _finalize_run("error")
+        # be left looking like it is still executing — *and must not be left
+        # driving the rig*. Until this parked, the only exit that made the
+        # hardware safe was the loop's own decision to park; anything the loop
+        # did not foresee (a crash, a Ctrl-C, an operator abort, a step raising
+        # through) unwound straight into `disconnect_all`, after which
+        # `safe_park` skips every instrument as not connected and a park becomes
+        # structurally impossible. The heater stays at setpoint and the lamp
+        # stays on until someone walks in.
+        #
+        # Sited before `_finalize_run` deliberately: that is a database write and
+        # this is a heater. Both run — the park is in a `try`/`finally` — but the
+        # physical one goes first.
+        try:
+            if not loop_parked:
+                reason = (f"campaign '{spec.name}' aborted: "
+                          f"{type(exc).__name__}: {exc}"[:300])
+                park_result = park_on_shutdown(manager, reason)
+                if park_result is not None:
+                    try:
+                        emit("park", reason=reason)
+                        emit("safe_park", ok=park_result.ok,
+                             actions=park_result.actions,
+                             errors=park_result.errors,
+                             skipped=park_result.skipped)
+                    except Exception:
+                        # A consumer's callback must not replace the exception
+                        # that is actually unwinding with one about reporting it.
+                        logger.warning("abort_park_emit_failed", exc_info=True)
+                    # Durable, because the event stream dies with this process
+                    # and an overnight crash has no other reader.
+                    try:
+                        raise_alert(
+                            Alert(
+                                kind="park",
+                                message=(f"Campaign '{spec.name}' aborted and was "
+                                         f"parked: {type(exc).__name__}"),
+                                severity=CRITICAL,
+                                run_id=run_id,
+                                details={
+                                    "error": str(exc)[:500],
+                                    "safe_park_ok": bool(park_result.ok),
+                                    "safe_park_errors": list(park_result.errors),
+                                },
+                            ),
+                            data_store=data_store,
+                        )
+                    except Exception:
+                        logger.warning("abort_park_alert_failed", exc_info=True)
+        finally:
+            _finalize_run("error")
         raise
 
     finally:
