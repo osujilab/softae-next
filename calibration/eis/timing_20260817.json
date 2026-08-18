@@ -1,0 +1,99 @@
+{
+  "schema": "softae.eis_timing/1",
+  "channel": 1,
+  "repeats": 1,
+  "warmup": 1,
+  "mock": false,
+  "started_utc": "2026-08-17T22:29:35.456125+00:00",
+  "finished_utc": "2026-08-17T22:52:40.572071+00:00",
+  "presets": {
+    "Standard": {
+      "params": {
+        "npts": 34,
+        "f_hi": 200000,
+        "f_lo_mHz": 3912,
+        "mv_ac": 10,
+        "mv_dc": 0
+      },
+      "samples_s": [
+        37.187
+      ],
+      "warmup_s": [
+        37.172
+      ],
+      "median_s": 37.19,
+      "mean_s": 37.19,
+      "min_s": 37.19,
+      "max_s": 37.19,
+      "spread_pct": 0.0,
+      "modelled_s": 37.38,
+      "model_error_pct": 0.5
+    },
+    "Quick": {
+      "params": {
+        "npts": 27,
+        "f_hi": 200000,
+        "f_lo_mHz": 6475,
+        "mv_ac": 10,
+        "mv_dc": 0
+      },
+      "samples_s": [
+        17.5
+      ],
+      "warmup_s": [
+        17.531
+      ],
+      "median_s": 17.5,
+      "mean_s": 17.5,
+      "min_s": 17.5,
+      "max_s": 17.5,
+      "spread_pct": 0.0,
+      "modelled_s": 21.5,
+      "model_error_pct": 22.9
+    },
+    "Extended": {
+      "params": {
+        "npts": 53,
+        "f_hi": 200000,
+        "f_lo_mHz": 1351,
+        "mv_ac": 10,
+        "mv_dc": 0
+      },
+      "samples_s": [
+        120.422
+      ],
+      "warmup_s": [
+        120.375
+      ],
+      "median_s": 120.42,
+      "mean_s": 120.42,
+      "min_s": 120.42,
+      "max_s": 120.42,
+      "spread_pct": 0.0,
+      "modelled_s": 130.17,
+      "model_error_pct": 8.1
+    },
+    "Longest": {
+      "params": {
+        "npts": 39,
+        "f_hi": 200000,
+        "f_lo_mHz": 228,
+        "mv_ac": 10,
+        "mv_dc": 0
+      },
+      "samples_s": [
+        516.438
+      ],
+      "warmup_s": [
+        516.485
+      ],
+      "median_s": 516.44,
+      "mean_s": 516.44,
+      "min_s": 516.44,
+      "max_s": 516.44,
+      "spread_pct": 0.0,
+      "modelled_s": 487.99,
+      "model_error_pct": -5.5
+    }
+  }
+}

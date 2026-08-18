@@ -434,27 +434,29 @@ class TestProjection:
         # The CEILING, which is what the old fixed-count projection was. It tracks
         # the round-period default, which is DERIVED and has moved several times:
         # 120 s -> 660 s when the period came off 'Standard', 660 -> 200 s when
-        # the shipped preset became 'Quick', and 200 -> 370 s on 2026-08-14 when
-        # `Quick`'s floor moved to 7 Hz. The night got longer for the last of
-        # those because the sweep did -- ~2x the low-frequency tail buys arcs that
-        # close down to ~2e-7 S/cm instead of ~5.7e-7. The down leg's own approach
-        # allowance is still in here: 4 setpoints at 5400 s against 4 at 1800 s.
-        assert projection.typical_s / 3600 == pytest.approx(15.33, abs=0.05)
-        assert projection.worst_case_s / 3600 == pytest.approx(24.33, abs=0.05)
+        # the shipped preset became 'Quick', 200 -> 370 s on 2026-08-14 when
+        # `Quick`'s floor moved to 7 Hz, and 370 -> 310 s on 2026-08-17 when the
+        # bench timed the retuned `Quick` at 17.50 s/channel. That last move is
+        # the only one that shortened the night, and it did so without touching
+        # the sweep: the period had been carrying a modelled 21.50 s plus the
+        # model's own under-count margin, and the stopwatch retired both. The down
+        # leg's approach allowance is still in here: 4 setpoints at 5400 s
+        # against 4 at 1800 s.
+        assert projection.typical_s / 3600 == pytest.approx(13.33, abs=0.05)
+        assert projection.worst_case_s / 3600 == pytest.approx(22.33, abs=0.05)
         # And the FLOOR, which the settle criterion makes reachable. Read off the
-        # three regimes rather than one number: at the 370 s period the 1500 s
-        # first-setpoint hold floor buys ceil(1500/370) = 5 rounds, so it now
-        # COINCIDES with MIN_POINTS_FOR_TAU rather than overtaking it -- the
-        # slower sweep spent the two extra sigma points the 200 s period had won.
-        # Setpoint 2 is inside the tau window with only ceil(600/370) = 2 rounds
-        # of time floor, so MIN_POINTS_FOR_TAU binds there; past the window the
-        # floor is settle_n_rounds alone.
+        # three regimes rather than one number: at the 310 s period the 1500 s
+        # first-setpoint hold floor buys ceil(1500/310) = 5 rounds, so it still
+        # COINCIDES with MIN_POINTS_FOR_TAU rather than overtaking it. Setpoint 2
+        # is inside the tau window with only ceil(600/310) = 2 rounds of time
+        # floor, so MIN_POINTS_FOR_TAU binds there; past the window the floor is
+        # settle_n_rounds alone.
         assert projection.min_rounds_first == MIN_POINTS_FOR_TAU
         assert projection.min_rounds_tau == MIN_POINTS_FOR_TAU
         assert projection.min_rounds_later == config.settle_n_rounds == 3
         assert projection.floor_rounds == (5, 5, 3, 3, 3, 3, 3, 3)
-        assert projection.typical_floor_s / 3600 == pytest.approx(5.88, abs=0.05)
-        assert projection.worst_floor_s / 3600 == pytest.approx(14.88, abs=0.05)
+        assert projection.typical_floor_s / 3600 == pytest.approx(5.41, abs=0.05)
+        assert projection.worst_floor_s / 3600 == pytest.approx(14.41, abs=0.05)
         assert projection.adaptive is True
         assert "anchor_rounds" not in projection.breakdown_typical
 
@@ -1261,19 +1263,20 @@ class TestRoundPeriodIsHonoured:
         # Pins the projection path: `plan` and `project_duration` have nothing
         # measured and must keep the behaviour they had.
         #
-        # The poll floor is part of that behaviour, and since `Quick` moved to a
-        # 7 Hz floor it is what BINDS at the operator's own settings: 12 channels
-        # model ~229 s against a 240 s period, leaving 11 s -- under the 30 s the
-        # watched gap never drops below, because both axes are graded by sampling
-        # it. Asserting the subtraction bare would now be asserting a gap that
-        # would leave the chamber ungraded.
+        # The poll floor is part of that behaviour. Since the 2026-08-17 bench run
+        # priced `Quick` at 17.50 s/channel, 12 channels cost exactly 210 s against
+        # a 240 s period, so the subtraction now lands exactly ON the 30 s poll
+        # floor instead of 11 s under it. The two branches therefore agree here by
+        # arithmetic coincidence -- so pin the RULE, and pin the coincidence
+        # separately rather than letting it masquerade as the rule.
         from softae.workflows.equilibration import eis_round_cost_s
 
         config = _operator_config()
         modelled = eis_round_cost_s(config, config.eis_preset)
         assert inter_round_gap_s(config) == pytest.approx(
             max(config.poll_interval_s, config.round_period_s - modelled))
-        assert config.round_period_s - modelled < config.poll_interval_s
+        assert config.round_period_s - modelled == pytest.approx(
+            config.poll_interval_s)
 
     @pytest.mark.parametrize("measured_s", [1.0, 60.0, 130.0, 209.9])
     def test_the_round_plus_the_gap_equals_the_configured_period(self, measured_s):

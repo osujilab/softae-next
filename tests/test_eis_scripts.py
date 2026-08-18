@@ -20,10 +20,12 @@ from softae.core.eis_scripts import (
 
 class TestResolution:
     def test_preset_values_are_read_from_config(self):
+        # Literals track [eis_presets.Standard]; last moved 2026-08-17 by the
+        # mains-notch retune (npts 35 -> 34, f_lo 4000 -> 3912 mHz).
         p = EISParams.from_preset("Standard")
-        assert p.npts == 35
+        assert p.npts == 34
         assert p.f_hi == 200_000
-        assert p.f_lo_mHz == 4_000
+        assert p.f_lo_mHz == 3_912
 
     def test_explicit_overrides_beat_the_preset(self):
         p = EISParams.from_preset("Standard", npts=99)
@@ -32,7 +34,8 @@ class TestResolution:
 
     def test_none_overrides_are_ignored(self):
         """An unset widget/field must not clobber a preset value with None."""
-        assert EISParams.from_preset("Standard", npts=None).npts == 35
+        expected = EISParams.from_preset("Standard").npts
+        assert EISParams.from_preset("Standard", npts=None).npts == expected
 
     def test_unknown_preset_falls_back_to_defaults_without_raising(self):
         """A 3 a.m. campaign must not refuse to start over a preset typo."""

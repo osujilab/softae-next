@@ -259,15 +259,78 @@ evaporation_pct = 100.0
 permitted_overfill_mm = 0.0
 
 # --- EIS measurement presets ---
+#
+# MAINS-NOTCH TUNING (2026-08-17). Every preset below was retuned to keep its
+# log-spaced grid *off* 60 Hz and its harmonics. Two knobs do the work and they
+# are not interchangeable: `npts` sets the grid ratio and so slides every
+# interior point at once, while `f_lo` sets the phase of the whole ladder. One
+# knob alone can only translate the comb; both together can land it in the gaps.
+#
+# `f_lo` is in INTEGER mHz — `EISParams` coerces with `int()` and the instrument
+# script emits `meas_loop_eis ... {f_lo}m` (min 16). Two of the four recommended
+# floors were not integer-representable and are rounded here: Extended 1350.6 ->
+# 1351, Longest 227.5 -> 228. Both rounds cost <0.1 pt of separation.
+#
+# Separation is quoted as the minimum fractional distance from any grid point to
+# any harmonic 60*k, and is reported for k<=3 and k<=5 because the two disagree:
+# a grid can clear the fundamental handsomely and still sit on the 5th.
+#
+#   preset     npts  f_lo      sep(k<=3)         sep(k<=5)        s/channel
+#   Standard    34   3.912 Hz  1.22% ->  9.69%   1.22% -> 6.63%   37.7 -> 37.4
+#   Quick       27   6.475 Hz  1.08% -> 12.73%   1.08% -> 3.35%   19.1 -> 21.5
+#   Extended    53   1.351 Hz  4.12% ->  8.09%   4.12% -> 8.09%  124.2 -> 130.2
+#   Longest     39   0.228 Hz  1.49% -> 13.40%   0.09% -> 2.04%  502.9 -> 488.0
+#
+# Durations are `core/preflight.estimate_eis_duration`, i.e. this rig's own
+# calibrated model, NOT the model the recommendation was derived from. The two
+# forms agree on every *delta* to within a point, and diverge on the absolute
+# only for Longest (488 s here vs 434 s there) — which is the extrapolated
+# region where the repo model is already flagged as speaking beyond its anchors.
+#
+# Longest was the preset that mattered: its old grid landed 0.09 % from 300 Hz,
+# which is to say it was sitting on the 5th harmonic. It is now 2.04 % off, and
+# shorter. That 2.04 % is still the weakest number in the table.
+#
+# COST: for Extended and Longest the floor moved UP (1.200 -> 1.351 Hz, 0.200 ->
+# 0.228 Hz), so their conductivity reach worsens by 13-14 % — see the sigma_min
+# note under `Quick`. Standard and Quick moved down and gain slightly.
+#
+# RE-TIMED ON THE BENCH (2026-08-17, same day)
+# --------------------------------------------
+# The retune moved every preset, which invalidated every stopwatch anchor at
+# once. `softae-eis-timing` re-read all four on channel 1 in one session
+# (calibration/eis/timing_20260817.json). Measured s/channel, against the model:
+#
+#   preset     measured   modelled   note
+#   Quick        17.50s     21.50s   model ran 22.8 % high
+#   Standard     37.19s     37.38s   model within 0.5 %
+#   Extended    120.42s    130.17s   model ran 8.1 % high
+#   Longest     516.44s    487.99s   model ran 5.5 % low; FIRST EVER timing
+#
+# Consequences, all of them good:
+#   - every shipped preset now reports basis "measured"; `Longest` had never
+#     been timed on this rig at all, and its true cost is 5.5 % ABOVE the
+#     extrapolation that was standing in for it.
+#   - projections use the stopwatch, not the model. The equilibration round
+#     period fell 370 s -> 310 s and the shipped overnight run 15.33 h ->
+#     13.33 h — the retune did not make the night longer, the model had simply
+#     been overcharging for `Quick`.
+#   - the model constants were refitted to all four (see
+#     `preflight.EIS_CYCLES_PER_POINT`). They now govern custom sweeps only.
+#
+# The anchors are keyed to these grids in `preflight.EIS_ANCHOR_GRIDS`. EDITING
+# ANY PRESET BELOW AUTOMATICALLY RETIRES ITS ANCHOR — provenance falls back to
+# "extrapolated" on its own, with no list to remember to update. That interlock
+# exists because this retune defeated the previous hand-maintained one.
 
 [eis_presets.Standard]
-npts   = 35
+npts   = 34
 f_hi   = 200_000
-f_lo_mHz = 4_000
+f_lo_mHz = 3_912
 mv_ac  = 10
 
 # `Quick` is DEFAULT_PRESET and what the equilibration runs use, so its floor is
-# the system's default reach. 7 Hz, not the 20 Hz it was through 2026-08-13:
+# the system's default reach. 6.475 Hz, not the 20 Hz it was through 2026-08-13:
 # f_lo is a CONDUCTIVITY floor in disguise. The -Z'' apex sits at
 # f = 1/(2*pi*R*C_cell) and C_cell is a property of the BOARD (0.09 nF median over
 # 1152 spectra, IQR 0.07-0.16, while R moved 109x), so
@@ -275,29 +338,34 @@ mv_ac  = 10
 # At 20 Hz that is 5.7e-7 S/cm and 476 of run 20260811T023757Z's 1440 spectra
 # (33 %, rising to 73 % at the cold end of the down leg) never closed their arc,
 # so their R1 came from extrapolating the high-frequency limb -- a measured 61 %
-# median OVERESTIMATE, systematic, and 175 % with a full CPE fit. 7 Hz reaches
-# 2.0e-7 S/cm, about a decade below anything this rig has measured, for roughly
-# 2x the time (10.47 -> ~21 s/channel).
+# median OVERESTIMATE, systematic, and 175 % with a full CPE fit. 6.475 Hz
+# reaches 1.9e-7 S/cm, about a decade below anything this rig has measured, for
+# roughly 2x the time (10.47 -> ~21.5 s/channel).
 #
 # Moving this RETIRED the `Quick` stopwatch anchor in core/preflight.py: 10.47
 # s/channel timed the 20 Hz sweep and says nothing about this one. Durations
 # quoted for `Quick` are extrapolated until a real run re-times it.
 [eis_presets.Quick]
-npts   = 25
+npts   = 27
 f_hi   = 200_000
-f_lo_mHz = 7_000
+f_lo_mHz = 6_475
 mv_ac  = 10
 
+# Extended buys its harmonic clearance with points, not with time: +8 points
+# costs ~5 % more wall-clock because per-point overhead is ~0.34 s against a
+# low-frequency tail that dominates the sum. The extra points also improve fit
+# conditioning, so this is the one preset where the notch tuning is a net gain
+# on both axes — against a 13 % worse sigma floor.
 [eis_presets.Extended]
-npts   = 45
+npts   = 53
 f_hi   = 200_000
-f_lo_mHz = 1_200
+f_lo_mHz = 1_351
 mv_ac  = 10
 
 [eis_presets.Longest]
-npts   = 35
+npts   = 39
 f_hi   = 200_000
-f_lo_mHz = 200
+f_lo_mHz = 228
 mv_ac  = 10
 
 # --- Channel-to-Pico routing ---

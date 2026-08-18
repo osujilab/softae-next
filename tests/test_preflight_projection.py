@@ -119,16 +119,18 @@ class TestEISDuration:
 #: to 7 Hz on 2026-08-14 and its entry in ``EIS_MEASURED_S_PER_CHANNEL`` was
 #: retired with it. The fit was still made against these three, so this stays a
 #: valid statement about the model even though only two presets are now "timed".
+#: The 2026-08-17 bench session (channel 1, all four presets interleaved). These
+#: are the *current* grids; the previous table here held the pre-retune ones.
 MEASURED_S_PER_CHANNEL = {
-    "Quick":    (EISParams(f_hi=200_000, f_lo_mHz=20_000, npts=25), 10.47),
-    "Standard": (EISParams(f_hi=200_000, f_lo_mHz=4_000, npts=35), 40.85),
-    "Extended": (EISParams(f_hi=200_000, f_lo_mHz=1_200, npts=45), 115.2),
+    "Quick":    (EISParams(f_hi=200_000, f_lo_mHz=6_475, npts=27), 17.50),
+    "Standard": (EISParams(f_hi=200_000, f_lo_mHz=3_912, npts=34), 37.19),
+    "Extended": (EISParams(f_hi=200_000, f_lo_mHz=1_351, npts=53), 120.42),
+    "Longest":  (EISParams(f_hi=200_000, f_lo_mHz=228, npts=39), 516.44),
 }
 
-#: Two constants cannot fit three points exactly. 7.8 % is what the minimax
-#: solution achieves; no reweighting of the three does better than 7.7 % with the
-#: ``max(floor, cycles/f)`` form, so this tolerance is the model's limit and not
-#: slack left for a future edit to hide in.
+#: Two constants cannot fit four points. ~9 % is what the best pair achieves, and
+#: a third parameter buys only ~1 %, so this tolerance is the functional form's
+#: limit and not slack left for a future edit to hide in.
 DURATION_TOL_REL = 0.10
 
 
@@ -138,13 +140,15 @@ class TestEISDurationAgainstTheBench:
     nothing compared it to a stopwatch."""
 
     @pytest.mark.parametrize("preset", sorted(MEASURED_S_PER_CHANNEL))
-    def test_estimate_eis_duration_measured_preset_matches_the_bench(self, preset):
+    def test_model_eis_duration_matches_the_bench(self, preset):
+        from softae.core.preflight import model_eis_duration
+
         params, measured = MEASURED_S_PER_CHANNEL[preset]
-        assert estimate_eis_duration(params) == pytest.approx(
+        assert model_eis_duration(params) == pytest.approx(
             measured, rel=DURATION_TOL_REL)
 
     @pytest.mark.parametrize("preset", sorted(MEASURED_S_PER_CHANNEL))
-    def test_estimate_eis_duration_old_constants_fail_the_bench(self, preset, monkeypatch):
+    def test_model_eis_duration_old_constants_fail_the_bench(self, preset, monkeypatch):
         # Proves the pin above has teeth. The pre-correction constants were 3.0
         # cycles and a 0.05 s floor; if this test can pass with those, it is not
         # measuring anything.
@@ -153,18 +157,35 @@ class TestEISDurationAgainstTheBench:
         monkeypatch.setattr(preflight, "EIS_CYCLES_PER_POINT", 3.0)
         monkeypatch.setattr(preflight, "EIS_MIN_POINT_S", 0.05)
         params, measured = MEASURED_S_PER_CHANNEL[preset]
-        assert estimate_eis_duration(params) != pytest.approx(
+        assert preflight.model_eis_duration(params) != pytest.approx(
             measured, rel=DURATION_TOL_REL)
 
-    def test_eis_duration_basis_untimed_preset_is_extrapolated(self):
+    @pytest.mark.parametrize("preset", sorted(MEASURED_S_PER_CHANNEL))
+    def test_estimate_returns_the_stopwatch_exactly_not_the_model(self, preset):
+        """The 2026-08-17 change: a timed grid must return its measurement, not a
+        model of it. Modelling ``Quick`` cost every projection 22.8 % while the
+        real number sat unused in the same module."""
+        params, measured = MEASURED_S_PER_CHANNEL[preset]
+        assert estimate_eis_duration(params) == pytest.approx(measured, abs=0.01)
+
+    def test_eis_duration_basis_is_measured_for_every_shipped_preset(self):
         from softae.core.preflight import eis_duration_basis
 
-        assert eis_duration_basis("Standard") == "measured"
-        # `Longest` reaches 0.2 Hz, six times below the lowest anchor. The model
-        # predicts ~500 s/channel for it and that number must never be quoted
-        # with the same confidence as the three above.
-        assert eis_duration_basis("Longest") == "extrapolated"
+        for preset in MEASURED_S_PER_CHANNEL:
+            assert eis_duration_basis(preset) == "measured"
         assert eis_duration_basis(None) == "extrapolated"
+        assert eis_duration_basis("NoSuchPreset") == "extrapolated"
+
+    def test_a_sweep_off_every_timed_grid_is_extrapolated_and_modelled(self):
+        """The fallback still exists and is still labelled. A custom ``f_lo``
+        matches no anchor, so it must model rather than borrow a neighbour's
+        stopwatch."""
+        from softae.core.preflight import measured_duration_s, model_eis_duration
+
+        custom = EISParams(f_hi=200_000, f_lo_mHz=500, npts=31)
+        assert measured_duration_s(custom) is None
+        assert estimate_eis_duration(custom) == pytest.approx(
+            model_eis_duration(custom))
 
 
 # ── Whole-workflow roll-up ───────────────────────────────────────────────────

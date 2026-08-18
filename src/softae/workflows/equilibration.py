@@ -42,11 +42,11 @@ phase-reliable ceiling below the magnitude ceiling — which is what allowed
 about ``Longest`` survives its premise on cost alone: **~502.9 s/channel modelled
 at 0.2 Hz against ~19.1 s/channel at 7 Hz, a factor of ~26**, buying reach nothing
 on this rig needs. Both figures are ``estimate_eis_duration`` output, and
-``Longest`` has **never been timed here** — ``EIS_MEASURED_S_PER_CHANNEL`` holds
-only ``Standard`` and ``Extended`` — so this is a modelled cost, not a stopwatch
-one. It is large enough that the distinction does not change the verdict: two such
-rounds at the shipped 16 channels would be ~134 min *each*, longer than most whole
-setpoints.
+Both figures are now stopwatch readings rather than modelled ones: the 2026-08-17
+bench session timed all four presets, and ``Longest`` — which had never been timed
+here — came in at 516.44 s/channel against 17.50 s for ``Quick``, a factor of ~30.
+The measurement made the case stronger, not weaker: two such rounds at the shipped
+16 channels would be ~138 min *each*, longer than most whole setpoints.
 
 Dropping the preset to ``Quick`` would have made an "anchor round" byte-identical
 to a series round, so the concept is removed rather than repriced. **Do not
@@ -299,10 +299,20 @@ def model_underestimate_frac() -> float:
     """How far the sweep model may fall *under* a real round, as a fraction of itself.
 
     Read off the model's own calibration rather than chosen.
-    ``estimate_eis_duration`` is fitted to three presets timed on this rig
-    (:data:`~softae.core.preflight.EIS_MEASURED_S_PER_CHANNEL`) and reproduces each
-    within ~8 %; on the one it under-counts — ``Standard``, ~37.7 s/channel modelled
-    against 40.85 s measured — it is 8.2 % low.
+    :func:`~softae.core.preflight.model_eis_duration` is fitted to the four presets
+    timed on this rig (:data:`~softae.core.preflight.EIS_MEASURED_S_PER_CHANNEL`)
+    and reproduces each within ~9 %; on the worst it under-counts — ``Standard``,
+    ~33.8 s/channel modelled against 37.19 s measured — it is ~10 % low.
+
+    Deliberately calls the **model** and not ``estimate_eis_duration``: the latter
+    now returns the measured value whenever one exists, which would make every
+    anchor reproduce itself perfectly and collapse this to zero. A calibration that
+    measures its own short-circuit is worse than no calibration, because it reports
+    confidence rather than absence.
+
+    Only anchors still on their measured grid contribute — a preset edited since it
+    was timed reports no measurement and is skipped, rather than contributing an
+    error term computed against a sweep that no longer exists.
 
     Computed here instead of written down so a re-fit of those constants moves
     everything sized against them. The threshold this replaced was a literal, and
@@ -313,11 +323,18 @@ def model_underestimate_frac() -> float:
     to having no measurement of its error.
     """
     from softae.core.eis_scripts import EISParams
-    from softae.core.preflight import EIS_MEASURED_S_PER_CHANNEL, estimate_eis_duration
+    from softae.core.preflight import (
+        EIS_MEASURED_S_PER_CHANNEL,
+        measured_s_for_preset,
+        model_eis_duration,
+    )
 
     worst = 0.0
-    for preset, measured in EIS_MEASURED_S_PER_CHANNEL.items():
-        modelled = estimate_eis_duration(EISParams.from_preset(preset))
+    for preset in EIS_MEASURED_S_PER_CHANNEL:
+        measured = measured_s_for_preset(preset)
+        if measured is None:
+            continue
+        modelled = model_eis_duration(EISParams.from_preset(preset))
         if modelled > 0:
             worst = max(worst, float(measured) / modelled - 1.0)
     return worst
@@ -393,12 +410,14 @@ def default_round_period_s(preset: str = DEFAULT_EIS_PRESET,
     round at the rig and this returns to the measured branch.
     """
     from softae.core.eis_scripts import EISParams
-    from softae.core.preflight import EIS_MEASURED_S_PER_CHANNEL, estimate_eis_duration
+    from softae.core.preflight import measured_s_for_preset, model_eis_duration
 
     n = max(1, int(n_channels))
-    per_channel = EIS_MEASURED_S_PER_CHANNEL.get(preset)
+    # Grid-checked rather than a bare dict lookup: a preset edited since it was
+    # timed must fall to the modelled branch and carry the model's own margin.
+    per_channel = measured_s_for_preset(preset)
     if per_channel is None:
-        per_channel = (estimate_eis_duration(EISParams.from_preset(preset))
+        per_channel = (model_eis_duration(EISParams.from_preset(preset))
                        * (1.0 + model_underestimate_frac()))
     return math.ceil((float(per_channel) * n + ROUND_BUFFER_S) / 10.0) * 10.0
 

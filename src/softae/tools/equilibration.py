@@ -1197,6 +1197,21 @@ def _print_basis(config: EquilibrationConfig, cost: float, *,
               f"line. The")
         print("     model is not used anywhere above.)")
         return
+
+    # Since 2026-08-17 a preset still on its timed grid resolves through the
+    # anchor table, so the cost above IS a stopwatch reading even though nobody
+    # typed one. Printing "MODELLED" here would understate the number's standing
+    # and push operators toward re-supplying a figure the system already has.
+    from softae.core.preflight import measured_duration_s
+
+    if measured_duration_s(config.eis_params()) is not None:
+        print(f"    (basis: MEASURED {per_channel:.1f}s/channel, timed on this rig "
+              f"for this exact")
+        print("     preset grid. The model is not used anywhere above; edit the "
+              "preset and")
+        print("     this reverts to MODELLED on its own.)")
+        return
+
     frac = model_underestimate_frac()
     print(f"    (basis: MODELLED {per_channel:.1f}s/channel, from a sweep model "
           f"fitted to the")

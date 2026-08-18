@@ -625,7 +625,7 @@ class TestPlan:
         out = capsys.readouterr().out
         assert "UNACHIEVABLE" in out
         assert "CAUTION" not in out
-        assert "Minimum feasible --round-period-s 610" in out
+        assert "Minimum feasible --round-period-s 600" in out
 
     def test_the_default_round_period_contains_a_real_round_at_the_default_channels(
             self, project, capsys):
@@ -750,7 +750,12 @@ class TestPlanningFromAMeasuredCost:
             self, project, capsys):
         # Requirement: never print a modelled number bare, as if it were a
         # prediction. This is the label that stops that.
-        _cmd_plan(_args(*self.OPERATOR))
+        #
+        # Reaching the modelled branch now takes an off-grid sweep. Since the
+        # 2026-08-17 bench run every shipped preset is anchored, so `--f-lo-mHz`
+        # is what leaves the timed grids behind -- which is also the honest
+        # shape of the remaining risk: custom sweeps, not stock ones.
+        _cmd_plan(_args(*self.OPERATOR, "--f-lo-mHz", "700"))
         out = capsys.readouterr().out
 
         assert "basis: MODELLED" in out
@@ -759,13 +764,23 @@ class TestPlanningFromAMeasuredCost:
         # What must survive is the label and the size of the doubt -- a modelled
         # figure is never printed bare, and the note quotes the model's own fitted
         # error rather than leaving the reader to guess at it.
-        # Not "three": the count is no longer written down. `Quick`'s reading was
-        # retired when its floor moved to 7 Hz, and a literal here would have gone
-        # on asserting an anchor that no longer exists.
         assert "fitted to the" in out
         assert "UNDER a real round" in out
-        assert "8%" in out
+        assert "10%" in out
         assert "--measured-per-channel-s 40.7" in out   # the flag that fixes it
+
+    def test_an_anchored_preset_reads_as_measured_with_no_flag_typed(
+            self, project, capsys):
+        """The other half of the 2026-08-17 change, and the reason ``_print_basis``
+        grew a third branch: the cost really did come from a stopwatch, so calling
+        it MODELLED would understate it and push the operator into re-supplying a
+        number the system already holds."""
+        _cmd_plan(_args(*self.OPERATOR))
+        out = capsys.readouterr().out
+
+        assert "basis: MEASURED" in out
+        assert "timed on this rig" in out
+        assert "basis: MODELLED" not in out
 
     def test_a_measured_plan_drops_the_modelled_caveats_rather_than_stacking_them(
             self, project, capsys):
@@ -801,13 +816,22 @@ class TestPlanningFromAMeasuredCost:
         assert modelled_span not in measured
         assert measured_span in measured
 
-    def test_a_nonpositive_measurement_falls_back_to_the_model_rather_than_exiting(
+    def test_a_nonpositive_measurement_falls_back_to_the_systems_own_basis(
             self, project, capsys):
         # The flag is an input to a projection, not a gate: a typo must not stop a
         # read-only command, but it must not be silently believed either.
+        #
+        # "falls back to the model" is now "falls back to whatever the system
+        # would have said unaided", and for an anchored preset that is its own
+        # stopwatch rather than the model. What is pinned is that the typed 0 is
+        # discarded -- which the per-channel figure proves, since believing it
+        # would print 0.0s/channel.
         assert _cmd_plan(_args(*self.OPERATOR, "--measured-per-channel-s", "0")) \
             == EXIT_OK
-        assert "basis: MODELLED" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "basis: MEASURED 37.2s/channel" in out
+        assert "timed on this rig" in out
+        assert "0.0s/channel" not in out
 
 
 def _whole_run_h(out: str) -> float:

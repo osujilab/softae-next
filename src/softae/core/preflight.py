@@ -32,75 +32,123 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
+#: Per-channel sweep cost, timed on the rig. **These are the ground truth**; the
+#: model below exists only for grids that are not in this table.
+#:
+#: Measured 2026-08-17 on channel 1 by ``softae-eis-timing``, one session, all
+#: four presets interleaved. The raw run is committed alongside the other rig
+#: calibration artifacts at ``calibration/eis/timing_20260817.json`` — ``docs/``
+#: is gitignored, so a provenance file there would not have survived. Each preset
+#: was swept twice — a discarded warmup and a timed pass — and the two agreed to
+#: better than 0.2 %, which is what licenses single-pass numbers: the instrument
+#: is executing a fixed script, so replicate scatter is milliseconds, not
+#: seconds. The timed regions accounted for 99.86 % of the session's wall clock,
+#: so there is no meaningful unmeasured cost hiding between sweeps.
+EIS_MEASURED_S_PER_CHANNEL: dict[str, float] = {
+    "Quick": 17.50,
+    "Standard": 37.19,
+    "Extended": 120.42,
+    "Longest": 516.44,
+}
+
+#: The grid each anchor above was timed at. **This is the staleness interlock.**
+#:
+#: An anchor is only meaningful for the sweep it measured, and presets get edited
+#: — the 2026-08-17 mains-notch retune moved all four at once, instantly making
+#: every then-current anchor a stopwatch on a grid that no longer existed. That
+#: failure was survivable only because someone noticed. Keying the anchors to
+#: their grids makes noticing unnecessary: :func:`measured_duration_s` compares
+#: these against the live preset and returns ``None`` on any mismatch, so a
+#: preset edit silently downgrades its own provenance to ``"extrapolated"``
+#: instead of silently keeping a stopwatch's authority.
+#:
+#: ``mv_ac``/``mv_dc`` are deliberately absent: amplitude does not change how long
+#: a sweep takes, and including it would retire good anchors for no reason.
+EIS_ANCHOR_GRIDS: dict[str, dict[str, int]] = {
+    "Quick":    {"npts": 27, "f_hi": 200_000, "f_lo_mHz": 6_475},
+    "Standard": {"npts": 34, "f_hi": 200_000, "f_lo_mHz": 3_912},
+    "Extended": {"npts": 53, "f_hi": 200_000, "f_lo_mHz": 1_351},
+    "Longest":  {"npts": 39, "f_hi": 200_000, "f_lo_mHz": 228},
+}
+
 #: Periods measured per frequency point in an EIS sweep. The low-frequency end
 #: dominates the sweep time; this is the multiplier on 1/f for each point.
 #:
-#: **Measured on this rig, not assumed.** The previous pair (3.0 cycles, 0.05 s)
-#: was a guess and ran ~10x low — ``Standard`` projected 3.9 s/channel against a
-#: bench-measured 40.85 s, which is how a 15 h run came to be planned at 9 h. The
-#: three anchors these constants are fitted to, each a timestamp delta from a
-#: production run and reproducible to ±0.1 s over four months:
+#: Refitted 2026-08-17 against all four measured presets above, replacing the
+#: (33.2, 0.342) pair fitted to three anchors of which one had since been
+#: retired. Against the new measurements that old pair ran +22.8 % on ``Quick``.
 #:
-#: ========  ====  =======  =================
-#: preset    npts  f_lo     measured s/channel
-#: ========  ====  =======  =================
-#: Quick       25  20 Hz    10.47  (RETIRED -- see below)
-#: Standard    35  4 Hz     40.85
-#: Extended    45  1.2 Hz   115.2
-#: ========  ====  =======  =================
+#: **This form cannot fit this rig, and the residual says so.** The best two
+#: constants reproduce the four anchors only to ~9 %, and the pattern is
+#: structured rather than noisy — ``Standard`` under-predicted, ``Extended``
+#: over-predicted, regardless of how the constants are chosen. Adding a third
+#: term (fixed per-sweep overhead) moves the worst case 9.0 % -> 7.9 %, which is
+#: not worth a parameter. Something frequency-dependent that this shape does not
+#: express is going on, and finding it needs sweeps at grids the four presets do
+#: not cover, not more refitting.
 #:
-#: ``Quick``'s row is kept here because it is what the two constants were fitted
-#: to, and refitting them on two points would be a different model. It is **not**
-#: kept in :data:`EIS_MEASURED_S_PER_CHANNEL`: ``[eis_presets.Quick]`` moved to a
-#: 7 Hz floor on 2026-08-14, and 10.47 s timed the 20 Hz sweep.
-#:
-#: ``Longest`` (35 pts, 0.2 Hz) is **not** an anchor — it has never been timed on
-#: this rig. The model predicts ~503 s/channel for it; that is extrapolation and
-#: is labelled as such wherever it surfaces.
-#:
-#: Two constants cannot fit three points exactly. These are the minimax-relative
-#: solution: every anchor is reproduced to within 7.8 %, and no reweighting of the
-#: three does better than 7.7 % with this functional form. The residual is a limit
-#: of the ``max(floor, cycles/f)`` shape, not of the measurements.
-EIS_CYCLES_PER_POINT = 33.2
+#: That ~9 % is tolerable **only because it is now the fallback and not the
+#: answer**: every shipped preset resolves through
+#: :data:`EIS_MEASURED_S_PER_CHANNEL`, and the model governs custom sweeps alone.
+EIS_CYCLES_PER_POINT = 34.5
 #: Floor on per-point time, covering instrument overhead at high frequency. The
-#: knee sits at ``33.2 / 0.342 ≈ 97 Hz``, so the floor — not the sweep — sets the
-#: cost of 24 of ``Standard``'s 35 points. Anything that shortens a sweep by
-#: raising ``f_lo`` therefore saturates quickly.
-EIS_MIN_POINT_S = 0.342
+#: knee moved to ``34.5 / 0.131 ≈ 264 Hz`` in the 2026-08-17 refit, from ~97 Hz.
+#: Treat the pair as fitted parameters rather than as physics: they are the least
+#: bad two numbers for a shape that does not match the instrument.
+EIS_MIN_POINT_S = 0.131
 
-#: The presets whose per-channel cost was actually timed on this rig, and what
-#: they cost. Kept as data so a projection can say which of its numbers rest on a
-#: measurement and which are the model speaking beyond its anchors — ``Longest``
-#: is the live case, and a duration quoted for it with the same confidence as
-#: ``Standard`` is how the 10x error stayed invisible for four months.
-#: ``Quick`` was retired from this table on 2026-08-14, when
-#: ``[eis_presets.Quick]`` moved its floor from 20 Hz to 7 Hz. The 10.47 s/channel
-#: reading is a stopwatch on the *20 Hz* sweep; the 7 Hz one costs a modelled ~2x
-#: and has never been timed here. Leaving the entry would have made
-#: :func:`eis_duration_basis` answer ``"measured"`` for a sweep that does not
-#: exist, and every projection would have quoted half a night with a stopwatch's
-#: authority — the exact class of silently-wrong number this table was built to
-#: expose. **Restore it from a real run**: time one all-channel round at 7 Hz and
-#: put the per-channel figure back.
-EIS_MEASURED_S_PER_CHANNEL: dict[str, float] = {
-    "Standard": 40.85,
-    "Extended": 115.2,
-}
+
+def _grid_key(eis_params: Any) -> tuple[int, int, int] | None:
+    """``(npts, f_hi, f_lo_mHz)`` for *eis_params*, or ``None`` if unreadable."""
+    try:
+        return (
+            int(getattr(eis_params, "npts")),
+            int(getattr(eis_params, "f_hi")),
+            int(getattr(eis_params, "f_lo_mHz")),
+        )
+    except Exception:
+        return None
+
+
+def measured_duration_s(eis_params: Any) -> float | None:
+    """The timed cost for this exact grid, or ``None`` if nothing measured it.
+
+    Matches on the grid rather than the preset name, so an overridden ``f_lo``
+    or a hand-built sweep correctly finds no anchor even when it started life as
+    a named preset. This is the check that keeps a stale stopwatch from being
+    quoted at a sweep it never timed.
+    """
+    key = _grid_key(eis_params)
+    if key is None:
+        return None
+    for name, grid in EIS_ANCHOR_GRIDS.items():
+        if (grid["npts"], grid["f_hi"], grid["f_lo_mHz"]) == key:
+            return EIS_MEASURED_S_PER_CHANNEL.get(name)
+    return None
+
+
+def measured_s_for_preset(preset: str | None) -> float | None:
+    """Timed cost for *preset* as it is configured **right now**, else ``None``.
+
+    Resolves the preset through config first, so a preset whose grid has been
+    edited since it was timed reports no measurement rather than its old one.
+    """
+    if not preset:
+        return None
+    from softae.core.eis_scripts import EISParams
+
+    return measured_duration_s(EISParams.from_preset(preset))
 
 
 def eis_duration_basis(preset: str | None) -> str:
-    """``"measured"`` for a timed preset, ``"extrapolated"`` for anything else.
+    """``"measured"`` for a preset still on its timed grid, else ``"extrapolated"``.
 
-    A one-word provenance tag, not a confidence score: the model reproduces its
-    three anchors to 7.8 %, and says nothing at all about how it behaves outside
-    them. ``Longest`` reaches 0.2 Hz, a factor of six below the lowest anchor.
-
-    ``Quick`` answers ``"extrapolated"`` since its floor moved to 7 Hz — the
-    default preset is now on the model's word, which is the honest state and not
-    a defect to be tuned away. Re-time it and the answer changes back.
+    A one-word provenance tag, not a confidence score. It answers ``"measured"``
+    only while the preset's live grid matches the one in
+    :data:`EIS_ANCHOR_GRIDS` — edit the preset and this reverts on its own,
+    which is the whole point of keying anchors to grids.
     """
-    return "measured" if preset in EIS_MEASURED_S_PER_CHANNEL else "extrapolated"
+    return "measured" if measured_s_for_preset(preset) is not None else "extrapolated"
 
 
 @dataclass
@@ -144,17 +192,41 @@ def _extrusion_s(vols, rates) -> float:
 
 
 def estimate_eis_duration(eis_params: Any = None) -> float:
-    """Estimated sweep time from the EIS parameters, in seconds per channel.
+    """Best available sweep time for these parameters, in seconds per channel.
+
+    **Prefers measurement over model.** If the grid matches one this rig has
+    actually timed, that stopwatch reading is returned unmodified; the model is
+    only consulted for grids nothing has measured. Before 2026-08-17 this always
+    modelled, which meant projections carried a 22.8 % error on ``Quick`` while
+    the true number sat unused two constants away.
+
+    Use :func:`model_eis_duration` when you specifically need the model's own
+    answer — calibrating the model against its anchors, for instance, which this
+    function would otherwise short-circuit into a tautology.
+    """
+    if eis_params is None:
+        from softae.core.eis_scripts import EISParams
+
+        eis_params = EISParams()
+
+    measured = measured_duration_s(eis_params)
+    if measured is not None:
+        return float(measured)
+    return model_eis_duration(eis_params)
+
+
+def model_eis_duration(eis_params: Any = None) -> float:
+    """Modelled sweep time, in seconds per channel — the model's own answer.
 
     The low-frequency end dominates: a point at 0.2 Hz costs ~165 s while one at
     100 kHz is instrument-limited. Points are assumed log-spaced between
     ``f_hi`` and ``f_lo``, each costing ``EIS_CYCLES_PER_POINT`` periods or
     ``EIS_MIN_POINT_S``, whichever is longer.
 
-    Calibrated against three measured presets (see :data:`EIS_CYCLES_PER_POINT`)
-    and reproducing all three within 7.8 %. Any *other* preset — ``Longest``
-    included — is an extrapolation from those three, and callers that surface a
-    projection for one should say so.
+    Reproduces the four measured presets to ~9 % — see
+    :data:`EIS_CYCLES_PER_POINT` for why that is a property of the functional
+    form and not of the constants. Callers surfacing this for a grid with no
+    anchor should say the number is modelled.
     """
     if eis_params is None:
         from softae.core.eis_scripts import EISParams

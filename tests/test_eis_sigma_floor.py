@@ -120,44 +120,56 @@ class TestSigmaFloor:
 # ── The preset carries the floor; the flag only deviates from it ─────────────
 
 class TestPresetFloor:
-    def test_the_quick_preset_sweeps_to_seven_hz(self):
+    def test_the_quick_preset_sweeps_to_six_point_five_hz(self):
         """The operator decision of 2026-08-14: the measured floor is the DEFAULT,
         not an opt-in. ``Quick`` is ``DEFAULT_PRESET`` and what the equilibration
-        runs take, so this is the reach the system has unless told otherwise."""
-        assert loader.eis_presets()["Quick"]["f_lo_mHz"] == 7_000
-        assert EISParams.from_preset("Quick").f_lo_mHz == 7_000
+        runs take, so this is the reach the system has unless told otherwise.
 
-    def test_the_default_presets_reach_is_two_e_minus_seven(self):
+        The 2026-08-17 mains-notch retune moved it 7.000 -> 6.475 Hz to clear the
+        60 Hz comb; the floor went DOWN, so the reach argument is unweakened.
+        """
+        assert loader.eis_presets()["Quick"]["f_lo_mHz"] == 6_475
+        assert EISParams.from_preset("Quick").f_lo_mHz == 6_475
+
+    def test_the_default_presets_reach_is_one_point_eight_e_minus_seven(self):
         """The preset and the reach are one statement, checked end to end rather
         than as two constants that could drift apart."""
         f_lo_hz = EISParams.from_preset(DEFAULT_EIS_PRESET).f_lo_mHz / 1000.0
-        assert sigma_floor_S_per_cm(f_lo_hz, *BOARD) == pytest.approx(2.0e-7,
+        assert sigma_floor_S_per_cm(f_lo_hz, *BOARD) == pytest.approx(1.83e-7,
                                                                      rel=0.05)
 
-    def test_the_other_presets_floors_are_untouched(self):
-        """Only ``Quick`` moved. ``Standard`` and ``Extended`` are still the sweeps
-        their stopwatch anchors were read from."""
-        assert EISParams.from_preset("Standard").f_lo_mHz == 4_000
-        assert EISParams.from_preset("Extended").f_lo_mHz == 1_200
+    def test_every_preset_floor_moved_off_the_mains_comb(self):
+        """The 2026-08-17 retune moved all four, not just ``Quick``.
+
+        ``Standard`` and ``Extended`` are consequently NO LONGER the sweeps their
+        stopwatch anchors were read from -- see
+        ``preflight.EIS_MEASURED_S_PER_CHANNEL``, which was emptied for exactly
+        this reason.
+        """
+        assert EISParams.from_preset("Standard").f_lo_mHz == 3_912
+        assert EISParams.from_preset("Extended").f_lo_mHz == 1_351
+        assert EISParams.from_preset("Longest").f_lo_mHz == 228
 
     def test_quicks_other_parameters_did_not_move_with_the_floor(self):
+        """``npts`` is the retune's second knob, so it moved WITH the floor; f_hi
+        and the amplitude did not."""
         params = EISParams.from_preset("Quick")
-        assert (params.npts, params.f_hi, params.mv_ac) == (25, 200_000, 10)
+        assert (params.npts, params.f_hi, params.mv_ac) == (27, 200_000, 10)
 
 
 class TestFloorFlag:
     def test_the_flag_defaults_to_none_and_passes_no_override(self):
         """Default ``None``, deliberately not 7000.
 
-        With ``Quick`` already at 7 Hz, a numeric default would make every ordinary
-        run look like an override and trip the EXTRAPOLATED-because-overridden
-        branch for a reason that is not true.
+        With ``Quick`` already at 6.475 Hz, a numeric default would make every
+        ordinary run look like an override and trip the
+        EXTRAPOLATED-because-overridden branch for a reason that is not true.
         """
         assert _args("plan").f_lo_mHz is None
         assert build_config(_args("plan")).eis_f_lo_mHz is None
 
     def test_an_ordinary_run_resolves_its_floor_from_the_preset(self):
-        assert build_config(_args("plan")).eis_params().f_lo_mHz == 7_000
+        assert build_config(_args("plan")).eis_params().f_lo_mHz == 6_475
 
     def test_a_supplied_floor_reaches_the_sweep_parameters_as_an_override(self):
         """A flag that does not reach ``EISParams`` is a flag that does nothing.
@@ -192,7 +204,8 @@ class TestPlanReach:
         assert _cmd_plan(_args("plan", "--channels", "1-12",
                                *GEOMETRY_FLAGS)) == 0
         out = capsys.readouterr().out
-        assert "sigma reach:  f_lo 7 Hz -> arcs close for sigma >~ 2.0e-07 S/cm" in out
+        assert ("sigma reach:  f_lo 6.475 Hz -> arcs close for sigma >~ 1.8e-07 S/cm"
+                in out)
         assert "at L=0.2 t=0.02 w=0.2 cm" in out
 
     def test_without_geometry_the_header_says_unavailable_rather_than_a_number(
@@ -219,40 +232,63 @@ class TestPlanReach:
 
 # ── The anchor that had to go with the floor ─────────────────────────────────
 
-class TestRetiredAnchor:
-    def test_quick_has_no_stopwatch_anchor_and_reports_extrapolated(self):
-        """Both halves pinned together, on purpose.
+class TestAnchorGridInterlock:
+    """Anchors are keyed to the grid they were timed at, so a preset edit retires
+    its own stopwatch. This class replaces the hand-maintained retirement that
+    the 2026-08-17 retune defeated by moving all four presets at once."""
 
-        ``EIS_MEASURED_S_PER_CHANNEL['Quick'] = 10.47`` timed the *20 Hz* sweep.
-        Restoring that entry without re-timing the 7 Hz one would make
-        ``eis_duration_basis`` answer "measured" for a sweep costing roughly twice
-        as much — a whole night mis-projected with a stopwatch's authority. Pinning
-        only one half would let the other be edited back in isolation.
-        """
-        assert "Quick" not in EIS_MEASURED_S_PER_CHANNEL
-        assert eis_duration_basis("Quick") == "extrapolated"
+    def test_every_shipped_preset_is_timed_on_its_current_grid(self):
+        """The 2026-08-17 bench session closed the gap ``Quick`` had carried since
+        2026-08-14 and gave ``Longest`` its first stopwatch ever."""
+        for preset in ("Quick", "Standard", "Extended", "Longest"):
+            assert preset in EIS_MEASURED_S_PER_CHANNEL
+            assert eis_duration_basis(preset) == "measured"
 
-    def test_the_still_valid_anchors_survived(self):
-        """``Standard`` and ``Extended`` were not touched: their floors did not
-        move, so their stopwatch readings still describe the sweeps they timed."""
-        assert EIS_MEASURED_S_PER_CHANNEL["Standard"] == pytest.approx(40.85)
-        assert EIS_MEASURED_S_PER_CHANNEL["Extended"] == pytest.approx(115.2)
-        assert eis_duration_basis("Standard") == "measured"
-        assert eis_duration_basis("Extended") == "measured"
+    def test_the_anchors_are_the_numbers_the_bench_returned(self):
+        assert EIS_MEASURED_S_PER_CHANNEL["Quick"] == pytest.approx(17.50)
+        assert EIS_MEASURED_S_PER_CHANNEL["Standard"] == pytest.approx(37.19)
+        assert EIS_MEASURED_S_PER_CHANNEL["Extended"] == pytest.approx(120.42)
+        assert EIS_MEASURED_S_PER_CHANNEL["Longest"] == pytest.approx(516.44)
 
-    def test_the_default_plan_says_its_duration_is_extrapolated(
+    def test_every_anchor_records_the_grid_it_was_timed_at(self):
+        """An anchor without its grid is unfalsifiable — it cannot be checked
+        against the preset it claims to describe."""
+        from softae.core.preflight import EIS_ANCHOR_GRIDS
+
+        assert set(EIS_ANCHOR_GRIDS) == set(EIS_MEASURED_S_PER_CHANNEL)
+        for preset, grid in EIS_ANCHOR_GRIDS.items():
+            live = EISParams.from_preset(preset)
+            assert (grid["npts"], grid["f_hi"], grid["f_lo_mHz"]) == (
+                live.npts, live.f_hi, live.f_lo_mHz), preset
+
+    def test_moving_a_preset_off_its_timed_grid_retires_its_anchor(self, monkeypatch):
+        """The interlock itself, and the reason this file no longer needs a
+        hand-maintained retirement list. Editing the preset is enough."""
+        import softae.core.preflight as preflight
+
+        stale = dict(preflight.EIS_ANCHOR_GRIDS)
+        stale["Standard"] = {**stale["Standard"], "npts": 999}
+        monkeypatch.setattr(preflight, "EIS_ANCHOR_GRIDS", stale)
+
+        assert preflight.measured_s_for_preset("Standard") is None
+        assert preflight.eis_duration_basis("Standard") == "extrapolated"
+        # Untouched presets are unaffected — retirement is per-anchor.
+        assert preflight.eis_duration_basis("Quick") == "measured"
+
+    def test_amplitude_is_not_part_of_the_grid_key(self):
+        """mv_ac does not change how long a sweep takes; keying on it would retire
+        good anchors for a change that costs nothing."""
+        from softae.core.preflight import measured_duration_s
+
+        loud = EISParams.from_preset("Standard", mv_ac=25)
+        assert measured_duration_s(loud) == pytest.approx(37.19)
+
+    def test_the_default_plan_no_longer_warns_that_it_is_extrapolated(
             self, project, capsys):
-        """Pinned so nobody "fixes" the notice away.
-
-        It is not noise: it is the difference between a night budgeted from a
-        stopwatch and one budgeted from a model asked about a sweep below its
-        lowest anchor. The equilibration plan does not pass through
-        ``project_campaign``, so it has to say this itself.
-        """
+        """The converse of the notice this class used to pin. ``Quick`` is timed
+        on its current grid, so the default plan is budgeted from a stopwatch."""
         assert _cmd_plan(_args("plan", "--channels", "1-12")) == 0
-        out = capsys.readouterr().out
-        assert "! EXTRAPOLATED" in out
-        assert "has never been timed on this rig" in out
+        assert "EXTRAPOLATED" not in capsys.readouterr().out
 
     def test_a_timed_preset_at_its_own_floor_carries_no_such_notice(
             self, project, capsys):
@@ -289,11 +325,20 @@ class TestCampaignProjectionWarning:
             budget=20,
             measurement=MeasurementSpec(modality="eis", **measurement))
 
-    def test_the_default_preset_now_projects_as_extrapolated(self, catalog):
-        """No override needed any more: ``Quick`` lost its anchor with its floor,
-        so the campaign path reaches the same warning by the honest route."""
+    def test_the_default_preset_projects_from_its_stopwatch_again(self, catalog):
+        """``Quick`` regained an anchor on 2026-08-17, so the campaign path is back
+        to a measured basis. The warning must follow the evidence in both
+        directions or it is decoration."""
         warnings = project_campaign(self._spec(preset="Quick"),
                                     catalog=catalog).warnings
+        assert not any("EXTRAPOLATED" in w for w in warnings), warnings
+
+    def test_an_overridden_floor_still_projects_as_extrapolated(self, catalog):
+        """The warning still has a live route: an override leaves every timed
+        grid behind, so nothing has measured what it is about to run."""
+        warnings = project_campaign(
+            self._spec(preset="Quick", overrides={"f_lo_mHz": 900}),
+            catalog=catalog).warnings
         assert any("EXTRAPOLATED" in w for w in warnings), warnings
 
     def test_a_timed_preset_keeps_its_measured_basis(self, catalog):
