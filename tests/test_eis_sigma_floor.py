@@ -9,13 +9,16 @@ systematic bias, not scatter, and therefore not something an error bar can absor
 
 The apex is predictable — ``f_peak = 1/(2*pi*R*C_cell)``, and C_cell is a property
 of the **board** (0.09 nF median while R moved 109×) — so a frequency floor is a
-conductivity floor and can be computed rather than tuned. ``Quick`` now sweeps to
-7 Hz for that reason.
+conductivity floor and can be computed rather than tuned. ``Quick`` sweeps to
+6.475 Hz for that reason — 7 Hz on that argument, then nudged by the 2026-08-17
+mains-notch retune to clear the 60 Hz comb.
 
 These tests pin the computation, the plan line that states its reach, and the
-thing most likely to be quietly undone: ``Quick``'s stopwatch anchor timed the
-*20 Hz* sweep and had to be retired with the floor. Restoring it without re-timing
-would put the word MEASURED back on a projection of half a night.
+thing most likely to be quietly undone: the tie between a preset's grid and the
+stopwatch that timed it. That tie was hand-maintained until 2026-08-17, when a
+retune moved all four presets at once and invalidated every anchor in a single
+edit; it is now enforced by ``preflight.EIS_ANCHOR_GRIDS``, and
+:class:`TestAnchorGridInterlock` is what holds the enforcement in place.
 """
 
 from __future__ import annotations
@@ -141,18 +144,22 @@ class TestPresetFloor:
     def test_every_preset_floor_moved_off_the_mains_comb(self):
         """The 2026-08-17 retune moved all four, not just ``Quick``.
 
-        ``Standard`` and ``Extended`` are consequently NO LONGER the sweeps their
-        stopwatch anchors were read from -- see
-        ``preflight.EIS_MEASURED_S_PER_CHANNEL``, which was emptied for exactly
-        this reason.
+        That briefly left every stopwatch anchor describing a grid that no longer
+        existed. The bench run later the same day re-timed all four, so
+        ``preflight.EIS_MEASURED_S_PER_CHANNEL`` is fully populated again --
+        against *these* floors, which is what
+        :class:`TestAnchorGridInterlock` checks.
         """
         assert EISParams.from_preset("Standard").f_lo_mHz == 3_912
         assert EISParams.from_preset("Extended").f_lo_mHz == 1_351
         assert EISParams.from_preset("Longest").f_lo_mHz == 228
 
-    def test_quicks_other_parameters_did_not_move_with_the_floor(self):
-        """``npts`` is the retune's second knob, so it moved WITH the floor; f_hi
-        and the amplitude did not."""
+    def test_only_npts_moved_with_quicks_floor(self):
+        """``npts`` is the retune's second knob, so it moved WITH the floor (25 ->
+        27); ``f_hi`` and the amplitude did not.
+
+        Renamed 2026-08-17: the old name said the *other* parameters did not move,
+        which stopped being true the moment ``npts`` became a retune knob."""
         params = EISParams.from_preset("Quick")
         assert (params.npts, params.f_hi, params.mv_ac) == (27, 200_000, 10)
 

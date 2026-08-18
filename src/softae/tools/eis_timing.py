@@ -304,6 +304,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    from softae.tools import use_utf8_console
+
+    use_utf8_console()
     args = build_parser().parse_args(argv)
 
     if args.repeats < 1:
