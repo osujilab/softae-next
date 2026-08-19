@@ -19,6 +19,9 @@ import pytest
 from softae.core.reservoir import ReservoirLedger
 from softae.core.safe_park import (
     DEFAULT_SAFE_TEMP_C,
+    HEADLINE_COMMANDED,
+    HEADLINE_NOTHING,
+    HEADLINE_PARTIAL,
     SafeParkResult,
     safe_park,
     safe_park_async,
@@ -271,6 +274,97 @@ class TestResultVocabulary:
     def test_the_result_is_constructible_by_keyword(self):
         """The headless shutdown path builds one directly on a raised park."""
         assert SafeParkResult(errors=["safe_park raised: x"]).ok is False
+
+
+# ── Did the park reach the rig at all? ───────────────────────────────────────
+
+class TestCommandedAnything:
+    """The question ``ok`` was being asked and cannot answer.
+
+    ``ok`` is a statement about exceptions and stays one (see
+    ``test_ok_still_means_nothing_raised``, which is the pin these tests sit
+    beside rather than replace). ``commanded_anything`` is the statement about
+    whether anything was actually sent.
+    """
+
+    def test_result_with_no_instruments_commanded_anything_false(self):
+        assert SafeParkResult(skipped=["lamp: not connected"]).commanded_anything \
+            is False
+
+    def test_result_with_a_commanded_write_commanded_anything_true(self):
+        assert SafeParkResult(commanded=["lamp off"]).commanded_anything is True
+
+    def test_result_with_only_a_verified_axis_commanded_anything_true(self):
+        """Empty on this rig today; if an axis ever graduates to read-back, a
+        park that verified something certainly commanded something."""
+        assert SafeParkResult(verified=["temperature at setpoint"]) \
+            .commanded_anything is True
+
+    def test_result_unverifiable_head_alone_commanded_anything_false(self):
+        """The head note is on *every* result, including the empty park. If it
+        counted, no park could ever report that it commanded nothing."""
+        assert SafeParkResult(unverifiable=["head"]).commanded_anything is False
+
+    def test_park_of_absent_manager_commanded_anything_false(self):
+        """The live defect, end to end: nothing raised, nothing sent."""
+        mgr = MagicMock()
+        mgr.get.side_effect = KeyError("nope")
+
+        result = safe_park(mgr)
+
+        assert result.ok is True                    # unchanged, and correct
+        assert result.commanded_anything is False
+
+    def test_park_of_disconnected_manager_commanded_anything_false(self):
+        mgr = _manager()
+        for inst in mgr._insts.values():
+            inst.is_connected = False
+
+        result = safe_park(mgr)
+
+        assert result.ok is True
+        assert result.commanded_anything is False
+        assert len(result.skipped) == 3
+
+    def test_park_of_connected_manager_commanded_anything_true(self):
+        assert safe_park(_manager()).commanded_anything is True
+
+    def test_park_with_one_connected_instrument_commanded_anything_true(self):
+        """A partial rig still reached something — this is not the empty case."""
+        mgr = _manager()
+        mgr._insts["syringe"].is_connected = False
+        mgr._insts["temp_controller"].is_connected = False
+
+        assert safe_park(mgr).commanded_anything is True
+
+
+class TestHeadline:
+    """One place decides the three-way, so no two dialogs can disagree."""
+
+    def test_headline_commanded_is_the_reassuring_sentence_and_not_severe(self):
+        assert safe_park(_manager()).headline() == (HEADLINE_COMMANDED, False)
+
+    def test_headline_with_errors_is_partial_and_severe(self):
+        result = SafeParkResult(commanded=["lamp off"], errors=["pump 0: dead"])
+        assert result.headline() == (HEADLINE_PARTIAL, True)
+
+    def test_headline_with_nothing_commanded_is_the_nothing_sentence_and_severe(self):
+        mgr = MagicMock()
+        mgr.get.side_effect = KeyError("nope")
+        assert safe_park(mgr).headline() == (HEADLINE_NOTHING, True)
+
+    def test_headline_with_errors_and_nothing_commanded_prefers_partial(self):
+        """A rig that answered and refused *was* connected, so the "no
+        instrument was connected" sentence would be a second false statement
+        replacing the first."""
+        result = SafeParkResult(errors=["pumps: driver exposes no halt_pump()"])
+        assert result.commanded_anything is False
+        assert result.headline() == (HEADLINE_PARTIAL, True)
+
+    def test_headline_nothing_sentence_names_this_process(self):
+        """It must not read as a claim about the rig — the instruments may be
+        perfectly alive and owned by someone else."""
+        assert "this process" in HEADLINE_NOTHING
 
 
 class TestTheAntiClogConsequence:

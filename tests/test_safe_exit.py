@@ -266,27 +266,66 @@ class TestTheButton:
 
         assert len(parked) == 1
 
-    def test_a_partial_park_does_not_exit_without_confirmation(self, qtbot,
-                                                               monkeypatch):
-        """Closing the window removes the operator's easiest way to see what failed."""
+    def _park_returning(self, qtbot, monkeypatch, result):
+        """A Safe Exit whose park yields *result*; returns (button, exited, warned)."""
         from softae.gui.widgets import safe_exit as mod
-        from softae.core.safe_park import SafeParkResult
         from PySide6.QtWidgets import QMessageBox
 
-        monkeypatch.setattr(
-            "softae.core.safe_park.safe_park",
-            lambda *a, **k: SafeParkResult(errors=["lamp: no reply"]))
+        monkeypatch.setattr("softae.core.safe_park.safe_park",
+                            lambda *a, **k: result)
+        warned: list[str] = []
         monkeypatch.setattr(
             QMessageBox, "warning",
-            staticmethod(lambda *a, **k: QMessageBox.StandardButton.Cancel))
+            staticmethod(lambda *a, **k: warned.append(a[2])
+                         or QMessageBox.StandardButton.Cancel))
 
         btn = mod.SafeExitButton(_Manager(_Syringe(up=True)))
         qtbot.addWidget(btn)
-
-        exited = []
+        exited: list[bool] = []
         btn.exit_requested.connect(lambda: exited.append(True))
         btn.click()
         qtbot.wait(200)
+        return btn, exited, warned
+
+    def test_a_partial_park_does_not_exit_without_confirmation(self, qtbot,
+                                                               monkeypatch):
+        """Closing the window removes the operator's easiest way to see what failed."""
+        from softae.core.safe_park import HEADLINE_PARTIAL, SafeParkResult
+
+        btn, exited, warned = self._park_returning(
+            qtbot, monkeypatch, SafeParkResult(errors=["lamp: no reply"]))
 
         assert exited == []
         assert btn.isEnabled()
+        assert warned and HEADLINE_PARTIAL in warned[0]
+
+    def test_a_park_that_commanded_nothing_does_not_exit_without_confirmation(
+        self, qtbot, monkeypatch
+    ):
+        """The exit path's version of the E-Stop's misreport, and the quieter one.
+
+        Safe Exit never claimed success in words — it signalled it by *closing
+        the window*. So a park that reached no instrument at all looked exactly
+        like one that reached every instrument, and the worker discarded the
+        evidence anyway by emitting only ``result.errors``.
+        """
+        from softae.core.safe_park import HEADLINE_NOTHING, SafeParkResult
+
+        btn, exited, warned = self._park_returning(
+            qtbot, monkeypatch, SafeParkResult(skipped=["lamp: not connected"]))
+
+        assert exited == []
+        assert btn.isEnabled()
+        assert warned and HEADLINE_NOTHING in warned[0]
+
+    def test_a_park_that_commanded_something_exits_without_a_dialog(
+        self, qtbot, monkeypatch
+    ):
+        """The inverse, so the change cannot be written as "always confirm"."""
+        from softae.core.safe_park import SafeParkResult
+
+        _btn, exited, warned = self._park_returning(
+            qtbot, monkeypatch, SafeParkResult(commanded=["lamp off"]))
+
+        assert exited == [True]
+        assert warned == []
