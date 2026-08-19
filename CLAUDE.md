@@ -135,6 +135,19 @@ edit cannot reach. Three tiers, each with its own owner and its own gate:
   the next edit; a green tier-3 run is what licenses a commit. Tier 3 is the tier that actually
   catches cross-cutting regressions, so it is never traded away before a commit — it is backgrounded
   so it does not block.
+- **Test time is a budgeted resource, and the budget is planned before the work starts.** Tier 3 now
+  costs ~28 min. On a multi-step arc, one tier-3 run per step is the default that quietly turns a
+  day of work into three: eleven steps is over five hours of gating, most of it re-proving the same
+  untouched subsystems. **Batch tier 3 to the wave boundary, not the step boundary** — steps whose
+  files do not collide are developed in parallel, each gated by tier 1 and tier 2, and one tier-3 run
+  licenses the whole wave's commits. This is a scheduling decision made when the arc is sequenced,
+  and the sequencing plan states explicitly where the tier-3 runs fall.
+- **Parallelism comes from file disjointness, not from dependency order.** Before fanning out, map
+  which files each step touches and cluster the collisions; steps in one cluster serialize, clusters
+  run concurrently. A lettered dependency list routinely hides five independent roots.
+- **This economy is every agent's concern, not only the orchestrator's.** A subagent that finds
+  itself about to run the full suite to validate a two-file edit runs the neighbourhood instead and
+  says what it ran. Spending an agent — or a suite run — must be worth more than what it costs.
 - **A slow test file is a defect to investigate, not merely a label.** When a file becomes the
   bottleneck of a tier, it is diagnosed rather than annotated: a single test costing 77+ s is usually
   reporting something real about the code under test, not about the test.
