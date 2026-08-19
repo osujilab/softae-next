@@ -35,6 +35,20 @@ logger = structlog.get_logger(__name__)
 #: pass ``gate_timeout_s=None`` to opt back into waiting forever.
 DEFAULT_GATE_TIMEOUT_S = 3600.0
 
+#: Outcomes of a campaign control request (:meth:`AutonomousLoop.pause`,
+#: :meth:`~AutonomousLoop.resume`, :meth:`~AutonomousLoop.abort`).
+#:
+#: Every request returns one of these and **none of them is a silent no-op**: a
+#: control an operator pressed and heard nothing back from is worse than no
+#: control, so "I did nothing" still has to say which nothing.
+CONTROL_APPLIED = "applied"
+CONTROL_ALREADY_PAUSED = "already_paused"
+CONTROL_NOT_PAUSED = "not_paused"
+#: The run has already ended (converged, stopped, errored, or previously
+#: aborted). Deliberately **not** a park: a converged run must not have its
+#: setpoint dropped by a control request that arrived after it finished.
+CONTROL_ENDED = "ended"
+
 
 # ---------------------------------------------------------------------------
 # Loop state machine
@@ -269,6 +283,32 @@ class AutonomousLoop:
         self._iteration = 0
         self._approval_event = asyncio.Event()
 
+        # --- Campaign controls (stage 4) ------------------------------------
+        # The trial currently in flight, so a control request has something to
+        # reach. It was a local in `_run_workflow` and dropped on return, which
+        # meant that even in-process there was nothing to pause or abort: the
+        # loop could decline the *next* trial and nothing else.
+        self._executor: Any | None = None
+        # Pause is deliberately **not** a `LoopState`. The three terminal states
+        # are decisions the run has already taken and `_set_state` latches them;
+        # a pause is by definition leaveable, so encoding it as a state would
+        # either need a hole in that latch or would overwrite `EXECUTING` with
+        # something the trial then has to restore. It is an orthogonal axis.
+        self._pause_requested = False
+        self._paused = False
+        self._resume_event = asyncio.Event()
+        self._resume_event.set()
+        self._abort_requested = False
+        self._abort_reason: str | None = None
+        # True only between entering and leaving `run()`. An Abort that arrives
+        # outside that window has nothing to stop and must not park — see
+        # :meth:`abort`.
+        self._running = False
+        # Fired as `(phase, detail)` with *phase* one of "requested",
+        # "holding", "deferred", "resumed" — so an operator learns not only that
+        # a Pause was heard but *where* it came to rest.
+        self.on_pause_change: Callable[[str, str], Any] | None = None
+
         # --- Callbacks ---
         self.on_state_change: Callable[[LoopState, LoopState], Any] | None = None
         self.on_suggestion: Callable[[int, dict[str, Any]], Any] | None = None
@@ -431,6 +471,298 @@ class AutonomousLoop:
         """
         self._set_state(LoopState.STOPPED)
 
+    # ── Campaign controls: Pause / Resume / Abort (stage 4) ─────────────
+    #
+    # Three scopes exist and only two of them are here. **E-Stop is rig-scale
+    # and is not a campaign control** — it lives on the main toolbar and stops
+    # everything. Abort and Pause are campaign-scoped, and the distinction
+    # between them is the whole design:
+    #
+    #   Pause  — *"stop issuing new steps, then hold in a safe state"*.
+    #            Resumable, keeps the anneal, touches **no** setpoint, no lamp,
+    #            no head, and never reaches `safe_park` or `_stop_wait`.
+    #            Step-granularity latency is the specification, not a shortfall.
+    #   Abort  — terminal for this campaign, **and it parks**. It is the one
+    #            that may cut into an eight-hour hold.
+    #
+    # They are separate methods rather than one `halt(kind)` because the two
+    # differ in every axis that matters — retract policy, checkpoint policy,
+    # whether the rig is made safe — and a single entry point would have to
+    # infer those from an argument. `halt_and_park_scope.md` records the same
+    # conclusion for the four stop events that already existed.
+
+    @property
+    def is_paused(self) -> bool:
+        """Whether a pause has been *requested*. Not the same as *held*."""
+        return self._pause_requested
+
+    def pause(self, reason: str = "") -> str:
+        """Stop issuing new steps and hold at the next safe interruption.
+
+        Returns one of the ``CONTROL_*`` outcomes; never raises.
+
+        **What this does not do.** It does not call ``safe_park``, does not
+        write a setpoint, does not touch the lamp and does not move the head.
+        ``safe_park`` drops the setpoint to ``DEFAULT_SAFE_TEMP_C = 10.0`` and
+        turns the lamp off — routing a Pause through it would destroy the anneal
+        the Pause exists to preserve. It does not set the temperature
+        controller's ``_stop_wait`` either, for the same reason: that flag ends
+        a hold, and Pause exists to keep one.
+
+        **Where the hold lands.** Not here. This records the request; the hold
+        is taken at the first step boundary whose rig pose
+        (:func:`~softae.core.rig_pose.safe_to_interrupt`) a purge would also
+        accept, and failing that at the top of the next cycle — which always
+        qualifies, because a trial's teardown has run by then. So a Pause during
+        an eight-hour anneal takes effect when the anneal ends. That is the
+        specified behaviour: an operator who wants a long hold cut short wants
+        Abort.
+
+        Unbounded on purpose. Every other wait in this loop has a ceiling
+        because "nobody answered" is indistinguishable from "still working"; a
+        pause is an explicit operator act, and auto-resuming a rig somebody
+        deliberately stopped would be the worse failure. The heartbeat keeps
+        ticking throughout, so a paused campaign never looks wedged.
+        """
+        if self._abort_requested or self._state in TERMINAL_STATES:
+            return CONTROL_ENDED
+        if self._pause_requested:
+            return CONTROL_ALREADY_PAUSED
+        self._pause_requested = True
+        self._paused = False
+        self._resume_event.clear()
+        logger.warning("loop_pause_requested", iteration=self._iteration,
+                       reason=reason or "operator request")
+        self._notify_pause("requested", reason or "operator request")
+        return CONTROL_APPLIED
+
+    def resume(self) -> str:
+        """Leave a pause. The exact inverse of :meth:`pause`.
+
+        Nothing is re-driven and nothing is re-initialised: the trial resumes at
+        the step it was holding before, or the loop proceeds to the next cycle.
+        The iteration counter and the checkpoint are untouched by the round
+        trip, which is what makes "resume" mean *continue* rather than *restart*.
+        """
+        if not self._pause_requested:
+            return CONTROL_NOT_PAUSED
+        self._pause_requested = False
+        self._paused = False
+        self._resume_event.set()
+        executor = self._executor
+        if executor is not None:
+            try:
+                executor.resume()
+            except Exception:
+                logger.warning("executor_resume_failed", exc_info=True)
+        logger.warning("loop_resumed", iteration=self._iteration)
+        self._notify_pause("resumed", "operator request")
+        return CONTROL_APPLIED
+
+    def abort(self, reason: str = "operator abort") -> str:
+        """End this campaign and park the rig. Terminal, and it cuts in.
+
+        Three stages, in this order, none of which blocks:
+
+        1. ``executor.abort()`` — the next step is refused;
+        2. every instrument's ``_stop_wait`` is set — a watched hold returns
+           within one poll instead of at the end of eight hours;
+        3. every gate is released — an abort issued while paused, or while
+           waiting on approval, must not wait for the thing it is ending.
+
+        **The park is deliberately not stage 4 of this method.** It happens on
+        the loop's own thread of control, in :meth:`run`, once the trial has
+        actually stopped — see the park site there for why parking a rig whose
+        current step is still mid-flight is not the same as parking a stopped
+        one.
+
+        **Stage 1 precedes stage 2, which reverses the order the spec gave**,
+        because the executor must already be ``ABORTED`` at the moment the hold
+        breaks. In the other order the interrupted anneal returns first, the
+        executor is still ``RUNNING``, and a step that raises on the way out
+        (the real temp controller refuses every command while ``_stop_wait`` is
+        set) can enter the channel-recovery path before the abort is seen.
+
+        Returns one of the ``CONTROL_*`` outcomes; never raises.
+        """
+        if self._abort_requested:
+            return CONTROL_ENDED
+        if self._state in TERMINAL_STATES or not self._running:
+            # The run is over. **Do not park.** A converged or already-stopped
+            # campaign has left the rig in a state somebody chose — possibly a
+            # deliberately head-down rest with a wet tip — and dropping the
+            # setpoint and killing the lamp underneath that would be a control
+            # request doing harm after the thing it controls has gone.
+            logger.warning("loop_abort_after_end", state=self._state.name,
+                           reason=reason)
+            return CONTROL_ENDED
+
+        self._abort_requested = True
+        self._abort_reason = reason
+        logger.error("loop_abort_requested", iteration=self._iteration,
+                     reason=reason)
+
+        executor = self._executor
+        if executor is not None:
+            try:
+                executor.abort()
+            except Exception:
+                logger.warning("executor_abort_failed", exc_info=True)
+
+        self._set_stop_wait()
+
+        # Release everything that could be blocking. `_resume_event` frees a
+        # paused loop; `_approval_event` frees an approval gate, whose caller
+        # then re-checks the abort flag rather than executing the trial it was
+        # holding.
+        self._resume_event.set()
+        self._approval_event.set()
+        return CONTROL_APPLIED
+
+    # ── Control internals ───────────────────────────────────────────────
+
+    def _notify_pause(self, phase: str, detail: str) -> None:
+        if self.on_pause_change is None:
+            return
+        try:
+            self.on_pause_change(phase, detail)
+        except Exception:
+            logger.warning("on_pause_change_failed", exc_info=True)
+
+    #: The mid-hold abort flags this system already has, by attribute name.
+    #:
+    #: **Both, not just the thermal one.** ``TempEISSweep.abort`` — the shipped
+    #: abort this is modelled on — sets ``_stop_wait`` on the temperature
+    #: controller *and* ``_wait_abort`` on the RH controller, because a
+    #: synchronous ``rh_controller.wait()`` is just as uninterruptible as a
+    #: thermal hold and is running in the same thread pool. An abort wired to
+    #: only one of them is an abort that works on the branch somebody tested.
+    HOLD_ABORT_FLAGS = ("_stop_wait", "_wait_abort")
+
+    def _hold_abort_events(self) -> list[Any]:
+        """Every instrument's mid-hold abort flag, by duck type.
+
+        Enumerated across the manager rather than reaching for
+        ``"temp_controller"`` by name: the temperature instrument is
+        configurable (``temp_eis_sweep`` and ``equilibration`` both take a
+        ``temp_instrument`` name), and an abort that missed a renamed controller
+        would be an eight-hour abort that looked like a working one.
+        """
+        events: list[Any] = []
+        try:
+            names = list(self._manager.names)
+        except Exception:
+            return events
+        for name in names:
+            try:
+                inst = self._manager.get(name)
+            except Exception:
+                continue
+            for attribute in self.HOLD_ABORT_FLAGS:
+                event = getattr(inst, attribute, None)
+                if event is not None and callable(getattr(event, "set", None)):
+                    events.append(event)
+        return events
+
+    def _set_stop_wait(self) -> None:
+        """Interrupt any watched hold, within one poll of its own cadence.
+
+        ``run_anneal_hold`` already derives ``monitored_hold``'s ``should_abort``
+        from this flag, and ``monitored_hold`` tests it at the top of every poll
+        before sleeping. The mechanism is fully built and tested; its only
+        consumers were the Arrhenius tab and the temperature sweep, and the
+        campaign path never picked it up. This is that wiring — **not a second
+        abort path**.
+        """
+        for event in self._hold_abort_events():
+            try:
+                event.set()
+            except Exception:
+                logger.warning("stop_wait_set_failed", exc_info=True)
+
+    def _release_stop_wait(self) -> None:
+        """Clear the flag, and clear it **before** the park, never after.
+
+        The real controller's ``_with_retry`` raises ``CommunicationError`` on
+        every command while this is set, and ``safe_park``'s whole contribution
+        on the thermal axis is one ``write_sp(10 °C)``. Parking with the flag
+        still set would therefore record ``temperature: ...`` in the park's
+        errors and leave the heater exactly where the abort found it — a park
+        that reports itself incomplete and leaves the rig hot overnight.
+
+        Safe to clear here and nowhere earlier: this runs on the loop's own
+        thread after the trial has already stopped, so the abort edge it exists
+        to deliver has demonstrably been delivered. Clearing it from
+        :meth:`abort` instead — set then immediately cleared — could fall
+        entirely inside one poll interval and be missed.
+        """
+        for event in self._hold_abort_events():
+            try:
+                event.clear()
+            except Exception:
+                logger.warning("stop_wait_clear_failed", exc_info=True)
+
+    def _hold_executor_if_quiescent(self) -> None:
+        """Take a requested pause at this step boundary, if the pose allows.
+
+        Called from ``on_step_complete``, which is the loop's existing view of a
+        step boundary — so the pause lands *between* steps by construction
+        rather than by a second mechanism agreeing to. The executor's own pause
+        loop sits at the top of the next tier/step, so pausing from here holds
+        before anything else runs.
+        """
+        if not self._pause_requested or self._paused:
+            return
+        executor = self._executor
+        if executor is None:
+            return
+        from softae.core.rig_pose import classify_pose, safe_to_interrupt
+
+        if not safe_to_interrupt(self._manager):
+            # Not a refusal — a deferral. The top-of-cycle gate always
+            # qualifies, so the worst case is that the pause lands one trial
+            # later rather than one step later.
+            self._notify_pause(
+                "deferred",
+                f"pose {classify_pose(self._manager).value} — holding later",
+            )
+            return
+        try:
+            executor.pause()
+        except Exception:
+            logger.warning("executor_pause_failed", exc_info=True)
+            return
+        self._paused = True
+        logger.warning("loop_paused_at_step_boundary", iteration=self._iteration)
+        self._notify_pause("holding", "at a step boundary")
+
+    async def _pause_gate(self) -> None:
+        """Hold at the top of a cycle while a pause is outstanding.
+
+        *"Before next cycle/loop start"*, the second half of the operator's
+        definition — and the backstop that makes the pose gate above a
+        deferral rather than a refusal. Between cycles the previous trial's
+        teardown has run, so this boundary is quiescent by construction and
+        needs no pose read.
+
+        An ``asyncio.Event`` rather than a poll: there is nothing to sample, and
+        a spin loop here would be a busy wait for however long an operator takes
+        to come back. Both :meth:`resume` and :meth:`abort` set it, which is why
+        an abort can never be trapped behind a pause.
+        """
+        if not self._pause_requested:
+            return
+        if not self._paused:
+            self._paused = True
+            logger.warning("loop_paused_between_cycles", iteration=self._iteration)
+            self._notify_pause("holding", "before the next cycle")
+        while (
+            self._pause_requested
+            and not self._abort_requested
+            and self._state not in TERMINAL_STATES
+        ):
+            await self._resume_event.wait()
+
     # ── Main loop ───────────────────────────────────────────────────────
 
     async def run(self) -> tuple[dict[str, Any], float] | None:
@@ -438,9 +770,24 @@ class AutonomousLoop:
 
         Returns the best ``(params, objective)`` or ``None`` on abort.
         """
+        self._running = True
+        try:
+            return await self._run()
+        finally:
+            self._running = False
+
+    async def _run(self) -> tuple[dict[str, Any], float] | None:
         self._set_state(LoopState.SUGGESTING)
 
         while self._state not in TERMINAL_STATES:
+            # 0a. CONTROL — "before next cycle/loop start". Both halves of the
+            # operator's definition of Pause meet here: this is the boundary
+            # that always qualifies as safe, and it is where an Abort that
+            # landed between trials leaves the loop.
+            await self._pause_gate()
+            if self._abort_requested:
+                break
+
             # 0. BUDGET
             if self._max_iterations is not None and self._iteration >= self._max_iterations:
                 logger.info("loop_budget_reached", iteration=self._iteration)
@@ -542,6 +889,27 @@ class AutonomousLoop:
                     self.on_converged(self._iteration, self._optimizer.best())
                 break
 
+        # ── The park half of Abort ──────────────────────────────────────────
+        # Sited here, and not inside `abort()`, because *here* the trial has
+        # actually stopped: the executor has raised through, teardown has run,
+        # and nothing is mid-command. `abort()` is called from the control
+        # watcher's task while a step may still be in flight, and parking a rig
+        # whose current step is still writing setpoints is a race — the park's
+        # `write_sp(10 °C)` and the anneal's `write_sp(original)` would be two
+        # writers with no defined winner.
+        #
+        # `_park` rather than a bare STOPPED, deliberately: it fires `on_park`,
+        # which is what runs `safe_park` and raises the durable CRITICAL alert.
+        # `stop()` only sets state and makes nothing safe.
+        #
+        # `park_reason` also decides the checkpoint's fate one layer up: a run
+        # with a park reason keeps it. That is right for an operator Abort — the
+        # campaign ended because somebody said so, not because it finished, and
+        # being able to resume it is exactly why the checkpoint exists.
+        if self._abort_requested and self._park_reason is None:
+            self._release_stop_wait()
+            self._park(self._abort_reason or "operator abort")
+
         best = self._optimizer.best()
         # Only a non-terminal exit (budget reached, optimizer exhausted) needs a
         # closing state. Asking for STOPPED from ERROR would now be refused, and
@@ -634,11 +1002,21 @@ class AutonomousLoop:
             continue_on_error=self._continue_on_error,
             max_channel_retries=self._max_channel_retries,
         )
+        # The trial's executor, reachable for as long as the trial lasts. Held
+        # on `self` rather than only as a local because a control request
+        # arrives on another task and has to reach *this* executor — without
+        # this, Pause and Abort could decline the next trial and nothing else.
+        self._executor = executor
+
         # Executor passes (step, idx, total, result, elapsed); accept extras so
         # this stays robust to callback-signature growth.
-        executor.on_step_complete = lambda step, idx, total, result, *_: results.update(
-            {step.name: result}
-        )
+        def _step_done(step, idx, total, result, *_) -> None:
+            results[step.name] = result
+            # A step boundary is the only place a Pause may take hold inside a
+            # trial, and this is the loop's existing view of one.
+            self._hold_executor_if_quiescent()
+
+        executor.on_step_complete = _step_done
         # Anti-clog purge alongside co-runnable steps (P8). Set from the loop so
         # every campaign gets it, GUI or headless, without each host wiring it.
         executor.on_purge_window = self.on_purge_window
@@ -664,7 +1042,18 @@ class AutonomousLoop:
         executor.on_step_recover = _recovered
         executor.on_step_skipped = _skipped
 
-        await executor.run(trial_wf)
+        try:
+            # An Abort that landed in the window between building this executor
+            # and starting it would otherwise be lost: `abort()` reached the
+            # previous trial's executor (or none), and this one starts fresh.
+            if self._abort_requested:
+                executor.abort()
+            await executor.run(trial_wf)
+        finally:
+            # Dropped as soon as the trial ends. A stale handle would let the
+            # *next* trial be paused by a request aimed at this one — or, worse,
+            # let `resume()` release an executor that no longer exists.
+            self._executor = None
         return await self._post_measure(results)
 
     async def _post_measure(self, results: dict[str, Any]) -> dict[str, Any]:
@@ -1117,16 +1506,23 @@ class AutonomousLoop:
         """Wait on a human-in-the-loop gate, bounded by ``gate_timeout_s``.
 
         Returns ``True`` if the gate was released, ``False`` if it timed out (in
-        which case the loop has already parked).  An unbounded wait here is what
-        turns "nobody answered the prompt" into a run that appears to be working
-        all night; parking instead makes the rig safe and records the reason.
+        which case the loop has already parked) **or if an Abort released it**.
+        An unbounded wait here is what turns "nobody answered the prompt" into a
+        run that appears to be working all night; parking instead makes the rig
+        safe and records the reason.
+
+        The abort check is on the return path rather than at the call sites
+        because :meth:`abort` releases this gate by *setting* its event — which
+        is indistinguishable from an operator answering it. Without the check,
+        an Abort issued at an approval prompt would be read as approval and
+        would execute the trial it was meant to stop.
         """
         if self._gate_timeout_s is None:
             await event.wait()
-            return True
+            return not self._abort_requested
         try:
             await asyncio.wait_for(event.wait(), timeout=self._gate_timeout_s)
-            return True
+            return not self._abort_requested
         except asyncio.TimeoutError:
             self._park(
                 f"{what} gate timed out after {self._gate_timeout_s:.0f}s "

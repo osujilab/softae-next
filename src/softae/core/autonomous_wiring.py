@@ -47,6 +47,12 @@ from softae.core.autonomous_loop import (
     BoardDecision,
     LoopState,
 )
+from softae.core.campaign_events import (
+    CampaignNarrator,
+    ControlWatcher,
+    open_control_watcher,
+    open_narrator,
+)
 from softae.core.data_store import DataStore
 from softae.core.electrode_allocator import ElectrodeAllocator
 from softae.core.deposition_recipe import (
@@ -2786,7 +2792,22 @@ async def run_autonomous_campaign(
         )
         data_store = DataStore(base)
 
+    # The durable half of `emit`. Assigned once the run has an identity (a run
+    # directory needs a run id); until then narration has nowhere to go, and the
+    # only thing before that point is a database insert.
+    narrator: CampaignNarrator | None = None
+    # The inbound half of the same pair, built once the loop exists. Declared
+    # here so the teardown below can close it whatever path the run exits by.
+    control: ControlWatcher | None = None
+
     def emit(event_type: str, **payload: Any) -> None:
+        # Persisted *before* dispatch, deliberately. `on_event` is arbitrary
+        # caller code — a GUI slot, a `print` to a pipe that may be broken — and
+        # if it raises, the record of what the campaign was doing when it did
+        # must already be on disk. The narrator's own contract is that it never
+        # raises, so this cannot reverse the failure direction.
+        if narrator is not None:
+            narrator.record(event_type, payload)
         if on_event:
             on_event({"type": event_type, **payload})
 
@@ -2862,7 +2883,29 @@ async def run_autonomous_campaign(
                 log_path=str(data_store.run_dir(run_id)),
             ))
 
+        # ── The narration stream (stage 3) ──────────────────────────────────
+        # `emit` is in-memory dispatch and dies with the process, which is why
+        # `settle.json`, the checkpoint and the alert rows exist. Those carry the
+        # scientific record; what still died was the *narration* — which mode was
+        # resolved, which step was recovered, why it parked — and, worse, any
+        # sign of life at all inside a step long enough to matter.
+        #
+        # Sited immediately before `run_started` so that event is the file's
+        # first record: a reader replaying from byte 0 learns the run's identity
+        # from the stream itself. Sited after the rig claim for the reason the
+        # claim gives above — a watcher must not be able to see the rig
+        # unclaimed on the very first thing it is told.
+        narrator = open_narrator(data_store.run_dir(run_id))
+
         emit("run_started", run_id=run_id, spec=spec.name)
+
+        # Beats on the event loop, not between steps. Sync instrument methods
+        # are dispatched through `run_in_executor` (`server/base_instrument.py`),
+        # so the loop stays free for the whole of an 8-hour anneal — which is
+        # exactly the case a watcher cares about and the one a step-boundary
+        # heartbeat cannot serve.
+        if narrator is not None:
+            narrator.start_heartbeat()
 
         # Let the modality prepare whatever its measurement steps will read,
         # before any of them runs (T2.5). For EIS that is the `.mscr` scripts:
@@ -3745,6 +3788,38 @@ async def run_autonomous_campaign(
         # would be a behaviour change, not an absence of one.
         loop.on_purge_window = _purge_window if purge_runner.performs_purges else None
 
+        # ── Reaching a campaign that is running in another process (stage 4) ─
+        # `emit` goes out; this is the one thing that comes in. The GUI (or
+        # `softae-campaign control`) writes `runs/<run_id>/control.json` and the
+        # watcher below picks it up within a poll.
+        #
+        # The dispatch table is *here*, not in the watcher, because this is the
+        # layer that knows what a campaign-scoped stop means. The watcher
+        # delivers and records; `AutonomousLoop` decides. Deliberately three
+        # entries and not one `halt`: Pause must not park and Abort must, and a
+        # single entry point would have to infer that from an argument.
+        #
+        # Every request is acknowledged on the narration stream — the same file,
+        # in the same order, as what the campaign was doing when it arrived. A
+        # control an operator pressed and heard nothing back from is worse than
+        # no control at all.
+        loop.on_pause_change = lambda phase, detail: emit(
+            "campaign_pause", phase=phase, detail=detail,
+            iteration=loop.iteration,
+        )
+        control = open_control_watcher(
+            data_store.run_dir(run_id),
+            handlers={
+                "pause": lambda req: loop.pause(req.reason),
+                "resume": lambda req: loop.resume(),
+                "abort": lambda req: loop.abort(
+                    req.reason or "operator abort (control.json)"),
+            },
+            on_ack=lambda ack: emit("control_ack", **ack),
+        )
+        if control is not None:
+            control.start()
+
         # Optional external approval gate (human or agent). When present, the
         # loop runs with auto_approve off and we release each trial here.
         if approval_fn is not None:
@@ -3852,6 +3927,18 @@ async def run_autonomous_campaign(
         raise
 
     finally:
+        # Stop listening before anything else. A control request accepted during
+        # teardown would reach a loop that has already ended — `abort()` refuses
+        # that case on its own, but a watcher that outlived the run it controls
+        # is a promise the process can no longer keep.
+        if control is not None:
+            await control.aclose()
+        # Then: stop beating. Every event worth narrating — `run_finished`, or
+        # the `park`/`safe_park` pair from the catch-all above — has already been
+        # emitted by now, and a heartbeat that outlived the campaign would tell a
+        # watcher the run is alive while it is being torn down.
+        if narrator is not None:
+            await narrator.aclose()
         try:
             # Must run before the store closes.  A no-op if already finalized
             # above; this catches any exit path that bypassed both branches.

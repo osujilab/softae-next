@@ -3,6 +3,7 @@
     softae-campaign check   <spec.toml>            # parse + project, run nothing
     softae-campaign run     <spec.toml> [--yes] [--resume] [--mock]
     softae-campaign resume  <spec.toml>            # alias for `run --resume`
+    softae-campaign control pause|resume|abort     # reach a campaign already running
 
 Exit codes: 0 ok · 1 campaign parked or failed · 2 usage/spec error · 3 declined ·
 4 rig busy.
@@ -36,6 +37,24 @@ Stopping is a CLI concern for the same reason. There is no window to close, so
 the rig safe **while the instruments are still connected** — the teardown that
 disconnects them is what makes a later park impossible — and the next launch
 picks up whatever a hard kill left behind, via the unfinished run row.
+
+``control`` is the same concern reached from a *different terminal*. Ctrl-C only
+works where the campaign was started, which is no use over a dropped remote
+desktop session or from a second window — and it has no "pause" at all. So
+``control`` writes one file into the run directory and returns; the owning
+process picks it up on its own poll and acts where the instruments are. Three
+stop scopes exist and this command carries exactly two of them: **Abort**
+(terminal, parks the rig, keeps the checkpoint) and **Pause** (resumable,
+touches no setpoint, no lamp, no head). The third, **E-Stop**, is rig-scale and
+lives on the GUI's main toolbar, not here.
+
+**Watching is a CLI concern too.** The terminal transcript below is prose for a
+human and dies with the console; the same events are also appended to
+``runs/<run_id>/events.jsonl`` (:mod:`softae.core.campaign_events`), flushed per
+record, alongside a heartbeat that ticks even inside an eight-hour anneal. That
+is what makes a headless run watchable — by ``tail -f`` today, by an attached GUI
+later — and what tells a returning operator whether a quiet process is working or
+wedged.
 """
 
 from __future__ import annotations
@@ -45,6 +64,7 @@ import asyncio
 import sys
 from typing import Any
 
+from softae.core.campaign_events import EVENTS_FILENAME
 from softae.core.campaign_spec_io import SpecLoadError, load_campaign_spec
 from softae.tools import use_utf8_console
 
@@ -78,6 +98,14 @@ def _emit(event: dict[str, Any]) -> None:
               f"{event.get('n_observations')} observation(s)", flush=True)
         for warning in event.get("warnings") or []:
             print(f"   note: {warning}", flush=True)
+    elif etype == "control_ack":
+        # Loud, and on its own line. This is the operator's confirmation that a
+        # button in another process reached this one — including when the answer
+        # is "no", which is the case a generic dict dump would bury.
+        print(f"** CONTROL {event.get('action', '?')} -> "
+              f"{event.get('outcome')}", flush=True)
+    elif etype == "campaign_pause":
+        print(f"   pause {event.get('phase')}: {event.get('detail')}", flush=True)
     elif etype in ("run_started", "converged", "run_finished", "board_check",
                    "step_skipped", "step_recovered"):
         print(f"   {etype}: "
@@ -426,6 +454,19 @@ def _cmd_run(args) -> int:
         print(f"Starting '{spec.name}'"
               f"{' (resuming)' if args.resume else ''}...", flush=True)
 
+        def _on_event(event: dict[str, Any]) -> None:
+            """``_emit``, plus a one-time pointer at the durable transcript.
+
+            Printed at ``run_started`` rather than at the end so it survives the
+            exits that matter: an operator who comes back to a killed process
+            still has the path in the terminal scrollback, and the file itself
+            still has everything the campaign got to say before it died.
+            """
+            _emit(event)
+            if event.get("type") == "run_started":
+                run_dir = store.run_dir(str(event.get("run_id")))
+                print(f"   transcript: {run_dir / EVENTS_FILENAME}", flush=True)
+
         async def _go():
             await manager.connect_all()
             try:
@@ -440,7 +481,7 @@ def _cmd_run(args) -> int:
                     spec,
                     manager=manager,
                     data_store=store,
-                    on_event=_emit,
+                    on_event=_on_event,
                     # Headless gates default to the safe answer: never swap a
                     # plate nobody is there to change, never re-cast a used well.
                     on_board_exchange=None,
@@ -494,6 +535,73 @@ def _cmd_run(args) -> int:
     return EXIT_OK if ended_on_purpose else EXIT_FAILED
 
 
+# ── Controlling a campaign that is already running ───────────────────────────
+
+def _running_campaign_run_dir() -> "tuple[str | None, str]":
+    """Where the live campaign's sidecars are, or why we cannot say.
+
+    Discovery is the rig lock and nothing else: the campaign already publishes
+    ``what = "campaign:<name>:<run_id>"`` and ``log_path = <run directory>``
+    (stage 2), so a controller reads one file it did not have to invent. A
+    second registry that could disagree with the lock is how a rig ends up with
+    two owners and two stories about it.
+    """
+    from softae.core.run_lock import read_run_lock
+
+    lock = read_run_lock()
+    if lock is None:
+        return None, "no process holds the rig."
+    if not lock.what.startswith("campaign:"):
+        return None, f"the rig is held by something that is not a campaign — {lock.describe()}"
+    if not lock.log_path:
+        return None, f"the campaign did not publish a run directory — {lock.describe()}"
+    return lock.log_path, lock.what
+
+
+def _cmd_control(args) -> int:
+    """Ask a running campaign to pause, resume, or abort.
+
+    This process drives **nothing**. It writes one small file into the run
+    directory and returns; the campaign that owns the rig reads it on its own
+    poll and acts inside its own process, where the instruments are. That is the
+    whole reason the channel is a file: terminating the other process instead
+    would be exactly the un-parked death this is here to avoid.
+    """
+    from softae.core.campaign_events import write_control_request
+
+    run_dir = args.run_dir
+    if not run_dir:
+        run_dir, detail = _running_campaign_run_dir()
+        if run_dir is None:
+            print(f"No campaign to control: {detail}", file=sys.stderr)
+            print("Pass --run-dir <project>/runs/<run_id> to name one explicitly.",
+                  file=sys.stderr)
+            return EXIT_USAGE
+        print(f"   campaign: {detail}", flush=True)
+
+    import os
+
+    request = write_control_request(
+        run_dir,
+        args.action,
+        reason=args.reason or "",
+        requested_by=f"softae-campaign control (pid {os.getpid()})",
+    )
+    print(f"{args.action} requested (seq {request.seq}) -> "
+          f"{run_dir}/control.json", flush=True)
+    # Said plainly, because the latency is not uniform and promising that it is
+    # would be the wrong kind of reassurance (R3).
+    if args.action == "abort":
+        print("   Abort is immediate during a temperature hold and takes effect "
+              "at the next step boundary otherwise. The rig is parked and the "
+              "checkpoint is kept.", flush=True)
+    elif args.action == "pause":
+        print("   Pause stops the run issuing new steps and then holds; a step "
+              "already running finishes first. Setpoints, lamp and head are "
+              "left exactly as they are.", flush=True)
+    return EXIT_OK
+
+
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -538,6 +646,20 @@ def build_parser() -> argparse.ArgumentParser:
     rhead = res.add_mutually_exclusive_group()
     rhead.add_argument("--head-up", action="store_true")
     rhead.add_argument("--head-down", action="store_true")
+
+    # A subcommand with an action argument rather than three top-level verbs:
+    # `resume` is already taken here and means "continue a saved checkpoint",
+    # which is a different thing from leaving a pause. Two meanings on one verb
+    # is a collision nobody would forgive at 3 a.m.
+    ctl = sub.add_parser(
+        "control", help="pause / resume / abort a campaign already running")
+    ctl.add_argument("action", choices=("pause", "resume", "abort"))
+    ctl.add_argument("--run-dir", default=None,
+                     help="the campaign's run directory (default: read it from "
+                          "the rig lock)")
+    ctl.add_argument("--reason", default=None,
+                     help="recorded verbatim in the campaign's transcript and, "
+                          "for abort, in its park alert")
     return p
 
 
@@ -551,6 +673,8 @@ def main(argv: "list[str] | None" = None) -> int:
     try:
         if args.command == "check":
             return _cmd_check(args)
+        if args.command == "control":
+            return _cmd_control(args)
         return _cmd_run(args)
     except SpecLoadError as exc:
         print(f"Spec error: {exc}", file=sys.stderr)

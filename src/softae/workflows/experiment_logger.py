@@ -34,14 +34,26 @@ class ExperimentLogger:
         Directory where log files are written.  Created if it does not exist.
     workflow_name : str
         Used as the file-name prefix.
+    filename : str, optional
+        Exact file name, overriding the ``<workflow_name>_<timestamp>`` default.
+        For a stream a *reader* has to find — the campaign narration sidecar at
+        ``runs/<run_id>/events.jsonl`` — a timestamp is not disambiguation, it is
+        an obstacle: one run directory holds one stream, and a watcher must open
+        it by name rather than by globbing and guessing which match is live.
     """
 
-    def __init__(self, output_dir: str | Path, workflow_name: str) -> None:
+    def __init__(
+        self,
+        output_dir: str | Path,
+        workflow_name: str,
+        *,
+        filename: str | None = None,
+    ) -> None:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        self.log_path = self.output_dir / f"{workflow_name}_{ts}.jsonl"
+        self.log_path = self.output_dir / (filename or f"{workflow_name}_{ts}.jsonl")
         self._file = open(self.log_path, "a", encoding="utf-8")  # noqa: SIM115
 
         logger.info("experiment_log_opened", path=str(self.log_path))
@@ -98,11 +110,27 @@ class ExperimentLogger:
         **kwargs
             Arbitrary payload.
         """
-        record = {
+        self.log_record({
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
             "event": event,
             **{k: _safe_serialize(v) for k, v in kwargs.items()},
-        }
+        })
+
+    def log_record(self, record: dict[str, Any]) -> None:
+        """Write a caller-shaped record verbatim — one line, flushed.
+
+        The escape hatch for a stream that already has a vocabulary of its own.
+        :meth:`log_step` and :meth:`log_event` impose this module's schema; the
+        campaign narration stream (``core/campaign_events.py``) persists
+        ``run_autonomous_campaign``'s existing ``emit()`` vocabulary, keyed on
+        ``type``, so that a replayed line can be fed to the same handler as the
+        live dispatch. Re-keying it to ``event`` here would invent a translation
+        for both ends to keep in step.
+
+        The caller owns the record's shape *and* its serialisability; failures
+        surface as exceptions rather than being swallowed, because the one
+        best-effort caller in the tree already has its own contract for that.
+        """
         self._write(record)
 
     def close(self) -> None:

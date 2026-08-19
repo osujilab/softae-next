@@ -24,18 +24,26 @@ quietly put its head back down — so that transition is gated, not assumed.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
 
 import structlog
 
-logger = structlog.get_logger(__name__)
+# `RigPose` and `classify_pose` were defined here and now live in
+# `core/rig_pose.py`, because a *third* consumer appeared — Pause's "next safe
+# interruption" — and a control path must not import the actuation path to ask
+# where the rig is. Re-exported so this module's own code, its callers and
+# `tests/test_purge_runner.py` see no change: it was a move, not a fork, and one
+# definition of quiescent is the whole point.
+from softae.core.rig_pose import (  # noqa: F401  (re-exported)
+    FLUSH_TOLERANCE_MM,
+    QUIESCENT_POSES,
+    RigPose,
+    _flush_position,
+    classify_pose,
+    safe_to_interrupt,
+)
 
-#: How close to the calibrated flush coordinates counts as "at the flush basin",
-#: in mm. Generous relative to stage jitter (~0.001 mm of mock noise, and real
-#: encoder repeatability far below this) and far tighter than the distance to
-#: the nearest electrode, so it can never mistake a well for the basin.
-FLUSH_TOLERANCE_MM = 2.0
+logger = structlog.get_logger(__name__)
 
 #: Escalate to a durable alert once a purge has been owed this long. Deferral is
 #: safe and expected — a long campaign holds the rig for hours — but a deferral
@@ -43,73 +51,6 @@ FLUSH_TOLERANCE_MM = 2.0
 #: and at info level the two look identical in the log. Four intervals at the
 #: default 15 min cadence.
 DEFAULT_DEFER_ALERT_S = 3600.0
-
-
-class RigPose(Enum):
-    """Where the rig is, as it bears on whether a purge may happen here.
-
-    Head position alone is not enough — **the head is down at the flush basin
-    and down over an electrode mid-cast**, and those two demand opposite
-    responses. Classification therefore reads the stage position too.
-    """
-
-    #: Head down at the flush basin — purge in place, no motion needed. This is
-    #: idle rest, and also a precondition flush or an anneal hold parked there.
-    AT_FLUSH = "at_flush"
-    #: Head raised, wherever. Safe to travel to the flush basin and lower.
-    HEAD_UP = "head_up"
-    #: Head down somewhere other than the flush basin — casting into a well or
-    #: dwelling on the wick. NEVER purge, and never move: the head guard would
-    #: refuse the travel anyway, and dispensing here contaminates the sample.
-    HEAD_DOWN_ELSEWHERE = "head_down_elsewhere"
-    #: State could not be read. Treated exactly like HEAD_DOWN_ELSEWHERE.
-    UNKNOWN = "unknown"
-
-
-def classify_pose(
-    manager: Any, *, flush_xy: "tuple[float, float] | None" = None
-) -> RigPose:
-    """Read the rig's current pose from the hardware, not from a belief flag.
-
-    Unreadable state resolves to :attr:`RigPose.UNKNOWN`, which is refused —
-    "I could not tell" and "it is unsafe" must lead to the same action.
-    """
-    try:
-        syringe = manager.get("syringe")
-    except Exception:
-        return RigPose.UNKNOWN
-
-    is_up = getattr(syringe, "is_head_up", None)
-    if not callable(is_up):
-        return RigPose.UNKNOWN
-    try:
-        if is_up():
-            return RigPose.HEAD_UP
-    except Exception:
-        return RigPose.UNKNOWN
-
-    # Head is down — the only question left is whether it is down somewhere safe.
-    try:
-        if flush_xy is None:
-            flush_xy = _flush_position()
-        stage = manager.get("stage")
-        x, y = stage.live_position()
-    except Exception:
-        return RigPose.UNKNOWN
-
-    at_flush = (
-        abs(float(x) - float(flush_xy[0])) <= FLUSH_TOLERANCE_MM
-        and abs(float(y) - float(flush_xy[1])) <= FLUSH_TOLERANCE_MM
-    )
-    return RigPose.AT_FLUSH if at_flush else RigPose.HEAD_DOWN_ELSEWHERE
-
-
-def _flush_position() -> tuple[float, float]:
-    """Calibrated flush-basin coordinates, with the engine's own fallback."""
-    from softae.core.deposition_steps import deposition_positions
-
-    positions = deposition_positions()
-    return tuple(getattr(positions, "flush", None) or (0.0, 0.0))
 
 
 class IdleRestState:
