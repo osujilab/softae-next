@@ -26,12 +26,159 @@ top-of-module import.
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import structlog
 
 logger = structlog.get_logger(__name__)
+
+
+# ── The fitter pre-gate: which spectra get a cheaper route ───────────────────
+#
+# `arc_closure` knows for ~1 ms what the optimiser takes 38 s to discover, and until
+# now it was consulted only *after* the fit, through `annotate_arc_closure`. Reading
+# it first is the whole idea. The predicate and its thresholds live here, next to the
+# engine's other arithmetic; the *routes* it selects live in `engine.py`, because a
+# module whose docstring says nothing here fits does not get to grow an estimator.
+
+#: `phase_low_deg` at or below which the response at the sweep floor is still
+#: essentially capacitive.
+#:
+#: **The state is not the discriminator; this is** — which is `ArcClosure`'s own
+#: severity/verdict separation being consumed rather than re-derived. Its docstring
+#: sets out why: *"near 0° the response at the sweep floor is already resistive and a
+#: modestly lower floor would close the arc; near −90° it is still essentially
+#: capacitive and no realistic extension of the preset will rescue it."*
+#:
+#: Measured on `20260811T023757Z_equilibration_characterization`, open arcs only:
+#:
+#: ===============  ==========================  =========
+#: `phase_low_deg`  covariance fit              cost
+#: ===============  ==========================  =========
+#: −92.0°           returns None (nfev spent)    51.6 s
+#: −87.7°           returns None                 66.0 s
+#: −81.7°           returns None                 48.1 s
+#: −31.1°           **converges**                **0.05 s**
+#: ===============  ==========================  =========
+#:
+#: The −31.1° row is why a bare `state == OPEN` test is wrong: it is an open arc that
+#: fits in 50 ms, so diverting it buys no time and — under the two-point route — would
+#: move an `R1` for nothing. −60° sits between the two clusters with a wide margin on
+#: both sides, and it is a threshold on *severity*, so it is deliberately not a
+#: threshold `arc.py` ships (§3.5 of the acquisition spec: that module keeps its
+#: CLOSED-biased verdict and gains no policy).
+DEFAULT_PREGATE_PHASE_MAX_DEG = -60.0
+
+#: Residual-evaluation budget for the capped fit. Two orders below
+#: :data:`~softae.analysis.eis.fitter.DEFAULT_MAX_NFEV` and still an order above the
+#: cost of every fit measured to converge at all on this corpus, so the cap sits in
+#: the empty band between "converges" and "never will".
+DEFAULT_PREGATE_MAX_NFEV = 2_000
+
+
+@dataclass(frozen=True)
+class PregateSettings:
+    """Whether the pre-gate runs, and what it does when it fires.
+
+    **Two flags, not one, and they are independent on purpose.** ``budget_cap``
+    changes how long the *same* estimator may run and cannot move a reported number;
+    ``two_point_open`` changes *which* estimator produces ``R1`` and deliberately does.
+    Flip them together and a shifted ``R1`` has two candidate causes with no way to
+    separate them — the same argument that keeps ``[eis.scout] enabled`` a third,
+    separate switch, since that one moves which frequencies were acquired in the first
+    place.
+
+    Both ship **false**, the posture ``[eis.gates] enabled`` and ``[purge] actuate``
+    ship in and for the same reason.
+    """
+
+    budget_cap: bool = False
+    two_point_open: bool = False
+    phase_low_max_deg: float = DEFAULT_PREGATE_PHASE_MAX_DEG
+    max_nfev: int = DEFAULT_PREGATE_MAX_NFEV
+
+    @property
+    def engaged(self) -> bool:
+        """True when either route is armed — the guard that keeps the off path free.
+
+        With both flags false the engine does not even read the arc before fitting, so
+        a disabled pre-gate costs nothing at all rather than costing "almost nothing".
+        """
+        return bool(self.budget_cap or self.two_point_open)
+
+    def describe(self) -> str:
+        if not self.engaged:
+            return "EIS fitter pre-gate off — every spectrum takes the full fit."
+        routes = []
+        if self.two_point_open:
+            routes.append("two-point read (CHANGES R1)")
+        if self.budget_cap:
+            routes.append(f"optimiser capped at {self.max_nfev} nfev (R1 unchanged)")
+        return (f"EIS fitter pre-gate on below {self.phase_low_max_deg:+.0f}° at the "
+                f"sweep floor: " + ", ".join(routes) + ".")
+
+
+def pregate_settings(config: dict[str, Any] | None = None) -> PregateSettings:
+    """Read ``[eis.pregate]``. Unparseable values fall back; nothing raises.
+
+    Same posture as :func:`~softae.analysis.eis.settings.eis_settings` and
+    :func:`~softae.analysis.eis.scout.scout_settings`: a typo in a config file must not
+    stop a campaign that would otherwise have run exactly as it always has. Here the
+    fallback is the *shipped-off* state, so a malformed key can only ever leave the
+    engine on the route it takes today.
+    """
+    if config is None:
+        try:
+            from softae.config import loader
+
+            config = (loader.load().get("eis", {}) or {}).get("pregate", {}) or {}
+        except Exception:      # noqa: BLE001 - an unreadable config must not stop a fit
+            config = {}
+
+    defaults = PregateSettings()
+
+    def _f(key: str, default: float) -> float:
+        try:
+            return float(config.get(key, default))
+        except (TypeError, ValueError):
+            logger.warning("eis_pregate_key_unparseable", key=key, default=default)
+            return default
+
+    return PregateSettings(
+        budget_cap=bool(config.get("budget_cap", False)),
+        two_point_open=bool(config.get("two_point_open", False)),
+        phase_low_max_deg=_f("phase_low_max_deg", defaults.phase_low_max_deg),
+        max_nfev=int(_f("max_nfev", defaults.max_nfev)),
+    )
+
+
+def blocking_open(arc: Any, settings: PregateSettings) -> bool:
+    """Is this the population the cheap route is for? Pure, and ~µs.
+
+    Two conditions, both read off fields :class:`~softae.analysis.eis.arc.ArcClosure`
+    already computes — no new detector, and **not** the interior-apex fields the
+    acquisition scout added, which answer *where should the next sweep put its points?*
+    rather than *what will the optimiser do with this one?*
+
+    1. the arc did not close in band, and
+    2. the response at the sweep floor is still essentially capacitive.
+
+    A NaN ``phase_low_deg`` — the caller supplied no phase — returns **False**. That is
+    the conservative direction and it is chosen rather than defaulted into: severity is
+    exactly what condition 2 is about, so a spectrum whose severity is unknown takes the
+    route it takes today. The same reasoning gives ``UNKNOWN`` the same answer, through
+    condition 1.
+    """
+    from softae.analysis.eis.arc import OPEN
+
+    if getattr(arc, "state", None) != OPEN:
+        return False
+    phase = float(getattr(arc, "phase_low_deg", float("nan")))
+    if phase != phase:                       # NaN: no phase was supplied
+        return False
+    return phase <= float(settings.phase_low_max_deg)
 
 
 def _physics_complex(eis_result: Any) -> tuple[np.ndarray, np.ndarray]:

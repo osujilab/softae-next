@@ -52,9 +52,25 @@ if TYPE_CHECKING:
     from softae.analysis.circuit_fitting import FitResult
     from softae.analysis.eis_data import EISResult
     from softae.core.data_store import DataStore
+    from softae.core.eis_scout_scripts import ScoutPlanner
     from softae.core.run_lock import RunLock
     from softae.gui.widgets.camera_worker import CameraWorker
     from softae.server.manager import InstrumentManager
+
+
+def _manual_scout_default() -> bool:
+    """Where the tab's scout checkbox starts — ``[eis.scout] actuate_manual``.
+
+    A default, not the control: the box is authoritative once the window is up.
+    Falls back to *off* if the config cannot be read, because the safe answer for
+    an uncharacterised sample is the sweep the operator chose, run once.
+    """
+    try:
+        from softae.analysis.eis.scout import scout_settings
+
+        return bool(scout_settings().actuate_manual)
+    except Exception:
+        return False
 
 
 class _ManualEisWorker(QObject):
@@ -63,6 +79,13 @@ class _ManualEisWorker(QObject):
     Measures one *or more* channels in series.  All channels of a run are grouped
     under a single ``manual_eis`` run in the DataStore, and ``finished`` emits a
     **list** of per-channel payloads (one per measured channel, in order).
+
+    This is the one call site that is genuinely **per measurement**: the ``.mscr``
+    is written inside :meth:`_measure_one`, immediately before the sweep it
+    describes. So it is the site where a channel's own spectrum can decide, then
+    and there, that one more sweep is worth taking — see
+    :class:`~softae.core.eis_scout_scripts.ScoutPlanner`. In the common case it
+    is not, and nothing extra is measured.
     """
 
     progress = Signal(str)
@@ -80,6 +103,7 @@ class _ManualEisWorker(QObject):
         auto_fit: bool,
         fit_model: str,
         auto_save: bool,
+        scout: "ScoutPlanner | None" = None,
     ):
         super().__init__()
         self._manager = manager
@@ -90,6 +114,9 @@ class _ManualEisWorker(QObject):
         self._auto_fit = auto_fit
         self._fit_model = fit_model
         self._auto_save = auto_save
+        # Owned by the tab, not by the worker: a plan is only worth anything to
+        # the *next* run on that channel, and a worker lives for one run.
+        self._scout = scout
 
     @Slot()
     def run(self) -> None:
@@ -126,6 +153,21 @@ class _ManualEisWorker(QObject):
         p = self._eis_params
 
         script_path = os.path.join(tempfile.gettempdir(), "softae_testing.mscr")
+
+        def _acquire(params: dict) -> "EISResult":
+            """Send whatever is at *script_path* and parse what comes back.
+
+            *params* is what the row records, so it must describe the script that
+            is about to run — never the one the operator selected if a different
+            one was written over it.
+            """
+            t_start = time.monotonic()
+            raw = pico.sendscript_getdata(script_path, pico._output_dir, channel)
+            return EISResult.from_raw(
+                raw, channel=channel,
+                measurement_time_s=time.monotonic() - t_start, eis_params=params,
+            )
+
         eis_run_mscrbuild(
             script_path,
             mux_ch=channel,
@@ -135,14 +177,28 @@ class _ManualEisWorker(QObject):
             npts=p.get("npts", 20),
             mVdc=p.get("mv_dc", 0),
         )
+        # A copy only when the scout will stamp its verdict on the row: `p` is one
+        # dict shared by every channel of this run, so stamping the shared one
+        # would leave channel 3's saved result claiming channel 7's verdict. With
+        # the scout off nothing writes to it and the caller's own dict is passed
+        # through, exactly as before.
+        observing = self._scout is not None and self._scout.observing
+        eis_result = _acquire(dict(p) if observing else p)
 
-        t_start = time.monotonic()
-        raw = pico.sendscript_getdata(script_path, pico._output_dir, channel)
-        elapsed = time.monotonic() - t_start
-
-        eis_result = EISResult.from_raw(
-            raw, channel=channel, measurement_time_s=elapsed, eis_params=p,
-        )
+        if self._scout is not None:
+            # The sweep just taken IS the scout sweep, and in the common case it
+            # is also the measurement: `build_follow_up` returns None — writing
+            # nothing — unless it can name a strictly wider or denser sweep. So
+            # an adequate spectrum is never re-measured, and a follow-up can
+            # never be narrower than what the operator asked for.
+            decision = self._scout.observe(channel, eis_result)
+            follow_up = self._scout.build_follow_up(script_path, channel, p, decision)
+            if follow_up is not None:
+                scout_sweep_s = eis_result.measurement_time_s
+                eis_result = _acquire(follow_up)
+                # The superseded sweep is not stored, so its cost would otherwise
+                # vanish from the record; the acquisition really did take both.
+                eis_result.eis_params["eis_scout_sweep_s"] = float(scout_sweep_s)
 
         fit_result: FitResult | None = None
         fit_error: str | None = None
@@ -306,6 +362,9 @@ class ManualControlTab(QWidget):
         self._cam_worker: CameraWorker | None = None
         self._eis_thread: QThread | None = None
         self._eis_worker: _ManualEisWorker | None = None
+        #: Rebuilt on every Run press — see :meth:`_on_eis_run`. Inert while
+        #: ``[eis.scout] actuate`` is off, which is how it ships.
+        self._eis_scout: ScoutPlanner | None = None
         self._eis_series_window: QWidget | None = None  # multi-channel plot window
         self._pv_worker: _ManualPollingWorker | None = None
         self._manual_dispense_count_by_pump: dict[int, int] = {0: 0, 1: 0, 2: 0}
@@ -736,6 +795,21 @@ class ManualControlTab(QWidget):
         self._combo_fit_model = QComboBox()
         self._combo_fit_model.addItems(["simpleSalt", "flexSalt", "simpleSaltMembrane"])
         fit_row.addWidget(self._combo_fit_model)
+        # Off by default and deliberately so: this tab is where non-standard
+        # samples get measured — two arcs, a stack, something nobody has
+        # characterised — and the scout picks ONE apex to plan around. Whether
+        # that is the right thing to do is a per-sample judgement made here, at
+        # the rig, so it is a checkbox rather than a deployment setting. A global
+        # `[eis.scout] actuate` cannot switch this on; only this box can.
+        self._chk_eis_scout = QCheckBox("Scout sweep")
+        self._chk_eis_scout.setChecked(_manual_scout_default())
+        self._chk_eis_scout.setToolTip(
+            "Measure once, then take a second, wider or denser sweep only if the "
+            "first one's arc did not close with enough band below its apex.\n\n"
+            "Leave OFF for a non-standard sample: the planner assumes a single "
+            "arc and will pick the tallest one if there are several. With it off "
+            "the preset above runs exactly once and that is the measurement.")
+        fit_row.addWidget(self._chk_eis_scout)
         self._chk_autosave = QCheckBox("Auto-save to DB")
         self._chk_autosave.setChecked(True)
         fit_row.addStretch()
@@ -1480,6 +1554,15 @@ class ManualControlTab(QWidget):
             f"Queueing EIS on {n} channels ({preset})..." if n > 1
             else f"Queueing EIS on ch {channels[0]} ({preset})...")
 
+        # A fresh planner per Run press, reading the checkbox as it stands now.
+        # Nothing an earlier press concluded may govern this one: the operator may
+        # have changed RH, temperature, the sample — or this very setting — in
+        # between, and the apex was measured moving ~100x across an RH change.
+        from softae.core.eis_scout_scripts import ScoutPlanner as _ScoutPlanner
+
+        self._eis_scout = _ScoutPlanner(
+            site="manual_tab", actuate=self._chk_eis_scout.isChecked())
+
         self._eis_thread = QThread(self)
         self._eis_worker = _ManualEisWorker(
             self._manager,
@@ -1496,6 +1579,7 @@ class ManualControlTab(QWidget):
             auto_fit=auto_fit,
             fit_model=fit_model,
             auto_save=auto_save,
+            scout=self._eis_scout,
         )
         self._eis_worker.moveToThread(self._eis_thread)
 

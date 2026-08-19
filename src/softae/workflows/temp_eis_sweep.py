@@ -136,6 +136,11 @@ class ArrheniusSweep:
         # Populated during run()
         self._eis_results: dict[tuple[int, int], EISResult] = {}
 
+        # Acquisition scout, OBSERVE-ONLY on this path — see
+        # _build_channel_scripts for why it cannot acquire here. Constructed
+        # lazily so a sweep that never measures never reads the config.
+        self._scout_planner: Any | None = None
+
         # Thermal fitter selected by config (Arrhenius or VFT); both share the
         # same fit() signature and return a result with .model / .R_squared / etc.
         from softae.analysis.thermal import make_fitter
@@ -721,6 +726,66 @@ class ArrheniusSweep:
         # Post-stabilisation hold (abortable)
         await self._abortable_sleep(dwell_s)
 
+    # ── Acquisition scripts ─────────────────────────────────────────────
+
+    @property
+    def _scout(self):
+        """The acquisition planner, built on first use."""
+        if self._scout_planner is None:
+            from softae.core.eis_scout_scripts import ScoutPlanner
+
+            self._scout_planner = ScoutPlanner(site="arrhenius_sweep")
+        return self._scout_planner
+
+    def _build_channel_scripts(self) -> None:
+        """Write every channel's ``.mscr`` for the sweep about to run.
+
+        **The scout observes here; it does not acquire.** Every channel's script
+        is written once, before ``executor.run``, and the workflow handed to the
+        executor then holds the whole temperature axis (and, on the ordered path,
+        the RH axis too) — so between two measurements on a channel there is no
+        moment at which a different script could be written. The only granularity
+        this path could ever offer is *per sweep*, i.e. one sweep's spectra
+        choosing the next sweep's grids; and that is exactly the cross-boundary
+        carry the always-replan rule forbids, because the sweeps either side of
+        that boundary are at different RH setpoints and the apex was measured
+        moving ~100x across an RH change.
+
+        So on this path ``[eis.scout] actuate`` has no effect by construction, and
+        ``enabled`` buys the verdict log and the per-row verdict stamp. Making it
+        acquire would mean moving this build into the step-completion path, which
+        is a change to the workflow's shape rather than to its wiring.
+        """
+        try:
+            from softae.drivers.mscr_library import eis_run_mscrbuild
+        except ImportError:
+            return  # mscr_library not available in test/CI environments
+
+        p = self.config.eis_params or {}
+        for ch in self.config.channels:
+            mscr_path = str(Path(tempfile.gettempdir()) / f"softae_ch{ch}.mscr")
+            eis_run_mscrbuild(
+                mscr_path,
+                mux_ch=ch,
+                mVac=p.get("mv_ac", 10),
+                f_hi=p.get("f_hi", 200_000),
+                f_lo=p.get("f_lo_mHz", 100),
+                npts=p.get("npts", 20),
+                mVdc=p.get("mv_dc", 0),
+            )
+
+    def _eis_params_for(self, channel: int) -> dict[str, Any]:
+        """The grid that reached the instrument for *channel*, as a row records it.
+
+        A fresh dict per measurement while the scout is observing, because it
+        stamps its verdict onto the row's params and ``config.eis_params`` is one
+        dict shared by every measurement in the sweep. Stamping the shared one
+        would leave every earlier row claiming the last spectrum's verdict — and
+        would edit the caller's configuration on the way past.
+        """
+        base = self.config.eis_params or {}
+        return dict(base) if self._scout.observing else base
+
     # ── Execution ───────────────────────────────────────────────────────
 
     async def run(self) -> list[ArrheniusResult]:
@@ -758,20 +823,7 @@ class ArrheniusSweep:
         self._eis_results_full: dict[tuple, Any] = {}  # (ch, t_int, rh_int) → EISResult
         temps = self.config.resolved_temperatures()
 
-        # Build .mscr files (mirrors _run_single)
-        try:
-            from softae.drivers.mscr_library import eis_run_mscrbuild
-            p = self.config.eis_params or {}
-            for ch in self.config.channels:
-                mscr_path = str(Path(tempfile.gettempdir()) / f"softae_ch{ch}.mscr")
-                eis_run_mscrbuild(
-                    mscr_path, mux_ch=ch,
-                    mVac=p.get("mv_ac", 10), f_hi=p.get("f_hi", 200_000),
-                    f_lo=p.get("f_lo_mHz", 100), npts=p.get("npts", 20),
-                    mVdc=p.get("mv_dc", 0),
-                )
-        except ImportError:
-            pass
+        self._build_channel_scripts()
 
         workflow = self._build_full_ordered_workflow()
         executor = WorkflowExecutor(
@@ -822,11 +874,14 @@ class ArrheniusSweep:
                     else 0
                 )
                 eis = _parse_eis_result(
-                    step, raw, eis_params=self.config.eis_params or {}, elapsed=elapsed
+                    step, raw, eis_params=self._eis_params_for(ch), elapsed=elapsed
                 )
                 if eis is not None:
                     self._eis_results_full[(ch, t_int, rh_int)] = eis
                     eis.T_sp = float(t_int)
+                    # Observe-only here: the verdict belongs on the row it was
+                    # drawn from, and nothing on this path can act on it.
+                    self._scout.observe(ch, eis)
                     if self.on_eis_point is not None:
                         r0, r1, sigma = self._live_point(eis)
                         _rh_sp_float = next(
@@ -976,23 +1031,7 @@ class ArrheniusSweep:
 
         # Build per-channel .mscr files before execution, mirroring HT tab
         # behaviour.  eis_run_mscrbuild handles pico2 channel remapping internally.
-        try:
-            from softae.drivers.mscr_library import eis_run_mscrbuild
-
-            p = self.config.eis_params or {}
-            for ch in self.config.channels:
-                mscr_path = str(Path(tempfile.gettempdir()) / f"softae_ch{ch}.mscr")
-                eis_run_mscrbuild(
-                    mscr_path,
-                    mux_ch=ch,
-                    mVac=p.get("mv_ac", 10),
-                    f_hi=p.get("f_hi", 200_000),
-                    f_lo=p.get("f_lo_mHz", 100),
-                    npts=p.get("npts", 20),
-                    mVdc=p.get("mv_dc", 0),
-                )
-        except ImportError:
-            pass  # mscr_library not available in test/CI environment
+        self._build_channel_scripts()
 
         executor = WorkflowExecutor(
             manager=self.manager,
@@ -1020,11 +1059,14 @@ class ArrheniusSweep:
                 eis = _parse_eis_result(
                     step,
                     raw,
-                    eis_params=self.config.eis_params or {},
+                    eis_params=self._eis_params_for(ch),
                     elapsed=elapsed,
                 )
                 if eis is not None:
                     self._eis_results[(ch, t_idx)] = eis
+                    # Observe-only here: the verdict belongs on the row it was
+                    # drawn from, and nothing on this path can act on it.
+                    self._scout.observe(ch, eis)
                     # Stamp commanded T_sp and live T_pv / RH readings
                     eis.T_sp = float(temps[t_idx]) if t_idx < len(temps) else float("nan")
                     try:

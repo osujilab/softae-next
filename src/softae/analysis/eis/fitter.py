@@ -315,7 +315,8 @@ def fit_with_covariance(
     )
 
 
-def fit_spectrum(eis_result: Any, model_name: str = "blocking_coplanar"):
+def fit_spectrum(eis_result: Any, model_name: str = "blocking_coplanar", *,
+                 max_nfev: int | None = None):
     """Fit one spectrum and return a legacy-shaped ``FitResult`` carrying covariance.
 
     Produces the *same* :class:`~softae.analysis.circuit_fitting.FitResult` type the
@@ -326,6 +327,20 @@ def fit_spectrum(eis_result: Any, model_name: str = "blocking_coplanar"):
 
     Never raises: a failure returns ``success=False`` with NaN resistances, matching
     :func:`softae.analysis.circuit_fitting.fit_circuit`'s contract.
+
+    *max_nfev* bounds the optimiser's residual-evaluation budget for this one call.
+    **``None`` is not "no budget" — it is the module default**, so an omitted argument
+    reproduces the call this function has always made, byte for byte; that is what
+    makes the parameter additive rather than a behaviour change.
+
+    It exists because :func:`fit_with_covariance` already takes the bound and nothing
+    could reach it. :func:`~softae.analysis.eis.engine.analyze_spectrum` uses it on the
+    blocking-open population, where the unbounded fit was measured to exhaust
+    :data:`DEFAULT_MAX_NFEV` and return ``None`` every time — 38–66 s spent on a result
+    the caller then discards in favour of its fallback fitter. A bounded run is a strict
+    *prefix* of the unbounded one's trajectory, so it cannot converge where the longer
+    run did not: capping a budget that was going to be exhausted anyway returns the same
+    ``None``, and the reported ``R1`` does not move at all.
     """
     from softae.analysis.circuit_fitting import FitResult, extract_features
     from softae.analysis.eis.models import EIS_CIRCUITS, roles_for
@@ -360,7 +375,11 @@ def fit_spectrum(eis_result: Any, model_name: str = "blocking_coplanar"):
             "CPE0_0": 1e-7, "CPE0_1": 0.8, "C0": 3e-10, "L0": 1e-6}
     guess = [seed.get(n, 1.0) for n in names] or [r0_guess, 1e-7, 0.8, r1_guess, 3e-10]
 
-    cov = fit_with_covariance(freq, Z, circuit, guess, constants=constants)
+    # Spelled as a splat rather than as `max_nfev=max_nfev or DEFAULT_MAX_NFEV` so the
+    # default lives in exactly one place: the callee's signature. Restating it here
+    # would be a second copy to keep in step.
+    budget = {} if max_nfev is None else {"max_nfev": int(max_nfev)}
+    cov = fit_with_covariance(freq, Z, circuit, guess, constants=constants, **budget)
 
     if cov is None:
         return FitResult(

@@ -38,7 +38,7 @@ from typing import Any
 import numpy as np
 import structlog
 
-from softae.analysis.eis.arc import annotate_arc_closure
+from softae.analysis.eis.arc import annotate_arc_closure, arc_closure
 from softae.analysis.eis.engine_support import (
     _as_eis,
     _demote_if_railed,
@@ -46,6 +46,8 @@ from softae.analysis.eis.engine_support import (
     _physics_complex,
     _resolve_reported_resistance,
     apply_correction_arrays,
+    blocking_open,
+    pregate_settings,
     spectrum_key,
 )
 from softae.analysis.eis.geometry import CellConstant
@@ -76,10 +78,19 @@ __all__ = [
     "_physics_complex",
     "_resolve_reported_resistance",
     "_sigma_from_R",
+    "_two_point_fit",
     "analyze_spectrum",
     "apply_correction_arrays",
+    "blocking_open",
+    "pregate_settings",
     "spectrum_key",
 ]
+
+#: What ``fit.estimator`` says when the two-point route produced ``R1``.
+#: ``DataStore.record_fit`` reads this off the *fit* — the same deviation
+#: ``_arc_columns`` makes, and for the same reason: the label has to survive to a row
+#: written by a caller that passes no report.
+TWO_POINT = "two_point_debye"
 
 
 def _sigma_from_R(
@@ -192,6 +203,95 @@ def _legacy_report(
                           gate_log=(), mask=None, cell=cell)
 
 
+def _two_point_fit(eis_result: Any, model_name: str) -> Any | None:
+    """``R₁`` from the ideal Debye circle through the two lowest-frequency points.
+
+    Returns ``None`` when the two points do not describe a physical arc, and that is
+    the safety property rather than an edge case: a decline falls through to the route
+    this engine takes today, so the two-point read can only ever *replace* a fit, never
+    fail one.
+
+    **The arithmetic.** A Debye arc is a semicircle centred on the real axis, so two
+    points ``(x, y)`` on it — with ``y = −Z″ > 0`` — determine it outright::
+
+        c = [(x₁² + y₁²) − (x₂² + y₂²)] / [2(x₁ − x₂)]        centre
+        r = √[(x₁ − c)² + y₁²]                                 radius
+        R_series = c − r,   R_bulk = 2r                        the intercepts
+
+    Closed form, three multiplications, no optimiser — against the 87 421 residual
+    evaluations the CPE fit spends on the same spectrum before returning nothing.
+
+    **Why the two *lowest* points**, and the risk in it. They are the two nearest the
+    end of the arc that was never measured, which is the end ``R₁`` lives at — and they
+    are also where this rig is noisiest. That trade is deliberate and it is the reason
+    [p35]'s bias measurement, not this docstring, is what licenses the route: on
+    truncated arcs the two-point read's median ``R_est/R_true`` is **1.598** against the
+    full CPE fit's **2.752**, so the cheap estimator is measurably the *less* biased one
+    exactly where it is used.
+
+    **Why it declines rather than clamps.** On a genuinely blocking spectrum the two
+    lowest points sit on a near-vertical tail, ``x₁ ≈ x₂``, and the circle through them
+    is enormous and meaningless. The physical guards below — a non-negative
+    ``R_series`` that does not exceed the smallest measured ``Re Z`` — reject exactly
+    that geometry. Returning a confident number there would be the failure [a53] names:
+    a biased ``R₁`` flowing through unlabelled.
+    """
+    from softae.analysis.circuit_fitting import FitResult
+
+    freq, Z = _physics_complex(eis_result)
+    order = np.argsort(freq)
+    f_s, x, y = freq[order], Z.real[order], -Z.imag[order]
+    if f_s.size < 2 or not (np.isfinite(x).all() and np.isfinite(y).all()):
+        return None
+
+    (f1, x1, y1), (f2, x2, y2) = (f_s[0], x[0], y[0]), (f_s[1], x[1], y[1])
+    if not (y1 > 0 and y2 > 0) or x1 == x2:
+        return None
+
+    centre = ((x1 * x1 + y1 * y1) - (x2 * x2 + y2 * y2)) / (2.0 * (x1 - x2))
+    radius = float(np.sqrt((x1 - centre) ** 2 + y1 * y1))
+    R_series, R_bulk = float(centre - radius), float(2.0 * radius)
+
+    # The high-frequency intercept of a real arc is non-negative and cannot sit to the
+    # right of the smallest resistance actually measured. A blocking tail fails both.
+    if not (np.isfinite(R_series) and np.isfinite(R_bulk)) or R_bulk <= 0:
+        return None
+    if R_series < 0 or R_series > float(np.min(x)):
+        return None
+
+    # τ from the same first point, so the reconstructed curve passes through it and the
+    # residuals downstream are the honest ones for *this* circle rather than a curve
+    # fitted a second time.
+    span = x1 - R_series
+    if span <= 0:
+        return None
+    tau = float(y1 / (span * 2.0 * np.pi * f1))
+    z_fit = R_series + R_bulk / (1.0 + 1j * 2.0 * np.pi * freq * tau)
+
+    quality: dict[str, float] = {}
+    try:
+        from softae.analysis.quality import compute_fit_quality
+
+        quality = compute_fit_quality(eis_result, z_fit, n_params=3)
+    except Exception:      # noqa: BLE001 - grading must not cost the estimate
+        quality = {}
+
+    fit = FitResult(
+        model_name=model_name,
+        parameters=np.array([R_series, R_bulk, tau], dtype=float),
+        R0=R_series, R1=R_bulk, R0_guess=R_series, R1_guess=R_bulk,
+        z_indices=[0, 1], z_fit=z_fit, quality=quality,
+    )
+    # Read by ``DataStore.record_fit`` so the stored row says which estimator produced
+    # its ``R1``. Attached to the fit rather than carried on the report because a row
+    # can be written with ``report=None``, and an unlabelled epoch is the whole problem.
+    fit.estimator = TWO_POINT
+    logger.info("eis_two_point_read", channel=getattr(eis_result, "channel", None),
+                R_series_ohm=R_series, R_bulk_ohm=R_bulk, tau_s=tau,
+                f_low_hz=float(f1))
+    return fit
+
+
 def _log_spectrum_metrics(
     eis_result: Any,
     *,
@@ -265,6 +365,7 @@ def analyze_spectrum(
     re_connection: str = "unverified",
     correction: Any = None,
     calibration: Any = None,
+    pregate: Any = None,
 ) -> SpectrumReport:
     """Analyse one spectrum through whichever engine is selected.
 
@@ -284,6 +385,11 @@ def analyze_spectrum(
         from ``[eis.fixture]`` and the stored calibration. The legacy engine ignores
         this entirely — correcting there would break the parity that makes the two
         engines comparable.
+    pregate
+        A :class:`~softae.analysis.eis.engine_support.PregateSettings`. ``None`` resolves
+        ``[eis.pregate]``, whose two flags both ship false. An override in the same shape
+        as ``gates`` and ``envelope``, and for the same reason — it does not choose an
+        *engine*, so it is not a second answer to the question ``engine`` asks.
     """
     cfg = settings if settings is not None else eis_settings()
     chosen = (engine or cfg.engine or "legacy").strip().lower()
@@ -391,12 +497,51 @@ def analyze_spectrum(
     # back to the legacy fitter keeps a spectrum analysable if the backend is absent.
     from softae.analysis.eis.fitter import fit_spectrum
 
-    try:
-        fit = fit_spectrum(surviving, model_name)
-    except ValueError:
-        fit = fit_circuit(surviving, model_name)
-    if not fit.success:
-        fit = fit_circuit(surviving, model_name)
+    # ── The pre-gate ─────────────────────────────────────────────────────────
+    #
+    # `arc_closure` costs ~1 ms and already knows what the optimiser needs 38 s to
+    # find out. Until now it was read only *after* the fit, by `annotate_arc_closure`
+    # below; reading it first is the entire change.
+    #
+    # **It does not decide admissibility, and it must not.** `arc.py` says outright
+    # that nothing there demotes a fit, because refusing the open third "would throw
+    # away most of the cold end of every temperature sweep" — 8 % open at the hot end
+    # against 73 % at the cold end, which is precisely where an Arrhenius slope has
+    # its leverage. So every spectrum still produces an R₁; the pre-gate only chooses
+    # a cheaper route to one.
+    #
+    # Judged on `surviving` — the same corrected, truncated points the fit and
+    # `annotate_arc_closure` see, so the route taken and the closure recorded beside
+    # it can never describe different data.
+    pre_cfg = pregate if pregate is not None else pregate_settings()
+    fit = None
+    budget = None
+    if pre_cfg.engaged and blocking_open(
+        arc_closure(surviving.frequency, surviving.z_imag_neg,
+                    getattr(surviving, "phase", None)), pre_cfg
+    ):
+        if pre_cfg.two_point_open:
+            # (B). Epoch-grade: this *changes* R₁ on the open population, under an
+            # operator authorisation naming that change — "given that the raw data
+            # will be better represented" — and on [p35]'s measurement that the CPE
+            # fit is the more biased estimator here (175.2 % against 60.9 %). A
+            # decline returns None and the ordinary route runs.
+            fit = _two_point_fit(surviving, model_name)
+        if fit is None and pre_cfg.budget_cap:
+            # (A). Same estimator, bounded effort, and it cannot move a number: the
+            # unbounded fit was measured to exhaust its 20 000 evaluations and return
+            # nothing on this exact population, and a bounded run is a strict prefix
+            # of that trajectory — so it fails identically, falls back identically,
+            # and reports the identical R₁ two orders of magnitude sooner.
+            budget = pre_cfg.max_nfev
+
+    if fit is None:
+        try:
+            fit = fit_spectrum(surviving, model_name, max_nfev=budget)
+        except ValueError:
+            fit = fit_circuit(surviving, model_name)
+        if not fit.success:
+            fit = fit_circuit(surviving, model_name)
     # After the fallback, never before it: demoting a railed fit clears
     # ``success``, and the line above reads that flag as "try the other fitter".
     railed = _demote_if_railed(fit)

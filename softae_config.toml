@@ -98,7 +98,12 @@ trinket_baud = 115_200
 pid_kp   = 0.007
 pid_ki   = 0.0015
 pid_kd   = 0.05
-max_consecutive_failures = 5   # sensor soft-reset threshold
+# Sensor soft-reset threshold: consecutive I2C read errors before the RH driver
+# power-cycles the HT sensor. NOT a campaign limit — the autonomous loop's
+# park-on-systematic-fault limit is `AutonomousLoop.park_after_failed_trials`
+# (3, and deliberately not config-resolved); the two were once spelled the same
+# and are not the same thing.
+max_consecutive_failures = 5
 max_stale_s              = 30.0  # seconds before held last-good reading becomes NaN
 
 [instruments.piezo]
@@ -475,7 +480,7 @@ rh_poll_interval_s       = 60.0
 # to the anneal above: there humidity IS the variable under test, so an unmet setpoint
 # is the primary result rather than a secondary one. How many CONSECUTIVE settle phases
 # may end RH-decided (ceiling-limited, or not evaluable because RH was unreadable)
-# before the campaign parks. Matches `AutonomousLoop.max_consecutive_failures = 3`: a
+# before the campaign parks. Matches `AutonomousLoop.park_after_failed_trials = 3`: a
 # second streak limit at a different K would be an unexplained inconsistency in the same
 # loop. Two in a row already implies something persistent; three is diagnostic.
 rh_ceiling_park_after_trials = 3
@@ -699,11 +704,158 @@ blank_repro_pct     = 5.0    # blank repeatability tolerance (E2)
 geom_sigma_spread_tol   = 0.25  # max fractional spread in sigma across frequencies
 geom_slope_exponent_tol = 0.15  # max |d ln m / d ln f|; loss trends toward 1, sigma 0
 
+# --- Acquisition scout (analysis/eis/scout.py) --------------------------------
+#
+# Where the NEXT sweep on a channel should put its points, given the arc the last
+# one found. A preset spends most of its time at the bottom of its grid -- for
+# `Longest` the single lowest point is 30 % of a 516 s sweep -- and the preset that
+# reaches low enough for a dry sample spends that time in a decade where nothing is
+# being measured. A piecewise sweep laid around the observed apex roughly doubles
+# arc coverage and is cheaper in 5 of the 6 cases where a preset reaches at all.
+#
+# `enabled` = the decision runs on every spectrum and LOGS the plan it would have
+# chosen.  `actuate` = that plan actually drives the next acquisition.  Separate on
+# purpose, so verdicts can accumulate against real runs at zero hardware cost --
+# exactly as `[eis.gates] enabled = false` accumulates gate verdicts.
+#
+# BOTH SHIP OFF. `core/eis_scout_scripts.py` is the shared runtime; two call sites
+# use it, and only one of them can act:
+#
+#   Manual Control tab -- scout-then-measure, gated by that tab's own "Scout
+#     sweep" checkbox (see `actuate_manual` below), NOT by `actuate`. The sweep
+#     you selected runs first and IS the measurement whenever its arc closes with
+#     enough band below the apex (11 of 15 ambient and 12 of 12 humid wells, on
+#     the source artifact's data), so the common case costs nothing extra. Only an
+#     inadequate spectrum earns a second sweep: a piecewise grid laid around the
+#     apex when one was measured, otherwise one rung down the preset ladder. A
+#     second sweep can only ever be WIDER or denser -- never narrower than what
+#     you asked for.
+#   Temperature/RH sweep -- OBSERVE-ONLY, by construction. Every channel's script
+#     is written before `executor.run` and the workflow then holds the whole
+#     temperature axis, so the finest granularity available is per-sweep: one RH
+#     setpoint's spectra choosing the next one's grids. That is a stale plan by
+#     definition -- the apex was measured moving ~100x across an RH change -- so
+#     `actuate` deliberately does nothing here.
+#   Campaign path -- out of scope. `modality.prepare_run` builds every script once
+#     before the trial loop, so a per-sample plan has nowhere to stand.
+#
+# NO PLAN OUTLIVES THE MEASUREMENT THAT MADE IT. There is no plan cache to go
+# stale: a decision is consumed by the acquisition that produced it and then
+# discarded. Between two Run presses (or two sweeps) the sample, RH and
+# temperature may all have moved, and nothing here can detect that.
+#
+# `enabled = true` alone is free: it logs `eis_scout_verdict` per spectrum and
+# stamps that verdict on the row, and takes no extra sweep. Leave `actuate` off
+# until the logged verdicts have been reviewed -- actuating changes WHICH spectrum
+# is acquired, a different lever from `[eis.gates]`, and the two are kept
+# independently flippable on purpose.
+[eis.scout]
+enabled                     = false
+actuate                     = false
+
+# The Manual Control tab has its OWN switch, and `actuate` above cannot reach it.
+# That tab is where non-standard samples get measured -- a two-arc system, a
+# stack, something nobody has characterised -- and the planner assumes a single
+# arc: `arc.py` reports the tallest interior maximum, so on a two-arc spectrum it
+# will pick one and plan around it without saying that it chose. Whether the thing
+# on the board is standard enough for that is a judgement made by a person at the
+# rig, per sample, so the tab carries a "Scout sweep" checkbox and THIS KEY IS
+# ONLY WHAT THE BOX STARTS AT. Leave it false unless every sample that tab sees is
+# a plain single-arc cell.
+actuate_manual              = false
+
+# The planner's OWN cut, and it is deliberately NOT arc.py's. `arc_closure` is
+# biased toward CLOSED because a missed warning is cheaper than a false one. Here
+# the asymmetry reverses: a too-narrow sweep costs a well and a MEASURED 60.9 %
+# median R1 overestimate (biased, not scattered; 175.2 % with the full CPE fit),
+# against 19.7-102.9 s for one preset step. So this cut sits well toward OPEN.
+# 1.0 decade, not the source artifact's 0.4: the 60.9 % was measured at 1.5x past
+# the apex, which is 0.176 decades. Calibration is by replay against the stored
+# corpus (spec section 10), jointly with parallel-session -- not by tuning here.
+band_below_apex_min_decades = 1.0
+apex_prominence_min         = 0.10   # topographic, relative to the peak's OWN height
+
+# --- Segment layout ---
+#
+# `arc_points_per_decade`, not a fixed arc point count: points per decade is what
+# the circle fit cares about, and it keeps cost proportional to the band. A fixed
+# 25 points made a 65 Hz apex 1.7x DEARER than the preset it replaced by putting
+# several points below 20 Hz at ~1.7 s each.
+#
+# f_hi_hz / f_floor_hz are NOT duplicated here -- they resolve from
+# [eis.instrument] f_max_hz / f_min_hz, which are the authority on this instrument.
+#
+# Costs are priced by `core/preflight.py` (34.5 cycles/point over a 0.131 s floor,
+# refitted against four stopwatched presets). `eis_opt` / `meas_ms_eis` remain
+# unavailable on this Pico firmware; a firmware that exposed them would invalidate
+# this whole cost basis, favourably, and these numbers would need re-deriving.
+hf_points                   = 10     # HF limb; every point sits at the 0.131 s floor
+arc_points_per_decade       = 12.0
+arc_decades_above           = 1.0
+arc_decades_below           = 1.0
+tail_points                 = 0      # 0 omits the tail segment entirely
+tail_decades                = 0.0
+max_total_s                 = 0.0    # 0 = uncapped; otherwise the arc band is
+                                     # trimmed in 0.1-decade steps until it fits,
+                                     # logged with requested vs granted
+
 # --- Fixture correction (E3) -------------------------------------------------
 #
 # How much of the measured impedance belongs to the mux, ribbon and trace rather
 # than to the cell. Applies on the GATED engine only.
 #
+# THE FITTER PRE-GATE. `arc_closure` knows in ~1 ms what the optimiser takes 38 s to
+# discover, and it used to be consulted only AFTER the fit. Measured over 192 real
+# spectra (replay 2026-08-14): arc CLOSED costs a median 0.16 s, arc OPEN 37.97 s
+# (P90 47.71 s), open-arc fraction 39 %. Looking INSIDE that 38 s: on the steeply
+# capacitive open arcs the covariance fit exhausts its 20 000-evaluation budget and
+# returns NOTHING -- the R1 on the row came from the fallback fitter all along.
+#
+# NOT A SKIP-ON-OPEN, and it must never become one. `arc.py` is explicit that nothing
+# there demotes a fit, because refusing the open third "would throw away most of the
+# cold end of every temperature sweep" -- 8 % open at the hot, wet end against 73 % at
+# the cold end, which is precisely where an Arrhenius slope has its leverage. Every
+# spectrum still produces an R1; these flags only choose a cheaper route to one.
+#
+# TWO FLAGS, INDEPENDENT ON PURPOSE, and a third lives in [eis.scout]:
+#
+#   budget_cap      how long the SAME estimator may run. Cannot move a number: a
+#                   bounded run is a strict prefix of the unbounded one's trajectory,
+#                   so a fit that was going to exhaust 20 000 evaluations exhausts
+#                   2 000 instead, fails identically and falls back identically.
+#   two_point_open  WHICH estimator produces R1. DELIBERATELY CHANGES IT, on the open
+#                   population only. Operator-authorized by name -- "given that the
+#                   raw data will be better represented" -- because on truncated arcs
+#                   the CPE fit's median R_est/R_true is 2.752 (175.2 % over) against
+#                   the two-point read's 1.598 (60.9 %), with a sixth of CPE fits
+#                   landing ~30x UNDER truth and none of the 80 declining. This is
+#                   SCHEMA EPOCH 5: rows either side are comparable only among
+#                   themselves ON THE OPEN POPULATION, diverted rows are labelled
+#                   `gated_two_point` in fit_results.engine, and nothing is backfilled.
+#   [eis.scout]     which frequencies are ACQUIRED in the first place.
+#
+# Arm them one at a time. Flip two together and a moved R1 has two candidate causes
+# with no way to separate them; the stored spectrum cannot tell you which.
+#
+# ALL SHIP OFF. Legacy is still the default engine, so on a stock config this table is
+# not even reached -- the pre-gate lives on the gated path only.
+[eis.pregate]
+budget_cap          = false
+two_point_open      = false
+
+# The discriminator is SEVERITY, not the verdict. `state == OPEN` alone is wrong:
+# measured on the same corpus, an open arc at -31.1 deg at the sweep floor CONVERGES
+# in 0.05 s, while -81.7/-87.7/-92.0 deg cost 48.1/66.0/51.6 s and return nothing.
+# -60 deg sits in the empty band between those clusters. This threshold is deliberately
+# NOT in arc.py: that module keeps its CLOSED-biased verdict and ships no policy.
+phase_low_max_deg   = -60.0
+
+# Residual-evaluation ceiling for the capped fit. Two orders below the fitter's
+# DEFAULT_MAX_NFEV = 20 000 and still an order above the cost of every fit measured to
+# converge at all on this corpus, so it sits in the gap between "converges" and
+# "never will".
+max_nfev            = 2000
+
 # mode = "auto" resolves from the calibration's capability ladder: "none" until a
 # short blank exists for this fixture, "series" the moment one does. Nobody has to
 # remember to switch it on after commissioning, and — more to the point — nobody

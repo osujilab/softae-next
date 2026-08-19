@@ -95,6 +95,32 @@ SCHEMA_EPOCHS: tuple[tuple[int, str, str], ...] = (
      "is obtained with SELECT temperature_source, COUNT(*) FROM conditions "
      "GROUP BY temperature_source. The migration that wrote it logs the same "
      "counts once, per database, as it goes"),
+    (5, "data-epoch",
+     "2026-08-18 fit_results.R1 may be produced by the TWO-POINT DEBYE READ instead "
+     "of the CPE circuit fit, on OPEN-ARC spectra only, when [eis.pregate] "
+     "two_point_open is armed. Column, units and type are unchanged - R1 is still a "
+     "REAL in ohms - and that is exactly why this is an epoch and not a schema note: "
+     "it is version 2's situation, where deposit_area_mm2 changed DERIVATION while "
+     "the column held still, and not version 3's, where the numbers held still and "
+     "the names moved. Operator-authorized by name, on the rationale that the "
+     "deliberate change is acceptable 'given that the raw data will be better "
+     "represented': on truncated arcs the CPE fitter's median R_est/R_true is 2.752 "
+     "(175.2% over) against the two-point read's 1.598 (60.9%), p16 = 0.031, and all "
+     "80 fits reported success while none declined - so the cheaper estimator is the "
+     "less biased one precisely where it is used. SCOPE, and it is narrow: arcs that "
+     "CLOSED are untouched and provably so; only spectra whose arc did not close AND "
+     "whose phase at the sweep floor is still essentially capacitive are diverted. "
+     "COMPARABILITY: rows either side of this date are comparable only among "
+     "themselves ON THE OPEN POPULATION; the closed population is continuous across "
+     "it. NO BACKFILL - historical rows keep their CPE-fit values, because "
+     "recomputing them would manufacture the false comparability this ledger exists "
+     "to prevent, the same argument _migrate_experiment_skipped_channels makes for "
+     "leaving NULL alone. A row does not have to be dated to be read: "
+     "fit_results.engine carries 'gated_two_point' on exactly the diverted rows, so "
+     "the population is SELECT-able rather than inferred from this timestamp - which "
+     "is the whole point, since [a53] records that the failure mode on this rig is "
+     "biased R1 flowing through UNLABELLED. Shipped DISABLED; the epoch begins for a "
+     "given database when someone arms the flag, not when this row was seeded"),
 )
 
 # ---------------------------------------------------------------------------
@@ -562,6 +588,33 @@ def _arc_columns(fit_result: Any) -> dict[str, Any]:
             "arc_f_peak_hz": _f_or_none(arc.f_peak_hz),
             "arc_f_low_hz": _f_or_none(arc.f_low_hz),
             "arc_phase_low_deg": _f_or_none(arc.phase_low_deg)}
+
+
+def _engine_label(engine: str, fit_result: Any) -> str:
+    """Name the estimator that produced this row's ``R1``, not just the engine.
+
+    Schema epoch 5. ``R1`` stays a REAL in ohms whichever route produced it, so
+    nothing about the row's *shape* says whether it came from the CPE circuit fit or
+    from the two-point Debye read — and [a53] records that the failure mode on this
+    rig is precisely a biased ``R1`` flowing through **unlabelled**. A date in the
+    epoch ledger cannot answer it either: the flag is per-configuration, so a database
+    can hold both kinds written the same afternoon.
+
+    ``engine`` is refined rather than joined by a second column, because that column
+    already answers *what produced this number* — ``'legacy'``, ``'gated'``, and now
+    ``'gated_two_point'`` — and a parallel ``estimator`` column would be a second
+    spelling of one fact, which is how two columns start disagreeing.
+
+    Read off the **fit**, the same deviation :func:`_arc_columns` makes and for the
+    same reason: a fit reaches this table from callers that pass no report at all, and
+    a label that only survives on reported rows is a label that goes missing exactly
+    where the epoch matters. Anything unlabelled is left exactly as it was.
+    """
+    from softae.analysis.eis.engine import TWO_POINT
+
+    if getattr(fit_result, "estimator", None) != TWO_POINT:
+        return engine
+    return f"{engine}_two_point" if engine != "legacy" else "two_point"
 
 
 @dataclass(frozen=True)
@@ -1182,6 +1235,7 @@ class DataStore:
         # columns landed carry the literal "[]" there, and the older rows that
         # carried the record in the JSON are still read by `shadow_db`'s fallback.
         extra.update(_arc_columns(fit_result))
+        extra["engine"] = _engine_label(extra["engine"], fit_result)
         # A bounded σ is not a value.  Storing it in ``sigma_S_per_cm`` would let any
         # reader that does not check ``sigma_is_bound`` treat a ceiling as a
         # measurement, so the column is cleared and the bound travels separately.

@@ -49,6 +49,46 @@ def _finite_or_none(value: float) -> float | None:
     return float(value) if value == value and np.isfinite(value) else None
 
 
+def _peak_prominence(y: np.ndarray, k: int) -> float:
+    """Topographic prominence of ``y[k]`` — how far it stands above its saddles.
+
+    The standard definition, and the one :func:`scipy.signal.peak_prominences`
+    computes: walk out either side until a value higher than the peak is met or the
+    array ends, take the lowest point reached on each side, and measure the peak
+    above the *higher* of those two bases. Written out here in nine lines because
+    this module imports only numpy and sits on the router's per-fit path; a scipy
+    import for one array walk is not a trade worth making.
+    """
+    left = y[k]
+    for i in range(k - 1, -1, -1):
+        if y[i] > y[k]:
+            break
+        left = min(left, y[i])
+    right = y[k]
+    for i in range(k + 1, y.size):
+        if y[i] > y[k]:
+            break
+        right = min(right, y[i])
+    return float(y[k] - max(left, right))
+
+
+def _interior_apex(y_s: np.ndarray) -> int:
+    """Index of the tallest **strict-interior** local maximum, or ``-1``.
+
+    Endpoints are never candidates. That is not a stylistic choice: this tree has
+    already paid twice for an extremum search that admitted a window edge (F15, the
+    ``|Z|`` minimum read as the interior ``−Z″`` valley, wrong by 10× and published),
+    and :func:`~softae.analysis.eis.gates.gate_valley_feature` was written to fix it
+    on the sibling feature. The same policy applies here on the maximum.
+    """
+    best = -1
+    for k in range(1, y_s.size - 1):
+        if y_s[k] > y_s[k - 1] and y_s[k] > y_s[k + 1]:
+            if best < 0 or y_s[k] > y_s[best]:
+                best = k
+    return best
+
+
 @dataclass(frozen=True)
 class ArcClosure:
     """Where the ``−Z″`` peak sat, and how far the sweep was from closing.
@@ -68,6 +108,31 @@ class ArcClosure:
     #: Why the state is ``UNKNOWN``, or why a peak at the sweep floor was still
     #: read as ``CLOSED``. Empty on a plain closed arc.
     reason: str = ""
+
+    # ── Additive, and never consulted by ``state`` or ``f_peak_hz`` ──────────
+    #
+    # Appended *after* ``reason`` because the constructions below are positional;
+    # inserting them earlier would silently rebind ``reason``. They answer the
+    # acquisition question — *where should the next sweep put its points?* — which
+    # is not the question ``state`` answers, and they carry no threshold: the cut
+    # lives in :mod:`softae.analysis.eis.scout`, because for a guard the cheap
+    # error is a missed warning while for a planner it is the opposite.
+    #
+    # On a tail-dominated spectrum the global maximum of ``−Z″`` *is* the tail
+    # (measured: 8.1e5 Ω of tail against a 5.3e4 Ω arc apex), so ``f_peak_hz`` is
+    # honestly the sweep floor and the arc worth measuring is 20 Hz up-sweep.
+
+    #: Tallest strict-interior local maximum of ``−Z″``. NaN when there is none.
+    f_apex_interior_hz: float = float("nan")
+    #: Its topographic prominence divided by **its own height** — never by the
+    #: spectrum's global maximum, which a blocking tail owns. Measured on a 15-well
+    #: humid series: 1/15 arcs detected with global scaling, 12/15 with relative.
+    apex_prominence_rel: float = float("nan")
+    #: ``log10(f_apex_interior_hz / f_low_hz)`` — how much band was measured below
+    #: the arc. Kept separate from the prominence on purpose: a prominent apex
+    #: 0.1 decades off the floor and a weak shoulder 2 decades up demand opposite
+    #: actions, and one score cannot tell them apart.
+    band_below_apex_decades: float = float("nan")
 
     @property
     def closed(self) -> bool:
@@ -132,6 +197,10 @@ def arc_closure(
     the cost of the guard is an occasional missed warning rather than an occasional
     false one. Over the 1440-spectrum characterisation run it reclassifies two
     spectra out of the 478 that bare ``argmax`` calls open.
+
+    The three interior-apex fields are computed alongside and reported alongside;
+    they never enter the rule above, so ``state`` and ``f_peak_hz`` are what they
+    have always been on every spectrum this rig has stored.
     """
     f = np.asarray(freq, dtype=float).ravel()
     y = np.asarray(z_imag_neg, dtype=float).ravel()
@@ -153,9 +222,21 @@ def arc_closure(
         if p.size == f.size:
             ph = float(p[order][0])
 
+    # Parallel result, computed off the same sorted arrays so it inherits the
+    # order-invariance above for free. It feeds only the three new fields — the
+    # verdict below is the same code, in the same order, that it always was.
+    interior: dict[str, float] = {}
+    apex = _interior_apex(y_s)
+    if apex >= 0 and y_s[apex] > 0.0:
+        interior = {
+            "f_apex_interior_hz": float(f_s[apex]),
+            "apex_prominence_rel": _peak_prominence(y_s, apex) / float(y_s[apex]),
+            "band_below_apex_decades": float(np.log10(f_s[apex] / f_s[0])),
+        }
+
     peak = int(np.argmax(y_s))
     if peak != 0:
-        return ArcClosure(CLOSED, float(f_s[peak]), float(f_s[0]), ph)
+        return ArcClosure(CLOSED, float(f_s[peak]), float(f_s[0]), ph, **interior)
 
     trailing = y_s[:TRAILING_POINTS]
     # Each rise is judged against the point it climbs *to*, never against the floor
@@ -166,8 +247,8 @@ def arc_closure(
         # frequency: the arc's real peak is up-sweep, so report that one.
         runner_up = 1 + int(np.argmax(y_s[1:]))
         return ArcClosure(CLOSED, float(f_s[runner_up]), float(f_s[0]), ph,
-                          reason="lone excursion at the sweep floor")
-    return ArcClosure(OPEN, float(f_s[0]), float(f_s[0]), ph)
+                          reason="lone excursion at the sweep floor", **interior)
+    return ArcClosure(OPEN, float(f_s[0]), float(f_s[0]), ph, **interior)
 
 
 def annotate_arc_closure(fit: Any, eis_result: Any) -> ArcClosure:
