@@ -199,15 +199,21 @@ class ParkGuard:
         return result
 
     def describe(self) -> str:
-        """One line an operator can read at the end of a killed run."""
+        """One line an operator can read at the end of a killed run.
+
+        The grade comes from :meth:`~softae.core.safe_park.SafeParkResult.headline`
+        rather than from ``ok``, which is a statement about exceptions: a park
+        that reached no instrument at all raises nothing, so this used to head
+        the report of a killed run *"parked"* having commanded not one byte.
+        That is the report a 3 a.m. reader acts on.
+        """
         if not self._claimed:
             return "the rig was NOT parked"
         if self.result is None:
             return f"park in progress ({self.reason})"
-        if self.result.ok:
-            return f"parked ({self.result.summary()}): {self.reason}"
-        return (f"park INCOMPLETE ({self.result.summary()}): "
-                + "; ".join(self.result.errors))
+        text, _severe = self.result.headline()
+        detail = "; ".join(self.result.errors) or self.reason
+        return f"{text} ({self.result.summary()}): {detail}"
 
 
 _active_lock = threading.Lock()

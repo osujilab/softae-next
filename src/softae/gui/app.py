@@ -128,12 +128,12 @@ def run_app(*, mock: bool | None = None) -> int:
     )
 
     # --- Main window ---
-    window = MainWindow(manager, data_store=data_store)
-    # The seam the attached views read.  Set here rather than passed to the
-    # constructor only because the window's own use of it lands in the next
-    # step of this arc; it is one decision, made once, and this is where it is
-    # made.
-    window.launch_mode = mode
+    # The mode is a constructor argument, not an attribute set afterwards: the
+    # window is *built* differently by it — no exit park, no idle-purge timer,
+    # no Safe Exit in attached mode — and none of that could be undone by a
+    # later assignment. ``MainWindow.launch_mode`` is read-only for the same
+    # reason.
+    window = MainWindow(manager, data_store=data_store, launch_mode=mode)
     window.show()
 
     from softae.gui.widgets.unclean_shutdown import check_unclean_shutdown

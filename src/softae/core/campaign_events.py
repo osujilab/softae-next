@@ -1,8 +1,10 @@
 """The campaign's run-directory sidecars: narration out, control in.
 
 ``events.jsonl`` (stage 3, D7) is the durable channel a watcher reads;
-``control.json`` (stage 4, D1) is the one small file a watcher writes. Both live
-beside the run, both are best-effort, and neither can refuse anyone anything.
+``control.json`` (stage 4, D1) is the one small file a watcher writes;
+``conditions.json`` (stage 5, S5.F) is the single slot the campaign republishes
+so a watcher holding no instrument sessions can still see the rig. All three live
+beside the run, all three are best-effort, and none can refuse anyone anything.
 
 Stages 3 and 4 of ``docs/SubAgent docs/campaign_attach_architecture.md``.
 
@@ -74,7 +76,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Sequence
 
 import structlog
 
@@ -388,6 +390,284 @@ def open_narrator(run_dir: str | Path, **kwargs: Any) -> CampaignNarrator | None
         logger.warning("campaign_narrator_unavailable", run_dir=str(run_dir),
                        exc_info=True)
         return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Reading events.jsonl — cursor, rotation, liveness (stage 5, S5.B)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Stage 3 shipped the writer and no reader, so every consumer that wanted the
+# stream — the attached GUI's sidebar, the E-Stop ladder's ack wait, the Pause
+# and Abort buttons — would have written its own tailer. This is that tailer,
+# written once, headless, with no Qt anywhere near it: everything below is a
+# pure function of what is on disk plus a cursor, so the whole surface is
+# testable without a window and reusable from a script.
+#
+# The one discipline that is not negotiable is stated at :meth:`_rotate`:
+# **the handle is opened, read to EOF and closed inside every call.** A tailer
+# that keeps the file open holds it without ``FILE_SHARE_DELETE``, ``os.replace``
+# then fails with a sharing violation, ``_rotate`` gives up and keeps writing to
+# the un-rotated file — and the 32 MB cap is silently off for as long as the
+# watcher is attached. The cap exists because this process shares a disk with the
+# DataStore. A reader is not allowed to disable it.
+
+#: The three liveness bands, named once here so no widget invents a fourth or
+#: disagrees about where the boundaries fall.
+LIVENESS_LIVE = "live"
+LIVENESS_QUIET = "quiet"
+LIVENESS_STALE = "stale"
+
+
+@dataclass(frozen=True)
+class EventCursor:
+    """Where a reader got to: a generation, and a count of records inside it.
+
+    ``lines_read`` counts **complete lines consumed**, not bytes, and the reason
+    is two lines of this file rather than a preference. A byte offset stops
+    meaning anything the moment :meth:`CampaignNarrator._rotate` moves the stream
+    aside; and the stream is written in *text* mode, so on Windows every ``\\n``
+    costs two bytes on disk and one character on read — which is exactly why
+    :meth:`CampaignNarrator._append` stats the file rather than counting the
+    string it wrote.
+
+    A line is counted whether or not it yielded a record. A blank line, or a
+    complete line that is not JSON, advances the cursor and returns nothing —
+    otherwise one corrupt record would stall the reader on it forever.
+
+    ``generation`` counts the rotations **this reader has followed**, from 0. It
+    is deliberately not the writer's absolute generation number: the writer keeps
+    exactly one previous generation, so a reader attaching after two rotations
+    cannot know it was the second and has nothing to do differently if it did.
+    What the number is for is noticing a discontinuity — if it advances, the
+    reader crossed a boundary rather than simply read further.
+    """
+
+    generation: int = 0
+    lines_read: int = 0
+
+
+def events_path(run_dir: str | Path) -> Path:
+    """The live stream, beside the run. Named, never globbed — see the module top."""
+    return Path(run_dir) / EVENTS_FILENAME
+
+
+def previous_events_path(run_dir: str | Path) -> Path:
+    """The one retained earlier generation. Exists only after a rotation."""
+    return Path(run_dir) / PREVIOUS_FILENAME
+
+
+def read_events(
+    run_dir: str | Path,
+    *,
+    cursor: EventCursor | None = None,
+) -> tuple[list[dict[str, Any]], EventCursor]:
+    """Read everything written since ``cursor``, and say where that leaves us.
+
+    ``cursor=None`` is a replay: the full history the run directory still holds,
+    which after a rotation means ``events.1.jsonl`` followed by ``events.jsonl``.
+    Pass the returned cursor back on the next poll and only what is new comes
+    back.
+
+    Never raises. A missing run directory, a stream that does not exist yet, a
+    permission failure — all of them are "nothing new", because a watcher that
+    dies when the file it watches is briefly unavailable is worse than one that
+    is briefly behind.
+
+    The four properties that make this correct, each forced by something the
+    writer already does:
+
+    **The handle does not outlive the call.** See the section comment above: a
+    held handle turns the size cap off.
+
+    **A truncated final line is "not yet written", not an error.**
+    ``ExperimentLogger._write`` writes then flushes, so a reader can arrive
+    between the two. Only text up to the last ``\\n`` is treated as lines, the
+    partial tail is left uncounted, and the next poll returns it whole.
+
+    **A rotation is followed rather than absorbed.** The writer announces one by
+    making ``stream_rotated`` the first record of the new file, so a current
+    stream that opens with that record is a generation the cursor may predate. If
+    it does, the tail of ``events.1.jsonl`` is delivered first and the new
+    generation from 0 — no gap, and no record twice.
+
+    **A generation the cursor cannot be inside is re-read, not trusted.** If the
+    position is past the end of the current file, the file underneath the reader
+    was replaced; everything it now holds is returned and the generation
+    advances, so a consumer can see the discontinuity rather than silently lose
+    the difference.
+
+    Known limit, stated rather than hidden: with two integers a *second* rotation
+    is detected by the position falling off the end of the new generation. A
+    reader positioned within the first few lines of a 32 MB generation when it
+    rotates would not notice. At the shipped cap that is a ~100,000-line
+    generation and a reader that has read almost none of it, which is not a state
+    a poller reaches.
+    """
+    run_dir = Path(run_dir)
+    lines = _complete_lines(events_path(run_dir))
+    opening = _first_record(lines)
+    current_is_rotated = (
+        opening is not None and opening.get("type") == "stream_rotated")
+
+    generation = 0 if cursor is None else max(0, int(cursor.generation))
+    position = 0 if cursor is None else max(0, int(cursor.lines_read))
+
+    if position > len(lines):
+        crossed = True          # the file we were reading is not this file
+    elif current_is_rotated and generation == 0:
+        crossed = True          # the rotation happened after our cursor was cut
+    elif not current_is_rotated and generation > 0:
+        crossed = True          # our generation vanished without announcing it
+    else:
+        crossed = False
+
+    if not crossed:
+        return _records(lines[position:]), EventCursor(generation, len(lines))
+
+    events: list[dict[str, Any]] = []
+    if current_is_rotated:
+        # `position` indexes the generation now sitting in events.1.jsonl, so
+        # this is its tail — empty when the cursor had already consumed it.
+        events.extend(_records(_complete_lines(previous_events_path(run_dir))[position:]))
+    events.extend(_records(lines))
+    return events, EventCursor(generation + 1, len(lines))
+
+
+def last_heartbeat(events: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+    """The newest ``heartbeat`` record, or ``None`` if the stream carries none.
+
+    :meth:`CampaignNarrator.beat` puts ``phase`` and ``phase_age_s`` on every
+    beat precisely so a watcher can say *what* the campaign is waiting on and not
+    merely that it is waiting. Exposed here so the sidebar line and the E-Stop
+    dialog read the same record rather than each scanning for it.
+    """
+    for record in reversed(list(events)):
+        if record.get("type") == "heartbeat":
+            return record
+    return None
+
+
+def liveness(
+    events: Sequence[dict[str, Any]],
+    *,
+    now: Any,
+    heartbeat_s: float = DEFAULT_HEARTBEAT_S,
+) -> str:
+    """``"live"`` / ``"quiet"`` / ``"stale"`` from the records, not from mtime.
+
+    The three-beat rule argued at :data:`DEFAULT_HEARTBEAT_S`, implemented once:
+    under one beat is :data:`LIVENESS_LIVE`, one to three beats is
+    :data:`LIVENESS_QUIET`, three beats or more (90 s at the shipped cadence) is
+    :data:`LIVENESS_STALE`. The boundaries close downward — exactly one beat is
+    already ``quiet``, exactly three is already ``stale`` — because a watcher
+    that rounds in the other direction reports a wedged process as healthy for
+    one more interval.
+
+    From mtime it would be simpler and wrong: a rotation rewrites mtime without
+    the campaign having done anything, and a stream on a network volume can carry
+    a timestamp from the other machine's clock. The records carry their own
+    stamps, written by the process whose liveness is the question.
+
+    **Any record counts, not only a beat.** A ``suggestion`` written two seconds
+    ago is proof the process is alive whatever the heartbeat task is doing, and
+    the cadence still bounds the silence, because a live campaign beats every
+    ``heartbeat_s`` even when nothing else happens. Use :func:`last_heartbeat`
+    when the question is *what* it is doing rather than *whether* it is there.
+
+    ``events`` is the stream as the caller has accumulated it, not one poll's
+    delta — a tailer that passes only what the last poll returned would report
+    ``stale`` the first time nothing new arrived. Keeping the newest record and
+    passing ``[record]`` is enough. An empty sequence is ``stale``: never having
+    seen the campaign is not evidence that it lives.
+
+    ``now`` accepts a :class:`~datetime.datetime` or epoch seconds. A campaign
+    that disabled its heartbeat has disabled liveness rather than redefined it,
+    so a non-positive ``heartbeat_s`` measures against the module default.
+    """
+    beat = float(heartbeat_s) if heartbeat_s and float(heartbeat_s) > 0 \
+        else DEFAULT_HEARTBEAT_S
+    stamp = _newest_stamp(events)
+    if stamp is None:
+        return LIVENESS_STALE
+    age = _epoch(now) - stamp
+    if age < beat:
+        return LIVENESS_LIVE
+    if age < 3 * beat:
+        return LIVENESS_QUIET
+    return LIVENESS_STALE
+
+
+# ── Reader internals ────────────────────────────────────────────────────────
+
+def _complete_lines(path: Path) -> list[str]:
+    """Every whole line in the file — opened, read to EOF and closed right here.
+
+    The close is the contract, not an implementation detail; see the section
+    comment. Splitting on ``"\\n"`` and dropping the last fragment is what makes
+    a half-flushed final line invisible until it is finished: ``"a\\nb\\n"`` gives
+    two lines, ``"a\\nb"`` gives one and leaves ``b`` for the next poll.
+
+    ``splitlines`` is deliberately not used — it also breaks on ``\\r``, ``\\x0b``
+    and the Unicode separators, any of which inside a JSON string value would
+    manufacture two torn lines out of one good record.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    return text.split("\n")[:-1]
+
+
+def _records(lines: Sequence[str]) -> list[dict[str, Any]]:
+    """Parse what parses. A line that does not is dropped, never raised."""
+    out: list[dict[str, Any]] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(record, dict):
+            out.append(record)
+    return out
+
+
+def _first_record(lines: Sequence[str]) -> dict[str, Any] | None:
+    parsed = _records(lines[:1])
+    return parsed[0] if parsed else None
+
+
+def _newest_stamp(events: Sequence[dict[str, Any]]) -> float | None:
+    for record in reversed(list(events)):
+        stamp = _parse_stamp(record.get("ts"))
+        if stamp is not None:
+            return stamp
+    return None
+
+
+def _parse_stamp(value: Any) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return _epoch(moment)
+
+
+def _epoch(moment: Any) -> float:
+    """Seconds since the epoch, from a datetime or from a number.
+
+    A naive datetime is read as UTC, matching :func:`_stamp`, which is the only
+    thing that writes the timestamps this is compared against.
+    """
+    if isinstance(moment, datetime):
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.timestamp()
+    return float(moment)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -748,5 +1028,291 @@ def open_control_watcher(
         return ControlWatcher(run_dir, handlers=handlers, **kwargs)
     except Exception:
         logger.warning("campaign_control_unavailable", run_dir=str(run_dir),
+                       exc_info=True)
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# conditions.json — what the campaign knows about the rig (stage 5, S5.F)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# An attached GUI opens no instrument sessions, so it cannot read a temperature
+# the campaign owns: a read is a serial transaction on a bus another process is
+# using. The campaign therefore publishes, and this is the publisher. Without it
+# the Monitoring tab — the panel an operator opens at 2 a.m. to see whether the
+# rig is still at setpoint — is blank for the whole of an unattended run.
+#
+# Three properties carry the whole design, and each is load-bearing for a reason
+# outside monitoring:
+#
+#   * **Cadence is a ceiling, not a guarantee.** One clock, one in-flight read.
+#     A beat that finds a read still running counts itself skipped and returns.
+#     Never a queue: one contended read can outlast six beats, and a backlog of
+#     six pending instrument reads fired at once is a monitoring knob taking the
+#     serial lock away from the campaign that owns it.
+#   * **The read never runs on the event loop.** `read_environment` is
+#     straight-line synchronous code over up to five blocking driver calls, and
+#     `AsyncTempController._with_retry` holds `_serial_lock` for a deadline
+#     measured in tens of seconds. Awaited directly, one bad read would stall the
+#     loop that also runs the heartbeat *and* the ~1 s `control.json` poll — so a
+#     comfort knob could delay an operator's Abort. It goes to a worker thread.
+#   * **Visibly stale rather than silently stale.** The file always carries the
+#     last *completed* read plus `started_at` / `completed_at` / `read_ms` /
+#     `skipped_beats`, and is rewritten on a skipped beat too. A frozen file
+#     would otherwise be ambiguous between "the publisher died" and "the read is
+#     stuck", which are different problems with different answers.
+
+#: Beside ``events.jsonl`` and ``control.json``, discovered the same way.
+CONDITIONS_FILENAME = "conditions.json"
+
+#: Written next to the target and renamed onto it — same directory, so the
+#: rename is same-volume and therefore atomic on both NTFS and POSIX. Identical
+#: discipline to :func:`write_control_request`, and identically load-bearing:
+#: a reader polling this path sees one whole payload or the previous one, never
+#: a prefix of either.
+CONDITIONS_TMP_SUFFIX = ".tmp"
+
+#: Seconds between conditions beats. ``0`` disables the publisher entirely.
+#:
+#: **A single slot, never appended.** The events stream deliberately carries no
+#: measurements, and a conditions file that grew would be a measurement log by
+#: another name — an unversioned second copy of what ``conditions`` rows already
+#: hold, written by the process least able to say what it means.
+#:
+#: On the traffic, honestly: against an *attended* run this is a reduction (the
+#: GUI's own poller runs at 2 s), but an attached GUI polls nothing, so against
+#: a *headless* run this is net-new Modbus traffic on the same ``_serial_lock``
+#: the anneal hold polls. ``0`` is a supported and reasonable value.
+DEFAULT_CONDITIONS_POLL_S = 5.0
+
+
+def conditions_path(run_dir: str | Path) -> Path:
+    return Path(run_dir) / CONDITIONS_FILENAME
+
+
+class ConditionsPublisher:
+    """Publish the rig conditions the campaign can see. Never raises.
+
+    Parameters
+    ----------
+    run_dir
+        The run's directory; ``conditions.json`` is written inside it.
+    manager
+        The instrument manager the campaign owns. Read through
+        :func:`~softae.core.conditions_capture.read_environment` unless *read*
+        is supplied.
+    poll_s
+        Beat cadence, a **ceiling** (see below). ``0`` publishes nothing.
+    read
+        Injection seam: a **synchronous** zero-argument callable returning an
+        :class:`~softae.core.conditions_capture.Environment`. Always dispatched
+        with :func:`asyncio.to_thread`, never called on the loop.
+    now, sleep
+        The clock and its sleep, injected for tests.
+
+    Its own task, its own clock
+    ---------------------------
+    Deliberately not folded into the narrator's heartbeat. The 30 s beat cadence
+    is load-bearing for the three-beat "wedged" rule a watcher applies to a
+    headless campaign, so sharing one clock would let a monitoring-comfort knob
+    silently redefine what *wedged* means: set the conditions cadence to 5 s to
+    get a livelier Monitoring tab and the staleness verdict quietly becomes 15 s,
+    which a busy event loop reaches without anything being wrong. Two knobs, two
+    clocks, two tasks — and neither can move the other.
+
+    Cadence is a ceiling
+    --------------------
+    One task drives the clock and at most one read is ever outstanding. A beat
+    that fires while a read is in flight increments :attr:`skipped_beats`,
+    republishes the last completed value with its older stamps, and returns. The
+    beats that did not happen are therefore *counted and visible* rather than
+    queued: a 33 s read at a 5 s cadence leaves ``skipped_beats == 6`` and fires
+    exactly one read, not seven.
+
+    Teardown
+    --------
+    :meth:`aclose` cancels the clock and detaches from any in-flight read
+    without waiting for it — a thread blocked inside a driver retry cannot be
+    cancelled, and a campaign teardown must not wait on one. (The interpreter's
+    own executor shutdown still joins that thread at loop close; the driver's
+    retry deadline bounds it.)
+    """
+
+    def __init__(
+        self,
+        run_dir: str | Path,
+        *,
+        manager: Any = None,
+        poll_s: float = DEFAULT_CONDITIONS_POLL_S,
+        read: Callable[[], Any] | None = None,
+        now: Callable[[], float] = time.time,
+        sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+    ) -> None:
+        self.run_dir = Path(run_dir)
+        self.path = conditions_path(self.run_dir)
+        self.poll_s = float(poll_s)
+        self.skipped_beats = 0
+        self._manager = manager
+        self._read = read if read is not None else self._read_manager
+        self._now = now
+        self._sleep = sleep
+        self._task: asyncio.Task[None] | None = None
+        self._pending: asyncio.Future[Any] | None = None
+        self._in_flight = False
+        self._degraded = False
+
+        self._started_at: str | None = None
+        self._completed_at: str | None = None
+        self._read_ms: int | None = None
+        self._read_began = 0.0
+        self._env: dict[str, Any] = _null_environment()
+
+    # ── Public API ──────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        """Begin publishing on the running event loop. Never raises."""
+        if self.poll_s <= 0 or self._task is not None:
+            return
+        try:
+            self._task = asyncio.ensure_future(self._publish_loop())
+        except Exception:
+            self._warn("campaign_conditions_start_failed")
+
+    async def aclose(self) -> None:
+        """Stop publishing and let go of any in-flight read. Never raises."""
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                # Including the CancelledError we just asked for. Nothing this
+                # task can raise is worth propagating into a campaign teardown.
+                pass
+        pending, self._pending = self._pending, None
+        if pending is not None:
+            pending.cancel()
+            try:
+                await pending
+            except BaseException:
+                pass
+
+    def payload(self) -> dict[str, Any]:
+        """The record as it is written — last completed read plus its stamps."""
+        return {
+            "started_at": self._started_at,
+            "completed_at": self._completed_at,
+            "read_ms": self._read_ms,
+            "env": dict(self._env),
+            "skipped_beats": self.skipped_beats,
+        }
+
+    # ── Internal ────────────────────────────────────────────────────────
+
+    async def _publish_loop(self) -> None:
+        # Sleeps first, like the heartbeat and the control watcher: at start-up
+        # the campaign is connecting and configuring instruments, and the first
+        # thing a monitoring read should not do is join that queue for the
+        # serial lock. One cadence of delay costs an attaching operator nothing.
+        while True:
+            await self._sleep(self.poll_s)
+            self._beat()
+
+    def _beat(self) -> None:
+        """One beat: start a read, or count this beat as skipped. Never blocks."""
+        if self._in_flight:
+            self.skipped_beats += 1
+            self._write()
+            return
+        self._in_flight = True
+        self._started_at = _stamp()
+        self._read_began = self._now()
+        try:
+            self._pending = asyncio.ensure_future(self._read_and_publish())
+        except Exception:
+            self._in_flight = False
+            self._warn("campaign_conditions_dispatch_failed")
+
+    async def _read_and_publish(self) -> None:
+        """Await one threaded read, then publish it. Never raises."""
+        env: Any = None
+        try:
+            env = await asyncio.to_thread(self._read)
+        except asyncio.CancelledError:
+            self._in_flight = False
+            raise
+        except Exception:
+            # `read_environment` returns nulls rather than raising, so reaching
+            # here means something worse — but it means the same thing to a
+            # reader, and it must not take the publisher down with it.
+            self._warn("campaign_conditions_read_failed")
+        finally:
+            self._in_flight = False
+        self._completed_at = _stamp()
+        self._read_ms = int(round(max(0.0, self._now() - self._read_began) * 1000))
+        # A failed read publishes nulls rather than the previous value: an old
+        # number carrying a fresh stamp is the one lie this file must not tell.
+        self._env = dict(env) if isinstance(env, dict) else _null_environment()
+        self._write()
+
+    def _read_manager(self) -> Any:
+        # Deferred: `conditions_capture` is a leaf, but importing it at module
+        # scope would put an instrument-facing import inside the sidecar module
+        # every reader of the stream also imports.
+        from softae.core.conditions_capture import read_environment
+
+        return read_environment(self._manager)
+
+    def _write(self) -> None:
+        """Replace the single slot. Never raises, never appends."""
+        try:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(self.path.name + CONDITIONS_TMP_SUFFIX)
+            tmp.write_text(json.dumps(self.payload(), indent=2), encoding="utf-8")
+            os.replace(tmp, self.path)
+        except Exception:
+            self._warn("campaign_conditions_write_failed")
+
+    def _warn(self, event: str) -> None:
+        """First failure is a warning; the rest are debug — as above."""
+        if self._degraded:
+            logger.debug(event, path=str(self.path))
+            return
+        self._degraded = True
+        logger.warning(event, path=str(self.path), exc_info=True)
+
+
+def _null_environment() -> dict[str, Any]:
+    """The five keys, all unread — the shape ``read_environment`` guarantees.
+
+    Named here rather than imported so a reader of ``conditions.json`` always
+    gets the same keys even when the capture module never ran.
+    """
+    return {
+        "stage_temp_sp_C": None,
+        "chamber_air_C": None,
+        "stage_temp_pv_C": None,
+        "rh_sp_pct": None,
+        "rh_pv_pct": None,
+    }
+
+
+def open_conditions_publisher(
+    run_dir: str | Path,
+    *,
+    manager: Any = None,
+    **kwargs: Any,
+) -> ConditionsPublisher | None:
+    """Build a publisher, or ``None`` if even constructing one fails.
+
+    The mirror of :func:`open_narrator` and :func:`open_control_watcher`, for
+    the mirror reason: a campaign that cannot be *watched* must still run.
+    ``None`` means "unobserved", never "do not start".
+    """
+    kwargs.setdefault("poll_s", DEFAULT_CONDITIONS_POLL_S)
+    try:
+        return ConditionsPublisher(run_dir, manager=manager, **kwargs)
+    except Exception:
+        logger.warning("campaign_conditions_unavailable", run_dir=str(run_dir),
                        exc_info=True)
         return None

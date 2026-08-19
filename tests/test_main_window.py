@@ -483,6 +483,164 @@ class TestSafeParkOnExit:
         monkeypatch.setattr(sp, "safe_park", boom)
         main_window.close()          # must not raise
 
+    def test_close_parks_after_the_workers_have_stopped(
+        self, main_window, monkeypatch
+    ):
+        """Ordering, unchanged by the injection: park last, before disconnect.
+
+        The park runs after every worker is stopped so nothing re-commands the
+        hardware behind it, and before ``gui/app.py`` disconnects the manager,
+        because ``safe_park`` skips anything not connected.
+        """
+        import softae.core.safe_park as sp
+
+        poller_running: list[bool] = []
+        monkeypatch.setattr(
+            sp, "safe_park",
+            lambda mgr, **kw: (
+                poller_running.append(main_window._poller.isRunning())
+                or sp.SafeParkResult(commanded=["stub"])
+            ),
+        )
+        main_window.close()
+        assert poller_running == [False]
+
+    def test_close_logs_a_park_that_commanded_nothing(
+        self, main_window, monkeypatch
+    ):
+        """``ok`` is true of a park that reached nothing — and said nothing.
+
+        Closing is unattended by definition, so this log line is the whole
+        account of it. Keyed on ``not ok`` it was silent in exactly the case
+        where the rig was left as it was found.
+        """
+        import structlog
+
+        import softae.core.safe_park as sp
+
+        warnings: list[tuple[str, dict]] = []
+
+        class _Recorder:
+            def warning(self, event, **kw):
+                warnings.append((event, kw))
+
+            def __getattr__(self, _name):
+                # Anything else (info, bind, …) is a no-op that stays chainable.
+                return lambda *a, **k: self
+
+        monkeypatch.setattr(structlog, "get_logger", lambda *a, **k: _Recorder())
+        monkeypatch.setattr(
+            sp, "safe_park",
+            lambda mgr, **kw: sp.SafeParkResult(skipped=["syringe", "lamp"]),
+        )
+        main_window.close()
+
+        assert [e for e, _ in warnings] == ["safe_park_on_exit_incomplete"]
+        assert warnings[0][1]["headline"] == sp.HEADLINE_NOTHING
+
+
+# ── Attach mode: the park path is absent, not conditional ────────────────────
+
+@pytest.fixture
+def attached_mode():
+    """A launch decision that says a campaign in another process owns the rig."""
+    from softae.gui.launch_mode import LaunchMode
+
+    return LaunchMode(
+        attached=True,
+        campaign=("shadow-run", "run-42"),
+        run_dir="C:/projects/demo/runs/run-42",
+        holder=None,
+        reason="Campaign 'shadow-run' (run run-42) holds the rig.",
+    )
+
+
+@pytest.fixture
+def attached_window(qapp, qtbot, monkeypatch, mock_manager, attached_mode):
+    monkeypatch.setattr(loader, "load", lambda: {"webcam": {"enabled": False}})
+    from softae.gui.main_window import MainWindow
+
+    mw = MainWindow(mock_manager, launch_mode=attached_mode)
+    qtbot.addWidget(mw)
+    yield mw
+
+    mw.close()
+    qapp.processEvents()
+    mw.deleteLater()
+    qapp.processEvents()
+
+
+class TestAttachedWindowCommandsNothing:
+    """Park follows the instrument session, not the campaign.
+
+    An attached window opened no session, so it has nothing to park — and the
+    ruling is that the park path is then *absent*, not a conditional that
+    evaluates false. A conditional on a safety path is what produces the "it was
+    supposed to check" post-mortem, in whichever direction it goes wrong.
+    """
+
+    def test_close_in_attach_mode_does_not_park(
+        self, attached_window, monkeypatch
+    ):
+        """The negative case that matters most: no command onto a foreign session."""
+        import softae.core.safe_park as sp
+
+        def _forbidden(*a, **k):
+            raise AssertionError(
+                "an attached window parked a rig it does not own"
+            )
+
+        monkeypatch.setattr(sp, "safe_park", _forbidden)
+        attached_window.close()     # must not raise
+
+    def test_the_attached_window_has_no_exit_park_of_its_own(
+        self, attached_window, main_window
+    ):
+        """Introspective, and deliberately so.
+
+        This is what stops a later "simplification" of ``closeEvent`` back into
+        an ``if`` — the attached window is *constructed* without the park, and
+        the owner-mode one carries it on the instance.
+        """
+        assert "_exit_park" not in vars(attached_window)
+        assert vars(main_window)["_exit_park"] == main_window._safe_park_on_exit
+
+    def test_the_attached_window_starts_no_purge_timer(
+        self, attached_window, main_window
+    ):
+        """The only thing on this rig that actuates with nobody asking."""
+        assert attached_window._purge_timer is None
+        assert main_window._purge_timer.isActive()
+
+    def test_safe_exit_is_not_offered_in_attach_mode(
+        self, attached_window, main_window
+    ):
+        """It is a park path too — the same call, the same manager, the same moment.
+
+        Left present it would warn on *every* close, because a park that
+        commanded nothing is correctly severe and in attach mode that is the
+        normal state rather than a fault.
+        """
+        assert getattr(attached_window, "_safe_exit", None) is None
+        assert main_window._safe_exit is not None
+
+    def test_the_missing_safe_exit_says_why(self, attached_window):
+        """A control that vanishes without a word reads as a bug."""
+        from PySide6.QtWidgets import QLabel
+
+        texts = [w.text() for w in attached_window.findChildren(QLabel)]
+        assert any("ATTACHED" in t and "shadow-run" in t for t in texts)
+
+    def test_the_launch_mode_cannot_be_reassigned(self, main_window, attached_mode):
+        """Construction branches on it, so a later assignment could only lie."""
+        with pytest.raises(AttributeError):
+            main_window.launch_mode = attached_mode
+
+    def test_a_window_built_without_a_decision_owns_the_rig(self, main_window):
+        """The default is the historical behaviour: park what you opened."""
+        assert main_window.launch_mode.owner is True
+        assert main_window.launch_mode.attached is False
+
 
 # ── Anti-clog purge wiring (P8) ──────────────────────────────────────────────
 

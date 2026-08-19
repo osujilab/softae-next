@@ -194,6 +194,59 @@ def feasibility_config() -> dict[str, Any]:
     return cfg.get("feasibility", {}) or {}
 
 
+def campaign_config() -> dict[str, Any]:
+    """Return the ``[campaign]`` section (stage 5, S5.F). Absent → ``{}``.
+
+    The section is **optional and currently absent from the shipped file**: a
+    headless campaign must run identically with it missing, so every accessor
+    below resolves its own default rather than requiring the block to exist.
+    """
+    cfg = load()
+    section = cfg.get("campaign", {})
+    return section if isinstance(section, dict) else {}
+
+
+def _campaign_seconds(key: str, default: float) -> float:
+    """Read a ``[campaign]`` cadence in seconds. ``0`` disables; junk → default.
+
+    ``0`` is a *value*, not an absence — it is how both cadences are switched
+    off — so it must survive the fallback, which is why this tests for presence
+    rather than for truthiness.
+    """
+    raw = campaign_config().get(key)
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning("campaign_cadence_not_a_number", key=key, value=raw)
+        return float(default)
+
+
+def campaign_conditions_poll_s() -> float:
+    """Seconds between ``conditions.json`` republishes. ``0`` disables it.
+
+    The default lives with the publisher, not here — a second copy of the number
+    would agree today and drift the day one of them changes.
+    """
+    from softae.core.campaign_events import DEFAULT_CONDITIONS_POLL_S
+
+    return _campaign_seconds("conditions_poll_s", DEFAULT_CONDITIONS_POLL_S)
+
+
+def campaign_heartbeat_s() -> float:
+    """Seconds between ``events.jsonl`` heartbeats. ``0`` disables the beat.
+
+    Surfaced from config for the first time here. Note that the three-beat
+    staleness rule a watcher applies is expressed in *beats*, so moving this
+    moves the verdict with it — which is exactly why the conditions cadence is a
+    separate knob on a separate clock.
+    """
+    from softae.core.campaign_events import DEFAULT_HEARTBEAT_S
+
+    return _campaign_seconds("heartbeat_s", DEFAULT_HEARTBEAT_S)
+
+
 def channel_routing() -> dict[str, Any]:
     """Return the ``[channel_routing]`` section.
 

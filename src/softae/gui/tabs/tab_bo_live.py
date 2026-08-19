@@ -55,6 +55,7 @@ from softae.core.geometry import electrode_count
 from softae.errors import CampaignError
 from softae.gui.tabs._autonomous_run import AutonomousRunMixin
 from softae.gui.tabs._bo_base import BOTabBase
+from softae.gui.widgets.campaign_control import CampaignControlBar, outcome_note
 from softae.gui.widgets.composition_axes_editor import CompositionAxesEditor
 
 if TYPE_CHECKING:
@@ -170,7 +171,23 @@ class LiveBOCampaignTab(AutonomousRunMixin, BOTabBase):
         wrap_v.addWidget(
             self._make_control_bar(run_label="▶  Run Live Campaign", with_export=False)
         )
+        # Beside the in-process Abort, and deliberately not merged with it: that
+        # one is a flag this thread reads, and reaches nothing when the campaign
+        # is running in another process. This one is a request written to the
+        # run directory, which is the only thing that reaches a campaign we do
+        # not own. Campaign-scoped, so it belongs in the tab that surfaces the
+        # campaign; the rig-scale stop stays on the toolbar.
+        self._campaign_controls = CampaignControlBar(parent=wrap)
+        self._campaign_controls.acknowledged.connect(self._on_control_ack)
+        wrap_v.addWidget(self._campaign_controls)
         return wrap
+
+    def _on_control_ack(self, ack: dict[str, Any]) -> None:
+        """Put the campaign's answer in the log beside its other events."""
+        self._log_line(
+            f"  ⇄ {ack.get('action', 'control')} → {ack.get('outcome')}: "
+            f"{outcome_note(str(ack.get('outcome') or ''))}"
+        )
 
     def _grp_space(self) -> QGroupBox:
         grp = QGroupBox("Parameter Space (continuous)")

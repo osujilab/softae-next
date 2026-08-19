@@ -540,22 +540,15 @@ def _cmd_run(args) -> int:
 def _running_campaign_run_dir() -> "tuple[str | None, str]":
     """Where the live campaign's sidecars are, or why we cannot say.
 
-    Discovery is the rig lock and nothing else: the campaign already publishes
-    ``what = "campaign:<name>:<run_id>"`` and ``log_path = <run directory>``
-    (stage 2), so a controller reads one file it did not have to invent. A
-    second registry that could disagree with the lock is how a rig ends up with
-    two owners and two stories about it.
+    The decision itself is :func:`softae.core.campaign_discovery.find_running_campaign`,
+    shared with the GUI's Pause/Abort buttons so the two surfaces cannot come to
+    disagree about what "no campaign to control" means. This wrapper is the
+    tuple shape this module's caller already reads.
     """
-    from softae.core.run_lock import read_run_lock
+    from softae.core.campaign_discovery import find_running_campaign
 
-    lock = read_run_lock()
-    if lock is None:
-        return None, "no process holds the rig."
-    if not lock.what.startswith("campaign:"):
-        return None, f"the rig is held by something that is not a campaign — {lock.describe()}"
-    if not lock.log_path:
-        return None, f"the campaign did not publish a run directory — {lock.describe()}"
-    return lock.log_path, lock.what
+    target = find_running_campaign()
+    return target.run_dir, target.detail
 
 
 def _cmd_control(args) -> int:
@@ -567,6 +560,7 @@ def _cmd_control(args) -> int:
     whole reason the channel is a file: terminating the other process instead
     would be exactly the un-parked death this is here to avoid.
     """
+    from softae.core.campaign_discovery import CONTROL_LATENCY_NOTES
     from softae.core.campaign_events import write_control_request
 
     run_dir = args.run_dir
@@ -590,15 +584,12 @@ def _cmd_control(args) -> int:
     print(f"{args.action} requested (seq {request.seq}) -> "
           f"{run_dir}/control.json", flush=True)
     # Said plainly, because the latency is not uniform and promising that it is
-    # would be the wrong kind of reassurance (R3).
-    if args.action == "abort":
-        print("   Abort is immediate during a temperature hold and takes effect "
-              "at the next step boundary otherwise. The rig is parked and the "
-              "checkpoint is kept.", flush=True)
-    elif args.action == "pause":
-        print("   Pause stops the run issuing new steps and then holds; a step "
-              "already running finishes first. Setpoints, lamp and head are "
-              "left exactly as they are.", flush=True)
+    # would be the wrong kind of reassurance (R3). One string per action, shared
+    # with the GUI's button tooltips: an operator must not be told two different
+    # things about what Pause guarantees depending on which surface they used.
+    note = CONTROL_LATENCY_NOTES.get(args.action)
+    if note:
+        print(f"   {note}", flush=True)
     return EXIT_OK
 
 

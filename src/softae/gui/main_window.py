@@ -19,10 +19,12 @@ from PySide6.QtWidgets import (
 )
 
 from contextlib import contextmanager
+from typing import Callable
 
 import structlog
 
 from softae.config import loader
+from softae.gui.launch_mode import OWNER_MODE, LaunchMode
 from softae.core.formulation import ChemicalCatalog, SolutionCatalog
 from softae.gui.tabs.tab_analysis import AnalysisTab
 from softae.gui.tabs.tab_arrhenius import ArrheniusTab
@@ -58,6 +60,20 @@ logger = structlog.get_logger(__name__)
 _PURGE_POLL_MS = 30_000
 
 
+def _park_nothing() -> None:
+    """The exit park of a window that opened no instrument session.
+
+    A process may command only the sessions it opened, so an attached window has
+    nothing to park — and the ruling this implements is that the park path must
+    then be *absent* rather than a conditional that evaluates false. This is what
+    "absent" is made of: :class:`MainWindow` binds its real exit park onto the
+    instance only in owner mode, and an attached window falls back to the
+    class-level default below, which is this. ``closeEvent`` therefore reads no
+    lock, tests no flag, and cannot be one stale boolean away from parking a rig
+    another process is driving — nor from skipping a park it owed.
+    """
+
+
 class MainWindow(QMainWindow):
     """Top-level window containing the full tabbed application.
 
@@ -67,18 +83,39 @@ class MainWindow(QMainWindow):
         Pre-configured instrument registry (mock or real).
     data_store : DataStore or None
         Project-scoped SQLite backend for experiment data.
+    launch_mode : LaunchMode or None
+        Owner or attached, decided **once** before the window exists (see
+        :mod:`softae.gui.launch_mode`). ``None`` means owner mode — the
+        historical behaviour, and what a bare ``MainWindow(manager)`` in a test
+        or a script gets. It is a constructor argument rather than an attribute
+        set afterwards because the window's construction *differs* by mode: an
+        attached window is built without an exit park and without the purge
+        timer, and neither can be un-built by a later assignment.
     """
+
+    #: The exit park, chosen once at construction. Owner mode binds the real one
+    #: onto the instance; an attached window is constructed without it and
+    #: inherits this, which does nothing. See :func:`_park_nothing`.
+    _exit_park: Callable[[], None] = staticmethod(_park_nothing)
 
     def __init__(
         self,
         manager: InstrumentManager,
         *,
         data_store: DataStore | None = None,
+        launch_mode: LaunchMode | None = None,
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
         self._manager = manager
         self._data_store = data_store
+        self._launch_mode = launch_mode if launch_mode is not None else OWNER_MODE
+
+        # The park path, installed here or not at all. Owner mode parks what it
+        # opened; an attached window opened nothing, so there is nothing to park
+        # and no branch on the way out to get wrong.
+        if self._launch_mode.owner:
+            self._exit_park = self._safe_park_on_exit
 
         # Stock interlock — attached before any tab can command a pump, via the
         # shared core helper so the GUI and the headless CLI enforce identically.
@@ -145,13 +182,20 @@ class MainWindow(QMainWindow):
                 manager.get("syringe").purge_runner = self._purge_runner
             except Exception:
                 pass
-            self._purge_timer = QTimer(self)
-            # Polls far more often than the purge interval: the timer only asks
-            # "is one owed and may it happen now", and a tick that finds the rig
-            # busy must not push the purge out by a whole period.
-            self._purge_timer.setInterval(_PURGE_POLL_MS)
-            self._purge_timer.timeout.connect(self._on_purge_tick)
-            self._purge_timer.start()
+            # The idle purge is the only thing on this rig that actuates with
+            # nobody asking — so an attached window has no timer at all, for the
+            # same reason it has no exit park: it would be commanding sessions
+            # another process owns. Not merely stopped; never created, so there
+            # is nothing here a later edit can .start().
+            if self._launch_mode.owner:
+                self._purge_timer = QTimer(self)
+                # Polls far more often than the purge interval: the timer only
+                # asks "is one owed and may it happen now", and a tick that
+                # finds the rig busy must not push the purge out by a whole
+                # period.
+                self._purge_timer.setInterval(_PURGE_POLL_MS)
+                self._purge_timer.timeout.connect(self._on_purge_tick)
+                self._purge_timer.start()
 
         # Cached catalogs refreshed by _on_catalogs_changed (no live list widget yet).
         self._chem_catalog = None
@@ -170,6 +214,19 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._build_statusbar()
         self._poller.start()
+
+    @property
+    def launch_mode(self) -> LaunchMode:
+        """Owner or attached — read-only, because it is decided before this exists.
+
+        Deliberately has no setter. Construction *branches* on the mode (no exit
+        park and no purge timer in attached mode), so a window that could be
+        re-moded afterwards would carry a mode its own wiring did not match —
+        which is the drift the launch-time decision exists to rule out. The one
+        way out of attach mode is the operator act that also acquires the
+        sessions: Init tab → Connect All.
+        """
+        return self._launch_mode
 
     # --- UI construction ------------------------------------------------------
 
@@ -454,10 +511,43 @@ class MainWindow(QMainWindow):
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         toolbar.addWidget(spacer)
 
-        self._safe_exit = SafeExitButton(self._manager)
-        self._safe_exit.parked.connect(self.notify_parked)
-        self._safe_exit.exit_requested.connect(self._on_safe_exit)
-        toolbar.addWidget(self._safe_exit)
+        # Safe Exit is a park path — the same safe_park() call as the exit park,
+        # on the same manager, at the same moment — so it is absent in attached
+        # mode for the same reason and by the same decision. Left present it
+        # would either warn on *every* close (a park that commanded nothing is
+        # correctly severe, and in attach mode that is not a fault but the
+        # normal state) or sit disabled with a live park one setEnabled away.
+        # Nothing is lost: closing is still X / Alt-F4 / File → Quit, the head
+        # question it exists to ask is meaningless about a head this process
+        # does not drive, and the stop control in attach mode is the E-Stop.
+        if self._launch_mode.owner:
+            self._safe_exit = SafeExitButton(self._manager)
+            self._safe_exit.parked.connect(self.notify_parked)
+            self._safe_exit.exit_requested.connect(self._on_safe_exit)
+            toolbar.addWidget(self._safe_exit)
+        else:
+            toolbar.addWidget(self._build_attach_notice())
+
+    def _build_attach_notice(self) -> QWidget:
+        """The statement that stands where Safe Exit does in owner mode.
+
+        A control that vanishes without saying why reads as a bug. This says the
+        mode, names the holder, and carries the launch decision's own sentence as
+        its tooltip — so the missing park control and the reason for it arrive
+        together.
+        """
+        from PySide6.QtWidgets import QLabel
+
+        mode = self._launch_mode
+        who = f"campaign '{mode.campaign[0]}'" if mode.campaign else "another process"
+        label = QLabel(f"ATTACHED — {who} owns the rig")
+        label.setToolTip(
+            mode.reason
+            + "\n\nNothing here can park the rig, so Safe Exit is not offered. "
+            "Close the window normally; use Emergency Stop to request a stop."
+        )
+        label.setStyleSheet("QLabel { color: #6a1b9a; font-weight: bold; padding: 0 12px; }")
+        return label
 
     def _on_safe_exit(self) -> None:
         """Close the window after the Safe Exit park has finished.
@@ -790,12 +880,19 @@ class MainWindow(QMainWindow):
         #    normal close left the head down and the heater at setpoint.
         #    Runs last, after the workers are stopped, so nothing re-commands the
         #    hardware afterwards; before the manager disconnects (see gui/app.py).
-        self._safe_park_on_exit()
+        #
+        #    Calls what it was given at construction — no lock read, no ownership
+        #    test, no flag. Park follows the instrument session, not the campaign:
+        #    a window that opened nothing was built with nothing to call here.
+        self._exit_park()
 
         super().closeEvent(event)
 
     def _safe_park_on_exit(self) -> None:
         """Best-effort park during shutdown — never blocks the close.
+
+        Installed as :attr:`_exit_park` only in owner mode; an attached window is
+        constructed without it.
 
         Retracts the head **unless** the operator just chose otherwise via Safe Exit.
         Closing the window is otherwise an unattended act — nobody is left to decide
@@ -811,7 +908,14 @@ class MainWindow(QMainWindow):
             retract = not getattr(self, "_skip_exit_retract", False)
             result = safe_park(self._manager, reason="application closing",
                                retract_head=retract)
-            if not result.ok:
-                log.warning("safe_park_on_exit_partial", errors=result.errors)
+            # ``severe``, not ``not ok``. This close is unattended by definition,
+            # so the log line is the only account of it — and ``ok`` is true of a
+            # park that raised nothing *because it reached nothing*, which on the
+            # way out of an owner-mode window means the sessions were already
+            # gone. That used to log nothing at all.
+            text, severe = result.headline()
+            if severe:
+                log.warning("safe_park_on_exit_incomplete", headline=text,
+                            summary=result.summary(), errors=result.errors)
         except Exception:
             log.warning("safe_park_on_exit_failed", exc_info=True)

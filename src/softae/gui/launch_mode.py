@@ -90,6 +90,21 @@ class LaunchMode:
         return self.campaign is not None
 
 
+#: The mode a window gets when nobody decided one — a direct
+#: ``MainWindow(manager)`` in a test, a tool, or a script. Owner mode is the
+#: historical behaviour and the right default *for a process that opened its own
+#: sessions*: it parks what it opened. Nothing infers ownership from this
+#: constant; a real launch always calls :func:`decide_launch_mode` and passes the
+#: answer in. Safe to share because :class:`LaunchMode` is frozen.
+OWNER_MODE = LaunchMode(
+    attached=False, campaign=None, run_dir=None, holder=None,
+    reason=(
+        "No launch decision was recorded, so this session owns the instrument "
+        "sessions it opens."
+    ),
+)
+
+
 def decide_launch_mode(
     *,
     lock_reader: Callable[[], Any] = foreign_run_lock,

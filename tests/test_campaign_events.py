@@ -20,6 +20,7 @@ anneal costs no wall-clock time here.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -556,3 +557,401 @@ def test_each_record_is_flushed_rather_than_buffered(tmp_path: Path):
     records = _read(narrator.path)
     assert [r["type"] for r in records] == ["run_started", "suggestion"]
     narrator.close()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# The reader — cursor, rotation, liveness (stage 5, S5.B)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Stage 3 shipped the writer and no reader, so everything downstream of the
+# stream — the sidebar owner line, the Pause/Abort ack wait, the E-Stop ladder —
+# would otherwise have grown a tailer each. These pin the four properties that
+# make one shared tailer safe: it lets go of the handle, it counts records, it
+# tolerates a half-flushed line, and it follows a rotation instead of losing or
+# repeating what crossed it.
+#
+# The load-bearing one is the first. A reader that keeps `events.jsonl` open
+# makes `os.replace` fail with a sharing violation, `_rotate` gives up, and the
+# 32 MB cap is off for as long as a watcher is attached — silently, on the disk
+# that also holds the DataStore.
+
+def _iterations(events: list[dict]) -> list[int]:
+    """Iteration numbers of the narration records, rotation markers dropped."""
+    return [e["iteration"] for e in events if e.get("type") == "step_recovered"]
+
+
+def _write_until_rotated(narrator: CampaignNarrator, run: Path, *,
+                         start: int = 1, limit: int = 200) -> int:
+    """Narrate until exactly one rotation has happened. Returns the last iteration."""
+    previous = run / ce.PREVIOUS_FILENAME
+    i = start - 1
+    while not previous.exists():
+        i += 1
+        assert i < start + limit, "the stream never reached its cap"
+        narrator.record("step_recovered", {"iteration": i, "pad": "x" * 200})
+    return i
+
+
+# ── A fresh read, and an incremental one ─────────────────────────────────────
+
+def test_read_events_fresh_read_returns_every_record_and_a_cursor(tmp_path: Path):
+    """No cursor means replay: the whole history, and a place to carry on from."""
+    run = tmp_path / "run"
+    narrator = CampaignNarrator(run, heartbeat_s=0)
+    narrator.record("run_started", {"run_id": "r1"})
+    narrator.record("suggestion", {"iteration": 1})
+    narrator.close()
+
+    events, cursor = ce.read_events(run)
+
+    assert [e["type"] for e in events] == ["run_started", "suggestion"]
+    assert cursor == ce.EventCursor(generation=0, lines_read=2)
+
+
+def test_read_events_incremental_read_returns_only_the_new_records(tmp_path: Path):
+    """The cursor is the whole point: a poll costs what arrived, not the file."""
+    run = tmp_path / "run"
+    narrator = CampaignNarrator(run, heartbeat_s=0)
+    narrator.record("run_started", {"run_id": "r1"})
+    _, cursor = ce.read_events(run)
+
+    narrator.record("suggestion", {"iteration": 1})
+    narrator.record("result", {"iteration": 1})
+    events, cursor = ce.read_events(run, cursor=cursor)
+
+    assert [e["type"] for e in events] == ["suggestion", "result"]
+    assert cursor.lines_read == 3
+
+    # And a poll with nothing new is empty rather than a repeat.
+    again, unchanged = ce.read_events(run, cursor=cursor)
+    narrator.close()
+    assert again == []
+    assert unchanged == cursor
+
+
+def test_read_events_absent_stream_returns_nothing_rather_than_raising(
+        tmp_path: Path):
+    """A watcher that dies when its file is briefly absent is worse than a late one.
+
+    The run directory exists before the campaign narrates into it, and a reader
+    that attaches in that window — or after a directory it cannot read — must
+    come back next poll rather than take the window down with it.
+    """
+    events, cursor = ce.read_events(tmp_path / "never_created")
+
+    assert events == []
+    assert cursor == ce.EventCursor(0, 0)
+
+
+# ── A half-flushed line is "not yet written" ─────────────────────────────────
+
+def test_read_events_truncated_final_line_is_skipped_then_returned_intact(
+        tmp_path: Path):
+    """`ExperimentLogger._write` writes then flushes; a reader can arrive between.
+
+    The partial tail must not be counted, must not be parsed, and must not be
+    lost: the next poll returns it whole, exactly once.
+    """
+    run = tmp_path / "run"
+    run.mkdir()
+    path = run / ce.EVENTS_FILENAME
+    whole = '{"ts": "2026-01-01T00:00:00+00:00", "seq": 0, "type": "run_started"}'
+    torn = '{"ts": "2026-01-01T00:00:30+00:00", "seq": 1, "type": "sugg'
+    path.write_text(whole + "\n" + torn, encoding="utf-8")
+
+    events, cursor = ce.read_events(run)
+    assert [e["type"] for e in events] == ["run_started"]
+    assert cursor.lines_read == 1, "the half-written line was counted as read"
+
+    path.write_text(
+        whole + "\n" + torn + 'estion", "iteration": 1}\n', encoding="utf-8")
+    events, cursor = ce.read_events(run, cursor=cursor)
+
+    assert [e["type"] for e in events] == ["suggestion"], (
+        "the line that was torn at the first poll never arrived at the second")
+    assert cursor.lines_read == 2
+
+
+def test_read_events_unparseable_complete_line_is_counted_and_not_repeated(
+        tmp_path: Path):
+    """A whole line that is not JSON is corruption, not a flush boundary.
+
+    Skipping it *without* counting it would park the reader on it forever, so
+    the line advances the cursor and yields no record.
+    """
+    run = tmp_path / "run"
+    run.mkdir()
+    path = run / ce.EVENTS_FILENAME
+    path.write_text(
+        '{"ts": "2026-01-01T00:00:00+00:00", "type": "run_started"}\n'
+        'this line is not json at all\n'
+        '\n'
+        '{"ts": "2026-01-01T00:00:01+00:00", "type": "result"}\n',
+        encoding="utf-8")
+
+    events, cursor = ce.read_events(run)
+    assert [e["type"] for e in events] == ["run_started", "result"]
+    assert cursor.lines_read == 4, "a corrupt line the reader will sit on forever"
+
+    assert ce.read_events(run, cursor=cursor)[0] == []
+
+
+# ── Rotation ─────────────────────────────────────────────────────────────────
+
+def test_read_events_rotation_mid_stream_is_followed_without_loss_or_duplication(
+        tmp_path: Path):
+    """The cursor was cut in the old generation; the tail of it is still owed.
+
+    A byte-offset tailer gets this wrong in both directions at once — it seeks
+    into the wrong file and it counts the wrong units. Records and generations
+    get it right.
+    """
+    run = tmp_path / "run"
+    narrator = CampaignNarrator(run, heartbeat_s=0, max_bytes=4096)
+    for i in (1, 2, 3):
+        narrator.record("step_recovered", {"iteration": i, "pad": "x" * 200})
+    seen, cursor = ce.read_events(run)
+    assert _iterations(seen) == [1, 2, 3]
+
+    last = _write_until_rotated(narrator, run, start=4)
+    narrator.close()
+
+    events, cursor = ce.read_events(run, cursor=cursor)
+
+    assert cursor.generation == 1, "the reader did not notice it crossed a boundary"
+    assert _iterations(seen) + _iterations(events) == list(range(1, last + 1)), (
+        "records were lost across the rotation, or delivered twice")
+    assert any(e["type"] == "stream_rotated" for e in events), (
+        "the boundary itself was swallowed — a consumer cannot see the gap it "
+        "did not get")
+
+
+def test_read_events_cursor_from_before_a_rotation_reads_the_previous_generation(
+        tmp_path: Path):
+    """`events.1.jsonl` is where the owed tail went, and the reader must go there.
+
+    Pinned separately from the no-loss assertion above because *how* the records
+    are recovered is the requirement: not by luck of timing, but by opening the
+    generation the writer moved aside.
+    """
+    run = tmp_path / "run"
+    narrator = CampaignNarrator(run, heartbeat_s=0, max_bytes=4096)
+    narrator.record("step_recovered", {"iteration": 1, "pad": "x" * 200})
+    _, cursor = ce.read_events(run)
+    last = _write_until_rotated(narrator, run, start=2)
+    narrator.close()
+
+    previous = run / ce.PREVIOUS_FILENAME
+    assert previous.exists()
+    # Everything still owed lives in the rotated-away file, not in the live one.
+    assert last not in _iterations(_read(run / ce.EVENTS_FILENAME)), (
+        "the fixture did not actually strand anything in the previous generation")
+
+    events, _ = ce.read_events(run, cursor=cursor)
+    assert _iterations(events) == list(range(2, last + 1))
+
+
+def test_read_events_fresh_read_after_a_rotation_returns_both_generations(
+        tmp_path: Path):
+    """A GUI attaching late still gets `run_started`, which names the run.
+
+    "Replay from byte 0" was true until stage 4 shipped rotation. Replay now
+    means both generations the run directory still holds — a reader that opened
+    only the live file would believe the campaign began mid-stream.
+    """
+    run = tmp_path / "run"
+    narrator = CampaignNarrator(run, heartbeat_s=0, max_bytes=4096)
+    narrator.record("run_started", {"run_id": "r1"})
+    last = _write_until_rotated(narrator, run, start=1)
+    narrator.close()
+
+    events, cursor = ce.read_events(run)
+
+    assert events[0]["type"] == "run_started", (
+        "the run's identity was rotated out of reach of a fresh reader")
+    assert _iterations(events) == list(range(1, last + 1))
+    assert cursor.generation == 1
+
+
+def test_read_events_polling_after_a_rotation_does_not_re_read_the_generation(
+        tmp_path: Path):
+    """Crossing once must not become crossing every poll.
+
+    The live file keeps its `stream_rotated` opening record for the whole of the
+    new generation, so a reader that treats the marker alone as "a rotation just
+    happened" replays the generation on every single poll.
+    """
+    run = tmp_path / "run"
+    narrator = CampaignNarrator(run, heartbeat_s=0, max_bytes=4096)
+    last = _write_until_rotated(narrator, run, start=1)
+    _, cursor = ce.read_events(run)
+    assert cursor.generation == 1
+
+    narrator.record("step_recovered", {"iteration": last + 1, "pad": "x" * 200})
+    narrator.close()
+
+    events, after = ce.read_events(run, cursor=cursor)
+    assert _iterations(events) == [last + 1]
+    assert after.generation == 1, "the same rotation was counted twice"
+
+
+def test_read_events_polling_does_not_prevent_the_writer_from_rotating(
+        tmp_path: Path):
+    """Requirement one, and the reason the handle is opened and closed per poll.
+
+    A tailer holding `events.jsonl` open holds it without ``FILE_SHARE_DELETE``;
+    ``os.replace`` then raises, ``_rotate`` keeps writing to the un-rotated file,
+    and the 32 MB cap is off for as long as the watcher is attached. This test is
+    what stops that being "optimised" back in: the reader polls between every
+    single record, and the rename still has to succeed.
+    """
+    run = tmp_path / "run"
+    narrator = CampaignNarrator(run, heartbeat_s=0, max_bytes=4096)
+    previous = run / ce.PREVIOUS_FILENAME
+
+    seen: list[dict] = []
+    cursor: ce.EventCursor | None = None
+    for i in range(1, 61):
+        narrator.record("step_recovered", {"iteration": i, "pad": "x" * 200})
+        events, cursor = ce.read_events(run, cursor=cursor)
+        seen.extend(events)
+    narrator.close()
+
+    assert previous.exists(), (
+        "the stream never rotated while a reader was polling it — the reader is "
+        "holding the handle between polls and has turned the size cap off")
+    assert cursor.generation >= 1
+    # And holding nothing open cost nothing: every record still arrived once.
+    assert _iterations(seen) == list(range(1, 61))
+
+
+def test_read_events_a_replaced_stream_is_re_read_rather_than_silently_short(
+        tmp_path: Path):
+    """A file shorter than the cursor is not the file the cursor was cut in.
+
+    Returning `lines[position:]` — an empty slice — would look like "nothing new"
+    forever. Everything present is returned instead, and the generation advances
+    so a consumer can see that it is a discontinuity and not a tail.
+    """
+    run = tmp_path / "run"
+    narrator = CampaignNarrator(run, heartbeat_s=0)
+    for i in (1, 2, 3):
+        narrator.record("step_recovered", {"iteration": i})
+    _, cursor = ce.read_events(run)
+    narrator.close()
+
+    (run / ce.EVENTS_FILENAME).write_text(
+        '{"ts": "2026-01-01T00:00:00+00:00", "type": "run_started"}\n',
+        encoding="utf-8")
+    events, after = ce.read_events(run, cursor=cursor)
+
+    assert [e["type"] for e in events] == ["run_started"]
+    assert after.generation == 1
+
+
+# ── Liveness ─────────────────────────────────────────────────────────────────
+
+_BASE = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def _aged(seconds: float) -> list[dict]:
+    """One record stamped `seconds` before :data:`_BASE`."""
+    return [{"ts": (_BASE - timedelta(seconds=seconds)).isoformat(),
+             "type": "heartbeat", "phase": "anneal", "phase_age_s": 12.0}]
+
+
+def test_liveness_under_one_beat_is_live(tmp_path: Path):
+    """One beat of silence is a busy event loop, not a corpse."""
+    assert ce.liveness(_aged(29.9), now=_BASE) == ce.LIVENESS_LIVE
+
+
+def test_liveness_at_exactly_one_beat_is_quiet(tmp_path: Path):
+    """The boundary closes downward, so a missed beat is reported as missed."""
+    assert ce.liveness(_aged(30.0), now=_BASE) == ce.LIVENESS_QUIET
+
+
+def test_liveness_just_under_three_beats_is_still_quiet(tmp_path: Path):
+    assert ce.liveness(_aged(89.9), now=_BASE) == ce.LIVENESS_QUIET
+
+
+def test_liveness_at_exactly_three_beats_is_stale(tmp_path: Path):
+    """90 s at the shipped cadence — the rule argued at DEFAULT_HEARTBEAT_S."""
+    assert ce.liveness(_aged(90.0), now=_BASE) == ce.LIVENESS_STALE
+
+
+def test_liveness_scales_with_the_configured_cadence(tmp_path: Path):
+    """The bands are in beats, not in seconds: a slower campaign is not stale."""
+    assert ce.liveness(_aged(90.0), now=_BASE, heartbeat_s=120.0) \
+        == ce.LIVENESS_LIVE
+    assert ce.liveness(_aged(6.0), now=_BASE, heartbeat_s=2.0) \
+        == ce.LIVENESS_STALE
+
+
+def test_liveness_accepts_epoch_seconds_as_well_as_a_datetime(tmp_path: Path):
+    """The GUI holds a datetime; a headless caller holds `time.time()`."""
+    assert ce.liveness(_aged(10.0), now=_BASE.timestamp()) == ce.LIVENESS_LIVE
+
+
+def test_liveness_uses_the_newest_record_of_any_type(tmp_path: Path):
+    """Narration is proof of life too — the beat is a floor, not the only signal."""
+    events = _aged(300.0) + [
+        {"ts": (_BASE - timedelta(seconds=2)).isoformat(), "type": "suggestion"}]
+    assert ce.liveness(events, now=_BASE) == ce.LIVENESS_LIVE
+
+
+def test_liveness_without_any_records_is_stale(tmp_path: Path):
+    """Never having seen the campaign is not evidence that it lives."""
+    assert ce.liveness([], now=_BASE) == ce.LIVENESS_STALE
+    assert ce.liveness([{"type": "heartbeat"}], now=_BASE) == ce.LIVENESS_STALE
+
+
+def test_liveness_with_the_heartbeat_disabled_measures_the_default_cadence(
+        tmp_path: Path):
+    """A campaign that switched the beat off disabled liveness, not redefined it."""
+    assert ce.liveness(_aged(10.0), now=_BASE, heartbeat_s=0) == ce.LIVENESS_LIVE
+
+
+def test_last_heartbeat_returns_the_newest_beat_with_its_phase(tmp_path: Path):
+    """`phase` and `phase_age_s` are what the sidebar line says out loud.
+
+    Exposed here rather than rescanned in each widget — the reason `beat()`
+    carries them at all is that "alive" and "waiting on an 8-hour anneal" are
+    different sentences.
+    """
+    events = [
+        {"type": "heartbeat", "phase": "suggestion", "phase_age_s": 1.0},
+        {"type": "result", "iteration": 2},
+        {"type": "heartbeat", "phase": "anneal", "phase_age_s": 4210.0},
+    ]
+    beat = ce.last_heartbeat(events)
+
+    assert beat is not None
+    assert beat["phase"] == "anneal"
+    assert beat["phase_age_s"] == 4210.0
+    assert ce.last_heartbeat([{"type": "result"}]) is None
+
+
+@pytest.mark.asyncio
+async def test_read_events_replays_a_real_campaign_in_emit_order(
+        connected, tmp_path: Path):
+    """The reader and the live dispatch must agree about what happened.
+
+    Stage 3's contract is that a replayed line is feedable to the same handler as
+    a live event; this is that contract exercised through the reader rather than
+    through a test-local parser.
+    """
+    store = DataStore(tmp_path / "proj")
+    live: list[dict] = []
+    try:
+        result = await run_autonomous_campaign(
+            _spec(), manager=connected, data_store=store,
+            on_event=lambda e: live.append(dict(e)))
+    finally:
+        store.close()
+
+    events, cursor = ce.read_events(store.run_dir(result.run_id))
+    narration = [e for e in events if e["type"] != "heartbeat"]
+
+    assert [e["type"] for e in narration] == [e["type"] for e in live]
+    assert cursor.lines_read == len(events)
+    assert ce.read_events(store.run_dir(result.run_id), cursor=cursor)[0] == []

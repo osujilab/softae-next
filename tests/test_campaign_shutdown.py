@@ -30,7 +30,12 @@ import pytest
 from softae.core import shutdown
 from softae.core.autonomous_wiring import CampaignResult, CampaignSpec
 from softae.core.data_store import DataStore
-from softae.core.safe_park import SafeParkResult
+from softae.core.safe_park import (
+    HEADLINE_COMMANDED,
+    HEADLINE_NOTHING,
+    HEADLINE_PARTIAL,
+    SafeParkResult,
+)
 from softae.core.shutdown import (
     ParkGuard,
     active_park_guard,
@@ -133,10 +138,40 @@ class TestParkGuard:
         assert result is not None
         assert result.ok is False
         assert "VISA is gone" in result.errors[0]
-        assert "INCOMPLETE" in guard.describe()
+        assert HEADLINE_PARTIAL in guard.describe()
 
     def test_describe_says_so_when_nothing_was_parked(self):
         assert "NOT parked" in ParkGuard(_manager()).describe()
+
+    def test_describe_of_a_park_that_reached_nothing_does_not_say_parked(
+        self, monkeypatch
+    ):
+        """A killed run's report, on a rig no session was open to.
+
+        ``ok`` is true here — nothing raised, because nothing was attempted —
+        and this line is the whole account of the shutdown for whoever finds the
+        terminal in the morning. It said "parked".
+        """
+        monkeypatch.setattr(
+            shutdown, "safe_park",
+            lambda *_a, **_k: SafeParkResult(skipped=["syringe", "lamp"]),
+        )
+        guard = ParkGuard(_manager(connected=False))
+        result = guard.park("SIGINT")
+
+        assert result is not None and result.ok is True
+        text = guard.describe()
+        assert HEADLINE_NOTHING in text
+        assert "parked (" not in text
+
+    def test_describe_of_a_park_that_commanded_something_still_says_so(
+        self, spy_park
+    ):
+        """The inverse, so the fix cannot be written as "never claim a park"."""
+        guard = ParkGuard(_manager())
+        guard.park("SIGINT")
+
+        assert HEADLINE_COMMANDED in guard.describe()
 
     def test_park_on_shutdown_deduplicates_against_the_active_guard(self, spy_park):
         """Library code parks unconditionally; the guard decides if it lands."""
@@ -447,7 +482,10 @@ class TestSignalOrdering:
         out = capsys.readouterr().out
 
         assert rc == cli.EXIT_FAILED
-        assert "Interrupted — parked" in out
+        # The grade, not the word "parked": a park that reached no instrument
+        # raises nothing and so used to be reported here identically to one that
+        # stopped the rig.
+        assert f"Interrupted — {HEADLINE_COMMANDED}" in out
         assert spy_park[0]["connected"] is True
 
     def test_an_unfinished_row_is_recovered_after_the_rig_connects(

@@ -307,9 +307,16 @@ class TestRunAppStartup:
         assert stubs.asyncio.ensure_future.call_count == 1
         _close_scheduled_coroutines(stubs)
 
-    def test_run_app_publishes_the_decision_on_the_window_for_the_attached_views(
+    def test_run_app_passes_the_decision_into_the_window_constructor(
             self, rig_scope, monkeypatch):
-        """One decision, made once, readable by whatever renders it."""
+        """One decision, made once — and handed over before the window is built.
+
+        It was briefly an attribute set afterwards. It cannot be: the window is
+        *constructed* differently by it (no exit park, no idle-purge timer, no
+        Safe Exit in attached mode), and none of that can be undone by a later
+        assignment. ``MainWindow.launch_mode`` is read-only for the same reason,
+        so the assignment this replaced would now raise at launch.
+        """
         from softae.gui.app import run_app
 
         _write_lock(rig_scope, what="campaign:phase_map:run_042",
@@ -318,6 +325,6 @@ class TestRunAppStartup:
 
         run_app()
 
-        window = stubs.MainWindow.return_value
-        assert window.launch_mode.attached is True
-        assert window.launch_mode.campaign == ("phase_map", "run_042")
+        mode = stubs.MainWindow.call_args.kwargs["launch_mode"]
+        assert mode.attached is True
+        assert mode.campaign == ("phase_map", "run_042")

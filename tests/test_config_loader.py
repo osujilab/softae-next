@@ -125,6 +125,52 @@ class TestDropcastConfig:
         assert loader.dropcast_config()["default_recipe"] == "two_phase"
 
 
+class TestCampaignCadences:
+    """``[campaign]`` — the two run-directory sidecar cadences (stage 5, S5.F).
+
+    The section is **optional and absent from the shipped config**, so the
+    absent case is the shipped case: a headless campaign must publish at the
+    documented defaults with nothing in the file at all.
+    """
+
+    def _cfg(self, tmp_path: Path, body: str = "") -> None:
+        toml = tmp_path / "softae_config.toml"
+        toml.write_text(f"[paths]\ndata_root = './data'\n{body}", encoding="utf-8")
+        loader.load(path=toml, reload=True)
+
+    def test_campaign_section_absent_returns_documented_defaults(self, tmp_path):
+        from softae.core.campaign_events import (
+            DEFAULT_CONDITIONS_POLL_S,
+            DEFAULT_HEARTBEAT_S,
+        )
+
+        self._cfg(tmp_path)
+        assert loader.campaign_config() == {}
+        assert loader.campaign_conditions_poll_s() == DEFAULT_CONDITIONS_POLL_S == 5.0
+        assert loader.campaign_heartbeat_s() == DEFAULT_HEARTBEAT_S == 30.0
+
+    def test_campaign_section_present_overrides_both_cadences(self, tmp_path):
+        self._cfg(tmp_path, "[campaign]\nconditions_poll_s = 12\nheartbeat_s = 45\n")
+        assert loader.campaign_conditions_poll_s() == 12.0
+        assert loader.campaign_heartbeat_s() == 45.0
+
+    def test_campaign_zero_survives_as_disabled_rather_than_defaulting(self, tmp_path):
+        """``0`` is a value, not an absence — it is how each sidecar is switched
+        off, so a truthiness test here would make the off switch unreachable."""
+        self._cfg(tmp_path, "[campaign]\nconditions_poll_s = 0\nheartbeat_s = 0\n")
+        assert loader.campaign_conditions_poll_s() == 0.0
+        assert loader.campaign_heartbeat_s() == 0.0
+
+    def test_campaign_unparsable_cadence_falls_back_to_the_default(self, tmp_path):
+        self._cfg(tmp_path, "[campaign]\nconditions_poll_s = 'soon'\n")
+        assert loader.campaign_conditions_poll_s() == 5.0
+
+    def test_campaign_section_of_the_wrong_type_is_ignored(self, tmp_path):
+        self._cfg(tmp_path, "campaign = 'yes please'\n")
+        assert loader.campaign_config() == {}
+        assert loader.campaign_heartbeat_s() == 30.0
+
+
 class TestDataRoot:
     def test_data_root_relative_anchors_at_config_dir_not_cwd(self, tmp_path, monkeypatch):
         _write_cfg(tmp_path, "./data")

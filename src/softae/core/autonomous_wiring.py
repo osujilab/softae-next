@@ -49,7 +49,9 @@ from softae.core.autonomous_loop import (
 )
 from softae.core.campaign_events import (
     CampaignNarrator,
+    ConditionsPublisher,
     ControlWatcher,
+    open_conditions_publisher,
     open_control_watcher,
     open_narrator,
 )
@@ -2746,6 +2748,8 @@ async def run_autonomous_campaign(
     on_board_exchange: "BoardExchangeFn | None" = None,
     on_board_check: "BoardCheckFn | None" = None,
     resume: bool = False,
+    heartbeat_s: float | None = None,
+    conditions_poll_s: float | None = None,
 ) -> CampaignResult:
     """Wire and drive a full autonomous campaign, headlessly.
 
@@ -2764,6 +2768,12 @@ async def run_autonomous_campaign(
     Returns a :class:`CampaignResult`.  Emits an event dict to ``on_event`` for
     every suggestion, result, state change, and convergence — the observation
     stream an overseeing agent consumes.
+
+    ``heartbeat_s`` and ``conditions_poll_s`` override the ``[campaign]`` config
+    cadences for the two run-directory sidecars this campaign publishes; ``None``
+    means "whatever the config says", and ``0`` disables that sidecar. They are
+    separate knobs on separate clocks deliberately — see
+    :class:`~softae.core.campaign_events.ConditionsPublisher`.
     """
     # Resolve the measurement modality FIRST (T2.5) — before a manager connects
     # or a run row is written. The registry supplies this campaign's pre-run
@@ -2799,6 +2809,27 @@ async def run_autonomous_campaign(
     # The inbound half of the same pair, built once the loop exists. Declared
     # here so the teardown below can close it whatever path the run exits by.
     control: ControlWatcher | None = None
+    # The third sidecar: what this process can see of the rig, for a watcher
+    # that holds no sessions and therefore cannot look for itself.
+    conditions: ConditionsPublisher | None = None
+
+    # Cadences resolved once, here. An explicit kwarg wins; otherwise the
+    # `[campaign]` section answers; and if reading the config raises, the value
+    # stays `None` and the sidecar's own `open_*` helper applies the shipped
+    # default. A monitoring knob does not get to refuse to start a campaign, and
+    # the number itself still lives in exactly one place.
+    def _cadence(explicit: float | None, accessor: Any) -> float | None:
+        if explicit is not None:
+            return float(explicit)
+        try:
+            return float(accessor())
+        except Exception:
+            logger.warning("campaign_cadence_unreadable", exc_info=True)
+            return None
+
+    heartbeat_s = _cadence(heartbeat_s, loader.campaign_heartbeat_s)
+    conditions_poll_s = _cadence(conditions_poll_s,
+                                 loader.campaign_conditions_poll_s)
 
     def emit(event_type: str, **payload: Any) -> None:
         # Persisted *before* dispatch, deliberately. `on_event` is arbitrary
@@ -2895,7 +2926,9 @@ async def run_autonomous_campaign(
         # from the stream itself. Sited after the rig claim for the reason the
         # claim gives above — a watcher must not be able to see the rig
         # unclaimed on the very first thing it is told.
-        narrator = open_narrator(data_store.run_dir(run_id))
+        narrator = open_narrator(
+            data_store.run_dir(run_id),
+            **({} if heartbeat_s is None else {"heartbeat_s": heartbeat_s}))
 
         emit("run_started", run_id=run_id, spec=spec.name)
 
@@ -2906,6 +2939,25 @@ async def run_autonomous_campaign(
         # heartbeat cannot serve.
         if narrator is not None:
             narrator.start_heartbeat()
+
+        # ── What the rig looks like, for a watcher that cannot look (stage 5) ─
+        # An attached GUI opens no instrument sessions, so it cannot read a
+        # temperature this process owns — a read is a serial transaction on a bus
+        # this process is using. So the campaign publishes `conditions.json`
+        # beside the stream and the GUI renders what it finds.
+        #
+        # Its own task and its own clock, beside the heartbeat rather than folded
+        # into it: the beat cadence is load-bearing for the three-beat staleness
+        # verdict, and a shared clock would let a monitoring-comfort knob
+        # silently redefine what "wedged" means. The read itself goes to a worker
+        # thread, so a contended serial bus can delay a temperature reading and
+        # can never delay this loop's `control.json` poll — i.e. never an Abort.
+        conditions = open_conditions_publisher(
+            data_store.run_dir(run_id), manager=manager,
+            **({} if conditions_poll_s is None
+               else {"poll_s": conditions_poll_s}))
+        if conditions is not None:
+            conditions.start()
 
         # Let the modality prepare whatever its measurement steps will read,
         # before any of them runs (T2.5). For EIS that is the `.mscr` scripts:
@@ -3933,6 +3985,13 @@ async def run_autonomous_campaign(
         # is a promise the process can no longer keep.
         if control is not None:
             await control.aclose()
+        # Then stop reading the rig — before `disconnect_all` below, because a
+        # conditions read racing a disconnect is a read of a session being taken
+        # away from under it. An in-flight read is let go of rather than waited
+        # on: a thread blocked in a driver retry cannot be cancelled, and a
+        # campaign teardown must not queue behind a monitoring read.
+        if conditions is not None:
+            await conditions.aclose()
         # Then: stop beating. Every event worth narrating — `run_finished`, or
         # the `park`/`safe_park` pair from the catch-all above — has already been
         # emitted by now, and a heartbeat that outlived the campaign would tell a
