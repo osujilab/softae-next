@@ -136,6 +136,7 @@ from softae.workflows.equilibration import (
     round_cost_s,
     round_headroom_s_per_channel,
 )
+from softae.core.preflight import EIS_MEASURED_S_PER_CHANNEL
 
 logger = structlog.get_logger(__name__)
 
@@ -174,17 +175,24 @@ DEFAULT_MILESTONE_INTERVAL_S = 300.0
 #:
 #: This number is why the sweep model is trustworthy today. It used to model
 #: ~3.9 s/channel here, roughly **ten times low**, and a plan resting on it told
-#: an operator 240 s for a round that took 2166 s. ``estimate_eis_duration`` was
-#: refitted against this and two other timed presets in 2026-08 and now says
-#: ~37.7 s/channel — within 8.2 % of the bench. The measured-vs-modelled machinery
-#: throughout this module dates from the era of the gap and is kept because a model
-#: that was wrong once can be wrong again, not because it is currently wrong.
+#: an operator 240 s for a round that took 2166 s. The measured-vs-modelled
+#: machinery throughout this module dates from the era of that gap and is kept
+#: because a model that was wrong once can be wrong again, not because it is
+#: currently wrong.
+#:
+#: **Derived, not restated.** This was the literal ``40.7`` until 2026-08-17. That
+#: reading described the *pre-retune* ``Standard`` grid, and when the mains-notch
+#: retune moved every preset the literal stayed behind — still quoting operators a
+#: stopwatch, in ``--help`` and in the modelled-basis advice, for a sweep that no
+#: longer existed. Reading it out of the anchor table makes the desync
+#: unrepresentable: there is one bench number for ``Standard`` in this codebase and
+#: this is a view of it.
 #:
 #: Quoted in ``--help`` and in the modelled-basis note so an operator has a
 #: stopwatch number beside the model's. Still **not** used as a default: it belongs
 #: to one rig and one preset, and a silently applied constant would be wrong the
 #: moment either changed.
-MEASURED_PER_CHANNEL_S_STANDARD = 40.7
+MEASURED_PER_CHANNEL_S_STANDARD = EIS_MEASURED_S_PER_CHANNEL["Standard"]
 
 # The modelled-basis caution below is sized by
 # `model_underestimate_frac`, imported from the workflow rather than restated here.
@@ -1217,11 +1225,22 @@ def _print_basis(config: EquilibrationConfig, cost: float, *,
           f"fitted to the")
     print(f"     presets timed on this rig. It runs up to {frac:.0%} UNDER a real "
           f"round on those:")
-    print(f"     'Standard' measured {MEASURED_PER_CHANNEL_S_STANDARD:g}s/channel over "
-          f"12 channels. Treat it as")
-    print(f"     +/-{frac:.0%}, not as a prediction; --measured-per-channel-s "
-          f"{MEASURED_PER_CHANNEL_S_STANDARD:g} plans")
-    print("     from that stopwatch instead.)")
+
+    # Grid-checked rather than the module constant: if `Standard` were ever moved
+    # off its timed grid, quoting its anchor here would repeat in the advice text
+    # exactly the staleness the anchor interlock removes from the arithmetic.
+    from softae.core.preflight import measured_s_for_preset
+
+    reference = measured_s_for_preset("Standard")
+    if reference is None:
+        print(f"     Treat it as +/-{frac:.0%}, not as a prediction; "
+              f"--measured-per-channel-s")
+        print("     plans from a stopwatch instead.)")
+    else:
+        print(f"     'Standard' measured {reference:g}s/channel here. Treat it as")
+        print(f"     +/-{frac:.0%}, not as a prediction; --measured-per-channel-s "
+              f"{reference:g} plans")
+        print("     from that stopwatch instead.)")
     _print_floor_extrapolation(config)
 
 
@@ -2242,15 +2261,18 @@ def _add_design_args(parser: argparse.ArgumentParser, *,
     design.add_argument("--measured-per-channel-s", dest="measured_per_channel_s",
                         type=float, default=None,
                         help="plan from a MEASURED per-channel round cost instead of "
-                             "the model. The model is fitted to the presets timed "
-                             "on this rig and runs up to ~8%% under them; it says "
-                             f"nothing about a preset that was never timed, and "
-                             f"'{DEFAULT_EIS_PRESET}' is now one of those -- its 7 Hz "
-                             f"floor has never been stopwatched. This rig "
-                             f"measured {MEASURED_PER_CHANNEL_S_STANDARD:g} s/channel "
-                             "on 'Standard' over 12 channels. Overrides the modelled "
-                             "cost in the round cost, the inter-round gap, the "
-                             "headroom, the sampling interval and the total duration.")
+                             "the model. Rarely needed since 2026-08-17: every "
+                             "shipped preset was stopwatched that day, so a plan on "
+                             "a stock preset already runs off a real measurement "
+                             f"({MEASURED_PER_CHANNEL_S_STANDARD:g} s/channel on "
+                             f"'Standard', {EIS_MEASURED_S_PER_CHANNEL[DEFAULT_EIS_PRESET]:g} "
+                             f"on '{DEFAULT_EIS_PRESET}'). Reach for this when the "
+                             "sweep is NOT a stock preset -- an overridden --f-lo-mHz "
+                             "leaves every timed grid behind and falls back to the "
+                             "model, which is fitted to those presets and runs up to "
+                             "~10%% under them. Overrides the modelled cost in the "
+                             "round cost, the inter-round gap, the headroom, the "
+                             "sampling interval and the total duration.")
     # `--model` meant the EIS CIRCUIT model here and the RELAXATION model on
     # `fit`/`report` -- one spelling, two vocabularies, both plausible-looking
     # strings, so `fit --model simpleSalt` failed confusingly rather than

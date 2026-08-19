@@ -767,7 +767,11 @@ class TestPlanningFromAMeasuredCost:
         assert "fitted to the" in out
         assert "UNDER a real round" in out
         assert "10%" in out
-        assert "--measured-per-channel-s 40.7" in out   # the flag that fixes it
+        # Derived, not "37.19": the literal here is what let the advice text go on
+        # quoting 40.7 after the retune moved the grid that number was timed at.
+        from softae.tools.equilibration import MEASURED_PER_CHANNEL_S_STANDARD
+
+        assert f"--measured-per-channel-s {MEASURED_PER_CHANNEL_S_STANDARD:g}" in out
 
     def test_an_anchored_preset_reads_as_measured_with_no_flag_typed(
             self, project, capsys):
