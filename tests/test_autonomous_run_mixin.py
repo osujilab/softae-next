@@ -9,6 +9,7 @@ convergence plot, the harness has leaked back into being BO-specific.
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,8 +19,17 @@ from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from softae.core.autonomous_loop import BoardCheck, BoardDecision
+from softae.core.run_lock import RunLock
 from softae.drivers.mock_factory import create_mock_manager
 from softae.gui.tabs._autonomous_run import AutonomousRunMixin
+
+
+def _foreign_lock(**over) -> RunLock:
+    base = dict(pid=4242, what="campaign:phase_map:20260817T090000Z_phase_map",
+                started_at="2026-08-17T09:00:00+00:00", host="another-host",
+                log_path=r"C:\proj\runs\20260817T090000Z_phase_map")
+    base.update(over)
+    return RunLock(**base)
 
 
 @pytest.fixture(scope="session")
@@ -47,9 +57,25 @@ class _BareHost(AutonomousRunMixin, QWidget):
         self._init_autonomous_run()
 
 
+class _PanelHost(_BareHost):
+    """A surface that *does* carry a config panel, as the BO tabs do."""
+
+    def _panel_state(self) -> dict:
+        return {"name": "phase_map", "budget": 8}
+
+
 @pytest.fixture
 def host(qapp):
     h = _BareHost(create_mock_manager(config={}))
+    yield h
+    h.deleteLater()
+
+
+@pytest.fixture
+def panel_host(qapp, tmp_path):
+    """A panel-carrying host whose files land in ``tmp_path``, never the data root."""
+    h = _PanelHost(create_mock_manager(config={}),
+                   data_store=SimpleNamespace(project_dir=tmp_path))
     yield h
     h.deleteLater()
 
@@ -122,6 +148,107 @@ class TestBoardGates:
                 break
         t.join(timeout=5)
         assert result == [BoardDecision.PROCEED]
+
+
+class TestSingleOccupancy:
+    """One campaign owns the rig, and being refused costs nothing (S5.I).
+
+    The refusal is outright — never a queue, never a takeover offer — and its
+    words are the CLI's, so the two surfaces cannot come to say different things
+    about one lock file.
+    """
+
+    @staticmethod
+    def _hold_rig(monkeypatch, lock):
+        """Install a foreign holder and make the rig read as real hardware.
+
+        Both halves are needed: the mock manager reads as *simulated*, and a
+        simulated rig is deliberately not refused — the same exemption
+        ``softae-campaign run`` grants a ``--mock`` run.
+        """
+        monkeypatch.setattr("softae.core.run_lock.foreign_run_lock", lambda *a: lock)
+        monkeypatch.setattr("softae.core.run_lock.rig_is_simulated", lambda m: False)
+
+    @staticmethod
+    def _capture_dialog(monkeypatch) -> list[str]:
+        shown: list[str] = []
+        monkeypatch.setattr(
+            QMessageBox, "warning",
+            staticmethod(lambda parent, title, text, *a, **k: shown.append(text)))
+        return shown
+
+    def test_refuse_if_rig_busy_with_a_free_rig_permits_the_launch(
+        self, host, monkeypatch
+    ):
+        monkeypatch.setattr("softae.core.run_lock.foreign_run_lock", lambda *a: None)
+        assert host._refuse_if_rig_busy(None) is False
+
+    def test_refuse_if_rig_busy_with_a_foreign_holder_refuses(
+        self, panel_host, monkeypatch
+    ):
+        self._hold_rig(monkeypatch, _foreign_lock())
+        self._capture_dialog(monkeypatch)
+        assert panel_host._refuse_if_rig_busy(None) is True
+
+    def test_refuse_if_rig_busy_on_a_simulated_rig_permits_the_launch(
+        self, panel_host, monkeypatch
+    ):
+        """Parity with the CLI: a run that claims nothing is not refused."""
+        monkeypatch.setattr(
+            "softae.core.run_lock.foreign_run_lock", lambda *a: _foreign_lock())
+        assert panel_host._refuse_if_rig_busy(None) is False
+
+    def test_refuse_if_rig_busy_reuses_the_cli_refusal_wording(
+        self, panel_host, monkeypatch
+    ):
+        """One sentence, one place. A second wording is a second policy."""
+        from softae.core.run_lock import busy_rig_message
+
+        lock = _foreign_lock()
+        self._hold_rig(monkeypatch, lock)
+        shown = self._capture_dialog(monkeypatch)
+        panel_host._refuse_if_rig_busy(None)
+        assert busy_rig_message(lock, action="This campaign") in shown[0]
+
+    def test_refuse_if_rig_busy_offers_no_takeover_or_queue(
+        self, panel_host, monkeypatch
+    ):
+        """Taking the rig stays a separate, deliberate act — never a Run button."""
+        self._hold_rig(monkeypatch, _foreign_lock())
+        shown = self._capture_dialog(monkeypatch)
+        broken: list[int] = []
+        monkeypatch.setattr("softae.core.run_lock.break_run_lock",
+                            lambda *a, **k: broken.append(1))
+        panel_host._refuse_if_rig_busy(None)
+        assert broken == []
+        assert "queue" not in shown[0].lower()
+
+    def test_refuse_if_rig_busy_writes_the_panel_state(self, panel_host, monkeypatch):
+        self._hold_rig(monkeypatch, _foreign_lock())
+        shown = self._capture_dialog(monkeypatch)
+        panel_host._refuse_if_rig_busy(None)
+
+        written = sorted((panel_host._project_dir() / "rejected").glob("*.json"))
+        assert len(written) == 1
+        assert str(written[0]) in shown[0]
+
+    def test_refuse_if_rig_busy_without_a_panel_state_still_refuses(
+        self, host, monkeypatch, tmp_path
+    ):
+        """A surface with no config panel is still refused, and still says why."""
+        host._data_store = SimpleNamespace(project_dir=tmp_path)
+        self._hold_rig(monkeypatch, _foreign_lock())
+        shown = self._capture_dialog(monkeypatch)
+        assert host._refuse_if_rig_busy(None) is True
+        assert "Nothing was started" in shown[0]
+
+    def test_refuse_if_rig_busy_logs_the_holder_to_the_campaign_log(
+        self, panel_host, monkeypatch
+    ):
+        self._hold_rig(monkeypatch, _foreign_lock())
+        self._capture_dialog(monkeypatch)
+        panel_host._refuse_if_rig_busy(None)
+        assert any("4242" in line for line in panel_host.logs)
 
 
 class TestPreflight:

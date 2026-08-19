@@ -13,6 +13,8 @@ import pytest
 
 pytest.importorskip("PySide6")
 
+from PySide6.QtWidgets import QMessageBox
+
 from softae.core.autonomous_wiring import CampaignResult, CampaignSpec
 from softae.drivers.mock_factory import create_mock_manager
 from softae.gui.tabs import tab_bo_live
@@ -260,6 +262,139 @@ def test_verify_head_position_delegates(qapp, manager, monkeypatch):
     assert tab._verify_head_position() is True
     assert seen["mgr"] is manager
     assert "campaign" in seen["context"]
+
+
+# ── Single occupancy, and what a refusal costs (S5.I) ──────────────────────
+
+
+class TestSingleOccupancyRefusal:
+    """A second campaign is refused outright — and the refusal preserves the setup.
+
+    What the tab adds over the harness (``test_autonomous_run_mixin.py``) is the
+    thing that decides whether the refusal is *safe*: a composition campaign
+    cannot be written to a spec file without silently becoming a raw-volume one,
+    so it must be refused a relaunch command, and the panel state — which is
+    lossless — must be what the operator is pointed at instead.
+    """
+
+    @staticmethod
+    def _tab(qapp, manager, tmp_path):
+        from types import SimpleNamespace
+
+        return LiveBOCampaignTab(
+            manager, data_store=SimpleNamespace(project_dir=tmp_path))
+
+    @staticmethod
+    def _hold_rig(monkeypatch) -> list[str]:
+        from softae.core.run_lock import RunLock
+
+        lock = RunLock(pid=4242, what="campaign:other:20260817T090000Z_other",
+                       started_at="2026-08-17T09:00:00+00:00",
+                       host="another-host", log_path=r"C:\proj\runs\x")
+        monkeypatch.setattr("softae.core.run_lock.foreign_run_lock", lambda *a: lock)
+        monkeypatch.setattr("softae.core.run_lock.rig_is_simulated", lambda m: False)
+        shown: list[str] = []
+        monkeypatch.setattr(
+            QMessageBox, "warning",
+            staticmethod(lambda parent, title, text, *a, **k: shown.append(text)))
+        return shown
+
+    def test_on_run_with_a_foreign_lock_starts_no_campaign(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        tab = self._tab(qapp, manager, tmp_path)
+        self._hold_rig(monkeypatch)
+        started: list = []
+        monkeypatch.setattr(tab, "_start_worker", lambda *a, **k: started.append(a))
+        tab._on_run()
+        assert started == []
+
+    def test_on_run_with_a_foreign_lock_never_reaches_the_head_gate(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        """The head gate prompts, and may retract — a refused launch moves nothing."""
+        tab = self._tab(qapp, manager, tmp_path)
+        self._hold_rig(monkeypatch)
+        asked: list[bool] = []
+        monkeypatch.setattr(tab, "_verify_head_position",
+                            lambda *a, **k: asked.append(True) or True)
+        monkeypatch.setattr(tab, "_start_worker", lambda *a, **k: None)
+        tab._on_run()
+        assert asked == []
+
+    def test_a_refused_volume_campaign_is_offered_a_relaunch_command(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        tab = self._tab(qapp, manager, tmp_path)
+        shown = self._hold_rig(monkeypatch)
+        monkeypatch.setattr(tab, "_start_worker", lambda *a, **k: None)
+        tab._on_run()
+
+        rejected = tmp_path / "rejected"
+        assert len(list(rejected.glob("*.toml"))) == 1
+        assert "softae-campaign run " in shown[0]
+
+    def test_a_refused_composition_campaign_is_offered_no_relaunch_command(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        """B-i: the written file would search composition axes as raw µL volumes."""
+        tab = self._tab(qapp, manager, tmp_path)
+        monkeypatch.setattr(
+            tab, "_load_stocks",
+            lambda: ({"PEO": object(), "LiCl": object()}, {"PEO": 0, "LiCl": 1},
+                     object()))
+        tab._combo_search_mode.setCurrentIndex(1)
+        tab._axes_editor.add_axis("Molar ratio", a="PEO", b="LiCl", low="5", high="40")
+        shown = self._hold_rig(monkeypatch)
+        monkeypatch.setattr(tab, "_start_worker", lambda *a, **k: None)
+        tab._on_run()
+
+        rejected = tmp_path / "rejected"
+        assert list(rejected.glob("*.toml")) == []
+        assert len(list(rejected.glob("*.json"))) == 1
+        assert "softae-campaign run" not in shown[0]
+        assert "general_formulation" in shown[0]
+
+    def test_the_preserved_panel_state_restores_the_refused_campaign(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        """The whole point: a refusal costs a file, not the setup."""
+        tab = self._tab(qapp, manager, tmp_path)
+        monkeypatch.setattr(
+            tab, "_load_stocks",
+            lambda: ({"PEO": object(), "LiCl": object()}, {"PEO": 0, "LiCl": 1},
+                     object()))
+        tab._combo_search_mode.setCurrentIndex(1)
+        tab._axes_editor.add_axis("Molar ratio", a="PEO", b="LiCl", low="5", high="40")
+        tab._le_name.setText("phase_map")
+        tab._spin_budget.setValue(23)
+        self._hold_rig(monkeypatch)
+        monkeypatch.setattr(tab, "_start_worker", lambda *a, **k: None)
+        tab._on_run()
+
+        saved = next((tmp_path / "rejected").glob("*.json"))
+        restored = LiveBOCampaignTab(manager)
+        restored._populate_from_config(
+            restored._config_from_json(saved.read_text(encoding="utf-8")))
+
+        assert restored._le_name.text() == "phase_map"
+        assert restored._spin_budget.value() == 23
+        assert restored._search_mode() == "composition"
+        axes = restored._axes_editor.axes()
+        assert (axes[0].a, axes[0].b, axes[0].low, axes[0].high) == (
+            "PEO", "LiCl", 5.0, 40.0)
+
+    def test_a_free_rig_runs_the_campaign_as_before(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        """The refusal must be reachable only from a live foreign lock."""
+        tab = self._tab(qapp, manager, tmp_path)
+        monkeypatch.setattr("softae.core.run_lock.foreign_run_lock", lambda *a: None)
+        monkeypatch.setattr(tab, "_verify_head_position", lambda *a, **k: True)
+        started: list = []
+        monkeypatch.setattr(tab, "_start_worker", lambda *a, **k: started.append(a))
+        tab._on_run()
+        assert started and not (tmp_path / "rejected").exists()
 
 
 # ── Concurrency invariant (Simulator + Live share a base, own their state) ──

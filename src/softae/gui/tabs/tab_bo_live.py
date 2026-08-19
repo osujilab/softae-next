@@ -809,15 +809,24 @@ class LiveBOCampaignTab(AutonomousRunMixin, BOTabBase):
     # ── run ──────────────────────────────────────────────────────────────────
 
     def _on_run(self) -> None:
-        # Head-position start-gate (the autonomous loop drives the head via
-        # conditional commands, so its belief must match reality first).
-        if not self._verify_head_position():
-            return
-
+        # The spec is built first so a refused launch has something to preserve,
+        # and so a malformed panel is reported without first asking the operator
+        # about the head.
         try:
             spec = self._build_config()
         except (ValueError, TypeError) as exc:
             QMessageBox.warning(self, "Campaign Error", str(exc))
+            return
+
+        # Single occupancy, checked **before** the head gate: that gate prompts
+        # the operator and can issue a safety retract, and a launch that is
+        # about to be refused must ask for nothing and move nothing.
+        if self._refuse_if_rig_busy(spec):
+            return
+
+        # Head-position start-gate (the autonomous loop drives the head via
+        # conditional commands, so its belief must match reality first).
+        if not self._verify_head_position():
             return
 
         if not self._preflight_overflow_ok(spec):

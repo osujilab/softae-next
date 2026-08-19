@@ -18,6 +18,8 @@ from softae.core.campaign_spec_io import (
     load_campaign_spec,
     spec_from_dict,
     spec_to_dict,
+    spec_toml_completeness,
+    write_campaign_spec_toml,
 )
 from softae.tools import campaign as cli
 
@@ -227,6 +229,91 @@ high = 1.0
     def test_a_default_block_is_not_written_out(self):
         written = spec_to_dict(spec_from_dict(MINIMAL))
         assert "measurement" not in written
+
+
+# ── Is the written part the whole spec? (S5.I) ───────────────────────────────
+
+class TestTomlCompleteness:
+    """The asymmetry that makes writing dangerous, and the check that closes it.
+
+    *Reading* a file that sets an unrepresentable field raises by design.
+    *Writing* a spec that has one omits it in silence — so anything that offers a
+    written file as a way to re-run the campaign has to prove first that the file
+    carries all of it.
+    """
+
+    def test_a_plain_spec_is_complete(self):
+        spec = spec_from_dict({**MINIMAL, "budget": 17, "channels": [3, 4],
+                               "two_phase": True})
+        assert spec_toml_completeness(spec).complete
+
+    def test_an_untouched_spec_is_complete(self):
+        assert spec_toml_completeness(spec_from_dict(MINIMAL)).complete
+
+    def test_a_composition_spec_is_not_toml_representable(self):
+        """The file would reload with no formulation *and* no vol_params, so
+        ``resolved_vol_params()`` would read its axes as raw µL volumes."""
+        spec = spec_from_dict(MINIMAL)
+        spec.general_formulation = object()
+        result = spec_toml_completeness(spec)
+        assert not result.complete
+        assert result.missing == ("general_formulation",)
+        assert "general_formulation" in result.explain()
+
+    @pytest.mark.parametrize("field", ["prior_mean", "formulation", "run_plan",
+                                       "piezo", "general_formulation"])
+    def test_an_unrepresentable_object_is_reported_not_dropped(self, field):
+        spec = spec_from_dict(MINIMAL)
+        setattr(spec, field, object())
+        assert field in spec_toml_completeness(spec).missing
+
+    def test_seed_observations_are_reported_when_present(self):
+        spec = spec_from_dict(MINIMAL)
+        spec.seed_observations = (({"a": 0.5}, 0.7),)
+        assert "seed_observations" in spec_toml_completeness(spec).missing
+
+    def test_an_explicitly_disabled_gate_is_not_silently_re_enabled(self):
+        """``rh_stability_pct = None`` switches the RH gate off; the writer drops
+        the ``None`` and the file would reload with the gate back ON."""
+        spec = spec_from_dict(MINIMAL)
+        spec.rh_stability_pct = None
+        result = spec_toml_completeness(spec)
+        assert not result.complete
+        assert "rh_stability_pct" in result.missing
+        assert "None" in result.explain()
+
+    def test_an_explicit_none_seed_is_reported_rather_than_reloading_as_42(self):
+        spec = spec_from_dict(MINIMAL)
+        spec.seed = None
+        assert spec.seed is None
+        assert spec_from_dict(spec_to_dict(spec)).seed == 42     # the silent change
+        assert "seed" in spec_toml_completeness(spec).missing    # …now reported
+
+    def test_a_default_valued_unrepresentable_field_is_not_reported(self):
+        """A spec that never set one has lost nothing by not writing it."""
+        spec = spec_from_dict(MINIMAL)
+        assert spec.prior_mean is None and spec.seed_observations == ()
+        assert spec_toml_completeness(spec).missing == ()
+
+    def test_a_value_toml_cannot_encode_is_reported_not_raised(self):
+        spec = spec_from_dict(MINIMAL)
+        spec.pcb_name = object()          # writable by the dict, not by TOML
+        result = spec_toml_completeness(spec)
+        assert not result.complete
+        assert any("TOML" in r for r in result.reasons)
+
+    def test_writing_and_reloading_a_complete_spec_gives_the_same_campaign(
+        self, tmp_path
+    ):
+        original = spec_from_dict({**MINIMAL, "budget": 17, "channels": [3, 4],
+                                   "vol_params": ["a"], "time_scale": 0.0})
+        path = write_campaign_spec_toml(original, tmp_path / "out" / "spec.toml")
+        reloaded = load_campaign_spec(path)
+
+        assert path.exists()
+        assert (reloaded.budget, reloaded.channels, reloaded.vol_params) == (
+            17, (3, 4), ("a",))
+        assert reloaded.time_scale == 0.0
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────

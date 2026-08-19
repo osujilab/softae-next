@@ -75,6 +75,81 @@ class AutonomousRunMixin:
 
         return verify_head_before_run(self, self._manager, context=context)
 
+    # ── Single occupancy — one campaign owns the rig at a time (S5.I) ────────
+
+    def _refuse_if_rig_busy(self, spec: Any = None) -> bool:
+        """``True`` when a live foreign run lock refuses this launch.
+
+        **Outright, never queued and never a takeover prompt.** A second
+        automated run on one rig is the collision the lock exists to prevent,
+        and offering to take the rig from the button that starts a campaign is
+        how a live overnight run gets killed by someone who only meant to start
+        theirs. Taking the rig stays where it already is: a deliberate,
+        separately-confirmed act (``break_run_lock``).
+
+        The predicate is the CLI's, imported rather than re-derived — ``softae-
+        campaign run`` refuses on exactly this pair (``tools/campaign.py``) — so
+        the two surfaces cannot come to disagree about what "busy" means. That
+        includes the simulation exemption: a mock manager claims no lock and
+        moves nothing, so it is not refused over hardware it will never touch.
+
+        ``foreign_run_lock`` is called **unwrapped**, not through
+        ``rig_owner.foreign_rig_lock``: the never-raises wrapper decorates a
+        *view*, and a launch that cannot find out who owns the rig must not
+        start blind. Raising here refuses too, and loudly.
+
+        A refusal costs the operator nothing — see
+        :func:`softae.core.rejected_launch.preserve_rejected_launch`.
+        """
+        from softae.core.run_lock import (
+            busy_rig_message,
+            foreign_run_lock,
+            rig_is_simulated,
+        )
+
+        holder = foreign_run_lock()
+        if holder is None or rig_is_simulated(self._manager):
+            return False
+
+        preserved = self._preserve_rejected_launch(spec)
+        self._sig_log.emit(
+            f"✗ Not started — {holder.describe().splitlines()[0]}")
+        QMessageBox.warning(
+            self, "The rig is already running a campaign",
+            busy_rig_message(holder, action="This campaign")
+            + "\n\n" + preserved.describe(),
+        )
+        return True
+
+    def _preserve_rejected_launch(self, spec: Any = None):
+        """Write the refused configuration where the operator can get it back.
+
+        The **panel state** is the lossless format and is what is always
+        written; the spec is offered to the completeness check, which decides
+        whether a terminal command may be handed over at all.
+        """
+        from softae.core.rejected_launch import preserve_rejected_launch
+
+        panel_state_fn = getattr(self, "_panel_state", None)
+        try:
+            panel_state = panel_state_fn() if callable(panel_state_fn) else None
+        except Exception:
+            logger.warning("panel_state_unavailable", exc_info=True)
+            panel_state = None
+        return preserve_rejected_launch(
+            project_dir=self._project_dir(), panel_state=panel_state, spec=spec)
+
+    def _project_dir(self):
+        """Where this surface's files live — the store's project, or the data root."""
+        from pathlib import Path
+
+        project = getattr(getattr(self, "_data_store", None), "project_dir", None)
+        if project:
+            return Path(project)
+        from softae.config import loader
+
+        return Path(loader.data_root())
+
     # ── Board-exchange gate (worker thread blocks on the GUI decision) ───────
 
     def _board_exchange_gate(self, board_index: int) -> BoardDecision:

@@ -41,6 +41,7 @@ spellings with *different* values is an error, not a precedence question.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Any
@@ -233,3 +234,155 @@ def spec_to_dict(spec: Any) -> dict[str, Any]:
             continue      # keep written files to what was actually chosen
         out[f.name] = value
     return out
+
+
+# ── Is the written part the whole spec? ──────────────────────────────────────
+#
+# `spec_to_dict` is honest about being *a* part of the spec, and the loader is
+# loud about what it refuses — but the two are asymmetric, and dangerously so:
+# *reading* a file that sets `general_formulation` raises by explicit design
+# (`_UNSUPPORTED`), while *writing* a spec that has one omits it in silence. A
+# caller that writes a file and then hands back the command to run it would hand
+# back a command that runs a **different experiment** and raises nothing — the
+# composition campaign reloads with neither `general_formulation` nor
+# `vol_params`, and `resolved_vol_params()` reads its axes as raw µL volumes.
+#
+# So a file may only stand in for a spec once something has *proved* it carries
+# the whole thing. That proof is here, next to the writer it checks, rather than
+# in each caller.
+
+
+@dataclass(frozen=True)
+class SpecCompleteness:
+    """Whether a TOML file could stand in for a spec, and what it would drop."""
+
+    complete: bool
+    #: Fields this spec sets that a written file would not carry.
+    missing: tuple[str, ...] = ()
+    #: One operator-facing sentence per defect, naming the field and the reason.
+    reasons: tuple[str, ...] = ()
+
+    def explain(self) -> str:
+        """The reasons as prose, or a statement that there are none."""
+        if self.complete:
+            return "Every setting this campaign uses can be written to a spec file."
+        return "\n".join(f"  - {r}" for r in self.reasons)
+
+
+def _writable(value: Any) -> Any:
+    """*value* in the shape :func:`spec_to_dict` would write it.
+
+    Normalising here rather than at each comparison is what makes "was it
+    written?" and "is it non-default?" answers to the same question; comparing a
+    tuple against the list the writer emits would report every tuple field as a
+    silent loss.
+    """
+    from softae.core.measurement_spec import MeasurementSpec
+
+    if isinstance(value, MeasurementSpec):
+        return value.as_dict()
+    if isinstance(value, tuple):
+        return list(value)
+    return value
+
+
+def _chosen_fields(spec: Any) -> tuple[str, ...]:
+    """Fields set to something other than the shipped default.
+
+    ``name`` and ``parameter_space`` are excluded because the writer emits them
+    unconditionally — there is nothing to prove about a field that is always
+    written.
+    """
+    from softae.core.autonomous_wiring import CampaignSpec
+
+    defaults = CampaignSpec(name="_", parameter_space={"_": {"type": "float",
+                                                            "low": 0, "high": 1}})
+    chosen: list[str] = []
+    for f in dataclass_fields(CampaignSpec):
+        if f.name in _LEGACY_MEASUREMENT_FIELDS or f.name in ("name",
+                                                              "parameter_space"):
+            continue
+        value = _writable(getattr(spec, f.name))
+        default = _writable(getattr(defaults, f.name, object()))
+        try:
+            same = bool(value == default)
+        except Exception:
+            same = False      # an answer we cannot get is not "unchanged"
+        if not same:
+            chosen.append(f.name)
+    return tuple(chosen)
+
+
+def _why_missing(spec: Any, name: str) -> str:
+    """One sentence naming why a chosen field would not survive a write."""
+    if name in _UNSUPPORTED:
+        return (f"{name} is {_UNSUPPORTED[name]} and cannot be written to a "
+                f"file at all")
+    if getattr(spec, name, "") is None:
+        return (f"{name} is set to an explicit None, which the writer drops — "
+                f"the file would reload with the default instead")
+    return f"{name} would not be written"
+
+
+def spec_toml_completeness(spec: Any) -> SpecCompleteness:
+    """Whether ``spec_to_dict(spec)`` is the *whole* spec rather than part of it.
+
+    Three questions, and a file has to pass all three before anything may offer
+    it as a stand-in for what is on screen:
+
+    1. **Coverage** — is every field this spec chose actually written? This is
+       what catches an unrepresentable object (``general_formulation``) and an
+       explicit ``None`` on a field whose default is not ``None`` (``seed``,
+       ``rh_stability_pct`` — where ``None`` is the documented way to switch the
+       RH gate *off*, and the default would switch it back on).
+    2. **Encodability** — is the written part valid TOML? Nothing else checks
+       this, so an unencodable value would surface as a traceback at write time.
+    3. **Round trip** — does reloading the file write the same file back? That
+       is the end-to-end statement, and the only one that survives a future
+       change to either half.
+
+    Never raises: every failure is a reason, because the caller is usually on a
+    path where something has already gone wrong.
+    """
+    written = spec_to_dict(spec)
+    missing = tuple(f for f in _chosen_fields(spec) if f not in written)
+    reasons = [_why_missing(spec, f) for f in missing]
+
+    text: str | None = None
+    try:
+        import tomli_w
+
+        text = tomli_w.dumps(written)
+    except Exception as exc:
+        reasons.append(f"the representable part is not valid TOML: {exc}")
+
+    if text is not None:
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+            import tomli as tomllib  # type: ignore
+        try:
+            if spec_to_dict(spec_from_dict(tomllib.loads(text))) != written:
+                reasons.append("the file does not reload to what was written")
+        except Exception as exc:
+            reasons.append(f"the file would not reload: {exc}")
+
+    return SpecCompleteness(complete=not reasons, missing=missing,
+                            reasons=tuple(reasons))
+
+
+def write_campaign_spec_toml(spec: Any, path: "str | Path") -> Path:
+    """Write the representable part of *spec* to *path*.
+
+    **Not a substitute for :func:`spec_toml_completeness`.** This writes what
+    can be written; only the check knows whether that is everything. Callers
+    that offer the file as a way to re-run the campaign must ask first.
+    """
+    import tomli_w
+
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("wb") as fh:
+        tomli_w.dump(spec_to_dict(spec), fh)
+    logger.info("campaign_spec_written", path=str(p), campaign=spec.name)
+    return p
