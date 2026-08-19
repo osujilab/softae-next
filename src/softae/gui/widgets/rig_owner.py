@@ -50,24 +50,25 @@ def owner_line(rig_lock: Any) -> str:
 
 
 def foreign_rig_lock() -> Any:
-    """The live rig lock **if another process holds it**, else ``None``.
+    """:func:`softae.core.run_lock.foreign_run_lock`, wrapped so a view survives it.
 
-    A lock this process owns is not foreign: a GUI running its own HT sequence or
-    in-process campaign is not a second owner of anything, and reporting it as one
-    would make the banner cry wolf on the ordinary case.
+    **The predicate is not reimplemented here.** ``run_lock`` owns "is a *live,
+    other* process holding the rig", and it has to: a headless campaign must be
+    able to ask the same question without importing ``softae.gui``, so a second
+    copy of the rule could only ever drift from the one the CLI enforces.
 
-    Never raises. This decorates a view; a lock file that cannot be read must not
-    take a tab down with it.
+    What this adds — and the only reason the wrapper exists — is that it **never
+    raises**. This decorates a view, and a lock file on a dead network share must
+    not take a tab down with it; the CLI deliberately does *not* swallow that,
+    because a run that cannot determine who owns the rig must refuse to start
+    rather than start blind.
     """
     try:
-        from softae.core.run_lock import read_run_lock
+        from softae.core.run_lock import foreign_run_lock
 
-        lock = read_run_lock()
+        return foreign_run_lock()
     except Exception:
         return None
-    if lock is None or lock.is_mine():
-        return None
-    return lock
 
 
 def campaign_identity(rig_lock: Any) -> tuple[str, str] | None:

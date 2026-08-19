@@ -1736,3 +1736,113 @@ class TestSkippedChannelProvenance:
             assert rows[0]["run_id"] == "old_run"
             assert rows[0]["skipped_channels"] is None
             assert store.run_skipped_channels("old_run") is None
+
+
+class TestCampaignCheckpointCounterMigration:
+    """Both escalation counters must reach a store that already exists.
+
+    ``campaign_checkpoints`` is created by a bare ``CREATE TABLE IF NOT EXISTS``,
+    so the DDL alone is correct on a fresh store and silently broken on every
+    store that already has the table — which is every real one. A missing column
+    is not a quiet degradation here: the resume read names it, so the failure is
+    ``no such column`` at the moment a parked overnight campaign is restarted.
+    """
+
+    #: The table as it stood before either counter column existed.
+    _LEGACY_DDL = (
+        "CREATE TABLE campaign_checkpoints ("
+        " campaign TEXT PRIMARY KEY, run_id TEXT, iteration INTEGER NOT NULL,"
+        " loop_state TEXT, board_id INTEGER, spec_json TEXT,"
+        " optimizer_json TEXT, updated_at TEXT NOT NULL)"
+    )
+
+    def _legacy_store(self, project: Path) -> None:
+        store = DataStore(project)
+        store._conn.execute("DROP TABLE campaign_checkpoints")
+        store._conn.execute(self._LEGACY_DDL)
+        store._conn.execute(
+            "INSERT INTO campaign_checkpoints (campaign, run_id, iteration,"
+            " loop_state, updated_at) VALUES ('overnight', 'r1', 7, 'STOPPED',"
+            " '2026-01-01T00:00:00Z')")
+        store._conn.commit()
+        store.close()
+
+    def test_a_legacy_table_gains_both_counter_columns(self, tmp_path: Path) -> None:
+        project = tmp_path / "legacy_checkpoints"
+        self._legacy_store(project)
+
+        with DataStore(project) as store:
+            cols = {
+                r[1] for r in store._conn.execute(
+                    "PRAGMA table_info(campaign_checkpoints)").fetchall()
+            }
+            assert {"rh_ceiling_streak", "consecutive_failures"} <= cols
+
+    def test_a_pre_existing_checkpoint_reads_back_with_zeroed_counters(
+        self, tmp_path: Path
+    ) -> None:
+        """Zero is the honest value — it had never counted anything.
+
+        The row itself must survive: a checkpoint is the only thing standing
+        between an interrupted multi-day campaign and starting it again.
+        """
+        project = tmp_path / "legacy_checkpoints"
+        self._legacy_store(project)
+
+        with DataStore(project) as store:
+            cp = store.campaign_checkpoint("overnight")
+            assert cp is not None
+            assert cp["iteration"] == 7                  # the row survived
+            assert cp["rh_ceiling_streak"] == 0
+            assert cp["consecutive_failures"] == 0
+
+    def test_a_fresh_database_has_the_counters_from_the_ddl_not_only_the_migration(
+        self, tmp_path: Path
+    ) -> None:
+        """Otherwise the DDL and the migration drift and only one is ever tested."""
+        with DataStore(tmp_path / "fresh") as store:
+            cols = {
+                r[1] for r in store._conn.execute(
+                    "PRAGMA table_info(campaign_checkpoints)").fetchall()
+            }
+            assert {"rh_ceiling_streak", "consecutive_failures"} <= cols
+
+    def test_the_failure_streak_round_trips_through_a_save(self, tmp_path: Path) -> None:
+        """The write replaces the whole row, so an unpassed counter is a lost one."""
+        with DataStore(tmp_path / "proj") as store:
+            store.save_campaign_checkpoint(
+                "overnight", iteration=3, consecutive_failures=2)
+            assert store.campaign_checkpoint("overnight")["consecutive_failures"] == 2
+
+            store.save_campaign_checkpoint("overnight", iteration=4)
+            assert store.campaign_checkpoint("overnight")["consecutive_failures"] == 0
+
+
+class TestRunOutcome:
+    """``run_outcome`` — the read side of ``finish_run``.
+
+    Its two fields answer different questions and the second is the one that is
+    easy to omit: ``status`` says which exit path closed the row, ``finished``
+    says whether anything closed it at all.
+    """
+
+    def test_a_finished_run_reports_its_status(self, tmp_path: Path) -> None:
+        with DataStore(tmp_path / "proj") as store:
+            run_id = store.start_run("wf")
+            store.finish_run(run_id, "converged")
+            assert store.run_outcome(run_id) == {
+                "status": "converged", "finished": True}
+
+    def test_a_live_run_is_reported_unfinished(self, tmp_path: Path) -> None:
+        """The state a hard kill leaves: status still at its default, never closed.
+
+        This is what stops a reader mistaking a killed run for a completed one
+        before the next launch's recovery sweep rewrites the status.
+        """
+        with DataStore(tmp_path / "proj") as store:
+            outcome = store.run_outcome(store.start_run("wf"))
+            assert outcome == {"status": "running", "finished": False}
+
+    def test_an_unknown_run_has_no_outcome(self, tmp_path: Path) -> None:
+        with DataStore(tmp_path / "proj") as store:
+            assert store.run_outcome("no-such-run") is None

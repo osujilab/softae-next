@@ -221,10 +221,40 @@ class TestHeadlessRefusesToJoinALiveRun:
                        "--project", str(tmp_path / "proj")])
         out = capsys.readouterr().out
 
-        assert rc == cli.EXIT_DECLINED
+        assert rc == cli.EXIT_BUSY
         assert "NOT STARTING" in out
         assert "campaign:overnight:run-7" in out      # who, not just "busy"
         assert "4321" in out
+
+    def test_a_busy_rig_is_a_different_exit_code_from_a_declined_run(
+            self, tmp_path, capsys, monkeypatch, _isolated_scope, _real_rig):
+        """The two refusals want opposite responses from an unattended wrapper.
+
+        "Rig busy" is a schedule collision and retrying later is correct; "the
+        operator declined" is a decision, and retrying it would override them.
+        A cron wrapper cannot tell them apart from stdout, so the codes must
+        differ — and this pins that they still do.
+        """
+        from softae.drivers import factory
+        from softae.drivers.mock_factory import create_mock_manager
+
+        monkeypatch.setattr(factory, "create_manager",
+                            lambda *a, **k: create_mock_manager(config={}))
+        _write_foreign(_isolated_scope)
+        busy = cli.main(["run", _spec_file(tmp_path), "--yes", "--head-up",
+                         "--project", str(tmp_path / "proj")])
+
+        # Same command, free rig, but the head state is neither stated nor
+        # answerable — the operator-declined path.
+        lock_path(_isolated_scope).unlink()
+        monkeypatch.setattr(cli.sys, "stdin", None)
+        declined = cli.main(["run", _spec_file(tmp_path), "--yes",
+                             "--project", str(tmp_path / "proj2")])
+        capsys.readouterr()
+
+        assert busy == cli.EXIT_BUSY
+        assert declined == cli.EXIT_DECLINED
+        assert busy != declined
 
     def test_the_refusal_happens_before_the_head_prompt(
             self, tmp_path, capsys, monkeypatch, _isolated_scope, _real_rig):
@@ -245,7 +275,7 @@ class TestHeadlessRefusesToJoinALiveRun:
                        "--project", str(tmp_path / "proj")])
         out = capsys.readouterr().out
 
-        assert rc == cli.EXIT_DECLINED
+        assert rc == cli.EXIT_BUSY
         assert "Head position unknown" not in out
 
     def test_a_simulated_run_is_not_refused_over_hardware_it_never_touches(

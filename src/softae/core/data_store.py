@@ -362,23 +362,27 @@ CREATE TABLE IF NOT EXISTS rig_state (
 -- optimizer: a crash between casting a well and checkpointing then costs one
 -- data point, whereas the reverse ordering would claim an observation for a well
 -- that was never actually cast. Losing data is recoverable; fabricating it is not.
--- `rh_ceiling_streak` is the one per-campaign counter that must survive a
--- restart: it parks nothing until it reaches its limit, so a restart can land
--- mid-streak for reasons unrelated to it, and zeroing there would hand a chronic
--- humidity fault a fresh allowance of trials. Legacy stores gain the column
--- through `_migrate_campaign_checkpoint_rh_streak` — this CREATE is a no-op on
--- them, so the DDL alone would be correct on a fresh store and silently broken
--- on every store that already exists.
+-- `rh_ceiling_streak` and `consecutive_failures` are the per-campaign escalation
+-- counters that must survive a restart: neither parks anything until it reaches
+-- its limit, so a restart can land mid-streak for reasons unrelated to it, and
+-- zeroing there would hand a chronic fault a fresh allowance of trials. They are
+-- separate columns rather than one `{reason: streak}` blob because each is read
+-- by exactly one owner at a different layer, and a blob would need parsing before
+-- either could be queried. Legacy stores gain both through
+-- `_migrate_campaign_checkpoint_counters` — this CREATE is a no-op on them, so
+-- the DDL alone would be correct on a fresh store and silently broken on every
+-- store that already exists.
 CREATE TABLE IF NOT EXISTS campaign_checkpoints (
-    campaign          TEXT PRIMARY KEY,
-    run_id            TEXT,
-    iteration         INTEGER NOT NULL,
-    loop_state        TEXT,
-    board_id          INTEGER,
-    spec_json         TEXT,
-    optimizer_json    TEXT,
-    rh_ceiling_streak INTEGER NOT NULL DEFAULT 0,
-    updated_at        TEXT    NOT NULL
+    campaign             TEXT PRIMARY KEY,
+    run_id               TEXT,
+    iteration            INTEGER NOT NULL,
+    loop_state           TEXT,
+    board_id             INTEGER,
+    spec_json            TEXT,
+    optimizer_json       TEXT,
+    rh_ceiling_streak    INTEGER NOT NULL DEFAULT 0,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    updated_at           TEXT    NOT NULL
 );
 
 -- Durable operator-facing alerts (a parked campaign, a depleted reservoir, a
@@ -657,8 +661,8 @@ class DataStore:
         # Tier 2 component 6: the sample-identity spine's other two anchors.
         self._migrate_formulation_sample_uuid()
         self._migrate_doe_outcome()
-        # The per-campaign RH-ceiling streak, which the resume path reads by name.
-        self._migrate_campaign_checkpoint_rh_streak()
+        # The per-campaign escalation counters, which the resume path reads by name.
+        self._migrate_campaign_checkpoint_counters()
         # LAST, always: the ledger records the epochs every migration above has
         # just finished establishing, so it must not claim them before they hold.
         self._migrate_schema_version()
@@ -812,6 +816,36 @@ class DataStore:
         if row is None or row[0] is None:
             return None
         return json.loads(row[0])
+
+    def run_outcome(self, run_id: str) -> dict[str, Any] | None:
+        """How *run_id* ended — ``None`` when there is no such row.
+
+        Returns ``{"status": str, "finished": bool}``. Both halves are needed and
+        neither substitutes for the other:
+
+        ``status``
+            The vocabulary :meth:`finish_run` documents. It says which *exit
+            path* closed the row.
+        ``finished``
+            ``finished_at IS NOT NULL`` — whether anything closed the row **at
+            all**. A hard kill leaves ``status`` at its ``'running'`` default
+            with ``finished_at`` NULL, and the next launch's recovery sweep
+            (:func:`softae.core.shutdown.record_unclean_shutdown`) only later
+            rewrites it to ``'interrupted'``. A reader that asked for the status
+            alone, before that sweep ran, would see ``'running'`` and have no way
+            to tell "died mid-run" from "running right now".
+
+        Read-only, and the read side of :meth:`finish_run` in the same way
+        :meth:`run_skipped_channels` is: the ``finished_at``-NULL convention is
+        stated once here rather than re-derived by every caller that needs it.
+        """
+        row = self._conn.execute(
+            "SELECT status, finished_at FROM experiments WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"status": row[0], "finished": row[1] is not None}
 
     # ── Path helpers ────────────────────────────────────────────────────
 
@@ -1575,6 +1609,7 @@ class DataStore:
         spec_json: str | None = None,
         optimizer_json: str | None = None,
         rh_ceiling_streak: int = 0,
+        consecutive_failures: int = 0,
     ) -> None:
         """Record (or replace) the resume point for *campaign*.
 
@@ -1583,21 +1618,22 @@ class DataStore:
         Call it **after** the iteration's observation has been told to the
         optimizer — see the schema note on ordering.
 
-        ``rh_ceiling_streak`` is the campaign's run of consecutive RH-decided
-        equilibrate phases. It defaults to ``0`` and the write replaces the whole
-        row, so a caller that tracks the streak must pass it on **every** call or
-        the count is lost — which is the same contract every other column here
+        ``rh_ceiling_streak`` (consecutive RH-decided equilibrate phases) and
+        ``consecutive_failures`` (consecutive failed/unmeasured trials) are the
+        two escalation counters. Both default to ``0`` and the write replaces the
+        whole row, so a caller that tracks either must pass it on **every** call
+        or the count is lost — which is the same contract every other column here
         already has.
         """
         self._conn.execute(
             "INSERT OR REPLACE INTO campaign_checkpoints "
             "(campaign, run_id, iteration, loop_state, board_id, spec_json, "
-            " optimizer_json, rh_ceiling_streak, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " optimizer_json, rh_ceiling_streak, consecutive_failures, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (str(campaign), run_id, int(iteration), loop_state,
              None if board_id is None else int(board_id),
              spec_json, optimizer_json, max(0, int(rh_ceiling_streak)),
-             _now_iso()),
+             max(0, int(consecutive_failures)), _now_iso()),
         )
         self._conn.commit()
 
@@ -1605,14 +1641,16 @@ class DataStore:
         """The saved resume point for *campaign*, or ``None``."""
         row = self._conn.execute(
             "SELECT campaign, run_id, iteration, loop_state, board_id, "
-            "spec_json, optimizer_json, rh_ceiling_streak, updated_at "
+            "spec_json, optimizer_json, rh_ceiling_streak, consecutive_failures, "
+            "updated_at "
             "FROM campaign_checkpoints WHERE campaign = ?",
             (str(campaign),),
         ).fetchone()
         if row is None:
             return None
         keys = ("campaign", "run_id", "iteration", "loop_state", "board_id",
-                "spec_json", "optimizer_json", "rh_ceiling_streak", "updated_at")
+                "spec_json", "optimizer_json", "rh_ceiling_streak",
+                "consecutive_failures", "updated_at")
         return dict(zip(keys, row))
 
     def campaign_checkpoints(self) -> list[dict[str, Any]]:
@@ -2177,16 +2215,25 @@ class DataStore:
             )
             self._conn.commit()
 
-    def _migrate_campaign_checkpoint_rh_streak(self) -> None:
-        """Add ``rh_ceiling_streak`` to ``campaign_checkpoints`` if missing.
+    #: Per-campaign escalation counters the resume path reads by name. Additive
+    #: only, and each defaults to ``0`` — the honest value for a checkpoint
+    #: written before the counter existed, which had never counted anything.
+    _CHECKPOINT_COUNTER_COLUMNS: tuple[str, ...] = (
+        "rh_ceiling_streak",
+        "consecutive_failures",
+    )
+
+    def _migrate_campaign_checkpoint_counters(self) -> None:
+        """Add the escalation-counter columns to ``campaign_checkpoints``.
 
         The table's DDL is a bare ``CREATE TABLE IF NOT EXISTS``, so an existing
         database never gains a column from it. Without this every real store —
         which is every store that already exists — would fail the resume read
         with ``no such column``.
 
-        Existing checkpoints get ``0``, which is the honest value: no campaign
-        written before this column existed had ever counted an RH-decided phase.
+        **No backfill and no new ``SCHEMA_EPOCHS`` row**: nothing already stored
+        changes meaning, and ``0`` is what every pre-existing checkpoint honestly
+        held.
         """
         cols = {
             row[1]
@@ -2194,11 +2241,13 @@ class DataStore:
                 "PRAGMA table_info(campaign_checkpoints)"
             ).fetchall()
         }
-        if "rh_ceiling_streak" not in cols:
+        missing = [c for c in self._CHECKPOINT_COUNTER_COLUMNS if c not in cols]
+        for name in missing:
             self._conn.execute(
-                "ALTER TABLE campaign_checkpoints "
-                "ADD COLUMN rh_ceiling_streak INTEGER NOT NULL DEFAULT 0"
+                f"ALTER TABLE campaign_checkpoints "
+                f"ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
             )
+        if missing:
             self._conn.commit()
 
     #: Legacy ``conditions`` temperature column → the instrument-named column it

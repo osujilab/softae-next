@@ -4,7 +4,16 @@
     softae-campaign run     <spec.toml> [--yes] [--resume] [--mock]
     softae-campaign resume  <spec.toml>            # alias for `run --resume`
 
-Exit codes: 0 ok · 1 campaign parked or failed · 2 usage/spec error · 3 declined.
+Exit codes: 0 ok · 1 campaign parked or failed · 2 usage/spec error · 3 declined ·
+4 rig busy.
+
+**3 and 4 are split because a wrapper answers them oppositely.** 3 is a decision —
+a gate was answered no, a projected shortfall was not accepted, the head state was
+not stated — and re-running changes nothing until a person changes something. 4 is
+a schedule collision: another process holds the rig, it will finish, and retrying
+later is exactly right. Unattended overnight running is the production path, so a
+cron wrapper must be able to tell "give up and page me" from "come back in an
+hour" without parsing stdout.
 
 **This does not reimplement the campaign.** It calls the same
 :func:`~softae.core.autonomous_wiring.run_autonomous_campaign` the GUI does, so
@@ -43,6 +52,9 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
 EXIT_DECLINED = 3
+#: Refused because another live process holds the rig — **retryable**, and the
+#: only code here that is. See the module docstring on why it is not 3.
+EXIT_BUSY = 4
 
 
 # ── Output ───────────────────────────────────────────────────────────────────
@@ -366,7 +378,10 @@ def _cmd_run(args) -> int:
     if holder is not None and not rig_is_simulated(manager):
         print(f"\n!! NOT STARTING '{spec.name}'\n\n"
               f"{busy_rig_message(holder, action='This campaign')}", flush=True)
-        return EXIT_DECLINED
+        # EXIT_BUSY, not EXIT_DECLINED: nobody decided anything here, the rig was
+        # simply occupied. A wrapper that retried an operator's "no" would be
+        # overriding them; one that gives up on a collision loses the night.
+        return EXIT_BUSY
 
     # `--project` is required by the parser for `run`/`resume`, so the store is
     # never None here — the campaign always has somewhere to record what it did.

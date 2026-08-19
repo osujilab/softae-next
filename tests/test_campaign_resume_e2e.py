@@ -141,6 +141,208 @@ async def test_resume_without_a_checkpoint_starts_normally(connected, tmp_path: 
     store.close()
 
 
+async def _park_on_a_failure_streak(connected, store) -> dict:
+    """Run a campaign in which nothing measures, so it parks at three failures.
+
+    Returns the checkpoint it left behind. Shared by both arms below because the
+    *only* thing that may differ between them is how the run then stopped —
+    if the setups drifted apart, neither arm would be evidence about the
+    discriminator.
+    """
+    unmeasurable = lambda _results: None                          # noqa: E731
+    events: list[dict] = []
+    result = await run_autonomous_campaign(
+        _spec(budget=6), manager=connected, data_store=store,
+        objective_extractor=unmeasurable, on_event=events.append)
+
+    assert "consecutive" in (result.park_reason or "")
+    assert sum(e["type"] == "suggestion" for e in events) == 3
+
+    # A parked campaign keeps its checkpoint — that is what makes it resumable —
+    # and the checkpoint must carry the streak that parked it. **Three, not
+    # two**: the count is incremented *before* the iteration that writes the
+    # checkpoint advances. This assertion is the ordering fix and is independent
+    # of everything below — a checkpoint written before the increment would
+    # persist `n-1`, making persistence a silent no-op no matter which way the
+    # resume rule then went.
+    cp = store.campaign_checkpoint("resumable")
+    assert cp is not None and cp["consecutive_failures"] == 3
+    return cp
+
+
+async def _resume_and_count_suggestions(connected, store) -> int:
+    unmeasurable = lambda _results: None                          # noqa: E731
+    events: list[dict] = []
+    await run_autonomous_campaign(
+        _spec(budget=6), manager=connected, data_store=store,
+        objective_extractor=unmeasurable, on_event=events.append, resume=True)
+    return sum(e["type"] == "suggestion" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_a_clean_park_resumes_with_a_clear_streak(connected, tmp_path: Path):
+    """A park is a stop somebody was told about, so the slate is clean.
+
+    The park raised a CRITICAL alert and the process unwound far enough to write
+    a terminal status (``stopped``). The operator resuming it is presumed to have
+    been to the rig — which is the whole reason a park stops the run rather than
+    retrying forever. So the resumed run gets its full allowance of three trials
+    back, not a counter already at the limit.
+
+    The companion test below is the other arm, and the pair is the point: same
+    fault, same streak, same budget — only *how the previous run stopped* differs.
+    """
+    store = DataStore(tmp_path / "proj")
+    await _park_on_a_failure_streak(connected, store)
+
+    assert await _resume_and_count_suggestions(connected, store) == 3, (
+        "an acknowledged park must clear the streak, not carry it")
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_crash_marked_run_resumes_with_its_streak_intact(
+    connected, tmp_path: Path
+):
+    """**The regression that matters**: a crash acknowledges nothing.
+
+    ``AutonomousLoop`` parks after three consecutive failed/unmeasured trials.
+    That counter was once zeroed on *every* resume, so a chronic fault — the
+    exact fault the limit exists to catch — got a fresh allowance of three trials
+    after each restart, and in a crash-restart loop the limit could never fire at
+    all. The counter existed and could not escalate.
+
+    Here the previous run is put in the state a hard kill really leaves — its row
+    never closed — and then marked by the real next-launch recovery sweep, which
+    is what stamps ``interrupted``. Nobody has been to the rig. The resumed run
+    must therefore park on the **first** further failure, not the fourth.
+    """
+    from softae.core.shutdown import UnfinishedRuns, record_unclean_shutdown
+
+    store = DataStore(tmp_path / "proj")
+    cp = await _park_on_a_failure_streak(connected, store)
+
+    # What TerminateProcess leaves behind: the row was never finalized.
+    store._conn.execute(
+        "UPDATE experiments SET finished_at = NULL, status = 'running' "
+        "WHERE run_id = ?", (cp["run_id"],))
+    store._conn.commit()
+    # ...and what the next launch does about it — the real recovery path, so this
+    # tracks `record_unclean_shutdown` rather than hard-coding the string it writes.
+    record_unclean_shutdown(UnfinishedRuns(tuple(store.unfinished_runs())), store)
+    assert store.run_outcome(cp["run_id"])["status"] == "interrupted"
+
+    assert await _resume_and_count_suggestions(connected, store) == 1, (
+        "the restored streak was ignored — the fault got a fresh allowance")
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_an_unclosed_run_resumes_with_its_streak_intact(
+    connected, tmp_path: Path
+):
+    """The crash arm again, *before* any recovery sweep has run.
+
+    Recovery happens at the next launch, and a resume can beat it there — the
+    headless CLI skips it while another process holds the rig lock, and nothing
+    forces it to have run at all. So the row still reads ``running`` with
+    ``finished_at`` NULL, which is byte-for-byte what a live run looks like and
+    is exactly why the status string alone cannot be trusted: ``finished_at``
+    is what separates "never closed" from "closed as still running".
+    """
+    store = DataStore(tmp_path / "proj")
+    cp = await _park_on_a_failure_streak(connected, store)
+
+    store._conn.execute(
+        "UPDATE experiments SET finished_at = NULL, status = 'running' "
+        "WHERE run_id = ?", (cp["run_id"],))
+    store._conn.commit()
+
+    assert await _resume_and_count_suggestions(connected, store) == 1, (
+        "an unfinalized run row is not an acknowledgement")
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_an_error_exit_resumes_with_its_streak_intact(
+    connected, tmp_path: Path
+):
+    """``error`` is the campaign's crash status — including Ctrl-C.
+
+    ``run_autonomous_campaign``'s ``except BaseException`` catch-all finalizes as
+    ``error``, and it covers the crash, the cancellation and the
+    ``KeyboardInterrupt`` alike. None of those is a report that a human read and
+    acted on, so none of them clears the streak.
+    """
+    store = DataStore(tmp_path / "proj")
+    cp = await _park_on_a_failure_streak(connected, store)
+
+    store._conn.execute(
+        "UPDATE experiments SET status = 'error' WHERE run_id = ?",
+        (cp["run_id"],))
+    store._conn.commit()
+
+    assert await _resume_and_count_suggestions(connected, store) == 1, (
+        "an error exit is not an acknowledgement")
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_the_resume_says_which_way_the_streak_went(connected, tmp_path: Path):
+    """Whichever way it goes, it is announced — with the reason.
+
+    A counter that silently changes value across a restart is what made this
+    hard to see in the first place: both of the earlier absolute behaviours were
+    invisible at runtime.
+    """
+    store = DataStore(tmp_path / "proj")
+    cp = await _park_on_a_failure_streak(connected, store)
+
+    unmeasurable = lambda _results: None                          # noqa: E731
+    cleared: list[dict] = []
+    await run_autonomous_campaign(
+        _spec(budget=6), manager=connected, data_store=store,
+        objective_extractor=unmeasurable, on_event=cleared.append, resume=True)
+
+    note = next(e for e in cleared if e["type"] == "resume_failure_streak")
+    assert note["action"] == "cleared"
+    assert note["saved"] == 3 and note["consecutive_failures"] == 0
+    assert "stopped" in note["why"]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_zero_failure_streak_resumes_with_its_full_allowance(
+    connected, tmp_path: Path
+):
+    """The control for the crash arm, and the reason it proves anything.
+
+    Same crash marking, same fault, same budget as
+    ``test_a_crash_marked_run_resumes_with_its_streak_intact`` — only the
+    *stored* streak differs. A crash-marked resume whose counter is zero takes
+    the full three trials to park, so the one-trial park in that test is
+    attributable to the persisted count and not to some other way a resumed run
+    stops early. (Pointing this control at a crash-marked run rather than a
+    parked one is deliberate: after a clean park the streak is cleared either
+    way, so a parked control could not tell the two apart.)
+    """
+    store = DataStore(tmp_path / "proj")
+    cp = await _park_on_a_failure_streak(connected, store)
+
+    store._conn.execute(
+        "UPDATE experiments SET finished_at = NULL, status = 'running' "
+        "WHERE run_id = ?", (cp["run_id"],))
+    store._conn.commit()
+    store.save_campaign_checkpoint(
+        "resumable", iteration=cp["iteration"], run_id=cp["run_id"],
+        loop_state=cp["loop_state"], board_id=cp["board_id"],
+        spec_json=cp["spec_json"], optimizer_json=cp["optimizer_json"],
+        consecutive_failures=0)
+
+    assert await _resume_and_count_suggestions(connected, store) == 3
+    store.close()
+
+
 @pytest.mark.asyncio
 async def test_a_resumed_run_does_not_recast_occupied_wells(
     connected, tmp_path: Path

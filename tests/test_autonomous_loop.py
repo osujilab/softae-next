@@ -251,7 +251,7 @@ class TestAutonomousLoop:
             workflow_template=Workflow(name="empty_trial"),
             manager=manager, data_store=store, run_id=run_id,
             objective_extractor=extractor, auto_approve=True,
-            max_consecutive_failures=3,
+            park_after_failed_trials=3,
         )
         await loop.run()
 
@@ -277,7 +277,7 @@ class TestAutonomousLoop:
             manager=manager, data_store=store, run_id=run_id,
             objective_extractor=lambda r: None,   # nothing ever measures
             auto_approve=True,
-            max_consecutive_failures=3,
+            park_after_failed_trials=3,
         )
         loop.on_park = parked.append
         await loop.run()
@@ -312,7 +312,7 @@ class TestAutonomousLoop:
             workflow_template=Workflow(name="empty_trial"),
             manager=manager, data_store=store, run_id=run_id,
             objective_extractor=extractor, auto_approve=True,
-            max_consecutive_failures=3,
+            park_after_failed_trials=3,
         )
         await loop.run()
 
@@ -339,7 +339,7 @@ class TestAutonomousLoop:
             workflow_template=Workflow(name="empty_trial"),
             manager=manager, data_store=store, run_id=run_id,
             objective_extractor=extractor, auto_approve=True,
-            max_consecutive_failures=3,
+            park_after_failed_trials=3,
         )
 
         async def boom(_wf):
@@ -754,7 +754,7 @@ class TestRoundCheckpointInvariant:
             batch_workflow_builder=exploding_builder,
             batch_objective_extractor=lambda res, k, p: 1.0,
             max_iterations=3,
-            max_consecutive_failures=5,     # one round failure must not park
+            park_after_failed_trials=5,     # one round failure must not park
         )
         checkpoints: list[int] = []
         loop.on_checkpoint = checkpoints.append
@@ -793,7 +793,7 @@ class TestRoundCheckpointInvariant:
             placement_workflow_builder=exploding_builder,
             placement_objective_extractor=lambda res, ch, p: 1.0,
             max_iterations=2,
-            max_consecutive_failures=5,
+            park_after_failed_trials=5,
         )
         checkpoints: list[int] = []
         loop.on_checkpoint = checkpoints.append

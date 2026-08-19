@@ -323,6 +323,12 @@ def foreign_run_lock(scope: str | Path | None = None) -> RunLock | None:
     A lock this process owns is deliberately **not** foreign. A GUI running its
     own sequence, or a campaign re-entering its own claim, is not a second owner
     of anything, and reporting it as one would refuse the ordinary case.
+
+    This is the **only** implementation of the predicate, and it lives here so a
+    headless caller can ask without importing ``softae.gui``.
+    :func:`softae.gui.widgets.rig_owner.foreign_rig_lock` is a thin wrapper that
+    only adds "never raises", which a view needs and a run that must decide
+    whether to start must not have.
     """
     lock = read_run_lock(scope)
     if lock is None or lock.is_mine():

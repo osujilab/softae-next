@@ -158,7 +158,7 @@ _SETTLE_REQUIRED = ("round_period_s", "min_hold_s", "max_hold_s")
 
 #: Consecutive RH-decided equilibrate phases that park the campaign. Three, to
 #: match the streak :class:`~softae.core.autonomous_loop.AutonomousLoop` already
-#: parks on (``max_consecutive_failures = 3``) — a second streak limit at a
+#: parks on (``park_after_failed_trials = 3``) — a second streak limit at a
 #: different K in the same loop would be an unexplained inconsistency. ``0``
 #: disables the escalation and leaves the per-trial behaviour (refuse to certify,
 #: run to the ceiling, continue) exactly as it is. Overridable as
@@ -181,6 +181,60 @@ _RUN_STATUS_BY_STATE = {
     LoopState.STOPPED: "stopped",
     LoopState.ERROR: "error",
 }
+
+#: Run statuses that mean **the previous run stopped by a path that told a
+#: human, and unwound far enough to say so**. This is the read side of
+#: ``_RUN_STATUS_BY_STATE`` and of ``finish_run``'s documented vocabulary; see
+#: ``_previous_exit_was_acknowledged`` for what it is used to decide.
+#:
+#: ``stopped``    a park (``AutonomousLoop._park`` sets STOPPED and raises a
+#:                CRITICAL ``kind="park"`` alert) *or* an operator's own
+#:                ``loop.stop()``. The DB cannot separate the two — there is no
+#:                ``'parked'`` status — but it does not need to: both are an
+#:                operator being told, or an operator acting.
+#: ``converged``  the campaign met its own convergence criterion.
+#: ``done``       normal completion, and the budget-exhausted default.
+#: ``partial``    finished every step it attempted, having abandoned channels.
+#: ``aborted``    an operator's deliberate abort — their own hand on the switch.
+#:
+#: Everything else is unacknowledged **by omission**, which is deliberate: a new
+#: status added later defaults to preserving the streak, and the failure mode of
+#: that default is a park that comes early rather than a chronic fault that never
+#: escalates.
+_ACKNOWLEDGED_EXIT_STATUSES = frozenset(
+    {"stopped", "converged", "done", "partial", "aborted"}
+)
+
+
+def _previous_exit_was_acknowledged(
+    data_store: "DataStore", run_id: str | None
+) -> tuple[bool, str]:
+    """Did the run this resume continues stop in a way a human was told about?
+
+    Returns ``(acknowledged, why)``; *why* is a short phrase for the log, because
+    the whole point of this decision is that it must not be silent.
+
+    ``run_id`` is the **previous** run's id, carried on the checkpoint row. Three
+    ways it can fail to answer, all of which resolve to *not* acknowledged:
+    the checkpoint predates the column and holds ``None``; the row was deleted;
+    the status is one nothing here has heard of.
+    """
+    if not run_id:
+        return False, "the checkpoint records no previous run id"
+    try:
+        outcome = data_store.run_outcome(run_id)
+    except Exception:  # noqa: BLE001 - a resume must not fail on a status read
+        logger.warning("run_outcome_failed", run_id=run_id, exc_info=True)
+        return False, "the previous run's status could not be read"
+    if outcome is None:
+        return False, f"no run row for {run_id}"
+    status = outcome["status"]
+    if not outcome["finished"]:
+        # `finished_at` NULL beats the status string: a hard kill leaves the row
+        # at its 'running' default, and the recovery sweep that rewrites it to
+        # 'interrupted' runs at the *next* launch, which may not have happened.
+        return False, f"the previous run was never closed (status {status!r})"
+    return status in _ACKNOWLEDGED_EXIT_STATUSES, f"the previous run ended {status!r}"
 
 
 # ── Campaign specification ───────────────────────────────────────────────────
@@ -3455,16 +3509,86 @@ async def run_autonomous_campaign(
             # check then stops at the right total, and checkpoint iteration
             # numbers stay monotonic across restarts instead of rewinding.
             loop._iteration = resume_plan.iteration
-            # The RH streak is per-campaign and must survive the restart, unlike
-            # `_consecutive_failures`, which resets defensibly: a resume there
-            # follows a park an operator has just been to the rig to address, so
-            # the slate is genuinely clean. This streak parks nothing until it
-            # reaches K, so a restart can land mid-streak for entirely unrelated
-            # reasons — a different park, a crash, an overnight shutdown — and
-            # zeroing would hand a chronic fault a fresh K trials, which is the
-            # exact case the escalation exists for.
+            # ── The two escalation streaks on resume ─────────────────────────
+            # Both are per-campaign and both are persisted. Neither parks
+            # anything until it reaches its limit, so a restart can land
+            # mid-streak, and how a resume treats the count decides whether a
+            # chronic fault can ever escalate.
+            #
+            # This has now been argued three ways, and the first two were each
+            # half right:
+            #
+            #   1. *Always zero* — "a resume follows a park an operator has just
+            #      been to the rig to address, so the slate is genuinely clean."
+            #      True of a park. False of a crash or an overnight shutdown,
+            #      which acknowledge nothing; and in a crash-restart loop the
+            #      counter could never reach its limit at all.
+            #   2. *Always persist* — fixes the crash case and breaks the park
+            #      case, handing the operator who *did* fix the rig a run that
+            #      parks again on its first unlucky trial.
+            #   3. *Conditional on how the previous run stopped* — this. A stop
+            #      that unwound far enough to write a terminal status is a stop
+            #      something reported: a park raises a CRITICAL alert, an
+            #      operator stop is the operator's own hand. A row left `error`
+            #      or `interrupted`, or never closed at all, is nobody telling
+            #      anybody anything.
+            #
+            # The discriminator is the previous run's row, reached through the
+            # run id on the checkpoint (`_previous_exit_was_acknowledged`).
+            #
+            # **Known limitation, stated rather than papered over.** "The run
+            # exited cleanly" is a proxy for "the operator acknowledged the
+            # park", and it is not the same claim: an operator can resume a
+            # parked campaign from the CLI without having gone near the rig, and
+            # this will clear their streak. The truer signal would be an
+            # acknowledged flag on the park alert — but `alerts` has no such
+            # column and no API that writes one (id / raised_at / run_id / kind /
+            # severity / message / details, and that is all), so the honest
+            # options were this proxy or inventing an ack system as a side effect
+            # of a counter fix. Should an ack state ever exist, this is the call
+            # site that should consume it.
+            #
+            # Being wrong here is bounded in the direction that matters: a
+            # wrongly-cleared streak costs at most `park_after_failed_trials`
+            # further wells before the fault parks the run again, and a genuinely
+            # fixed rig clears the streak on its first measured trial anyway via
+            # `_note_trial_success`. Unknown provenance therefore resolves to
+            # *preserve*, not clear.
+            #
+            # **The RH ceiling streak deliberately does NOT take this branch.**
+            # `AutonomousLoop._note_trial_failure`'s comment says the three
+            # counters should share their treatment on resume; that is no longer
+            # true, and this is the exception with a reason. The operator's
+            # ruling was about the trial-failure streak specifically, and
+            # `test_the_rh_ceiling_streak_survives_a_checkpoint_round_trip` pins
+            # the RH streak surviving a park on its own argument — an RH ceiling
+            # is a slowly developing environmental condition, and a park for some
+            # *other* fault is not evidence anybody addressed it. Restoring it
+            # unconditionally stays correct until someone rules otherwise.
             _saved = data_store.campaign_checkpoint(spec.name) or {}
             rh_escalation.streak = int(_saved.get("rh_ceiling_streak") or 0)
+            _streak = int(_saved.get("consecutive_failures") or 0)
+            _acknowledged, _why = _previous_exit_was_acknowledged(
+                data_store, resume_plan.run_id or _saved.get("run_id"))
+            loop._consecutive_failures = 0 if _acknowledged else _streak
+            # Say which way it went, and why. A counter that silently changes
+            # value across a restart is precisely what made this hard to see:
+            # both of the earlier behaviours were invisible at runtime, so the
+            # only way to know which one a given resume had applied was to read
+            # the source it happened to be running.
+            logger.info(
+                "resume_failure_streak",
+                campaign=spec.name,
+                action="cleared" if _acknowledged else "restored",
+                saved=_streak,
+                consecutive_failures=loop._consecutive_failures,
+                rh_ceiling_streak=rh_escalation.streak,
+                why=_why,
+            )
+            emit("resume_failure_streak",
+                 action="cleared" if _acknowledged else "restored",
+                 saved=_streak, consecutive_failures=loop._consecutive_failures,
+                 why=_why)
 
         def on_suggestion(iteration: int, params: dict[str, Any]) -> None:
             last_params.clear()
@@ -3571,11 +3695,14 @@ async def run_autonomous_campaign(
                 board_id=data_store.current_board_id(),
                 spec_json=serialize_campaign_spec(spec),
                 optimizer_json=json.dumps(optimizer.to_dict()),
-                # Deliberately a column and not a key inside `spec_json`: that
-                # blob is fingerprint-verified *spec identity*, and a counter that
-                # changes every iteration does not belong inside the thing whose
+                # Deliberately columns and not keys inside `spec_json`: that blob
+                # is fingerprint-verified *spec identity*, and counters that
+                # change every iteration do not belong inside the thing whose
                 # stability proves the resume is legitimate.
                 rh_ceiling_streak=rh_escalation.streak,
+                # Already incremented for a failing trial: `_note_trial_failure`
+                # counts before it advances the iteration that lands here.
+                consecutive_failures=loop.consecutive_failures,
             )
 
         loop.on_checkpoint = _on_checkpoint

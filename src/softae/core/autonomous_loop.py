@@ -188,7 +188,7 @@ class AutonomousLoop:
         sample_uuid_for: Callable[[int], str | None] | None = None,
         continue_on_error: bool = True,
         max_channel_retries: int = 1,
-        max_consecutive_failures: int = 3,
+        park_after_failed_trials: int = 3,
         gate_timeout_s: float | None = DEFAULT_GATE_TIMEOUT_S,
     ) -> None:
         if workflow_template is None and workflow_builder is None:
@@ -245,12 +245,21 @@ class AutonomousLoop:
         # The executor already implements per-channel replay/skip recovery; it was
         # simply never enabled for campaigns (only the HT tab opted in), so any
         # step failure ended the run. Enabling it makes a single bad channel
-        # survivable — and ``max_consecutive_failures`` is what keeps that from
+        # survivable — and ``park_after_failed_trials`` is what keeps that from
         # becoming the opposite failure mode, silently burning a whole board on a
         # systematic fault.
+        #
+        # **Named to pair with ``[safety] rh_ceiling_park_after_trials``, and to
+        # be unmistakable for ``[instruments.rh_controller].max_consecutive_failures``**,
+        # which is a *sensor soft-reset* threshold of 5 and has nothing to do with
+        # trials or parking. Under the old shared spelling, wiring this limit up
+        # by the obvious config key would have silently given a campaign five
+        # trials' rope instead of three, with nothing in either file to say so.
+        # This limit is deliberately **not** config-resolved at all today; if that
+        # ever changes it belongs in ``[safety]`` beside its sibling.
         self._continue_on_error = continue_on_error
         self._max_channel_retries = max_channel_retries
-        self._max_consecutive_failures = max_consecutive_failures
+        self._park_after_failed_trials = park_after_failed_trials
         self._consecutive_failures = 0
         self._park_reason: str | None = None
         self._gate_timeout_s = gate_timeout_s
@@ -312,6 +321,11 @@ class AutonomousLoop:
     def iteration(self) -> int:
         return self._iteration
 
+    @property
+    def consecutive_failures(self) -> int:
+        """Trials failed back-to-back, for the checkpoint that must persist it."""
+        return self._consecutive_failures
+
     # ── Iteration advance + checkpoint (P3.2) ───────────────────────────
 
     def _advance_iteration(self) -> None:
@@ -322,6 +336,10 @@ class AutonomousLoop:
         them. A resume that replayed a failed trial would re-cast a used well.
         Routing all advances through one helper is what keeps a future code path
         from silently skipping the checkpoint.
+
+        Failure paths reach it **through** :meth:`_note_trial_failure`, which
+        calls it after incrementing the streak so the checkpoint carries the new
+        count; see that method for why the order is load-bearing.
         """
         self._iteration += 1
         self._checkpoint()
@@ -483,7 +501,6 @@ class AutonomousLoop:
                 if self._is_hard_fault(exc):
                     self._park(f"hard fault: {type(exc).__name__}: {exc}")
                     break
-                self._advance_iteration()
                 if self._note_trial_failure(f"execute: {type(exc).__name__}"):
                     break
                 continue
@@ -494,14 +511,12 @@ class AutonomousLoop:
                 objective = self._extract_objective(step_results)
             except Exception as exc:
                 logger.error("objective_extraction_error", iteration=self._iteration, error=str(exc))
-                self._advance_iteration()
                 if self._note_trial_failure(f"analyze: {type(exc).__name__}"):
                     break
                 continue
 
             # 5. TELL — never fabricate an observation for an unmeasured trial.
             if self._is_unmeasured(objective, params):
-                self._advance_iteration()
                 if self._note_trial_failure("unmeasured"):
                     break
                 continue
@@ -762,9 +777,8 @@ class AutonomousLoop:
             # consumed, so each advances through _advance_iteration — a bare
             # ``+= len(batch)`` here skipped the checkpoint, and a resume from
             # the stale point would have re-cast the whole round's used wells.
-            for _ in batch:
-                self._advance_iteration()
-            return not self._note_trial_failure(f"execute: {type(exc).__name__}")
+            return not self._note_trial_failure(
+                f"execute: {type(exc).__name__}", wells=len(batch))
 
         # 4/5. ANALYZE + TELL each batch member against its own channel result.
         self._set_state(LoopState.ANALYZING)
@@ -776,12 +790,10 @@ class AutonomousLoop:
                     "objective_extraction_error",
                     iteration=self._iteration, error=str(exc),
                 )
-                self._advance_iteration()
                 if self._note_trial_failure(f"analyze: {type(exc).__name__}"):
                     return False
                 continue
             if self._is_unmeasured(objective, params):
-                self._advance_iteration()
                 if self._note_trial_failure("unmeasured"):
                     return False
                 continue
@@ -947,9 +959,8 @@ class AutonomousLoop:
             # cast), so the budget and the resume point must account for them
             # even though nothing was measured — mirroring the batch round. The
             # failure itself is still counted once for the whole round.
-            for _ in alloc.channels:
-                self._advance_iteration()
-            return not self._note_trial_failure(f"execute: {type(exc).__name__}")
+            return not self._note_trial_failure(
+                f"execute: {type(exc).__name__}", wells=len(alloc.channels))
 
         # Persist single-use occupancy for the wells just cast (keyed by this
         # board's id, so a later session can detect re-casts). The sample uuid,
@@ -1044,21 +1055,53 @@ class AutonomousLoop:
                 logger.warning("on_park_failed", exc_info=True)
         self._set_state(LoopState.STOPPED)
 
-    def _note_trial_failure(self, what: str) -> bool:
-        """Count a failed/unmeasured trial; ``True`` when the loop should park.
+    def _note_trial_failure(self, what: str, *, wells: int = 1) -> bool:
+        """Count a failed/unmeasured trial, close it out; ``True`` → park.
 
         Only failures that already survived the executor's own retries reach
         here, so a single flaky step never parks a run — but a systematic fault
-        stops burning wells after ``max_consecutive_failures``.
+        stops burning wells after ``park_after_failed_trials``.
+
+        **The three steps are in this order on purpose, and the ordering is why
+        the advance lives here** rather than at the nine call sites that used to
+        do it themselves:
+
+        1. *count* — so that
+        2. *checkpoint* (via :meth:`_advance_iteration`, once per well the failed
+           trial consumed) persists the **incremented** streak. Checkpointing
+           first would write ``n-1`` and a crash-restart loop would then restore
+           the counter to the value it had before every failure, reproducing
+           exactly the bug persistence exists to fix; and
+        3. *park* last, so the resume point is on disk before the run stops.
+
+        **This is one of three consecutive-failure counters, deliberately.**
+        ``RHCeilingEscalation`` (``core/autonomous_wiring.py``) counts RH-decided
+        equilibrate phases at campaign-wiring level, and
+        ``_consecutive_channel_failures`` (``workflows/workflow_executor.py``)
+        counts channel faults inside one workflow. They are **not** to be merged:
+        they sit at three layers, escalate differently (two park directly, the
+        executor's prompts-and-holds first), and one abstraction across loop /
+        wiring / executor would couple layers that are meant to stay separate.
+        **That decision stands; do not merge them.**
+
+        They were also once expected to share their *treatment on resume*, and
+        they no longer do. This counter is restored only when the previous run
+        stopped in a way somebody was told about, and cleared otherwise; the RH
+        ceiling streak is restored unconditionally. The reasoning for both, and
+        for why they diverge, is at the restore site in ``autonomous_wiring`` —
+        which is the one place that can see both counters at once, and therefore
+        the only place the comparison can honestly live.
         """
         self._consecutive_failures += 1
         logger.warning(
             "trial_failed",
             iteration=self._iteration, what=what,
             consecutive=self._consecutive_failures,
-            limit=self._max_consecutive_failures,
+            limit=self._park_after_failed_trials,
         )
-        if self._consecutive_failures >= self._max_consecutive_failures:
+        for _ in range(max(1, int(wells))):
+            self._advance_iteration()
+        if self._consecutive_failures >= self._park_after_failed_trials:
             self._park(
                 f"{self._consecutive_failures} consecutive trial failures "
                 f"({what}) — treating as a systematic fault"
@@ -1135,7 +1178,6 @@ class AutonomousLoop:
                     "objective_extraction_error",
                     iteration=self._iteration, error=str(exc),
                 )
-                self._advance_iteration()
                 if self._note_trial_failure(f"analyze: {type(exc).__name__}"):
                     return True   # parked — stop the round
                 continue
@@ -1146,7 +1188,6 @@ class AutonomousLoop:
                 iteration=self._iteration, parameters=params,
             )
             if self._is_unmeasured(objective, params):
-                self._advance_iteration()
                 if self._note_trial_failure("unmeasured"):
                     return True   # parked — stop the round
                 continue

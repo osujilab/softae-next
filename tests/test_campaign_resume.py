@@ -298,3 +298,101 @@ def test_resume_plan_exposes_exhaustion():
     plan = ResumePlan(campaign="c", optimizer=_optimizer(1), iteration=5,
                       board_id=1, run_id="r", remaining_budget=0)
     assert plan.is_exhausted
+
+
+# ── How the previous run stopped: the resume-time discriminator ──────────────
+
+class TestPreviousExitWasAcknowledged:
+    """The rule that decides whether a resume clears the failure streak.
+
+    The unit-level companion to the end-to-end arms in
+    ``test_campaign_resume_e2e.py``. Those prove the counter behaves; these
+    enumerate the vocabulary, which is where a status added later would
+    otherwise slip through unclassified.
+    """
+
+    @staticmethod
+    def _run(store: DataStore, status: str, *, finished: bool = True) -> str:
+        run_id = store.start_run("campaign", mode="autonomous")
+        if finished:
+            store.finish_run(run_id, status)
+        else:
+            store._conn.execute(
+                "UPDATE experiments SET status = ? WHERE run_id = ?",
+                (status, run_id))
+            store._conn.commit()
+        return run_id
+
+    @pytest.mark.parametrize(
+        "status", ["stopped", "converged", "done", "partial", "aborted"])
+    def test_a_status_written_by_an_unwinding_exit_is_acknowledged(
+        self, tmp_path: Path, status: str
+    ) -> None:
+        """Each of these means the process lived long enough to say how it ended.
+
+        ``stopped`` covers a park (which raises a CRITICAL alert) and an
+        operator's own stop; ``aborted`` is an operator's deliberate abort.
+        """
+        from softae.core.autonomous_wiring import _previous_exit_was_acknowledged
+
+        with DataStore(tmp_path / "proj") as store:
+            ok, why = _previous_exit_was_acknowledged(
+                store, self._run(store, status))
+            assert ok is True
+            assert status in why
+
+    @pytest.mark.parametrize("status", ["error", "interrupted"])
+    def test_a_crash_status_is_not_acknowledged(
+        self, tmp_path: Path, status: str
+    ) -> None:
+        """``error`` is the campaign catch-all; ``interrupted`` is the recovery sweep."""
+        from softae.core.autonomous_wiring import _previous_exit_was_acknowledged
+
+        with DataStore(tmp_path / "proj") as store:
+            ok, why = _previous_exit_was_acknowledged(
+                store, self._run(store, status))
+            assert ok is False
+            assert status in why
+
+    def test_an_unfinalized_row_is_not_acknowledged_whatever_its_status_says(
+        self, tmp_path: Path
+    ) -> None:
+        """``finished_at`` beats the status string, and must.
+
+        A hard kill leaves the row at its ``running`` default; the sweep that
+        rewrites it to ``interrupted`` runs at the *next* launch and may not have
+        run yet. Trusting the status alone would read a killed run as a live one.
+        """
+        from softae.core.autonomous_wiring import _previous_exit_was_acknowledged
+
+        with DataStore(tmp_path / "proj") as store:
+            # Even a status from the acknowledged set cannot rescue an open row.
+            ok, why = _previous_exit_was_acknowledged(
+                store, self._run(store, "stopped", finished=False))
+            assert ok is False
+            assert "never closed" in why
+
+    def test_an_unknown_status_is_not_acknowledged(self, tmp_path: Path) -> None:
+        """Unrecognised defaults to preserving the streak, not clearing it.
+
+        A status added later should fail towards an early park rather than
+        towards a chronic fault that can never escalate.
+        """
+        from softae.core.autonomous_wiring import _previous_exit_was_acknowledged
+
+        with DataStore(tmp_path / "proj") as store:
+            ok, _ = _previous_exit_was_acknowledged(
+                store, self._run(store, "quiesced"))
+            assert ok is False
+
+    @pytest.mark.parametrize("run_id", [None, "", "no-such-run"])
+    def test_an_unresolvable_run_id_is_not_acknowledged(
+        self, tmp_path: Path, run_id
+    ) -> None:
+        """A checkpoint predating the column, or whose run row is gone."""
+        from softae.core.autonomous_wiring import _previous_exit_was_acknowledged
+
+        with DataStore(tmp_path / "proj") as store:
+            ok, why = _previous_exit_was_acknowledged(store, run_id)
+            assert ok is False
+            assert why
