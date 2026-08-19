@@ -90,8 +90,17 @@ class PregateSettings:
     separate switch, since that one moves which frequencies were acquired in the first
     place.
 
-    Both ship **false**, the posture ``[eis.gates] enabled`` and ``[purge] actuate``
-    ship in and for the same reason.
+    **The dataclass defaults are both false; the shipped config no longer is.**
+    ``[eis.pregate] budget_cap`` was armed ``true`` on 2026-08-19 — 80 stored spectra,
+    ``R1`` bit-identical on 80/80 (worst relative difference 0.000e+00) for ≈3.4× off
+    the analysis path, because on the population it targets the covariance fit exhausts
+    its ``nfev`` ceiling and is discarded either way. ``two_point_open`` is still false
+    in the file, being the flag that deliberately *does* move ``R1``.
+
+    The defaults here stay false regardless, and that is not drift: they are the
+    fallback for an unreadable config (see :func:`pregate_settings`), the posture
+    ``[eis.gates] enabled`` and ``[purge] actuate`` take for the same reason — a typo
+    must only ever leave the engine on the route it takes today.
     """
 
     budget_cap: bool = False

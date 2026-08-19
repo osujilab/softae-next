@@ -471,11 +471,52 @@ def _as_channel(value: Any) -> Any:
     return int(text) if text.isdigit() else text
 
 
-def _safe_json(obj: Any) -> str:
-    """Serialise *obj* to JSON, handling numpy arrays and other types."""
+def _json_finite(obj: Any) -> Any:
+    """Recursively replace non-finite floats with ``None``, in place of NaN.
+
+    ``arc.py``'s boundary rule, applied to every JSON column this module writes:
+    *JSON has no NaN, and a NaN read back as a number is worse than a null.*
+
+    **The blast radius is the table, not the row.** ``json.dumps`` emits the bare
+    token ``NaN`` (and ``Infinity``) for a non-finite float. Python's own loader
+    accepts both; SQLite's JSON1 accepts neither, and it rejects the *whole
+    document* rather than the offending key. Because the predicate is evaluated
+    per row, **one** NaN-bearing row anywhere in ``measurements`` makes every
+    ``json_extract`` query over the table raise ``malformed JSON`` — every row,
+    every key, for every reader. That is reachable in ordinary operation:
+    ``arc_closure`` returns NaN for an apex it did not find, which is the common
+    case on an open-arc sweep, and the scout stamps it into ``eis_params``.
+
+    Scrubbing here rather than at each stamper is deliberate. This is the single
+    write boundary — there is exactly one INSERT into ``eis_params_json`` and no
+    UPDATE — so no upstream module can defeat it by forgetting.
+
+    ``None`` and not the string ``"NaN"``: a reader that gets a string back has to
+    know to parse it, and one that does not silently treats "no apex" as a value.
+    ``None`` and not omission: for keys whose absence means "this run predates the
+    field", a missing key and a null are different facts.
+    """
     if isinstance(obj, np.ndarray):
-        return json.dumps(obj.tolist())
-    return json.dumps(obj, default=str)
+        return _json_finite(obj.tolist())
+    if isinstance(obj, dict):
+        return {k: _json_finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_finite(v) for v in obj]
+    if isinstance(obj, (float, np.floating)):
+        value = float(obj)
+        return value if value == value and np.isfinite(value) else None
+    return obj
+
+
+def _safe_json(obj: Any) -> str:
+    """Serialise *obj* to JSON, handling numpy arrays and other types.
+
+    Non-finite floats become JSON ``null`` at this boundary — see
+    :func:`_json_finite` for why one un-scrubbed row would cost the whole table.
+    """
+    if isinstance(obj, np.ndarray):
+        return json.dumps(_json_finite(obj.tolist()))
+    return json.dumps(_json_finite(obj), default=str)
 
 
 def _f_or_none(value: Any) -> float | None:

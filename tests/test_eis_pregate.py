@@ -99,21 +99,37 @@ def _arc_of(f, Z) -> ArcClosure:
     return arc_closure(eis.frequency, eis.z_imag_neg, eis.phase)
 
 
-# ── The flags ship off ───────────────────────────────────────────────────────
+# ── The defaults ship off; the config arms exactly one route ─────────────────
 
 class TestThePregateShipsInert:
     def test_pregate_settings_default_to_both_routes_off(self):
+        """The dataclass default is the unreadable-config fallback, and stays off.
+
+        Unchanged by the 2026-08-19 arming of ``budget_cap`` in the file: a config a
+        campaign cannot parse must leave the engine on the route it takes today.
+        """
         cfg = PregateSettings()
         assert cfg.budget_cap is False
         assert cfg.two_point_open is False
         assert cfg.engaged is False
 
-    def test_the_shipped_config_arms_neither_route(self):
-        """The file on disk, not the dataclass default — they are different claims."""
+    def test_the_shipped_config_arms_the_budget_cap_and_nothing_else(self):
+        """The file on disk, not the dataclass default — they are different claims.
+
+        ``budget_cap`` was armed **2026-08-19** on the evidence of 80 stored spectra:
+        ``R1`` bit-identical on **80/80**, worst relative difference **0.000e+00**, for
+        ≈3.4× off the analysis path. It cannot move a number because on the population
+        it targets the covariance fit exhausts its ``nfev`` ceiling and is discarded
+        100 % of the time regardless — the capped run returns the same ``None`` and the
+        same ``fit_circuit`` fallback.
+
+        ``two_point_open`` stays false: it is the flag that deliberately *does* move
+        ``R1`` (schema epoch 5), and the one-at-a-time rule is the point of this test.
+        """
         config = tomllib.loads(
             (REPO / "softae_config.toml").read_text(encoding="utf-8"))
         table = config["eis"]["pregate"]
-        assert table["budget_cap"] is False
+        assert table["budget_cap"] is True
         assert table["two_point_open"] is False
         # …and the severity threshold is the one the measurement chose, not OPEN alone.
         assert table["phase_low_max_deg"] == -60.0

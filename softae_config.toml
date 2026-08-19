@@ -837,10 +837,28 @@ max_total_s                 = 0.0    # 0 = uncapped; otherwise the arc band is
 # Arm them one at a time. Flip two together and a moved R1 has two candidate causes
 # with no way to separate them; the stored spectrum cannot tell you which.
 #
-# ALL SHIP OFF. Legacy is still the default engine, so on a stock config this table is
-# not even reached -- the pre-gate lives on the gated path only.
+# ONE IS NOW ARMED, ONE IS STILL OFF -- and that is the one-at-a-time rule being
+# followed, not broken. Legacy is still the default engine, so on a stock config this
+# table is not even reached: the pre-gate lives on the gated path only.
+#
+#   budget_cap     = TRUE, armed 2026-08-19. Measured on 80 stored spectra: R1
+#                    BIT-IDENTICAL on 80/80, worst relative difference 0.000e+00, for
+#                    ~3.4x off the analysis path. It cannot move a number, and the
+#                    mechanism -- not just the statistic -- is why: on the population it
+#                    targets, the covariance fit exhausts its nfev ceiling and is
+#                    discarded 100 % of the time REGARDLESS. Capping a trajectory that
+#                    was going to be thrown away returns the same `None` and the same
+#                    `fit_circuit` fallback. The saving is the 20 000 evaluations nobody
+#                    was ever going to read.
+#   two_point_open = still false, deliberately. It is the flag that DOES move R1 (schema
+#                    epoch 5); arming it is a separate, separately-evidenced decision and
+#                    must not ride along with this one.
+#
+# The DATACLASS default in `PregateSettings` remains False. That is not a contradiction:
+# it is the fallback for an unreadable config, and an unparseable file must leave the
+# engine on the route it takes today rather than silently arming anything.
 [eis.pregate]
-budget_cap          = false
+budget_cap          = true
 two_point_open      = false
 
 # The discriminator is SEVERITY, not the verdict. `state == OPEN` alone is wrong:

@@ -1846,3 +1846,169 @@ class TestRunOutcome:
     def test_an_unknown_run_has_no_outcome(self, tmp_path: Path) -> None:
         with DataStore(tmp_path / "proj") as store:
             assert store.run_outcome("no-such-run") is None
+
+
+# ---------------------------------------------------------------------------
+# Non-finite floats never reach a JSON column
+# ---------------------------------------------------------------------------
+
+
+class TestNonFiniteFloatsNeverReachAJsonColumn:
+    """``json.dumps`` emits bare ``NaN``; SQLite's JSON1 rejects the document.
+
+    The failure is not row-local. The JSON1 predicate is evaluated per row, so a
+    single NaN-bearing row anywhere in ``measurements`` makes every
+    ``json_extract`` query over the table raise ``malformed JSON`` — including
+    queries about entirely unrelated rows and unrelated keys. And it is reachable
+    in ordinary operation: ``arc_closure`` returns NaN for an apex it did not
+    find, which is the common case on an open-arc sweep, and the scout stamps that
+    straight into ``eis_params``.
+
+    These tests pin the *boundary*, not any one stamper: ``DataStore`` has exactly
+    one INSERT into ``eis_params_json`` and no UPDATE, so scrubbing there is what
+    makes the guarantee unforgeable.
+    """
+
+    def test_a_nan_parameter_is_stored_as_json_null(self, store_with_run) -> None:
+        """``null`` — not the string ``"NaN"``, and not omitted.
+
+        A string forces every reader to know to parse it; an omission is a
+        different fact from a null for any key whose absence means "this run
+        predates the field".
+        """
+        import json
+
+        store, run_id = store_with_run
+        eis = _make_eis_result()
+        eis.eis_params["eis_scout_apex_hz"] = float("nan")
+        store.record_measurement(run_id, eis)
+
+        raw = store._conn.execute(
+            "SELECT eis_params_json FROM measurements").fetchone()[0]
+        assert "NaN" not in raw
+        params = json.loads(raw)
+        assert "eis_scout_apex_hz" in params          # present, not dropped
+        assert params["eis_scout_apex_hz"] is None    # null, not the string "NaN"
+
+    def test_infinity_is_stored_as_json_null_too(self, store_with_run) -> None:
+        """``json.dumps`` renders ``inf`` as ``Infinity``, equally invalid JSON.
+
+        ``_f_or_none``'s ``f == f`` idiom catches NaN and misses this one, which is
+        why the JSON boundary tests for finiteness rather than for NaN.
+        """
+        import json
+
+        store, run_id = store_with_run
+        eis = _make_eis_result()
+        eis.eis_params["eis_scout_apex_hz"] = float("inf")
+        eis.eis_params["band_below_apex_decades"] = float("-inf")
+        store.record_measurement(run_id, eis)
+
+        raw = store._conn.execute(
+            "SELECT eis_params_json FROM measurements").fetchone()[0]
+        assert "Infinity" not in raw
+        params = json.loads(raw)
+        assert params["eis_scout_apex_hz"] is None
+        assert params["band_below_apex_decades"] is None
+
+    def test_finite_values_are_untouched(self, store_with_run) -> None:
+        """The scrub must be invisible to every value that was already legal."""
+        import json
+
+        store, run_id = store_with_run
+        eis = _make_eis_result()
+        eis.eis_params.update({
+            "eis_scout_apex_hz": 42.5,
+            "eis_scout_verdict": "ok",
+            "eis_scout_enabled": True,
+            "eis_scout_note": None,
+        })
+        store.record_measurement(run_id, eis)
+
+        params = json.loads(store._conn.execute(
+            "SELECT eis_params_json FROM measurements").fetchone()[0])
+        assert params["eis_scout_apex_hz"] == 42.5
+        assert params["npts"] == 10
+        assert params["eis_scout_verdict"] == "ok"
+        assert params["eis_scout_enabled"] is True
+        assert params["eis_scout_note"] is None
+
+    def test_nested_and_array_valued_params_are_scrubbed(
+        self, store_with_run
+    ) -> None:
+        """One NaN buried in a list or a sub-dict poisons the document identically."""
+        import json
+
+        import numpy as np
+
+        store, run_id = store_with_run
+        eis = _make_eis_result()
+        eis.eis_params["segments"] = [
+            {"f_hi": 1e5, "f_lo": float("nan")},
+            {"f_hi": 1e3, "f_lo": 1.0},
+        ]
+        eis.eis_params["residuals"] = np.array([1.0, np.nan, 3.0])
+        store.record_measurement(run_id, eis)
+
+        raw = store._conn.execute(
+            "SELECT eis_params_json FROM measurements").fetchone()[0]
+        assert "NaN" not in raw
+        params = json.loads(raw)
+        assert params["segments"][0]["f_lo"] is None
+        assert params["segments"][1]["f_lo"] == 1.0
+        assert params["residuals"] == [1.0, None, 3.0]
+
+    def test_a_nan_bearing_row_leaves_json_extract_working_for_every_row(
+        self, store_with_run
+    ) -> None:
+        """The regression that matters: the whole TABLE stays queryable.
+
+        Before the boundary scrub this raised ``malformed JSON`` and returned
+        nothing at all — not merely a bad value for the offending row. Any reader
+        forced to prefilter with ``LIKE`` instead of ``json_extract`` is paying
+        this tax.
+        """
+        store, run_id = store_with_run
+
+        open_arc = _make_eis_result(channel=1)
+        open_arc.eis_params["eis_scout_apex_hz"] = float("nan")
+        open_arc.eis_params["eis_scout_verdict"] = "open_no_apex"
+        store.record_measurement(run_id, open_arc)
+
+        closed_arc = _make_eis_result(channel=2)
+        closed_arc.eis_params["eis_scout_apex_hz"] = 137.0
+        closed_arc.eis_params["eis_scout_verdict"] = "ok"
+        store.record_measurement(run_id, closed_arc)
+
+        rows = store._conn.execute(
+            "SELECT channel, "
+            "       json_extract(eis_params_json, '$.eis_scout_verdict'), "
+            "       json_extract(eis_params_json, '$.eis_scout_apex_hz') "
+            "  FROM measurements ORDER BY channel"
+        ).fetchall()
+        assert [tuple(r) for r in rows] == [
+            (1, "open_no_apex", None),
+            (2, "ok", 137.0),
+        ]
+
+        # …and the row-selecting form works too: the predicate is what used to
+        # raise, so a WHERE over the NaN row is the sharper version of the test.
+        picked = store._conn.execute(
+            "SELECT channel FROM measurements "
+            " WHERE json_extract(eis_params_json, '$.eis_scout_verdict') = 'ok'"
+        ).fetchall()
+        assert [r[0] for r in picked] == [2]
+
+    def test_the_scrub_covers_every_json_column_the_store_writes(
+        self, store_with_run
+    ) -> None:
+        """``_safe_json`` is shared, so ``gate_log_json`` gets the same guarantee.
+
+        ``arc_closure``'s own gate dict already nulls its non-finite fields, but the
+        column must not depend on every producer remembering to.
+        """
+        from softae.core.data_store import _safe_json
+
+        assert _safe_json({"f_peak_hz": float("nan")}) == '{"f_peak_hz": null}'
+        assert _safe_json([float("inf"), 2.0]) == "[null, 2.0]"
+        assert _safe_json(np.array([np.nan, 1.0])) == "[null, 1.0]"
