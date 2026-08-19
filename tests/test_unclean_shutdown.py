@@ -166,6 +166,62 @@ class TestStartupCheck:
         assert check_unclean_shutdown(None, MagicMock(), broken) is False
 
 
+# ── What the recovery park is allowed to claim ─────────────────────────────
+
+
+class TestTheRecoveryParkReport:
+    """This path read ``result.ok`` — *nothing raised* — and warned only on a
+    refusal. A park at start-up against instruments that are not connected yet
+    skips all three, raises nothing, and used to pass in silence, leaving the
+    operator of a session that died with the head possibly down believing the
+    rig had just been made safe.
+    """
+
+    def _accept_and_capture(self, monkeypatch, store, mgr):
+        _patch_dialog(monkeypatch, "Park now")
+        warned: list[str] = []
+        monkeypatch.setattr(
+            QMessageBox, "warning",
+            staticmethod(lambda *a, **k: warned.append(a[2])))
+        store.start_run("wf")
+        check_unclean_shutdown(None, mgr, store)
+        return warned
+
+    def test_a_recovery_park_that_commanded_something_warns_about_nothing(
+        self, qapp, store, monkeypatch
+    ):
+        mgr = MagicMock()
+        mgr.get.return_value.is_connected = True
+        assert self._accept_and_capture(monkeypatch, store, mgr) == []
+
+    def test_a_recovery_park_that_commanded_nothing_warns_that_nothing_was_sent(
+        self, qapp, store, monkeypatch
+    ):
+        from softae.core.safe_park import HEADLINE_NOTHING
+
+        mgr = MagicMock()
+        mgr.get.return_value.is_connected = False
+
+        warned = self._accept_and_capture(monkeypatch, store, mgr)
+
+        assert warned and HEADLINE_NOTHING in warned[0]
+        assert "not connected" in warned[0]      # describe() names each one
+
+    def test_a_recovery_park_that_refused_still_says_partial_stop(
+        self, qapp, store, monkeypatch
+    ):
+        from softae.core.safe_park import HEADLINE_PARTIAL
+
+        mgr = MagicMock()
+        mgr.get.return_value.is_connected = True
+        mgr.get.return_value.off.side_effect = RuntimeError("lamp: no reply")
+
+        warned = self._accept_and_capture(monkeypatch, store, mgr)
+
+        assert warned and HEADLINE_PARTIAL in warned[0]
+        assert "no reply" in warned[0]
+
+
 # ── OS shutdown blocking ───────────────────────────────────────────────────
 
 

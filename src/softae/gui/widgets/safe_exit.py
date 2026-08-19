@@ -81,9 +81,16 @@ class _SafeExitWorker(QThread):
 
     Drives the same :func:`softae.core.safe_park.safe_park` as the E-Stop button and
     an unattended campaign — there must not be two stop sequences that can drift.
+
+    Emits ``done(SafeParkResult)``. The whole result travels, matching
+    ``_EStopWorker``: this used to emit ``list(result.errors)``, which made
+    *"nothing was commanded"* indistinguishable from *"everything was
+    commanded"* at the thread boundary — and on an exit path that difference is
+    invisible in the other direction too, because success is reported by the
+    window simply closing.
     """
 
-    done = Signal(list)
+    done = Signal(object)
 
     def __init__(self, manager: "InstrumentManager", *, retract_head: bool,
                  parent=None):
@@ -99,7 +106,7 @@ class _SafeExitWorker(QThread):
             reason="operator safe exit",
             retract_head=self._retract_head,
         )
-        self.done.emit(list(result.errors))
+        self.done.emit(result)
 
 
 class SafeExitButton(QPushButton):
@@ -198,19 +205,23 @@ class SafeExitButton(QPushButton):
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
 
-    def _on_done(self, errors: list) -> None:
+    def _on_done(self, result) -> None:
         self._worker = None
         self.setEnabled(True)
         self.setText(self.LABEL)
 
-        if errors:
-            # A partial park is the one case where exiting anyway is the wrong
-            # default: something refused to go safe, and closing the window removes
-            # the operator's easiest way to see what.
+        text, severe = result.headline()
+        if severe:
+            # The two bad outcomes are the one case where exiting anyway is the
+            # wrong default, and closing the window removes the operator's
+            # easiest way to see which it was. A refusal was already caught
+            # here; a park that commanded *nothing* was not, and it is the more
+            # deceiving of the two on this path — success is signalled by the
+            # window closing, so a park that never reached the rig looked
+            # exactly like one that did.
             answer = QMessageBox.warning(
                 self, "Safe Exit",
-                "Some subsystems did not park:\n\n" + "\n".join(errors)
-                + "\n\nClose anyway?",
+                text + "\n\n" + result.describe() + "\n\nClose anyway?",
                 QMessageBox.StandardButton.Close | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
             )

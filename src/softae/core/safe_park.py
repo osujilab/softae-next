@@ -66,6 +66,17 @@ PURGE_SUSPENDED_NOTE = (
     "and clear the park to let purging restart."
 )
 
+#: The three operator headlines a park can land under. They live here, beside
+#: :meth:`SafeParkResult.describe`, because they are claims about the same
+#: result — and a headline each surface derives for itself is how two dialogs
+#: come to say different things about one park. :meth:`SafeParkResult.headline`
+#: is the only thing that chooses between them.
+HEADLINE_COMMANDED = "Stop commands were issued."
+HEADLINE_PARTIAL = "PARTIAL STOP — something refused to go safe."
+HEADLINE_NOTHING = (
+    "NOTHING WAS COMMANDED — no instrument was connected to this process."
+)
+
 
 @dataclass
 class SafeParkResult:
@@ -120,6 +131,48 @@ class SafeParkResult:
         statement about exceptions, not about hardware.
         """
         return not self.errors
+
+    @property
+    def commanded_anything(self) -> bool:
+        """Whether this park reached the hardware **at all**.
+
+        The question ``ok`` is routinely mistaken for. A park against a manager
+        whose instruments are absent or disconnected files every one under
+        ``skipped``, raises nothing, and so reports ``ok is True`` having sent
+        not one byte to the rig. That is not a bug in ``ok`` — it is exactly
+        what ``ok`` says — but a surface that heads such a result *"Stop
+        commands were issued."* is telling the operator the rig was stopped by
+        a process that never spoke to it.
+
+        ``verified`` is included even though it is empty on this rig today: if
+        an axis ever graduates to read-back, a park that verified something
+        certainly commanded something.
+        """
+        return bool(self.commanded or self.verified)
+
+    def headline(self) -> tuple[str, bool]:
+        """The operator's one-sentence verdict, and whether it is a *warning*.
+
+        Three grades, and the order between the first two is deliberate:
+
+        * **errors present** → :data:`HEADLINE_PARTIAL`. Something was reached
+          and refused, so instruments *were* connected — which is precisely
+          what :data:`HEADLINE_NOTHING` denies. Reporting "no instrument was
+          connected" about a rig that answered and said no would be a second
+          false statement replacing the first.
+        * **nothing commanded, nothing raised** → :data:`HEADLINE_NOTHING`.
+        * otherwise → :data:`HEADLINE_COMMANDED`.
+
+        Returns ``(text, severe)``. ``severe`` is a plain bool rather than a Qt
+        icon on purpose: this module is imported by the headless campaign and
+        must not grow a GUI dependency. Each dialog maps the bool to its own
+        icon; none of them re-derives the three-way choice.
+        """
+        if self.errors:
+            return HEADLINE_PARTIAL, True
+        if not self.commanded_anything:
+            return HEADLINE_NOTHING, True
+        return HEADLINE_COMMANDED, False
 
     def summary(self) -> str:
         parts = [f"{len(self.commanded)} commanded"]

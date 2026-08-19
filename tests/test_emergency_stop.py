@@ -20,7 +20,12 @@ pytest.importorskip("PySide6.QtWidgets")
 
 from PySide6.QtWidgets import QMessageBox      # noqa: E402
 
-from softae.core.safe_park import SafeParkResult      # noqa: E402
+from softae.core.safe_park import (                  # noqa: E402
+    HEADLINE_COMMANDED,
+    HEADLINE_NOTHING,
+    HEADLINE_PARTIAL,
+    SafeParkResult,
+)
 from softae.gui.widgets import emergency_stop as mod  # noqa: E402
 
 
@@ -153,6 +158,88 @@ class TestTheReport:
         qtbot.waitUntil(lambda: bool(shown), timeout=5000)
 
         assert "head" in shown[0].lower()
+
+
+# ── The headline: three grades, not two ──────────────────────────────────────
+
+def _capture_report(monkeypatch, btn, result):
+    """Run ``_report`` against a real QMessageBox and read back what it said."""
+    seen: dict = {}
+
+    def fake_exec(self):
+        seen["text"] = self.text()
+        seen["informative"] = self.informativeText()
+        seen["icon"] = self.icon()
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+    btn._report(result)
+    return seen
+
+
+class TestTheHeadline:
+    """``result.ok`` used to pick the words, and it means *nothing raised*.
+
+    So a park against a rig this process is not connected to — the crisp case,
+    and the one an attached GUI hits every time — skipped every instrument,
+    raised nothing, and was headed *"Stop commands were issued."* under a benign
+    blue icon with an empty ``commanded`` list. ``describe()`` was always honest;
+    only the headline over-read.
+    """
+
+    def test_report_of_a_commanded_park_says_issued_with_the_information_icon(
+        self, qtbot, button, monkeypatch
+    ):
+        btn, _ = button
+        seen = _capture_report(monkeypatch, btn,
+                               SafeParkResult(commanded=["lamp off"]))
+
+        assert seen["text"] == HEADLINE_COMMANDED
+        assert seen["icon"] == QMessageBox.Icon.Information
+
+    def test_report_of_a_refusing_park_says_partial_with_the_warning_icon(
+        self, qtbot, button, monkeypatch
+    ):
+        btn, _ = button
+        seen = _capture_report(
+            monkeypatch, btn,
+            SafeParkResult(commanded=["lamp off"], errors=["pump 0: dead"]))
+
+        assert seen["text"] == HEADLINE_PARTIAL
+        assert seen["icon"] == QMessageBox.Icon.Warning
+
+    def test_report_of_a_park_that_commanded_nothing_warns_and_says_so(
+        self, qtbot, button, monkeypatch
+    ):
+        btn, _ = button
+        seen = _capture_report(
+            monkeypatch, btn,
+            SafeParkResult(skipped=["lamp: not connected"]))
+
+        assert seen["text"] == HEADLINE_NOTHING
+        assert seen["icon"] == QMessageBox.Icon.Warning
+        assert seen["text"] != HEADLINE_COMMANDED
+
+    def test_pressing_stop_against_an_unconnected_rig_does_not_report_success(
+        self, qtbot, monkeypatch
+    ):
+        """End to end through the real park: press the red button with nothing
+        connected and the dialog must not say the stop was issued."""
+        btn = mod.EmergencyStopButton(_Manager(None))
+        qtbot.addWidget(btn)
+        monkeypatch.setattr(btn, "_ask_head_state", lambda: None)
+
+        seen: dict = {}
+        monkeypatch.setattr(
+            QMessageBox, "exec",
+            lambda self: seen.update(text=self.text(), icon=self.icon()) or 0)
+
+        btn._on_stop()
+        qtbot.waitUntil(lambda: bool(seen), timeout=5000)
+        qtbot.waitUntil(lambda: btn.isEnabled(), timeout=5000)
+
+        assert seen["text"] == HEADLINE_NOTHING
+        assert seen["icon"] == QMessageBox.Icon.Warning
 
 
 # ── The operator is the sensor ───────────────────────────────────────────────

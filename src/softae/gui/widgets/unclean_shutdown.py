@@ -156,11 +156,17 @@ def check_unclean_shutdown(
         from softae.core.safe_park import safe_park
 
         result = safe_park(manager, reason="recovery after unclean shutdown")
-        if not result.ok:
-            QMessageBox.warning(
-                parent, "Park incomplete",
-                "Some subsystems did not go safe:\n" + "\n".join(result.errors),
-            )
+        # Two ways this recovery park can fail to make the rig safe, and the
+        # second one used to be silent: something refused (``errors``), or
+        # nothing was commanded at all because no instrument was connected —
+        # which raises nothing and so passed the old ``result.ok`` check. That
+        # is the likelier of the two here: this runs at start-up, and whether
+        # the manager has connected yet is a start-up ordering question.
+        # ``headline()`` is the one place that decides between them.
+        text, severe = result.headline()
+        if severe:
+            QMessageBox.warning(parent, "Park incomplete",
+                                text + "\n\n" + result.describe())
         return True
     except Exception:
         logger.warning("recovery_park_failed", exc_info=True)

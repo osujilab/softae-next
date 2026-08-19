@@ -130,13 +130,19 @@ class EmergencyStopButton(QPushButton):
 
         This replaces *"All instruments stopped / safe."* — a sentence the system
         is not in a position to assert about any axis, and can never assert about
-        the head. ``result.ok`` is still what picks the icon, because a refusal is
-        the louder finding; it is no longer what picks the *words*.
+        the head.
+
+        The headline is **not** derived here. It used to be, from ``result.ok``
+        alone, which over-read it: ``ok`` means *nothing raised*, and a park
+        against a disconnected rig raises nothing while commanding nothing, so
+        the press of a red button could answer "Stop commands were issued." with
+        an empty ``commanded`` list and a reassuring blue icon.
+        :meth:`SafeParkResult.headline` now makes that choice once, for every
+        surface that reports a park.
         """
-        text = ("Stop commands were issued." if result.ok
-                else "PARTIAL STOP — something refused to go safe.")
+        text, severe = result.headline()
         box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Warning if not result.ok
+        box.setIcon(QMessageBox.Icon.Warning if severe
                     else QMessageBox.Icon.Information)
         box.setWindowTitle("Emergency Stop")
         box.setText(text)
