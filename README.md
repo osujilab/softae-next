@@ -5,6 +5,7 @@ Authored by:
 Pavel Shapturenka,
 Christopher W. Johnson,
 Yvonne Zagzag,
+Justin Hughes,
 Minki Lee,
  *In collaboration and with assistance from frontier agentic large-language models.*
 
