@@ -30,7 +30,7 @@ Ordering
 --------
 1. resolve the plan; print the projection; **thermal confirmation**
 2. start (or re-enter) the run row, **open the stream**, **claim the rig**, connect
-3. approach temperature -> approach RH        (refuses on timeout)
+3. command BOTH setpoints; judge temperature, then RH   (refuses on timeout)
 4. settle phase -> arc-capture watch          (refuses on ceiling/not_evaluable)
 5. soak: hold the established condition       (``--soak-h``, default 0)
 6. per channel, **interleaved**: reference, then adaptive, then the next channel
@@ -104,7 +104,12 @@ from typing import Any
 
 import structlog
 
-from softae.tools import run_finalizer, use_utf8_console
+from softae.tools import (
+    add_verbosity_flag,
+    configure_logging,
+    run_finalizer,
+    use_utf8_console,
+)
 from softae.tools.eis_validate_hold import (
     DEFAULT_DRIFT_CHECK,
     DEFAULT_MIN_TREATMENT,
@@ -623,6 +628,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    add_verbosity_flag(parser)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     run = sub.add_parser("run", help="drive the rig and persist every sweep")
@@ -706,6 +712,9 @@ def build_parser() -> argparse.ArgumentParser:
     from softae.tools.eis_validate_report import cmd_report
 
     report.set_defaults(func=cmd_report)
+
+    for subparser in (run, report):
+        add_verbosity_flag(subparser)
     return parser
 
 
@@ -1108,6 +1117,16 @@ def _establish_condition(ctx: RunContext, plan: ValidationPlan,
     exercises every branch of :func:`~softae.tools.eis_validate_hold.soak_phase`
     in milliseconds; a test that really slept for a soak would be a defect.
 
+    **The approach overlap is degenerate under ``--mock``, and is exercised
+    anyway.** Collapsed pacing means the humidifier gets no real head start --
+    ``FastMockRHController`` advances per *read*, and nothing reads RH during the
+    temperature approach -- so a mock run cannot demonstrate the *saving*. What
+    it can and does demonstrate is the *sequence*: the same early
+    ``set_setpoint``/``start`` runs, on the same code path, and the virtual clock
+    the mock hands down is what makes ``ApproachReport.lead_s`` non-zero there,
+    so the ordering and the reported lead are both pinned by tests rather than
+    taken on trust. Nothing about the overlap is branched on ``plan.mock``.
+
     The soak sits **after** the min-treatment refusal, not before it. Both are
     gates on the same first spectrum, and the free one goes first: refusing on a
     setpoint that projects too few TREATMENT cells costs nothing, while doing it
@@ -1121,15 +1140,25 @@ def _establish_condition(ctx: RunContext, plan: ValidationPlan,
     narration = ctx.narration
     narration.state(PHASE_APPROACH, rh_setpoint_pct=plan.rh_setpoint_pct,
                     temp_setpoint_C=plan.temp_setpoint_c)
-    reports = approach_condition(ctx.manager, plan, **pacing)
+    reports = approach_condition(ctx.manager, plan,
+                                 on_command=_approach_command_observer(ctx),
+                                 **pacing)
     for index, report in enumerate(reports, start=1):
+        # `elapsed_s` is the JUDGED window -- the one the timeout bounds -- and
+        # the lead is printed beside it rather than folded into it, because the
+        # operator reads this line to decide whether the axis is slow. An RH row
+        # reading "0.3 min" with no lead would look like a chamber that dries in
+        # twenty seconds.
+        lead = (f"  (+{report.lead_s / 60:.1f} min commanded during the heat)"
+                if report.lead_s > 0 else "")
         print(f"[approach] {report.axis:<12} -> {report.target:g}  "
-              f"PV {report.pv_final:g}  {report.elapsed_s / 60:.1f} min")
+              f"PV {report.pv_final:g}  {report.elapsed_s / 60:.1f} min{lead}")
         # The axis and how long it took, not the PV it reached. A PV is a
         # reading, and readings belong in `conditions` rows and in
         # `conditions.json` -- both of which this run already writes.
         narration.progress(PHASE_APPROACH, index, len(reports),
                            axis=report.axis, elapsed_s=round(report.elapsed_s, 1),
+                           lead_s=round(report.lead_s, 1),
                            attempts=report.attempts)
 
     # THE MOMENT THE CONDITION EXISTS, and so the moment the soak clock starts.
@@ -1195,6 +1224,28 @@ def _establish_condition(ctx: RunContext, plan: ValidationPlan,
     soak_phase(plan, ctx.watch, established_at=established_at,
                on_poll=_soak_observer(ctx), on_restart=_soak_restart(ctx),
                **pacing)
+
+
+def _approach_command_observer(ctx: RunContext) -> Any:
+    """Publish each setpoint WRITE, distinctly from the arrival it precedes.
+
+    The RH loop is commanded before the temperature approach rather than after
+    it, and that is a fact about what the rig is *doing* that no other record
+    carries: the ``progress`` record for the RH axis is emitted when RH
+    **arrives**, which on a chamber that dries well is minutes after the heat and
+    an hour or more after the humidifier started. Between the two there would
+    otherwise be nothing in the stream saying the loop was live, and a watcher
+    would read the gap as an idle humidifier.
+
+    ``target`` and not a PV, matching the ``progress`` records' own rule: this is
+    what was *commanded*, which is an instruction rather than a reading.
+    """
+    def _observer(axis: str, target: float) -> None:
+        ctx.narration.record("approach_commanded", axis=str(axis),
+                             target=float(target),
+                             judged_after_temperature=(str(axis) != "temperature"))
+
+    return _observer
 
 
 def _settle_observer(ctx: RunContext) -> Any:
@@ -1303,6 +1354,9 @@ def _write_report(store: Any, plan: ValidationPlan,
 def main(argv: list[str] | None = None) -> int:
     use_utf8_console()
     args = build_parser().parse_args(argv)
+    # Before dispatch, so every subcommand is covered and there is exactly one
+    # place the level is decided.
+    configure_logging(getattr(args, "verbose", False))
     try:
         return int(args.func(args))
     except KeyboardInterrupt:

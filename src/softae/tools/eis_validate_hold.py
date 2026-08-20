@@ -33,6 +33,16 @@ commanded 15 % at 85 C. Inheriting 1800 s blindly would make the harness refuse
 to start on exactly the conditions that most need a hold. The default here is
 :data:`DEFAULT_RH_APPROACH_TIMEOUT_S` = 5400 s, and the projection prints why.
 
+**Actuating and judging are two different orderings, and only the second one
+carries the evidence.** The RH loop is commanded at the *start* of
+:func:`approach_condition`, beside the temperature setpoint, so the humidifier
+works through the heat rather than waiting it out; RH *arrival* is still judged
+only after temperature is satisfied, because the attainable RH floor rises with
+temperature and a reading accepted against a floor about to move is not
+evidence. That docstring carries the whole argument -- including why an
+early-started loop cannot over-dry the chamber, and what takes the loop down
+when the temperature approach refuses.
+
 **The settle rounds pay for themselves twice.** They are the stability gate
 *and* the arc-capture watch: running ``arc_closure`` over spectra that were
 going to be taken anyway yields an apex histogram for the whole strip **before a
@@ -370,7 +380,12 @@ def render_projection(plan: ValidationPlan, projection: Projection) -> str:
     add("  " + "-" * 68)
     add(f"  {'approach   temperature':<44}{'0 - 30 min':>14}"
         f"{plan.temp_approach_timeout_s / 60:>7.0f} min")
-    add(f"  {'approach   RH':<44}{'0 - 30 min':>14}"
+    # The RH loop is commanded WITH the temperature setpoint, so this row is
+    # what is left to wait for AFTER the heat -- not a fresh descent. It is
+    # labelled rather than re-costed: how much of the descent the heat absorbs
+    # is the chamber's business, and a smaller number printed here would be a
+    # saving this table cannot promise. The operator types "yes" against it.
+    add(f"  {'approach   RH  (commanded with temperature)':<44}{'0 - 30 min':>14}"
         f"{plan.rh_approach_timeout_s / 60:>7.0f} min")
     settle_label = (f"settle     {plan.baseline_preset} rounds "
                     f"(~{projection.settle_round_s:.0f} s/round)")
@@ -411,6 +426,17 @@ def render_projection(plan: ValidationPlan, projection: Projection) -> str:
     add("  at 85 C was MEASURED at ~5000 s (2026-08-11). The shipped default would")
     add("  refuse to start on exactly the conditions that most need a hold.")
     add("")
+    add("  BOTH SETPOINTS ARE COMMANDED AT THE START. The humidifier loop runs")
+    add("  through the heat instead of waiting it out, because drying is the slow")
+    add("  axis. RH ARRIVAL is still judged only AFTER temperature is satisfied:")
+    add("  the attainable RH floor RISES with temperature (15 % commanded gave")
+    add("  16.9-23.2 % PV at 65-85 C), so a reading accepted before the block is")
+    add("  hot is accepted against a floor about to move. The RH row above is")
+    add("  therefore the REMAINDER after the heat, and its bound is measured from")
+    add("  the moment judging starts, not from the setpoint write. How much of")
+    add("  the descent the heat absorbs is the chamber's to decide; this table")
+    add("  projects no saving for it.")
+    add("")
     if plan.soak_s > 0:
         add(f"  SOAK {plan.soak_s / 3600:.2f} h: the settle gate proves the RIG "
             "stopped moving; this")
@@ -437,9 +463,23 @@ class ApproachReport:
     axis: str
     target: float
     reached: bool
+    #: Seconds spent **judging arrival** -- and so the quantity ``timeout_s``
+    #: bounds. Not the time the axis has been under command; see :attr:`lead_s`.
     elapsed_s: float
     pv_final: float
     attempts: int
+    #: Seconds this axis was already being driven **before judging began**. Zero
+    #: for temperature, which is judged straight off its own setpoint write; the
+    #: whole temperature approach for RH, whose loop is commanded at the start
+    #: and judged after temperature. Appended with a default rather than
+    #: inserted, so every positional construction of this record still reads the
+    #: same and the printing loop's shape is unchanged.
+    lead_s: float = 0.0
+
+    @property
+    def driven_s(self) -> float:
+        """Total seconds under command: the lead plus the judged window."""
+        return self.lead_s + self.elapsed_s
 
 
 def approach_condition(
@@ -449,44 +489,160 @@ def approach_condition(
     sleep: Any = None,
     now: Any = None,
     poll_interval_s: float = 30.0,
+    on_command: Callable[[str, float], None] | None = None,
 ) -> list[ApproachReport]:
-    """Temperature first, then RH. Refuses rather than proceeding unequilibrated.
+    """Both setpoints commanded at once; temperature judged first, then RH.
 
-    **Order matters.** The attainable RH floor *rises with temperature* -- 15 %RH
-    commanded gave 16.9-23.2 % PV at 65-85 C -- so approaching RH before the
-    block is at temperature is approaching a target that is about to move.
+    **The order that carries the evidence is the order of the two JUDGEMENTS,
+    and it is unchanged.** The attainable RH floor *rises with temperature* --
+    15 %RH commanded gave 16.9-23.2 % PV at 65-85 C -- so *declaring* RH reached
+    before the block is at temperature is declaring it against a floor that is
+    about to move. No RH reading is compared against tolerance until the
+    temperature approach has returned ``reached``.
+
+    **What was welded to that ordering, and is now separated from it, is when the
+    loop starts ACTUATING.** Drying is the slow axis -- a measured ~5000 s
+    descent against a ~13 min heat -- and it had no reason to sit idle through
+    the heat. The RH setpoint is written and the loop started immediately after
+    the temperature setpoint write, so the humidifier is under closed-loop
+    control at *this run's own target* for the whole approach, and the RH
+    approach that follows the heat is whatever is left of the descent.
+
+    **An early-started loop cannot dry the chamber further than leaving it alone
+    would, so no clamp is needed and none is added.** The PID's
+    ``output_limits`` are ``(out_min, out_max) = (0.01, 1.0)`` -- a *humidifier*
+    duty cycle. There is no drying actuator on this axis; a descent to a low
+    setpoint is passive, and the loop's only authority is to ADD moisture. The
+    state it displaces is not "no command" either:
+    ``AsyncRHController.safe_off`` records that a process which sets a setpoint
+    and never calls ``start`` "writes **nothing** -- leaving the Trinket at
+    whatever duty a previous session left it at". So through the heat the
+    sequential form left an *unsupervised* humidifier at a stale duty.
+    Commanding the loop early replaces that with closed-loop control whose worst
+    case is the ``out_min`` = 0.01 trickle -- the substitution is biased *wet*,
+    never dry, and the undershoot a clamp would have bounded is not reachable.
+
+    **The same asymmetry is the honest limit on what the overlap buys.** If the
+    previous session left the Trinket near zero, the descent to a low setpoint
+    was already passive and already underway, and the overlap saves close to
+    nothing. If it left a real duty, the sequential form spent the whole heat
+    humidifying *against* the target and the descent only began afterwards --
+    and there the overlap is worth the entire approach. Which of the two it is
+    is a fact about the chamber's history, not about this harness, which is why
+    :func:`render_projection` declares the overlap and projects no saving for it.
+
+    **A temperature refusal takes the early loop down with it** -- see
+    :func:`_release_rh`, which is the arm that closes what this one opened.
+
+    *on_command* ``(axis, target)`` fires as each setpoint is written, distinct
+    from the arrival that the returned report describes, so a watcher can see
+    that the RH loop is live rather than inferring it from a silence. Injected
+    and **swallowed**, for the reasons :func:`_observe` exists.
     """
     from softae.workflows.equilibration import approach_setpoint
 
     temp = manager.get(TEMP_CONTROLLER)
     rh = manager.get(RH_CONTROLLER)
+    clock = now or time.monotonic
     reports: list[ApproachReport] = []
 
+    # Temperature setpoint first, and RH's "immediately after" rather than
+    # "before": `set_setpoint` raises `SafetyError` on an over-max target, and
+    # that refusal now lands ~13 min earlier than it used to. Keeping the heater
+    # write ahead of it means the state a rejected RH setpoint leaves is
+    # byte-for-byte the state it left before -- heater commanded, RH loop never
+    # started, park in `cmd_run`'s `finally` -- only sooner.
     temp.write_sp(float(plan.temp_setpoint_c))
-    reports.append(_approach_one(
-        approach_setpoint, lambda: float(temp.get_pv(1)),
-        plan.temp_setpoint_c, axis="temperature", instrument=TEMP_CONTROLLER,
-        tolerance=plan.tolerance_c, timeout_s=plan.temp_approach_timeout_s,
-        poll_interval_s=poll_interval_s, sleep=sleep, now=now,
-    ))
+    _observe(on_command, _COMMAND_OBSERVER_FAILED,
+             "temperature", float(plan.temp_setpoint_c))
 
     rh.set_setpoint(float(plan.rh_setpoint_pct))
     rh.start()
+    rh_commanded_at = float(clock())
+    _observe(on_command, _COMMAND_OBSERVER_FAILED,
+             "rh", float(plan.rh_setpoint_pct))
+    logger.info("eis_validate_rh_commanded_early",
+                rh_target=float(plan.rh_setpoint_pct),
+                temp_target=float(plan.temp_setpoint_c))
+    print(f"[approach] rh loop commanded at {plan.rh_setpoint_pct:g} % now, and "
+          f"judged after temperature: the floor rises with T.", flush=True)
+
+    try:
+        reports.append(_approach_one(
+            approach_setpoint, lambda: float(temp.get_pv(1)),
+            plan.temp_setpoint_c, axis="temperature", instrument=TEMP_CONTROLLER,
+            tolerance=plan.tolerance_c, timeout_s=plan.temp_approach_timeout_s,
+            poll_interval_s=poll_interval_s, sleep=sleep, now=now,
+        ))
+    except RefuseToStart:
+        _release_rh(rh)
+        raise
+
     reports.append(_approach_one(
         approach_setpoint, lambda: float(rh.get_H()),
         plan.rh_setpoint_pct, axis="rh", instrument=RH_CONTROLLER,
         tolerance=plan.rh_tolerance_pct, timeout_s=plan.rh_approach_timeout_s,
         poll_interval_s=poll_interval_s, sleep=sleep, now=now,
+        lead_s=max(0.0, float(clock()) - rh_commanded_at),
     ))
     return reports
+
+
+#: One string, because both command observations are the same failure.
+_COMMAND_OBSERVER_FAILED = "eis_validate_approach_command_observer_failed"
+
+
+def _release_rh(rh: Any) -> None:
+    """Take the early-started RH loop down when the temperature approach refuses.
+
+    The loop is started early *so that the RH approach which follows is short*.
+    A temperature refusal means no RH approach follows: the humidifier would be
+    left driving a setpoint nothing will ever judge, and under ``--end-state
+    hold`` -- the one exit with no park -- nothing would take it down either. So
+    the arm that opened it closes it, and the change is a no-worse-than-today
+    guarantee on every path rather than only on the parking ones.
+
+    ``safe_off``, not ``stop``. They are not aliases and the driver says why:
+    ``stop`` returns cleanly having sent nothing when the PID thread is wedged in
+    an I2C read, while ``safe_off`` writes the zero itself. This introduces no
+    control logic -- it is the shipped safe state, and the same call
+    :mod:`softae.core.safe_park` makes.
+
+    Best-effort through :func:`_observe`, whose guarantee ("call it, never
+    raise") is exactly the one wanted here even though the callee is a driver
+    rather than an observer: the refusal is the news, and a humidifier that
+    cannot be zeroed must not become a *different* exception on the way out of
+    one. ``cmd_run``'s park tries again and ``SafeParkResult`` is where that
+    failure is meant to be reported.
+
+    **Only the temperature arm is wrapped.** An RH refusal leaves the loop
+    running, which is byte-for-byte what the sequential form did; changing it
+    here would be an unrelated behaviour change smuggled in beside this one.
+    """
+    _observe(getattr(rh, "safe_off", None) or getattr(rh, "stop", None),
+             "eis_validate_rh_release_failed")
 
 
 def _approach_one(
     approach_setpoint: Any, read_pv: Any, target: float, *, axis: str,
     instrument: str, tolerance: float, timeout_s: float,
-    poll_interval_s: float, sleep: Any, now: Any,
+    poll_interval_s: float, sleep: Any, now: Any, lead_s: float = 0.0,
 ) -> ApproachReport:
-    """One axis, one bounded retry, then refuse. **The first policy inversion.**"""
+    """One axis, one bounded retry, then refuse. **The first policy inversion.**
+
+    **``timeout_s`` bounds the judging, and ``elapsed_s`` measures the same
+    window**, so the number the operator reads and the number the refusal quotes
+    are the same clock. For RH the loop has already been driving for *lead_s*
+    when this is called, and charging that lead against the timeout was rejected
+    on two grounds. The bound is calibrated from a descent measured *at 85 C*
+    (~5000 s, 2026-08-11) -- i.e. against the floor that exists once the block is
+    hot -- so time spent at some other temperature is not the quantity it bounds.
+    And the consequence would be perverse: two full temperature attempts is
+    3600 s out of a 5400 s budget, so a slow heat would refuse an RH approach
+    that was descending exactly as measured. The lead is *reported* rather than
+    charged -- :attr:`ApproachReport.lead_s`, with
+    :attr:`ApproachReport.driven_s` for the total time under command.
+    """
     elapsed = 0.0
     for attempt in (1, 2):
         outcome = approach_setpoint(
@@ -498,15 +654,24 @@ def _approach_one(
         if outcome.reached:
             logger.info("eis_validate_approach_reached", axis=axis,
                         target=float(target), pv=float(outcome.pv_final),
-                        elapsed_s=elapsed, attempts=attempt)
+                        elapsed_s=elapsed, lead_s=float(lead_s),
+                        attempts=attempt)
             return ApproachReport(axis, float(target), True, elapsed,
-                                  float(outcome.pv_final), attempt)
+                                  float(outcome.pv_final), attempt,
+                                  float(lead_s))
         logger.warning("eis_validate_approach_timeout", axis=axis,
                        target=float(target), pv=float(outcome.pv_final),
-                       attempt=attempt, timeout_s=float(timeout_s))
+                       attempt=attempt, timeout_s=float(timeout_s),
+                       lead_s=float(lead_s))
+    # The lead is named in the refusal because it changes what the refusal
+    # means: a chamber that missed the band having had the whole heat as a head
+    # start is a different diagnosis from one that missed it from a cold write.
+    head_start = (f", after already driving for {lead_s / 60:.0f} min during the "
+                  "temperature approach" if lead_s > 0 else "")
     raise RefuseToStart(
         f"{axis} never reached {target:g} within {tolerance:g} after two "
-        f"attempts of {timeout_s:.0f} s (last PV {outcome.pv_final:g}). "
+        f"attempts of {timeout_s:.0f} s (last PV {outcome.pv_final:g})"
+        f"{head_start}. "
         "A validation run on an unequilibrated cell measures the drying "
         "transient, not the material -- refusing to start."
     )
@@ -633,6 +798,10 @@ def settle_phase(
               f"-> {state}", flush=True)
         if check is not None and not check.evaluable:
             print(f"         not evaluable: {check.reason}", flush=True)
+        # Routed through `_observe` for the reason `_observe` exists: the table
+        # is a monitoring convenience and must never be why a gate refuses.
+        _observe(_print_trend, "eis_validate_trend_render_failed",
+                 tracker.rounds, plan, check, apexes, rounds)
         _observe(on_round, "eis_validate_settle_observer_failed", {
             "round": rounds,
             "elapsed_s": round(elapsed, 1),
@@ -715,6 +884,43 @@ def band_by_channel(
     return {int(channel): classify_apex(
                 apexes.get(int(channel), float("nan")), plan)
             for channel in plan.channels}
+
+
+def _print_trend(
+    history: list[Any], plan: ValidationPlan, check: Any,
+    apexes: dict[int, float], round_index: int,
+) -> None:
+    """The per-channel signed table, under the round's ``[settle]`` line.
+
+    The gate's line reports a **magnitude** -- how far the worst channel sits
+    from its own recent mean -- which cannot distinguish a film still taking up
+    water from one merely jittering around a settled value, and those two want
+    opposite decisions from the operator. :mod:`softae.tools.eis_validate_trend`
+    renders the same rounds signed, against a baseline that excludes the current
+    reading.
+
+    **Console only, deliberately.** Not added to the ``on_round`` payload: the
+    published stream carries the *gate's state*, and per-channel sigma was kept
+    out of it by an earlier decision that this view does not reopen. The band is
+    passed through because the operator has been correlating drift against it by
+    hand -- and it is marked provisional in the legend, because ``apexes`` is
+    read off pre-equilibration sweeps.
+    """
+    from softae.tools.eis_validate_trend import (
+        render_trend_legend,
+        render_trend_table,
+        trend_rows,
+    )
+
+    rows = trend_rows(
+        history, plan.channels,
+        bands=band_by_channel(apexes, plan),
+        excluded=None if check is None else check.excluded,
+        participating=None if check is None else check.participating,
+    )
+    if round_index <= 1:
+        print(render_trend_legend(), flush=True)
+    print(render_trend_table(rows), flush=True)
 
 
 def _project_populations(
