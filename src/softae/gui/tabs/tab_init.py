@@ -627,13 +627,64 @@ class InitCalibrationTab(QWidget):
         )
         return True
 
+    def _claim_rig(self, action: str) -> bool:
+        """Take the rig claim before opening a port. ``False`` means don't open.
+
+        The claim follows the session (:mod:`softae.core.rig_session`): these two
+        buttons are the operator's visible hand-off of the rig, so Connect All is
+        also the act that takes it. Without this the GUI could hold every port
+        while the lock file said the rig was free, and a headless run started in
+        that window would pass its own guard and connect on top.
+
+        Distinct from :meth:`_refuse_if_rig_held`, which runs first and supplies
+        the operator-facing refusal. This is the *atomic* form — the acquire
+        itself — and it fires only when a foreign run starts inside the
+        microseconds between the two, which is precisely the case a
+        check-then-act cannot cover.
+        """
+        from softae.core.rig_session import claim_rig_session
+        from softae.core.run_lock import RunLockHeld
+
+        try:
+            claim_rig_session(self._manager)
+        except RunLockHeld as exc:
+            QMessageBox.warning(
+                self, "Rig in use",
+                f"{action} was not attempted — {exc.lock.describe()}\n\n"
+                "That run started just now, between this window checking and "
+                "acting. Nothing was opened.")
+            return False
+        return True
+
+    async def _disconnect_all_and_release(self) -> None:
+        """Close the sessions, then give the rig back — in that order.
+
+        Releasing first would advertise a free rig while these ports are still
+        being closed. Released even if the disconnect raises: a session that
+        failed to close cleanly still ends here, and a claim outliving the
+        process that made it is repaired only by the lock's liveness check, which
+        is meant to be the backstop rather than the mechanism.
+
+        The disconnect is started *inside* this coroutine rather than passed in,
+        so that a caller which never schedules this one (a test's sink, a cancel)
+        leaves no orphaned coroutine behind it.
+        """
+        from softae.core.rig_session import release_rig_session
+
+        try:
+            await self._manager.disconnect_all()
+        finally:
+            release_rig_session()
+
     def _on_connect_all(self) -> None:
         if self._refuse_if_rig_held("Connect All"):
+            return
+        if not self._claim_rig("Connect All"):
             return
         self._schedule_async(self._manager.connect_all())
 
     def _on_disconnect_all(self) -> None:
-        self._schedule_async(self._manager.disconnect_all())
+        self._schedule_async(self._disconnect_all_and_release())
 
     def _project_dir(self) -> str:
         """Where a launched sequence should write. The store's directory wins.
@@ -663,10 +714,16 @@ class InitCalibrationTab(QWidget):
 
     def _on_connect_selected(self) -> None:
         name = self._selected_instrument()
-        if name and not self._refuse_if_rig_held(f"Connect '{name}'"):
+        if not name or self._refuse_if_rig_held(f"Connect '{name}'"):
+            return
+        # One port is a session too — the claim is rig-wide because the lock is.
+        if self._claim_rig(f"Connect '{name}'"):
             self._schedule_async(self._manager.connect(name))
 
     def _on_disconnect_selected(self) -> None:
+        # No release here, deliberately: the other instruments are still open, and
+        # the claim ends when the *session* does, not when one port of it does.
+        # Disconnect All is the act that hands the rig back.
         name = self._selected_instrument()
         if name:
             inst = self._manager.get(name)

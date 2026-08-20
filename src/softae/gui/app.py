@@ -42,14 +42,37 @@ async def _connect_and_refresh(
         manual_tab.refresh_head_label()
 
 
-def _begin_owner_session(manager, window: MainWindow) -> None:
-    """The three acts that make this process the rig's live owner.
+def _begin_owner_session(manager, window: MainWindow) -> bool:
+    """The acts that make this process the rig's live owner. Whether it began.
 
     Grouped rather than left inline because they share one precondition — that
     no other process is driving the hardware — and an attached session performs
     none of them. Arming is not here: it happens before the window exists.
+
+    **The claim comes first, and it is what makes the rest honest.** Every other
+    act here opens or touches hardware, so a claim taken afterwards would leave a
+    window in which this process holds ports while the lock file says the rig is
+    free — which is the whole defect. It also has to precede the head prompt
+    specifically: that prompt is modal and an operator may leave it open for
+    minutes while they walk to the rig, and the launch decision that found the rig
+    free is by then that many minutes old.
+
+    A refusal here is a genuine race — a headless run started between
+    :func:`~softae.gui.launch_mode.decide_launch_mode` and this line. Nothing is
+    opened, armed further, or asked; the window stays up as a viewer.
     """
+    from softae.core.rig_session import claim_rig_session
+    from softae.core.run_lock import RunLockHeld, busy_rig_message
     from softae.gui.widgets.head_check_dialog import ask_head_state, register_head_state
+
+    try:
+        claim_rig_session(manager)
+    except RunLockHeld as exc:
+        log.error(
+            "The rig was claimed by another process between the launch decision "
+            "and connecting — opening nothing.\n%s",
+            busy_rig_message(exc.lock, action="Opening the instruments"))
+        return False
 
     # Register the physical dispenser-head position at launch.  The head has no
     # position feedback and may have been flipped manually while the app was
@@ -64,6 +87,7 @@ def _begin_owner_session(manager, window: MainWindow) -> None:
 
     # Schedule instrument connection in background (non-blocking)
     asyncio.ensure_future(_connect_and_refresh(manager, window))
+    return True
 
 
 def run_app(*, mock: bool | None = None) -> int:
@@ -150,9 +174,11 @@ def run_app(*, mock: bool | None = None) -> int:
     # operator answer from memory before being told to go and look.
     check_unclean_shutdown(window, manager, data_store)
 
-    if mode.owner:
-        _begin_owner_session(manager, window)
-    else:
+    if mode.owner and not _begin_owner_session(manager, window):
+        log.warning(
+            "The window is up but owns nothing — no ports opened and no head "
+            "prompt. Use Init tab → Connect All once the other run has finished.")
+    elif mode.attached:
         log.warning(
             "No instruments connected, none armed, and the head prompt was "
             "skipped — the rig belongs to another process.")
@@ -161,6 +187,19 @@ def run_app(*, mock: bool | None = None) -> int:
         rc = loop.run_forever()
         # Cleanup: disconnect instruments before exit
         loop.run_until_complete(manager.disconnect_all())
+        # The claim follows the session, so it ends where the session does —
+        # after the ports are closed, not before. Releasing first would leave a
+        # window in which another process may legitimately open ports this one
+        # is still closing.
+        #
+        # Asked unconditionally, and *not* branched on the launch decision: a
+        # window that started attached may have taken the rig since, via Init tab
+        # → Connect All, which is the one way out of attached mode. The release
+        # is keyed on what this process actually holds, which is the only thing
+        # true in every one of those paths.
+        from softae.core.rig_session import release_rig_session
+
+        release_rig_session()
         data_store.close()
 
     return rc

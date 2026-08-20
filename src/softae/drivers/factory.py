@@ -4,9 +4,13 @@ Usage::
 
     from softae.drivers.factory import create_manager
 
-    mgr = create_manager()           # auto-detect
-    mgr = create_manager(mock=True)  # force mock suite
+    mgr = create_manager(mock=None)   # auto-detect — real, falling back to mock
+    mgr = create_manager(mock=True)   # force mock suite
+    mgr = create_manager(mock=False)  # force real drivers
     await mgr.connect_all()
+
+``mock`` is a **required** keyword: whether a process means to open real ports
+decides whether it claims the rig and whether what it records is data.
 
 When ``mock=False`` (or auto-detect), the factory probes each serial
 port / device.  If it cannot import a required hardware library **or**
@@ -109,7 +113,7 @@ def _try_real_driver(
 
 def create_manager(
     *,
-    mock: bool | None = None,
+    mock: bool | None,
     config: dict[str, Any] | None = None,
 ) -> InstrumentManager:
     """Build an :class:`InstrumentManager` with the best available drivers.
@@ -117,9 +121,19 @@ def create_manager(
     Parameters
     ----------
     mock : bool or None
+        **Required — there is no default.** Whether this process intends to open
+        real ports is not a detail a caller may leave unstated: it decides
+        whether the rig gets claimed, whether the interlock arms, and whether a
+        recorded spectrum is data or a simulation. The old default was ``None``,
+        so a caller that simply forgot inherited *auto-detect* — the one mode
+        that can produce a manager which is partly real and partly mock, which is
+        also the shape that reads as "simulated" to any motion-scoped check (see
+        :func:`softae.core.rig_session.session_is_simulated`).
+
         - ``True`` — force all mocks.
         - ``False`` — force real drivers (raises if hardware unavailable).
-        - ``None`` (default) — auto: try real, fall back to mock.
+        - ``None`` — auto: try real, fall back to mock. Still available, but now
+          only ever by an explicit request for it.
     config : dict, optional
         Override for the ``[instruments]`` section of the TOML config.
 
