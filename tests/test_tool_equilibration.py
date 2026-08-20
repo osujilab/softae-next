@@ -2055,3 +2055,118 @@ class TestSettleFlags:
         whole = [line for line in out.splitlines() if "WHOLE RUN" in line][0]
         assert "-" not in whole.split()[2]
         assert "every setpoint runs exactly 15 rounds" in out
+
+
+# ── The run row is closed, on every exit path ────────────────────────────────
+
+def _arrange_outcome(monkeypatch, outcome: BaseException | None = None):
+    """``_arrange_interrupt``, but the runner's ending is chosen per test.
+
+    The existing helper only ever raises ``KeyboardInterrupt``, and what the run
+    row is entitled to say differs per exit path, so each one has to be reachable.
+    """
+    _arrange_interrupt(monkeypatch)
+
+    import softae.tools.equilibration as tool
+
+    class _Runner(_InterruptedRunner):
+        async def run(self):
+            if outcome is not None:
+                raise outcome
+            return None
+
+    monkeypatch.setattr(tool, "EquilibrationRun", _Runner)
+
+
+def _the_only_outcome(project: Path) -> dict:
+    """``run_outcome`` for the single run the command wrote."""
+    from softae.core.data_store import DataStore
+
+    with DataStore(project) as ds:
+        run_ids = [r[0] for r in ds._conn.execute(
+            "SELECT run_id FROM experiments ORDER BY started_at")]
+        assert len(run_ids) == 1, run_ids
+        return ds.run_outcome(run_ids[0])
+
+
+class TestRunRowFinalization:
+    """``start_run`` had no matching ``finish_run`` anywhere in this tool.
+
+    Neither the CLI nor ``WorkflowExecutor`` closed the row, so a nine-hour
+    characterization that finished cleanly left ``finished_at`` NULL — which is
+    byte-for-byte what a killed process leaves behind. The next GUI launch read
+    it as an unclean shutdown and offered to park the rig over a run that had
+    completed, which is how a real crash report gets trained out of an operator.
+    """
+
+    def _run(self, monkeypatch, project: Path, outcome=None):
+        _arrange_outcome(monkeypatch, outcome)
+        return _cmd_run(_args("run", "--channels", "1-2", *GEOMETRY, "--execute",
+                              "--project", str(project)))
+
+    def test_a_completed_run_closes_its_row_done(self, monkeypatch, tmp_path):
+        project = tmp_path / "proj"
+        assert self._run(monkeypatch, project) == EXIT_OK
+        assert _the_only_outcome(project) == {"status": "done", "finished": True}
+
+    def test_a_completed_run_is_not_reported_as_an_unclean_shutdown(
+            self, monkeypatch, tmp_path):
+        """The defect as the operator met it, pinned at its own surface."""
+        from softae.core.data_store import DataStore
+
+        project = tmp_path / "proj"
+        self._run(monkeypatch, project)
+        with DataStore(project) as ds:
+            assert ds.unfinished_runs() == []
+
+    def test_a_ctrl_c_closes_its_row_interrupted(self, monkeypatch, tmp_path):
+        project = tmp_path / "proj"
+        assert self._run(monkeypatch, project, KeyboardInterrupt()) == EXIT_FAILED
+        assert _the_only_outcome(project)["status"] == "interrupted"
+
+    def test_a_dead_sensor_abort_closes_its_row_aborted(self, monkeypatch, tmp_path):
+        from softae.workflows.equilibration import EquilibrationAbort
+
+        project = tmp_path / "proj"
+        abort = EquilibrationAbort("the RH probe stopped replying", kind="unreadable")
+        assert self._run(monkeypatch, project, abort) == EXIT_FAILED
+        assert _the_only_outcome(project)["status"] == "aborted"
+
+    def test_an_unnamed_failure_still_closes_its_row_error(
+            self, monkeypatch, tmp_path):
+        """The ``finally`` catch-all: no ``except`` names a bare RuntimeError."""
+        project = tmp_path / "proj"
+        with pytest.raises(RuntimeError):
+            self._run(monkeypatch, project, RuntimeError("the mux stopped replying"))
+        assert _the_only_outcome(project)["status"] == "error"
+
+    def test_a_finalization_failure_does_not_fail_the_run(
+            self, monkeypatch, tmp_path):
+        """Recording *how* a run ended must not decide *whether* it succeeded."""
+        from softae.core.data_store import DataStore
+
+        def _boom(self, *_a, **_kw):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(DataStore, "finish_run", _boom)
+        assert self._run(monkeypatch, tmp_path / "proj") == EXIT_OK
+
+    def test_the_row_is_closed_before_the_store_is(self, monkeypatch, tmp_path):
+        """The finalizer and ``store.close()`` share one ``finally``, in order.
+
+        A closed connection can record nothing, so the ordering inside that
+        block is the whole of the fix on the failure paths.
+        """
+        from softae.core.data_store import DataStore
+
+        events: list[str] = []
+        real_finish, real_close = DataStore.finish_run, DataStore.close
+        monkeypatch.setattr(
+            DataStore, "finish_run",
+            lambda self, *a, **k: events.append("finish") or real_finish(self, *a, **k))
+        monkeypatch.setattr(
+            DataStore, "close",
+            lambda self, *a, **k: events.append("close") or real_close(self, *a, **k))
+
+        self._run(monkeypatch, tmp_path / "proj", KeyboardInterrupt())
+        assert events[:2] == ["finish", "close"]

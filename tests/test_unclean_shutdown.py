@@ -160,6 +160,45 @@ class TestStartupCheck:
         assert check_unclean_shutdown(None, MagicMock(), store) is False
         assert len(store.query_alerts()) == 1
 
+    def test_the_row_is_not_relabelled_before_the_operator_is_asked(
+            self, qapp, store, monkeypatch):
+        """The stamp used to run in a loop *above* the dialog.
+
+        ``finish_run`` is an UPDATE with no unset, so a row relabelled
+        ``interrupted`` cannot be un-relabelled — dismissing the dialog does not
+        undo it. Whatever the operator then answered, the rewrite had already
+        happened, to rows they had not yet been shown. The check is made from
+        inside ``exec`` because that is the only instant at which "asked" and
+        "not yet answered" are both true.
+        """
+        rid = store.start_run("wf")
+        seen: list[dict] = []
+        monkeypatch.setattr(QMessageBox, "exec",
+                            lambda self: seen.append(store.run_outcome(rid)) or 0)
+        monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: None)
+
+        check_unclean_shutdown(None, MagicMock(), store)
+
+        assert seen == [{"status": "running", "finished": False}]
+        # And it *is* stamped once the ask has happened — the fix is the
+        # ordering, not the removal.
+        assert store.run_outcome(rid)["status"] == "interrupted"
+
+    def test_a_dialog_that_never_appeared_relabels_nothing(
+            self, qapp, store, monkeypatch):
+        """No display, no QApplication, a teardown race — none of it is an ask.
+
+        The report is durable, so deferring costs one launch; stamping on a
+        dialog nobody saw costs the record permanently.
+        """
+        rid = store.start_run("wf")
+        monkeypatch.setattr(QMessageBox, "exec",
+                            lambda self: (_ for _ in ()).throw(RuntimeError("no gui")))
+
+        assert check_unclean_shutdown(None, MagicMock(), store) is False
+        assert store.run_outcome(rid) == {"status": "running", "finished": False}
+        assert [r["run_id"] for r in store.unfinished_runs()] == [rid]
+
     def test_query_failure_does_not_block_startup(self, qapp):
         broken = MagicMock()
         broken.unfinished_runs.side_effect = RuntimeError("db locked")

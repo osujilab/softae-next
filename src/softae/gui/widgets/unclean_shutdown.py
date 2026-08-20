@@ -120,13 +120,6 @@ def check_unclean_shutdown(
     except Exception:
         logger.warning("unclean_shutdown_alert_failed", exc_info=True)
 
-    # Mark them so this is reported once, not on every subsequent launch.
-    for row in stale:
-        try:
-            data_store.finish_run(row["run_id"], "interrupted")
-        except Exception:
-            logger.warning("mark_interrupted_failed", run_id=row["run_id"])
-
     box = QMessageBox(parent)
     box.setWindowTitle("Previous session ended unexpectedly")
     box.setIcon(QMessageBox.Icon.Warning)
@@ -146,7 +139,54 @@ def check_unclean_shutdown(
     park_btn = box.addButton("Park now", QMessageBox.ButtonRole.AcceptRole)
     box.addButton("Skip", QMessageBox.ButtonRole.RejectRole)
     box.setDefaultButton(park_btn)
-    box.exec()
+
+    # ── Ask FIRST, stamp SECOND. This ordering is the fix — do not reorder. ──
+    #
+    # `finish_run` is an UPDATE with no unset, so relabelling a row `interrupted`
+    # is permanent and dismissing the dialog cannot undo it. Stamping before the
+    # dialog therefore rewrote the history of runs the operator was never shown,
+    # and — while `tools/commission.py` and `tools/equilibration.py` still leaked
+    # an unfinished row on their *success* path — it was relabelling completed
+    # runs as interrupted. Both halves land together: those tools now finalize
+    # their own rows, so a row that survives to here really is a crashed one, and
+    # the relabelling now happens only after the operator has seen the list.
+    #
+    # A dialog that never appeared is not an ask. If `exec()` raises — no
+    # display, no QApplication, a Qt teardown race at start-up — nothing is
+    # stamped and the whole report returns intact at the next launch. That also
+    # keeps the promise this function's docstring makes, which the bare `exec()`
+    # did not: no failure here may stop the application opening.
+    try:
+        box.exec()
+    except Exception:
+        logger.warning("unclean_shutdown_dialog_failed", exc_info=True)
+        return False
+
+    # Stamped now that it has been reported, so it is reported once rather than
+    # on every subsequent launch.
+    #
+    # Why the stamp is kept at all, rather than replaced by a suppression record
+    # that leaves the run row untouched: "we already asked" and "this run was
+    # interrupted" really are different facts, but `unfinished_runs()` is
+    # project-wide and read by three surfaces — `core/shutdown.py`,
+    # `tools/campaign.py` and here. A row left NULL forever re-arms all three,
+    # so suppression living anywhere else (the alerts table, a sidecar) would
+    # have to be taught to each of them separately. And `interrupted` is the
+    # row's *true* terminal status: the write was mistimed, not untrue.
+    #
+    # Why closing via the window's X also stamps. Qt already resolves the close
+    # box to Reject, which is the same answer as "Skip", and both mean the
+    # operator was shown the rows and chose not to park. Re-prompting on X would
+    # put this dialog in front of anyone who habitually dismisses it on every
+    # launch — and a dialog seen every launch is one that gets dismissed unread,
+    # which is a worse outcome than the bug on a prompt whose subject is a
+    # possibly-lowered head. What carries the fact for an operator who X'd out is
+    # the durable alert above, raised *before* the dialog for exactly that reason.
+    for row in stale:
+        try:
+            data_store.finish_run(row["run_id"], "interrupted")
+        except Exception:
+            logger.warning("mark_interrupted_failed", run_id=row["run_id"])
 
     if box.clickedButton() is not park_btn:
         logger.info("unclean_shutdown_park_declined")

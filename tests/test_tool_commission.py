@@ -247,3 +247,201 @@ class TestNominalIsRequiredWhereItMatters:
 
         assert ARTIFACT_NOMINAL_UNITS["reference_cap"] == "farads"
         assert ARTIFACT_NOMINAL_UNITS["blank_load"] == "ohms"
+
+
+# ── Every run row is closed, on every exit path ──────────────────────────────
+
+class _Manager:
+    """A manager that opens and closes and drives nothing."""
+
+    async def connect_all(self):
+        return None
+
+    async def disconnect_all(self):
+        return None
+
+
+def _arrange_run(monkeypatch, outcome: BaseException | None = None):
+    """Wire ``_cmd_run`` to an executor that ends with *outcome* (None = success).
+
+    The interlock is stubbed *open* here rather than closed: these tests are
+    about what happens to a run row once one exists, and a declined run never
+    creates one (see ``TestHardwareInterlock``).
+    """
+    import softae.core.hardware_safety as safety
+    import softae.drivers.factory as factory
+    import softae.workflows.workflow_executor as wfx
+
+    monkeypatch.setattr(factory, "create_manager", lambda **_kw: _Manager())
+    monkeypatch.setattr(safety, "assert_hardware_armed", lambda *_a, **_kw: None)
+
+    class _Executor:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        async def run(self, _wf):
+            if outcome is not None:
+                raise outcome
+            return None
+
+    monkeypatch.setattr(wfx, "WorkflowExecutor", _Executor)
+
+
+def _the_only_outcome(project: Path) -> dict:
+    """``run_outcome`` for the single run the command wrote."""
+    from softae.core.data_store import DataStore
+
+    with DataStore(project) as ds:
+        run_ids = [r[0] for r in ds._conn.execute(
+            "SELECT run_id FROM experiments ORDER BY started_at")]
+        assert len(run_ids) == 1, run_ids
+        return ds.run_outcome(run_ids[0])
+
+
+class TestRunRowFinalization:
+    """``start_run`` had no matching ``finish_run`` anywhere in this tool.
+
+    Neither the CLI nor ``WorkflowExecutor`` closed the row, so **every**
+    successful commissioning sweep left ``finished_at`` NULL — which is
+    byte-for-byte what a killed process leaves behind. The next GUI launch read
+    it as an unclean shutdown and offered to park the rig over a run that had
+    finished perfectly, which is how a real crash report gets trained out of an
+    operator.
+    """
+
+    def _run(self, monkeypatch, project: Path, outcome=None):
+        from softae.tools.commission import _cmd_run
+
+        _arrange_run(monkeypatch, outcome)
+        args = build_parser().parse_args(
+            ["run", "blank_short", "--channels", "1", "--yes",
+             "--project", str(project)])
+        return _cmd_run(args)
+
+    def test_a_completed_sweep_closes_its_row_done(self, monkeypatch, tmp_path):
+        from softae.tools.commission import EXIT_OK
+
+        project = tmp_path / "proj"
+        assert self._run(monkeypatch, project) == EXIT_OK
+        assert _the_only_outcome(project) == {"status": "done", "finished": True}
+
+    def test_a_completed_sweep_is_not_reported_as_an_unclean_shutdown(
+            self, monkeypatch, tmp_path):
+        """The defect as the operator met it, pinned at its own surface."""
+        from softae.core.data_store import DataStore
+
+        project = tmp_path / "proj"
+        self._run(monkeypatch, project)
+        with DataStore(project) as ds:
+            assert ds.unfinished_runs() == []
+
+    def test_a_ctrl_c_closes_its_row_interrupted(self, monkeypatch, tmp_path):
+        from softae.tools.commission import EXIT_FAILED
+
+        project = tmp_path / "proj"
+        assert self._run(monkeypatch, project, KeyboardInterrupt()) == EXIT_FAILED
+        assert _the_only_outcome(project)["status"] == "interrupted"
+
+    def test_an_unarmed_rig_at_the_executor_closes_its_row_aborted(
+            self, monkeypatch, tmp_path):
+        from softae.core.hardware_safety import HardwareNotArmedError
+        from softae.tools.commission import EXIT_DECLINED
+
+        project = tmp_path / "proj"
+        outcome = HardwareNotArmedError("SAFETY INTERLOCK")
+        assert self._run(monkeypatch, project, outcome) == EXIT_DECLINED
+        assert _the_only_outcome(project)["status"] == "aborted"
+
+    def test_an_unnamed_failure_still_closes_its_row_error(
+            self, monkeypatch, tmp_path):
+        """The ``finally`` catch-all: no ``except`` names a bare RuntimeError."""
+        project = tmp_path / "proj"
+        with pytest.raises(RuntimeError):
+            self._run(monkeypatch, project, RuntimeError("the mux stopped replying"))
+        assert _the_only_outcome(project)["status"] == "error"
+
+    def test_a_finalization_failure_does_not_fail_the_run(
+            self, monkeypatch, tmp_path):
+        """Recording *how* a run ended must not decide *whether* it succeeded."""
+        from softae.core.data_store import DataStore
+        from softae.tools.commission import EXIT_OK
+
+        def _boom(self, *_a, **_kw):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(DataStore, "finish_run", _boom)
+        assert self._run(monkeypatch, tmp_path / "proj") == EXIT_OK
+
+    def test_the_row_is_closed_before_the_store_is(self, monkeypatch, tmp_path):
+        """The finalizer and ``store.close()`` share one ``finally``, in order.
+
+        A closed connection can record nothing, so the ordering inside that
+        block is the whole of the fix on the failure paths.
+        """
+        from softae.core.data_store import DataStore
+
+        events: list[str] = []
+        real_finish, real_close = DataStore.finish_run, DataStore.close
+        monkeypatch.setattr(
+            DataStore, "finish_run",
+            lambda self, *a, **k: events.append("finish") or real_finish(self, *a, **k))
+        monkeypatch.setattr(
+            DataStore, "close",
+            lambda self, *a, **k: events.append("close") or real_close(self, *a, **k))
+
+        with pytest.raises(RuntimeError):
+            self._run(monkeypatch, tmp_path / "proj", RuntimeError("boom"))
+        assert events[:2] == ["finish", "close"]
+
+
+class TestImportRowFinalization:
+    """The tool's *second* ``start_run`` site.
+
+    The two are alternatives, not nested: ``import`` opens its own store and
+    runs no workflow, so it needs its own finalizer rather than sharing
+    ``run``'s.
+    """
+
+    def _a_spectrum(self, path: Path) -> Path:
+        import numpy as np
+
+        from softae.analysis.eis_data import EISResult
+
+        eis = EISResult(
+            channel=1,
+            frequency=np.array([1e5, 1e4, 1e3]),
+            z_magnitude=np.array([100.0, 110.0, 120.0]),
+            phase=np.array([-1.0, -2.0, -3.0]),
+            z_real=np.array([100.0, 110.0, 120.0]),
+            z_imag_neg=np.array([1.0, 2.0, 3.0]),
+        )
+        eis.save(path)
+        return path
+
+    def _import(self, tmp_path: Path, project: Path):
+        from softae.tools.commission import _cmd_import
+
+        src = self._a_spectrum(tmp_path / "spectrum.csv")
+        args = build_parser().parse_args(
+            ["import", "blank_short", "--file", str(src), "--channel", "1",
+             "--electrode-mode", "two", "--project", str(project)])
+        return _cmd_import(args)
+
+    def test_a_completed_import_closes_its_row_done(self, tmp_path):
+        from softae.tools.commission import EXIT_OK
+
+        project = tmp_path / "proj"
+        assert self._import(tmp_path, project) == EXIT_OK
+        assert _the_only_outcome(project) == {"status": "done", "finished": True}
+
+    def test_a_failed_import_closes_its_row_error(self, monkeypatch, tmp_path):
+        from softae.core.data_store import DataStore
+
+        def _boom(self, *_a, **_kw):
+            raise RuntimeError("the measurements table is locked")
+
+        monkeypatch.setattr(DataStore, "record_measurement", _boom)
+        project = tmp_path / "proj"
+        with pytest.raises(RuntimeError):
+            self._import(tmp_path, project)
+        assert _the_only_outcome(project)["status"] == "error"

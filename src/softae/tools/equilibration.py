@@ -92,7 +92,7 @@ from softae.core.channel_spec import (
     parse_channel_spec,
 )
 from softae.core.hardware_safety import ARM_ENV_VAR, HardwareNotArmedError
-from softae.tools import use_utf8_console
+from softae.tools import run_finalizer, use_utf8_console
 from softae.workflows.equilibration import (
     DEFAULT_APPROACH_TIMEOUT_S,
     DEFAULT_DOWN_APPROACH_TIMEOUT_S,
@@ -143,6 +143,7 @@ logger = structlog.get_logger(__name__)
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_DECLINED = 2
+
 
 #: The typed word that starts a nine-hour thermal run. Not "y".
 CONFIRM_WORD = "yes"
@@ -1761,6 +1762,7 @@ def _cmd_run(args) -> int:
     run_id = store.start_run("equilibration_characterization", mode="characterization",
                              annotation=f"{config.rh_setpoint_pct:g}%RH, peak "
                                         f"{config.peak_temperature_C:g}C")
+    finalize = run_finalizer(store, run_id)
     runner = EquilibrationRun(config, manager, data_store=store, run_id=run_id)
     renderer = ProgressRenderer(
         config, quiet=getattr(args, "quiet", False),
@@ -1778,14 +1780,22 @@ def _cmd_run(args) -> int:
     try:
         asyncio.run(_go())
     except EquilibrationAbort as exc:
+        finalize("aborted")
         print(f"\nABORTED ({exc.kind}): {exc}", file=sys.stderr)
         _print_teardown(runner)
         return EXIT_FAILED
     except KeyboardInterrupt:
+        finalize("interrupted")
         print("\nInterrupted.", file=sys.stderr)
         _print_teardown(runner)
         return EXIT_FAILED
+    else:
+        finalize("done")
     finally:
+        # The catch-all, and it must run before `store.close()` — a closed
+        # connection cannot record anything. Idempotent, so it is a no-op unless
+        # an exception no `except` above names is on its way out.
+        finalize("error")
         renderer.close()
         store.close()
 

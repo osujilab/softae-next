@@ -45,7 +45,7 @@ from softae.analysis.eis.calibration import (
 )
 from softae.analysis.eis.policy import RE_STATES
 from softae.core.hardware_safety import ARM_ENV_VAR, HardwareNotArmedError
-from softae.tools import use_utf8_console
+from softae.tools import run_finalizer, use_utf8_console
 from softae.workflows.commissioning import (
     ARTIFACT_SETUP,
     CommissioningError,
@@ -250,6 +250,7 @@ def _cmd_run(args) -> int:
 
     run_id = store.start_run(wf.name, mode="commissioning",
                              annotation=f"{args.role} / {args.fixture}")
+    finalize = run_finalizer(store, run_id)
 
     async def _go():
         await manager.connect_all()
@@ -265,6 +266,7 @@ def _cmd_run(args) -> int:
         # By design: headless paths cannot self-arm, so the operator arms the rig
         # deliberately and session-scoped. Say how, rather than surfacing the raw
         # exception at the bench.
+        finalize("aborted")
         print(f"\nHardware is not armed: {exc}", file=sys.stderr)
         print(f"  Set {ARM_ENV_VAR}=1 in this shell and re-run. It is deliberately",
               file=sys.stderr)
@@ -273,9 +275,16 @@ def _cmd_run(args) -> int:
         print("  real motion hardware on its own.", file=sys.stderr)
         return EXIT_DECLINED
     except KeyboardInterrupt:
+        finalize("interrupted")
         print("\nInterrupted — partial spectra are recorded and can be re-run.")
         return EXIT_FAILED
+    else:
+        finalize("done")
     finally:
+        # The catch-all, and it must run before `store.close()` — a closed
+        # connection cannot record anything. Idempotent, so it is a no-op unless
+        # an exception no `except` above names is on its way out.
+        finalize("error")
         store.close()
 
     print()
@@ -646,19 +655,30 @@ def _cmd_import(args) -> int:
 
         run_id = store.start_run(f"import_{args.role}", mode="commissioning",
                                  annotation=f"imported {src.name}")
-        dest = Path(store.project_dir) / "eis" / f"import_{args.role}_ch{channel}.csv"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        eis.save(dest)
+        # The second of this module's two `start_run` sites. They are
+        # alternatives, not nested — `import` opens its own store and never runs
+        # a workflow — so it needs its own finalizer rather than sharing one.
+        finalize = run_finalizer(store, run_id)
+        try:
+            dest = (Path(store.project_dir) / "eis"
+                    / f"import_{args.role}_ch{channel}.csv")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            eis.save(dest)
 
-        mid = store.record_measurement(
-            run_id, eis, role=args.role, fixture_id=args.fixture,
-            nominal_value=args.nominal, electrode_mode=args.electrode_mode,
-            re_connection=args.re_connection,
-        )
-        print(f"Imported {src.name} as {args.role} on ch{channel} "
-              f"({args.electrode_mode}-electrode), measurement #{mid}")
-        print(f"  stored: {dest}")
-        print(f"  then:  softae-commission derive --fixture {args.fixture}")
+            mid = store.record_measurement(
+                run_id, eis, role=args.role, fixture_id=args.fixture,
+                nominal_value=args.nominal, electrode_mode=args.electrode_mode,
+                re_connection=args.re_connection,
+            )
+            finalize("done")
+            print(f"Imported {src.name} as {args.role} on ch{channel} "
+                  f"({args.electrode_mode}-electrode), measurement #{mid}")
+            print(f"  stored: {dest}")
+            print(f"  then:  softae-commission derive --fixture {args.fixture}")
+        finally:
+            # Idempotent; a no-op once "done" is recorded. A failed `eis.save` or
+            # `record_measurement` would otherwise leave the row open forever.
+            finalize("error")
     finally:
         store.close()
     return EXIT_OK

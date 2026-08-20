@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import sys
+from typing import Any, Callable
+
+import structlog
+
+logger = structlog.get_logger(__name__)
 
 
 def use_utf8_console() -> None:
@@ -35,4 +40,43 @@ def use_utf8_console() -> None:
             pass
 
 
-__all__ = ["use_utf8_console"]
+def run_finalizer(store: Any, run_id: str) -> Callable[[str], None]:
+    """Return a one-shot, never-raising closer for *run_id*.
+
+    Every ``DataStore.start_run`` needs a matching ``finish_run`` on **every**
+    exit path, and neither these CLIs nor ``WorkflowExecutor`` used to provide
+    one. A row left with ``finished_at`` NULL is byte-for-byte what a *crashed*
+    run looks like (``DataStore.unfinished_runs``), and the consequence is not
+    cosmetic: ``gui/widgets/unclean_shutdown.py`` reads those rows at the next
+    launch, offers the operator a recovery park of the rig over a run that
+    finished perfectly, and **relabels the row** ``interrupted`` — an ``UPDATE``
+    with no unset. A tool that does not close its own row therefore rewrites its
+    own history the next time the GUI starts.
+
+    Idempotent, so the caller can put ``finalize("error")`` in a ``finally`` as
+    the catch-all for paths no ``except`` names without it overwriting the status
+    a handler already recorded — and, on the success path, so the explicit
+    ``finalize("done")`` wins. Never raises, for the same reason
+    ``autonomous_wiring._finalize_run`` does not: failing to record how a run
+    ended must not turn a successful run into a failed one.
+
+    Statuses come from ``finish_run``'s documented vocabulary only —
+    ``done`` / ``partial`` / ``aborted`` / ``error`` / ``interrupted``.
+    """
+    finalized = False
+
+    def _finalize(status: str) -> None:
+        nonlocal finalized
+        if finalized:
+            return
+        finalized = True
+        try:
+            store.finish_run(run_id, status)
+        except Exception:
+            logger.warning("finish_run_failed", run_id=run_id, status=status,
+                           exc_info=True)
+
+    return _finalize
+
+
+__all__ = ["run_finalizer", "use_utf8_console"]

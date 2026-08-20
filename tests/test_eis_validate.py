@@ -797,6 +797,132 @@ def test_console_script_is_registered():
     assert 'softae-eis-validate = "softae.tools.eis_validate:main"' in text
 
 
+class TestRunRowFinalization:
+    """`_enter_run`'s `start_run` had no matching `finish_run` on any exit path.
+
+    A row left with `finished_at` NULL is byte-for-byte what a *crashed* run
+    looks like, so a validation that completed perfectly was read at the next GUI
+    launch as an unclean shutdown, offered a recovery park of the rig, and had
+    its row permanently relabelled `interrupted`. Every path below goes through
+    `--mock`, which is also the answer to "does the mock path finalize" -- it
+    starts a real row in a real store and closes it the same way.
+    """
+
+    ARGV = ["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
+            "--temp-setpoint-c", "25", "--mock", "--min-treatment", "1",
+            "--drift-check", "0"]
+
+    def _run(self, tmp_path, name="fin", *extra):
+        return V.main(self.ARGV + ["--validation-name", name,
+                                   "--project", str(tmp_path), *extra])
+
+    def _outcomes(self, tmp_path):
+        """How each run in the project ended, oldest first."""
+        from softae.core.data_store import DataStore
+
+        with DataStore(Path(tmp_path)) as ds:
+            run_ids = [r[0] for r in ds._conn.execute(
+                "SELECT run_id FROM experiments ORDER BY started_at")]
+            return [ds.run_outcome(run_id) for run_id in run_ids]
+
+    def test_a_completed_validation_closes_its_row_done(self, tmp_path):
+        """`done`, not `error`: the `finally` catch-all must not overwrite it."""
+        assert self._run(tmp_path) == V.EXIT_OK
+        assert self._outcomes(tmp_path) == [{"status": "done", "finished": True}]
+
+    def test_a_completed_validation_is_not_reported_as_an_unclean_shutdown(
+            self, tmp_path):
+        """The defect as the operator met it, pinned at its own surface."""
+        from softae.core.data_store import DataStore
+
+        self._run(tmp_path)
+        with DataStore(Path(tmp_path)) as ds:
+            assert ds.unfinished_runs() == []
+
+    def test_a_refusal_closes_its_row_aborted(self, tmp_path, monkeypatch):
+        """A refusal is a decision, not an accident -- and not an interruption.
+
+        The approach timeout refuses *after* the row exists, which is the only
+        reason this path needs the finalizer at all.
+        """
+        import softae.workflows.equilibration as EQ
+        from softae.workflows.equilibration import ApproachOutcome
+
+        monkeypatch.setattr(EQ, "approach_setpoint",
+                            lambda read_pv, target, *, axis, **kw: ApproachOutcome(
+                                axis=axis, target=target, reached=False,
+                                elapsed_s=1.0, pv_final=99.0, n_samples=1))
+        assert self._run(tmp_path, "ref") == V.EXIT_FAILED
+        assert self._outcomes(tmp_path) == [{"status": "aborted", "finished": True}]
+
+    def test_a_ctrl_c_closes_its_row_interrupted(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(H.HoldWatch, "poll",
+                            lambda self: (_ for _ in ()).throw(KeyboardInterrupt()))
+        assert self._run(tmp_path, "kb") == V.EXIT_INTERRUPTED
+        assert self._outcomes(tmp_path) == [
+            {"status": "interrupted", "finished": True}]
+
+    def test_an_unnamed_failure_closes_its_row_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(H.HoldWatch, "poll",
+                            lambda self: (_ for _ in ()).throw(
+                                RuntimeError("the mux stopped replying")))
+        assert self._run(tmp_path, "err") == V.EXIT_FAILED
+        assert self._outcomes(tmp_path) == [{"status": "error", "finished": True}]
+
+    def test_a_finalization_failure_does_not_fail_the_run(self, tmp_path,
+                                                          monkeypatch):
+        """Recording *how* a run ended must not decide *whether* it succeeded."""
+        from softae.core.data_store import DataStore
+
+        def _boom(self, *_a, **_kw):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(DataStore, "finish_run", _boom)
+        assert self._run(tmp_path) == V.EXIT_OK
+
+    def test_a_resumed_validation_closes_the_row_it_re_entered(self, tmp_path):
+        """`--resume` adopts the existing run_id, so it closes that same row."""
+        assert self._run(tmp_path, "rf") == V.EXIT_OK
+        assert self._run(tmp_path, "rf", "--resume") == V.EXIT_OK
+        # One row, not two: the resume re-entered rather than starting a run.
+        assert self._outcomes(tmp_path) == [{"status": "done", "finished": True}]
+
+    def test_a_refused_resume_leaves_the_earlier_row_and_the_next_resume_intact(
+            self, tmp_path):
+        """A `ResumeMismatch` names a *different* plan's row. It stamps nothing.
+
+        And finalizing never blocks resuming: `_enter_run` resumes off the
+        campaign checkpoint and `_remaining_channels` off the measurements, so
+        neither consults the run row's status.
+        """
+        assert self._run(tmp_path, "rf2") == V.EXIT_OK
+        mismatch = V.main(
+            ["run", "--channels", "18,19,20,21", "--rh-setpoint-pct", "30",
+             "--temp-setpoint-c", "25", "--mock", "--min-treatment", "1",
+             "--drift-check", "0", "--validation-name", "rf2",
+             "--project", str(tmp_path), "--resume"])
+        assert mismatch == V.EXIT_FAILED
+        assert self._outcomes(tmp_path) == [{"status": "done", "finished": True}]
+        assert self._run(tmp_path, "rf2", "--resume") == V.EXIT_OK
+
+    def test_the_checkpoint_loop_state_is_deliberately_left_running(self, tmp_path):
+        """Not an oversight, and not a second unclosed liveness claim.
+
+        The checkpoint is a *resume point*, which outlives the process on
+        purpose: a park ends the condition and `--resume` re-enters. The row
+        that answers "did this process die" is `experiments`, and it is now
+        closed. Pinned so nobody 'fixes' the checkpoint to a terminal value and
+        breaks resume in the process.
+        """
+        from softae.core.data_store import DataStore
+
+        assert self._run(tmp_path, "ls") == V.EXIT_OK
+        with DataStore(Path(tmp_path)) as ds:
+            checkpoint = ds.campaign_checkpoint(V.checkpoint_campaign("ls"))
+            assert checkpoint["loop_state"] == "running"
+            assert ds.unfinished_runs() == []
+
+
 class _ParkResult:
     def summary(self) -> str:
         return "parked (test double)"

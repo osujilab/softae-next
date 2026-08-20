@@ -68,7 +68,7 @@ from typing import Any
 
 import structlog
 
-from softae.tools import use_utf8_console
+from softae.tools import run_finalizer, use_utf8_console
 from softae.tools.eis_validate_hold import (
     DEFAULT_DRIFT_CHECK,
     DEFAULT_MIN_TREATMENT,
@@ -111,6 +111,17 @@ EXIT_INTERRUPTED = 130
 #: (``pico2_range = [17, 32]``, remapped by ``mod_channel_restart`` to pico2's
 #: 2-16). Channel 18 is the one bench-verified for segmented scripts.
 EXAMPLE_CHANNELS = "18-32"
+
+
+def _no_run_to_finalize(status: str) -> None:
+    """The finalizer before a run row exists. Deliberately does nothing.
+
+    ``cmd_run`` opens its ``DataStore`` before the ``try`` that owns the exit
+    paths, so the ``except``/``finally`` arms are reachable with no ``run_id``
+    yet -- most plausibly a ``--resume`` that raises ``ResumeMismatch`` inside
+    ``_enter_run``. There is no row of this process's to close there, and the row
+    the checkpoint names belongs to a *different* plan.
+    """
 
 
 # ── Plan resolution ──────────────────────────────────────────────────────────
@@ -638,14 +649,21 @@ def cmd_run(args: argparse.Namespace) -> int:
         return EXIT_DECLINED
 
     store = DataStore(resolve_project(args.project))
+    # Rebound the moment `_enter_run` yields a run_id. Until then there is no row
+    # of ours to close: a `--resume` whose fingerprint has moved raises before one
+    # is adopted, and stamping the *previous* plan's row would be a lie about a
+    # run this process never entered.
+    finalize = _no_run_to_finalize
     try:
         import asyncio
 
         asyncio.run(manager.connect_all())
         ctx = _enter_run(store, manager, plan, args)
+        finalize = run_finalizer(store, ctx.run_id)
         remaining = _remaining_channels(store, plan, resume=bool(args.resume))
         if not remaining:
             print("Every planned cell is already complete; nothing to measure.")
+            finalize("done")
             return EXIT_OK
 
         _establish_condition(ctx, plan, remaining)
@@ -654,18 +672,30 @@ def cmd_run(args: argparse.Namespace) -> int:
         run_cells(ctx, planner, remaining)
         drift_check(ctx, remaining)
         _write_report(store, plan, args)
+        finalize("done")
         return EXIT_OK
     except RefuseToStart as exc:
+        # A refusal is a decision, not an accident: the harness declined to spend
+        # the measurement block. `aborted`, never `interrupted` -- nothing was
+        # interrupted, and this row is the only place the distinction survives.
+        finalize("aborted")
         print(f"\nREFUSING TO START: {exc}")
         return EXIT_FAILED
     except KeyboardInterrupt:
+        finalize("interrupted")
         print("\nInterrupted. Recorded rows stand; nothing new was started.")
         return EXIT_INTERRUPTED
     except Exception as exc:
+        finalize("error")
         logger.error("eis_validate_run_failed", error=str(exc))
         print(f"\nRUN FAILED: {exc}")
         return EXIT_FAILED
     finally:
+        # The catch-all, and it runs before the park: an exception no `except`
+        # above names must not be the reason the row stays open, and the park
+        # below is the longest thing left in the process. Idempotent, so it is a
+        # no-op on every path above.
+        finalize("error")
         # Every exit path, success included. `retract_head=None` because absent
         # an operator the correct response to an unknown is to add no motion to
         # it -- `safe_park`'s default is reversed for exactly this caller class.
@@ -752,6 +782,16 @@ def _enter_run(store: Any, manager: Any, plan: ValidationPlan,
 
     payload = plan.as_dict()
     payload["hold_epoch"] = hold_epoch
+    # `loop_state` is deliberately left at "running" on every exit, and it is not
+    # a second unclosed liveness claim like the run row was. This checkpoint is a
+    # *resume point*: `--resume` re-enters it after a park, so "not finished" is
+    # true of it for as long as it exists, and the row that answers "did this
+    # process die" is `experiments` -- which `cmd_run` now closes. Nothing reads
+    # this column for liveness (`unfinished_runs` does not see this table), and
+    # settling it would mean a second whole-row INSERT OR REPLACE on the exit
+    # path, risking the resume point of a nine-hour run to update a field no
+    # reader consults. The schema's terminal move is `clear_campaign_checkpoint`,
+    # and clearing is what destroys resumability.
     store.save_campaign_checkpoint(
         campaign, iteration=hold_epoch, run_id=run_id,
         loop_state="running", spec_json=json.dumps(payload))
