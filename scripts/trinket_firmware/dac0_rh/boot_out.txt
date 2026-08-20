@@ -1,0 +1,4 @@
+Adafruit CircuitPython 9.2.7 on 2025-04-01; Adafruit Trinket M0 with samd21e18
+Board ID:trinket_m0
+UID:8B8A77EE4A57305020312E592F1E0FFF
+boot.py output:
