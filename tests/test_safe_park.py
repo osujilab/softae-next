@@ -33,7 +33,7 @@ from softae.server.base_instrument import InstrumentState
 def _manager(**overrides):
     """A manager whose instruments are all connected MagicMocks."""
     insts: dict[str, MagicMock] = {}
-    for name in ("syringe", "temp_controller", "lamp"):
+    for name in ("syringe", "temp_controller", "lamp", "rh_controller"):
         m = MagicMock()
         m.is_connected = True
         insts[name] = m
@@ -239,8 +239,117 @@ class TestBestEffort:
         result = safe_park(mgr)
 
         assert result.ok
-        assert len(result.skipped) == 3               # syringe, temp, lamp
+        assert len(result.skipped) == 4       # syringe, temp, rh_controller, lamp
         assert result.actions == []
+
+
+# ── The humidifier ───────────────────────────────────────────────────────────
+
+class TestHumidifier:
+    """A parked rig must not keep humidifying.
+
+    The safe state is not invented here: the operator ruled it is the one the
+    driver already writes on a clean stop — duty 0. What is new is that the park
+    reaches it at all, on the paths where nothing did.
+    """
+
+    def test_the_park_turns_the_humidifier_off(self):
+        mgr = _manager()
+        result = safe_park(mgr, reason="unit test")
+
+        mgr._insts["rh_controller"].safe_off.assert_called_once()
+        assert any("humidifier off" in c for c in result.commanded)
+
+    def test_the_park_never_calls_stop_instead_of_safe_off(self):
+        """``stop()`` writes nothing when ``start()`` was never called, and
+        returns cleanly having written nothing when the loop is wedged past its
+        five-second join. Pinned, because it is the tempting substitution."""
+        mgr = _manager()
+        safe_park(mgr)
+
+        mgr._insts["rh_controller"].stop.assert_not_called()
+
+    def test_an_absent_rh_controller_is_skipped_not_an_error(self):
+        mgr = _manager()
+        mgr._insts.pop("rh_controller")
+
+        result = safe_park(mgr)
+
+        assert result.ok
+        assert any("rh_controller: not registered" in s for s in result.skipped)
+
+    def test_a_disconnected_rh_controller_is_skipped(self):
+        mgr = _manager()
+        mgr._insts["rh_controller"].is_connected = False
+
+        result = safe_park(mgr)
+
+        assert result.ok
+        assert any("rh_controller: not connected" in s for s in result.skipped)
+        mgr._insts["rh_controller"].safe_off.assert_not_called()
+        assert not any("humidifier" in c for c in result.commanded)
+
+    def test_a_driver_with_no_safe_off_is_an_error_not_a_silent_skip(self):
+        """Mirrors the pump halt: a registered driver that cannot be turned off
+        is a finding, not a non-event."""
+        rh = MagicMock(spec=["is_connected", "stop"])
+        rh.is_connected = True
+
+        result = safe_park(_manager(rh_controller=rh))
+
+        assert any("safe_off" in e for e in result.errors)
+        rh.stop.assert_not_called()
+
+    def test_a_raising_safe_off_does_not_block_the_lamp(self):
+        mgr = _manager()
+        mgr._insts["rh_controller"].safe_off.side_effect = RuntimeError("wedged")
+
+        result = safe_park(mgr)
+
+        assert any("humidity: wedged" in e for e in result.errors)
+        mgr._insts["lamp"].off.assert_called_once()
+
+    def test_a_failed_duty_write_is_reported_as_an_error_not_commanded(self):
+        """``safe_off`` swallows a comms failure to keep the never-raise
+        contract, so a park that only watched for an exception would claim a
+        write that never landed."""
+        mgr = _manager()
+        mgr._insts["rh_controller"].last_safe_off_error = (
+            "Failed to send duty cycle: port went away")
+
+        result = safe_park(mgr)
+
+        assert any("port went away" in e for e in result.errors)
+        assert not any("humidifier off" in c for c in result.commanded)
+
+    def test_the_humidifier_is_zeroed_before_the_lamp(self):
+        order: list[str] = []
+        mgr = _manager()
+        mgr._insts["temp_controller"].write_sp.side_effect = (
+            lambda *a, **k: order.append("temp"))
+        mgr._insts["rh_controller"].safe_off.side_effect = lambda: order.append("rh")
+        mgr._insts["lamp"].off.side_effect = lambda: order.append("lamp")
+
+        safe_park(mgr)
+
+        assert order == ["temp", "rh", "lamp"]
+
+    def test_a_mock_rh_controller_is_turned_off_too(self):
+        """``safe_park`` cannot tell a mock from a real driver, so the mock's own
+        ``safe_off`` is what makes every simulated park honest."""
+        from softae.drivers.mock_rh_controller import MockRHController
+
+        rh = MockRHController(name="rh_controller")
+        rh._state = InstrumentState.CONNECTED
+        rh.set_setpoint(45.0)
+        rh.start()
+
+        result = safe_park(_manager(rh_controller=rh))
+
+        assert result.ok
+        assert rh._duty == 0.0
+        assert rh._running is False
+        assert rh._setpoint == 0.0
 
 
 # ── The vocabulary of the result ─────────────────────────────────────────────
@@ -324,7 +433,7 @@ class TestCommandedAnything:
 
         assert result.ok is True
         assert result.commanded_anything is False
-        assert len(result.skipped) == 3
+        assert len(result.skipped) == 4
 
     def test_park_of_connected_manager_commanded_anything_true(self):
         assert safe_park(_manager()).commanded_anything is True
@@ -411,3 +520,12 @@ class TestAsync:
         mgr = _manager()
         await safe_park_async(mgr, retract_head=True)
         mgr._insts["syringe"].head_retract.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_async_park_turns_the_humidifier_off(self):
+        """The async wrapper is ``to_thread(safe_park, …)``; it inherits the step
+        rather than restating it, and this is what says so."""
+        mgr = _manager()
+        result = await safe_park_async(mgr, reason="async test")
+        mgr._insts["rh_controller"].safe_off.assert_called_once()
+        assert any("humidifier off" in c for c in result.commanded)

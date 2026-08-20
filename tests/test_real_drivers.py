@@ -13,6 +13,7 @@ They verify:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 import time
 import types
@@ -180,6 +181,182 @@ class TestAsyncRHController:
         # Now get_H() does a live read via _rh_reader when PID isn't running
         h = ctrl.get_H()
         assert h == 55.0  # the injected lambda always returns 55.0
+
+    # ── safe_off: the entry point the park calls ─────────────────────────────
+    #
+    # The serial spy throughout is ``mock_ser.write``, whose call args are the
+    # encoded duty strings the Trinket receives.
+
+    ZERO = b"0.0000\n"
+
+    def test_safe_off_sends_duty_zero_when_start_was_never_called(self, rh_ctrl):
+        """The hole the whole entry point exists for.
+
+        ``stop()`` returns immediately when ``_running`` is False, so a process
+        that connected and died before ``start()`` sends nothing at all and
+        leaves the Trinket at a previous session's duty.
+        """
+        ctrl, mock_ser, _ = rh_ctrl
+        assert ctrl._running is False
+        mock_ser.write.reset_mock()
+
+        ctrl.safe_off()
+
+        assert mock_ser.write.call_count == 1
+        assert mock_ser.write.call_args[0][0] == self.ZERO
+        assert ctrl.last_safe_off_error == ""
+
+    def test_safe_off_zeroes_the_stored_setpoint(self, rh_ctrl):
+        """A later bare ``start()`` must not resume the pre-park target."""
+        ctrl, _, pid_inst = rh_ctrl
+        ctrl.set_setpoint(45.0)
+
+        ctrl.safe_off()
+
+        assert ctrl._setpoint == 0.0
+        assert pid_inst.setpoint == 0.0
+
+    def test_safe_off_stops_a_running_loop(self, rh_ctrl):
+        ctrl, _, _ = rh_ctrl
+        ctrl.start()
+        assert ctrl._running is True
+
+        ctrl.safe_off()
+
+        assert ctrl._running is False
+        assert ctrl._thread is None
+
+    def test_safe_off_after_a_running_loop_still_writes_zero_itself(self, rh_ctrl):
+        """A duplicate zero from the exiting thread is explicitly tolerated.
+
+        What matters is that the *last* thing on the wire is the zero this
+        method wrote — the thread's own write cannot be relied on, because a
+        wedged loop's ``join`` expires and ``stop()`` returns anyway.
+        """
+        ctrl, mock_ser, _ = rh_ctrl
+        ctrl.start()
+        time.sleep(0.05)                      # let the loop take a tick
+
+        ctrl.safe_off()
+
+        assert mock_ser.write.call_args[0][0] == self.ZERO
+        assert ctrl.last_safe_off_error == ""
+
+    def test_safe_off_does_not_raise_when_the_write_fails(self, rh_ctrl):
+        """Never-raise is the park's contract; the failure travels in the attribute."""
+        ctrl, mock_ser, _ = rh_ctrl
+        mock_ser.write.side_effect = OSError("port went away")
+
+        ctrl.safe_off()                        # must not raise
+
+        assert ctrl.last_safe_off_error != ""
+        assert "port went away" in ctrl.last_safe_off_error
+
+    def test_safe_off_does_not_raise_when_the_port_is_none(self, rh_ctrl):
+        """No transport still zeroes the setpoint, and still says so."""
+        ctrl, _, _ = rh_ctrl
+        ctrl.set_setpoint(45.0)
+        ctrl._serial = None
+
+        ctrl.safe_off()                        # must not raise
+
+        assert ctrl._setpoint == 0.0
+        assert ctrl.last_safe_off_error != ""
+
+    def test_safe_off_clears_a_previous_error_on_a_later_success(self, rh_ctrl):
+        """Per-call, not sticky — a stale error would fail the *next* park."""
+        ctrl, mock_ser, _ = rh_ctrl
+        mock_ser.write.side_effect = OSError("port went away")
+        ctrl.safe_off()
+        assert ctrl.last_safe_off_error != ""
+
+        mock_ser.write.side_effect = None
+        ctrl.safe_off()
+
+        assert ctrl.last_safe_off_error == ""
+
+    def test_safe_off_leaves_the_port_open(self, rh_ctrl):
+        """It is a safe state, not a disconnect: the caller owns teardown."""
+        ctrl, _, _ = rh_ctrl
+
+        ctrl.safe_off()
+
+        assert ctrl._serial is not None
+        assert ctrl._state is InstrumentState.CONNECTED
+
+    def test_safe_off_is_idempotent(self, rh_ctrl):
+        ctrl, mock_ser, _ = rh_ctrl
+        mock_ser.write.reset_mock()
+
+        ctrl.safe_off()
+        ctrl.safe_off()                        # must not raise
+
+        assert mock_ser.write.call_count == 2
+        assert all(c[0][0] == self.ZERO for c in mock_ser.write.call_args_list)
+        assert ctrl._running is False
+        assert ctrl._setpoint == 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MockRHController — safe_off parity
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestMockRHControllerSafeOff:
+    """The mock is not a formality here.
+
+    ``create_manager`` falls back to :class:`MockRHController` for
+    ``rh_controller`` and ``safe_park`` cannot tell it from a real driver, so
+    every mock-backed park and every ``--mock`` tool run is graded by this class.
+    """
+
+    @pytest.fixture()
+    def mock_rh(self):
+        from softae.drivers.mock_rh_controller import MockRHController
+        ctrl = MockRHController(name="rh_mock")
+        run(ctrl.connect())
+        return ctrl
+
+    def test_mock_safe_off_zeroes_duty_and_setpoint_and_running(self, mock_rh):
+        mock_rh.set_setpoint(45.0)
+        mock_rh.start()
+        mock_rh.status()                       # let the sim raise the duty
+
+        mock_rh.safe_off()
+
+        assert mock_rh._running is False
+        assert mock_rh._duty == 0.0
+        assert mock_rh._setpoint == 0.0
+
+    def test_mock_safe_off_is_a_superset_of_stop(self, mock_rh):
+        """``stop()`` leaves the setpoint standing; ``safe_off()`` does not."""
+        mock_rh.set_setpoint(45.0)
+        mock_rh.start()
+        mock_rh.stop()
+        assert mock_rh._setpoint == 45.0
+
+        mock_rh.set_setpoint(45.0)
+        mock_rh.safe_off()
+        assert mock_rh._setpoint == 0.0
+
+    def test_mock_stays_at_zero_duty_after_safe_off(self, mock_rh):
+        """``_update_sim`` gates on ``_running``, so nothing re-raises the duty."""
+        mock_rh.set_setpoint(45.0)
+        mock_rh.start()
+
+        mock_rh.safe_off()
+
+        assert mock_rh.status()["duty_cycle"] == 0.0
+        assert mock_rh.status()["duty_cycle"] == 0.0
+
+    def test_both_drivers_expose_safe_off_with_the_same_signature(self):
+        """The parity rule, made mechanical rather than asserted in prose."""
+        from softae.drivers.async_rh_controller import AsyncRHController
+        from softae.drivers.mock_rh_controller import MockRHController
+
+        assert (inspect.signature(AsyncRHController.safe_off)
+                == inspect.signature(MockRHController.safe_off))
+        assert AsyncRHController.last_safe_off_error == ""
+        assert MockRHController.last_safe_off_error == ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

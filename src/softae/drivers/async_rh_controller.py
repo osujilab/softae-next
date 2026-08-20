@@ -380,6 +380,76 @@ class AsyncRHController(BaseInstrument):
         self._stop_pid_loop()
         logger.info("rh_control_stopped")
 
+    #: Why the last :meth:`safe_off` could **not** write duty 0 — ``""`` when it
+    #: did. Declared on the class rather than assigned in ``__init__`` so this
+    #: entry point stays strictly additive: every instance reads the class
+    #: default until its first ``safe_off``, which is exactly right — no call,
+    #: no failure.
+    #:
+    #: It exists because :meth:`safe_off` must not raise (the park's contract is
+    #: never-raise) while a park that silently swallowed a dead port would report
+    #: *"humidifier off"* about a write that never landed —  the exact class of
+    #: falsehood ``SafeParkResult`` exists to remove. ``core.safe_park`` reads
+    #: this after the call and files the step under ``errors`` instead.
+    last_safe_off_error: str = ""
+
+    def safe_off(self) -> None:
+        """Stop the loop **and** write duty 0. The humidifier's safe state.
+
+        Not an alias for :meth:`stop`, and the park must never substitute one for
+        the other. :meth:`_stop_pid_loop` returns immediately when ``_running`` is
+        ``False``, so a process that connected, set a setpoint and never called
+        :meth:`start` writes **nothing** — leaving the Trinket at whatever duty a
+        previous session left it at. And when the loop *is* running, the
+        ``join(timeout=5.0)`` clears ``_thread``/``_running`` whether or not the
+        thread exited, so a loop wedged in an I²C read or a port reopen lets
+        ``stop()`` return cleanly having sent nothing. This method closes both by
+        writing the zero itself.
+
+        A duplicate zero is accepted deliberately: in the ordinary case the
+        exiting thread also writes ``0.0``, the value is idempotent, and a second
+        ``"0.0000\\n"`` costs one frame on a 115200-baud link. Suppressing it would
+        mean reading an outcome ``_stop_pid_loop`` does not report.
+
+        The stored setpoint is zeroed too, so a later bare :meth:`start` cannot
+        resume the pre-park target — ``_pid_loop`` re-reads ``_setpoint`` every
+        tick, so leaving it at 45 % would reactuate immediately.
+
+        Never raises, and never disconnects: the port stays open and the state
+        stays ``CONNECTED``, because a park runs while sessions are open and the
+        caller owns teardown. A failed write is reported through
+        :attr:`last_safe_off_error`.
+        """
+        self.last_safe_off_error = ""
+
+        # Stop first, then write: the reverse races a still-running loop, which
+        # writes a fresh PID output every poll period and would overwrite the zero.
+        self._stop_pid_loop()
+
+        with self._thread_lock:
+            self._setpoint = 0.0
+        if self._pid is not None:
+            self._pid.setpoint = 0.0
+
+        if self._serial is None:
+            # Never connected, or already disconnected. Nothing to write to —
+            # said out loud rather than reported as a successful park.
+            self.last_safe_off_error = (
+                "no serial transport — the humidifier could not be zeroed from "
+                "this process")
+            logger.warning("rh_safe_off_no_transport", instrument=self.name)
+            return
+
+        try:
+            self._send_duty(0.0)
+        except Exception as exc:
+            self.last_safe_off_error = str(exc)
+            logger.warning("rh_safe_off_send_failed", instrument=self.name,
+                           error=str(exc))
+            return
+
+        logger.info("rh_safe_off", instrument=self.name)
+
     def wait(
         self,
         target: float | None = None,

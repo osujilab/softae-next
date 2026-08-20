@@ -29,6 +29,7 @@
 20. [Shadow Campaign Review](#20-shadow-campaign-review)
 21. [Thickness Series](#21-thickness-series)
 22. [Equilibration Characterization](#22-equilibration-characterization)
+23. [Environment Hold — `softae-env`](#23-environment-hold--softae-env)
 
 ---
 
@@ -495,6 +496,7 @@ instruments.
 | `softae-shadow` | Arm and review a shadow campaign | [§20](#20-shadow-campaign-review) |
 | `softae-thickness` | Plan / record an unconfounded thickness series | [§21](#21-thickness-series) |
 | `softae-equilibration` | Measure σ(t) and derive the conditioning hold | [§22](#22-equilibration-characterization) |
+| `softae-env` | Hold the chamber at a humidity and measure nothing | [§23](#23-environment-hold--softae-env) |
 
 > **New commands need a reinstall.** Console scripts are generated at install time, so a
 > newly added entry point resolves only after `pip install -e .`. A "command not recognized"
@@ -502,17 +504,20 @@ instruments.
 > back to `python -m softae.tools.<name>`, which resolves whether or not a script was
 > generated.
 
-**All ten resolve in this venv, re-verified 2026-08-14** — each of the ten names above resolves
-to a generated `.exe` under `.venv/Scripts/`, and `softae-shadow --help` prints its three
-subcommands. `softae-shadow`, `softae-thickness` and `softae-equilibration` were added after
-the previous editable install and were module-only until it was refreshed; the refresh
-generated all three `.exe`s. Every section below names the console script first, with the
-module form given as the exact equivalent:
+**The first ten resolve in this venv, re-verified 2026-08-14** — each of those ten names
+resolves to a generated `.exe` under `.venv/Scripts/`, and `softae-shadow --help` prints its
+three subcommands. `softae-shadow`, `softae-thickness` and `softae-equilibration` were added
+after the previous editable install and were module-only until it was refreshed; the refresh
+generated all three `.exe`s. **`softae-env` is newer than that install** (added 2026-08-19) and
+has no `.exe` yet — use `python -m softae.tools.env_hold` until the editable install is
+re-run. Every section below names the console script first, with the module form given as the
+exact equivalent:
 
 ```bash
 softae-shadow --help          # equivalently: python -m softae.tools.shadow_review
 softae-thickness --help       #               python -m softae.tools.thickness
 softae-equilibration --help   #               python -m softae.tools.equilibration
+python -m softae.tools.env_hold --help        # softae-env, once the install is refreshed
 ```
 
 The module behind `softae-shadow` is **`shadow_review`**, not `shadow` — the one substitution
@@ -841,9 +846,21 @@ Both drive the *same* park sequence — there is deliberately no second path to 
 1. Retract dispenser head
 2. Stop all syringe pumps (0, 1, 2)
 3. Set temperature to 10 °C
-4. Turn lamp off
+4. Turn the humidifier off — PID loop stopped, duty 0
+5. Turn lamp off
 
 Each step is attempted even if others fail. A dialog reports success or lists any errors.
+
+**The humidifier joined the sequence on 2026-08-19.** Parking a rig that keeps humidifying is
+not a park, so every route through this sequence — E-Stop, Safe Exit, the window's X, a
+fault-class park and the unclean-shutdown recovery park at the next launch — now zeroes it. It
+sits between the heater and the lamp because ordering here only decides what has already been
+written if the process dies partway through: a latched heater outranks a latched humidifier,
+which outranks a lamp. The step is graded **commanded, never verified** — nothing reads the
+Trinket back — and an absent or disconnected RH controller is *skipped*, while a driver that
+exposes no way to turn off, or a duty write that failed, is reported as an **error** rather
+than passed over quietly. See [§23](#23-environment-hold--softae-env) for what a park still
+cannot reach.
 
 ### Safe Exit and the dispenser head
 
@@ -865,8 +882,8 @@ you are never asked about hardware whose state nothing actually knows.
 > left to decide — so the safe default applies. Safe Exit is the deliberate path, and being
 > asked is what earns the right to leave the head down.
 
-Only the head is negotiable. Pumps, temperature and lamp are parked unconditionally in both
-modes; a stop that skipped them would not be a park.
+Only the head is negotiable. Pumps, temperature, humidifier and lamp are parked unconditionally
+in both modes; a stop that skipped them would not be a park.
 
 If any subsystem fails to park, Safe Exit reports what failed and asks before closing —
 closing the window would remove your easiest way to see it.
@@ -2251,6 +2268,120 @@ Reading the groups:
 - **`-v` / `--verbose`** works on the top-level parser *and* on every subcommand, so
   `... -v run ...` and `... run -v ...` both take. It is genuinely noisy — the RH controller logs
   a duty cycle on every update.
+
+---
+
+## 23. Environment Hold — `softae-env`
+
+Every other shipped route to the humidifier bundles it into a measurement protocol: the only
+one is inside `softae-equilibration run`'s nine-to-fifteen-hour EIS characterization
+([§22](#22-equilibration-characterization)). An operator who simply wants a board conditioned
+at 45 %RH for four hours had no surface at all, and an ad-hoc script would take no rig claim,
+attach no watchdog, and restore nothing on the way out. `softae-env` is that surface — a hold
+that measures nothing.
+
+**One axis, deliberately.** There is no `--temp` and no heater is driven. `softae-equilibration
+run` already owns the temperature hold — approach timeout, tolerance band, watched hold,
+ambient restore — and a second copy here would be a second path to the same hardware. Chamber
+temperature is *reported* beside the humidity (one `get_TH` transaction returns both) because a
+humidity number without the air temperature is not actionable. Reporting is not driving.
+
+> **⚠ What no software here can close: a hard-killed host leaves the humidifier running.**
+> The RH Trinket latches its last PWM duty until something tells it otherwise, and **there is
+> no firmware deadman** — the Trinket's firmware is not in this repository, so this codebase has
+> no record of what is on the device and cannot add a timeout to it. Every clean exit, every
+> signal, every park and every fault-class stop **now** zeroes the duty, which narrows the
+> window to the paths where no Python runs at all: a `SIGKILL` / *End Task*, a power cut to the
+> host, or a blue screen. The next launch's unclean-shutdown recovery park zeroes it too — but
+> that may be hours later. **Until a firmware deadman exists, treat a hard-killed host as a
+> humidifier still running at its last duty, and check the chamber.**
+
+### Invocation
+
+```bash
+softae-env plan --rh 45 --duration-h 4                        # prints; opens nothing
+softae-env hold --rh 45 --duration-h 4 --execute              # the hold itself
+softae-env hold --rh 45 --execute --yes --quiet > hold.log    # unattended, until signalled
+softae-env hold --rh 45 --duration-s 600 --execute --mock     # no hardware, no rig claim
+```
+
+> **`python -m softae.tools.env_hold …` is the exact equivalent**, and is the form the tool
+> prints in its own suggested commands: whether a console script resolves is a fact about when
+> the venv was last installed from, not about the tool. `softae-env` was added **2026-08-19**,
+> after the last editable install, so it is **module-only until `pip install -e .` is re-run**.
+
+`plan` and `hold` take the same flags, so a plan can be turned into a run by changing one word
+and adding `--execute`.
+
+| Flag | Default | What it decides |
+|---|---|---|
+| `--rh PCT` | **required** | The setpoint. Validated against the driver's own cap at `set_setpoint` time; the tool does not re-implement it |
+| `--duration-s S` / `--duration-h H` | mutually exclusive; **both omitted ⇒ hold until signalled** | Until-signal is the honest default for an operator conditioning a board who will decide when to stop; a bounded hold is what a scripted invocation wants |
+| `--execute` | off | **Without it nothing is opened.** See below |
+| `--yes` / `-y` | off | Skips the typed confirmation, with a printed acknowledgement |
+| `--mock` | off | Simulated drivers, recording to an isolated `<project>/mock` store. Claims no rig |
+| `--project PATH` | `[data] project_dir` | Where the run is recorded |
+| `--quiet` | off | Drops the per-interval heartbeat line only; the plan, milestones and the final verdict still print |
+| `--heartbeat-s S` | 300 | Seconds between heartbeat lines. Sampling is independent of this — the watchdog is polled at its own configured cadence regardless |
+
+### Nothing actuates without three separate acts
+
+1. **`hold` is a dry run unless `--execute`.** Without it the tool prints the plan, says so, and
+   returns having opened no instrument and created no run row.
+2. **A typed confirmation.** The literal word `yes` — not `y`. It states the setpoint, the
+   duration (or "until interrupted"), and that the humidifier will actuate **unattended**.
+3. **`--yes` for scripts.** On a non-TTY there is nobody to type, so the prompt reads
+   end-of-input as a **decline** and exits 2. An unattended invocation that meant to run says so
+   with `--yes`.
+
+### The rig must be free
+
+A real hold claims the rig for itself as `tool:env-hold:<run_id>`, alongside every other
+claimant (the GUI, `softae-campaign`). If someone else holds it, the tool **refuses before it
+opens anything** — it checks the lock *before* the store exists, so a refusal over hardware this
+hold never touched leaves **no run row** behind to be mistaken for a hold that started and
+failed. It prints who holds the rig and exits **4**. Nothing was decided; the rig was occupied.
+
+`--mock` claims nothing and can neither be refused nor lock out a real run.
+
+### The watchdog alerts loudly and never stops the hold
+
+The RH watchdog from `[safety]` is attached with the same thresholds every other RH-watched run
+uses, and it writes durable alert rows to the DataStore. A sustained excursion — or a sensor
+that goes unreadable for the whole window — raises at **CRITICAL** and appears on the console.
+
+**It does not stop the hold, and that is the policy, not an omission.** A hold is a thing a
+human explicitly asked for and is watching the alerts on; a tool that switched a conditioning
+chamber off because the humidity was 6 % low for ten minutes would be worse than one that says
+so loudly and keeps going. Unreadable values render as `--` on the heartbeat line, never as
+`0.0` and never as a stale number, so a dropout is visible as a dropout.
+
+### Stopping: Ctrl-C is a clean zero
+
+**Ctrl-C** (and `SIGBREAK`) stops the hold the way it is meant to be stopped:
+
+1. the PID loop is stopped **and** duty 0 is written unconditionally — including the cases where
+   the loop was never started or is wedged past its join, where "stop" alone writes nothing;
+2. the verdict is printed **to stderr**, so `--quiet > hold.log` still shows on the terminal
+   whether the humidifier came off. A failed zero prints `!!!! HUMIDIFIER WAS NOT TURNED OFF`
+   and names the setpoint it may still be driving;
+3. the run row is finalized, the rig claim released, the instruments disconnected — in that
+   order, because a disconnected driver can no longer be zeroed.
+
+A **second** Ctrl-C during teardown is not a second park: the handler uninstalls itself, so the
+second one reaches the default handler and an operator watching a wedged teardown is not left
+with only Task Manager.
+
+| Exit | Meaning |
+|---|---|
+| 0 | Bounded hold reached its duration — or an *until-signal* hold was signalled, which is exactly what it was asked to do |
+| 1 | A bounded hold was interrupted early; or the driver refused (setpoint cap, comms, instrument error) |
+| 2 | The confirmation was declined — including end-of-input on a non-TTY without `--yes` |
+| 4 | The rig is held by someone else; nothing was opened |
+
+Every path finalizes the run row: `done`, `interrupted`, `aborted` or `error`. An interrupted
+until-signal hold exits 0 and still records `interrupted` — the status says nothing but a person
+decided the end, and the exit code says the tool did its job.
 
 ---
 

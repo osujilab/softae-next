@@ -392,7 +392,42 @@ def safe_park(
         except Exception as exc:
             result.errors.append(f"temperature: {exc}")
 
-    # 5. Lamp off.
+    # 5. Humidifier off. Not a new safe state — the operator ruled that parking
+    #    the humidifier means what the driver already does on a clean stop: duty
+    #    0. It sits between the heater and the lamp because ordering here only
+    #    decides what has already been written if the process dies mid-park, and
+    #    a latched heater outranks a latched humidifier, which outranks a lamp.
+    rh = _instrument(manager, "rh_controller", result)
+    if rh is not None:
+        off = getattr(rh, "safe_off", None)
+        if not callable(off):
+            # An error, not a silent skip — the same call `_halt_pumps` makes
+            # about a driver with no `halt_pump`. A registered RH driver that
+            # cannot be turned off is a finding, not a non-event. Deliberately
+            # not a fallback to `stop()`: that writes nothing at all when the
+            # loop was never started, and returns cleanly having written nothing
+            # when the loop is wedged past its join.
+            result.errors.append(
+                "rh_controller: driver exposes no safe_off() — the humidifier "
+                "was not zeroed")
+        else:
+            try:
+                off()
+                # `safe_off` never raises on a comms failure — that is this
+                # module's own never-raise contract read back into the driver —
+                # so without this the park would report a `commanded` write that
+                # never reached the Trinket. The driver records why; this reads it.
+                # Non-`str` means no report, so a driver predating the attribute
+                # (and a test double) is not accused of a failure it never had.
+                err = getattr(rh, "last_safe_off_error", "")
+                if isinstance(err, str) and err:
+                    result.errors.append(f"humidity: {err}")
+                else:
+                    result.commanded.append("humidifier off (PID stopped, duty 0)")
+            except Exception as exc:
+                result.errors.append(f"humidity: {exc}")
+
+    # 6. Lamp off.
     lamp = _instrument(manager, "lamp", result)
     if lamp is not None:
         try:

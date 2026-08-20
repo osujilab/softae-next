@@ -74,6 +74,27 @@ class MockRHController(BaseInstrument):
         self._running = False
         self._duty = 0.0
 
+    #: Parity with :attr:`AsyncRHController.last_safe_off_error`. Always ``""``
+    #: here — a simulated humidifier has no transport to fail — but present, and
+    #: present on the class for the same reason, so ``core.safe_park`` reads the
+    #: same attribute on either driver rather than branching on which it got.
+    last_safe_off_error: str = ""
+
+    def safe_off(self) -> None:
+        """Stop and zero — the mock's statement of the same safe state.
+
+        A superset of :meth:`stop`, which leaves ``_setpoint`` where it was.
+        ``create_manager`` falls back to this class for ``rh_controller`` and
+        ``safe_park`` cannot tell a mock from a real driver, so every mock-backed
+        park, every ``--mock`` tool run and the whole simulated campaign path
+        goes through here: a ``safe_off`` that accepted the call and did nothing
+        would make all of them pass while proving nothing.
+        """
+        self.last_safe_off_error = ""
+        self._running = False
+        self._duty = 0.0
+        self._setpoint = 0.0
+
     def wait(
         self,
         target: float | None = None,
