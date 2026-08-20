@@ -86,14 +86,24 @@ class AsyncRHController(BaseInstrument):
     ):
         super().__init__(name, config)
 
+        # Five keys are dual-spelled, long spelling PREFERRED, short name as
+        # fallback, code default last.  `softae_config.toml` documents
+        # `trinket_port` / `trinket_baud` / `pid_kp` / `pid_ki` / `pid_kd` under
+        # `[instruments.rh_controller]`, but this driver only ever read the short
+        # names and `factory.py` passes the section raw — so none of those five
+        # keys reached anything, and the rig ran the code-default kp = 0.008
+        # instead of the operator's tuned pid_kp = 0.007.  Reading them changes
+        # the physical loop response, which is the point.  See SESSION_MAIL
+        # [a69] and `rh_safe_state_and_hold_spec.md` §9.2.
+
         # Serial config
-        self._port: str = self.config.get("port", "COM11")
-        self._baud: int = int(self.config.get("baud", 115200))
+        self._port: str = self.config.get("trinket_port", self.config.get("port", "COM11"))
+        self._baud: int = int(self.config.get("trinket_baud", self.config.get("baud", 115200)))
 
         # PID config
-        self._kp: float = float(self.config.get("kp", 0.008))
-        self._ki: float = float(self.config.get("ki", 0.0015))
-        self._kd: float = float(self.config.get("kd", 0.05))
+        self._kp: float = float(self.config.get("pid_kp", self.config.get("kp", 0.008)))
+        self._ki: float = float(self.config.get("pid_ki", self.config.get("ki", 0.0015)))
+        self._kd: float = float(self.config.get("pid_kd", self.config.get("kd", 0.05)))
         self._out_min: float = float(self.config.get("out_min", 0.01))
         self._out_max: float = float(self.config.get("out_max", 1.0))
         self._poll_period: float = float(self.config.get("poll_period", 2.0))

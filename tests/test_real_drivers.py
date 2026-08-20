@@ -16,7 +16,9 @@ import asyncio
 import inspect
 import math
 import time
+import tomllib
 import types
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -24,6 +26,8 @@ import pytest
 
 from softae.errors import CommunicationError, ConnectionError_, SafetyError
 from softae.server.base_instrument import InstrumentState
+
+REPO = Path(__file__).resolve().parents[1]
 
 # Pre-import AsyncESPico at module level so it stays in sys.modules even
 # when patch.dict() contexts inside fixtures restore the snapshot.
@@ -295,6 +299,136 @@ class TestAsyncRHController:
         assert all(c[0][0] == self.ZERO for c in mock_ser.write.call_args_list)
         assert ctrl._running is False
         assert ctrl._setpoint == 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AsyncRHController — config key spellings ([a69])
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestAsyncRHControllerConfigKeys:
+    """The five dual-spelled ``[instruments.rh_controller]`` keys.
+
+    ``softae_config.toml`` documents ``trinket_port`` / ``trinket_baud`` /
+    ``pid_kp`` / ``pid_ki`` / ``pid_kd``; the driver historically read only
+    ``port`` / ``baud`` / ``kp`` / ``ki`` / ``kd``, so **none of the five
+    reached it** and the rig ran the code-default ``kp = 0.008`` rather than the
+    operator's tuned ``pid_kp = 0.007``.  See SESSION_MAIL ``[a69]`` and
+    ``rh_safe_state_and_hold_spec.md`` §9.2.
+    """
+
+    @pytest.fixture()
+    def build(self):
+        """``(build, pid_cls)`` — ``build(config, connect=…)`` → controller.
+
+        Serial and ``simple_pid`` are faked exactly as in
+        :class:`TestAsyncRHController`; ``pid_cls`` is the ``PID`` constructor
+        spy, which is where the gains actually have to land.
+        """
+        ser_mod = types.ModuleType("serial")
+        mock_ser = MagicMock()
+        mock_ser.is_open = True
+        ser_mod.Serial = MagicMock(return_value=mock_ser)
+
+        pid_mod = types.ModuleType("simple_pid")
+        pid_inst = MagicMock()
+        pid_inst.return_value = 0.5
+        pid_mod.PID = MagicMock(return_value=pid_inst)
+
+        def _build(config, *, connect=False):
+            with patch.dict("sys.modules", {"serial": ser_mod, "simple_pid": pid_mod}):
+                from softae.drivers.async_rh_controller import AsyncRHController
+                ctrl = AsyncRHController(
+                    name="rh_cfg_test",
+                    config=dict(config),
+                    rh_reader=lambda: 55.0,
+                )
+                if connect:
+                    run(ctrl.connect())
+            return ctrl
+
+        return _build, pid_mod.PID
+
+    LONG = {
+        "trinket_port": "COM77",
+        "trinket_baud": 57600,
+        "pid_kp": 0.007,
+        "pid_ki": 0.002,
+        "pid_kd": 0.04,
+    }
+
+    def test_rh_controller_long_spellings_reach_the_driver(self, build):
+        """The defect itself: the TOML's own spellings must be read."""
+        make, pid_cls = build
+        ctrl = make(self.LONG, connect=True)
+
+        assert ctrl._port == "COM77"
+        assert ctrl._baud == 57600
+        assert ctrl._kp == 0.007
+        assert ctrl._ki == 0.002
+        assert ctrl._kd == 0.04
+
+        # …and reaching the driver is not enough — the PID must be built with them.
+        kwargs = pid_cls.call_args.kwargs
+        assert (kwargs["Kp"], kwargs["Ki"], kwargs["Kd"]) == (0.007, 0.002, 0.04)
+
+    def test_rh_controller_short_names_still_reach_the_driver(self, build):
+        """Every existing caller and fixture passes the short names."""
+        make, _ = build
+        ctrl = make({"port": "COM42", "baud": 9600, "kp": 0.01, "ki": 0.003, "kd": 0.06})
+
+        assert ctrl._port == "COM42"
+        assert ctrl._baud == 9600
+        assert ctrl._kp == 0.01
+        assert ctrl._ki == 0.003
+        assert ctrl._kd == 0.06
+
+    def test_rh_controller_long_spelling_wins_over_short_name(self, build):
+        """Precedence is documented-long → short alias → code default."""
+        make, _ = build
+        ctrl = make({
+            **self.LONG,
+            "port": "COM1", "baud": 9600, "kp": 0.5, "ki": 0.5, "kd": 0.5,
+        })
+
+        assert ctrl._port == "COM77"
+        assert ctrl._baud == 57600
+        assert ctrl._kp == 0.007
+        assert ctrl._ki == 0.002
+        assert ctrl._kd == 0.04
+
+    def test_rh_controller_empty_config_yields_code_defaults(self, build):
+        """Neither spelling present → the values baked into ``__init__``."""
+        make, _ = build
+        ctrl = make({})
+
+        assert ctrl._port == "COM11"
+        assert ctrl._baud == 115200
+        assert ctrl._kp == 0.008
+        assert ctrl._ki == 0.0015
+        assert ctrl._kd == 0.05
+
+    def test_rh_controller_shipped_config_delivers_the_tuned_gain(self, build):
+        """The regression this claim exists for, against the file on disk.
+
+        ``factory.py`` passes the section raw, so the literal
+        ``[instruments.rh_controller]`` table is what the driver receives on the
+        rig.  ``_kp == 0.007`` is the whole point: before [a69] this asserted
+        ``0.008``, silently, for as long as the TOML has been spelled that way.
+        """
+        make, _ = build
+        section = tomllib.loads(
+            (REPO / "softae_config.toml").read_text(encoding="utf-8")
+        )["instruments"]["rh_controller"]
+        ctrl = make(section)
+
+        assert ctrl._kp == 0.007
+        assert ctrl._ki == section["pid_ki"]
+        assert ctrl._kd == section["pid_kd"]
+        assert ctrl._port == section["trinket_port"]
+        assert ctrl._baud == section["trinket_baud"]
+        # The two keys that were already spelled correctly must not regress.
+        assert ctrl._max_consecutive_failures == section["max_consecutive_failures"]
+        assert ctrl._max_stale_s == section["max_stale_s"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
