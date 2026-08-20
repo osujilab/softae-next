@@ -84,10 +84,26 @@ def test_a_non_bo_surface_can_host_the_whole_harness(host):
     """The point of P2.4: no BO apparatus required to drive the rig."""
     for name in (
         "_verify_head_position", "_board_exchange_gate", "_board_check_gate",
-        "_acquire_shutdown_block", "_release_shutdown_block",
-        "_preflight_overflow_ok", "_execute_campaign", "_release_board_gates",
+        "_refuse_if_rig_busy", "_preflight_overflow_ok",
+        "_hand_over_to_a_detached_campaign", "_release_board_gates",
     ):
         assert hasattr(host, name), name
+
+
+def test_the_harness_no_longer_runs_a_campaign_in_this_process(host):
+    """Step J's whole point, pinned introspectively.
+
+    ``_execute_campaign`` drove the loop on a daemon thread over this process's
+    own instrument sessions, which cost the run its lock identity and put two
+    processes on one serial bus. Its absence is what the handover replaced it
+    with; a later "simplification" that restores it would undo the step, so the
+    absence is asserted rather than merely intended. Same for the OS-shutdown
+    block, which hung on *this* window's HWND and so protected nothing once the
+    campaign stopped living here.
+    """
+    for gone in ("_execute_campaign", "_acquire_shutdown_block",
+                 "_release_shutdown_block", "_rig_run"):
+        assert not hasattr(host, gone), gone
 
 
 class TestBoardGates:
@@ -263,75 +279,244 @@ class TestPreflight:
         assert host._preflight_overflow_ok(object()) is True
 
 
-class TestShutdownBlock:
-    def test_acquire_and_release_never_raise(self, host):
-        """Best-effort: a failure here must not take down a campaign."""
-        host._acquire_shutdown_block("c")
-        host._release_shutdown_block()
+class TestHandover:
+    """The campaign is prepared here and *run somewhere else* (S5.J).
 
-    def test_release_without_acquire_is_a_no_op(self, host):
-        host._release_shutdown_block()
+    These replace ``TestExecution`` and ``TestShutdownBlock``, which asserted a
+    contract that no longer exists: the harness ran the loop in this process on a
+    daemon thread and blocked OS shutdown on this window's HWND. Both were
+    written around ``_execute_campaign``, so they are rewritten rather than
+    deleted — the behaviour they described moved, it did not stop mattering.
+    """
 
+    @staticmethod
+    def _spec():
+        from softae.core.autonomous_wiring import CampaignSpec
 
-class TestExecution:
-    def test_execute_reports_the_result_and_releases_the_block(
-        self, host, monkeypatch
-    ):
-        import softae.core.autonomous_wiring as wiring
-        from softae.core.autonomous_wiring import CampaignResult
+        return CampaignSpec(
+            name="handover", channels=(1,),
+            parameter_space={"vol_p0": {"type": "float", "low": 5.0, "high": 30.0}},
+            vol_params=("vol_p0",), pump_ids=(0,), budget=2)
 
-        released: list[bool] = []
+    @staticmethod
+    def _arm(host, monkeypatch, *, released=None, spawned=None, lock=None):
+        """Drive the handover synchronously and let nothing reach the rig.
+
+        The scheduler is replaced because the real one needs the qasync loop the
+        GUI runs on; the lock reader and the spawn are replaced because this test
+        must not read the operator's live rig lock or start a process.
+        """
+        import asyncio
+
+        import softae.gui.campaign_launch as launch
+
+        released = [] if released is None else released
+        spawned = [] if spawned is None else spawned
         monkeypatch.setattr(
-            host, "_release_shutdown_block", lambda: released.append(True))
+            host, "_schedule",
+            lambda coro, done: done(asyncio.run(coro) is None))
+        monkeypatch.setattr("softae.core.rig_session.release_rig_session",
+                            lambda *a, **k: released.append(True) or True)
+        monkeypatch.setattr("softae.core.run_lock.read_run_lock",
+                            lambda *a, **k: lock)
+        monkeypatch.setattr(
+            launch, "spawn_campaign",
+            lambda argv, *, log_file: spawned.append((argv, log_file)) or 31337)
+        monkeypatch.setattr(
+            QMessageBox, "information",
+            staticmethod(lambda *a, **k: QMessageBox.StandardButton.Ok))
 
-        async def fake_run(spec, **kw):
-            return CampaignResult(
-                run_id="r1", best_params={}, best_objective=1.25, n_trials=3,
-                final_state="CONVERGED", converged=True, history=[])
+    def test_handover_writes_a_spec_file_and_spawns_a_child(
+        self, panel_host, monkeypatch
+    ):
+        spawned: list = []
+        self._arm(panel_host, monkeypatch, spawned=spawned)
 
-        monkeypatch.setattr(wiring, "run_autonomous_campaign", fake_run)
+        assert panel_host._hand_over_to_a_detached_campaign(self._spec()) is True
 
-        class _Spec:
-            name = "c"
+        written = sorted((panel_host._project_dir() / "launched").glob("*.toml"))
+        assert len(written) == 1
+        assert spawned and str(written[0]) in spawned[0][0]
 
-        result = host._execute_campaign(
-            _Spec(), on_event=lambda e: None, aborted_exc=RuntimeError)
+    def test_handover_argv_is_the_cli_command_a_terminal_would_run(
+        self, panel_host, monkeypatch
+    ):
+        """One entry point. A GUI-only launch path is one that can drift."""
+        spawned: list = []
+        self._arm(panel_host, monkeypatch, spawned=spawned)
+        panel_host._hand_over_to_a_detached_campaign(self._spec())
 
-        assert result is not None and result.n_trials == 3
-        assert host.done and host.done[0][0] is True
-        assert released == [True]
+        argv = spawned[0][0]
+        assert argv[:3] == ["-m", "softae.tools.campaign", "run"]
+        assert "--project" in argv
+        # The child's stdin is DEVNULL, so an un-pre-approved prompt is a refusal
+        # and an unstated head position is a refusal to start at all.
+        assert "--yes" in argv
+        assert "--head-up" in argv or "--head-down" in argv
 
-    def test_a_failing_campaign_reports_failure_not_a_crash(self, host, monkeypatch):
-        import softae.core.autonomous_wiring as wiring
+    def test_handover_releases_the_rig_before_it_spawns(
+        self, panel_host, monkeypatch
+    ):
+        """Disconnect *and* give the claim back — the child acquires its own."""
+        order: list[str] = []
+        import asyncio
 
-        async def boom(spec, **kw):
-            raise ValueError("instrument exploded")
+        import softae.gui.campaign_launch as launch
 
-        monkeypatch.setattr(wiring, "run_autonomous_campaign", boom)
+        async def _disconnect():
+            order.append("disconnect")
 
-        class _Spec:
-            name = "c"
+        monkeypatch.setattr(panel_host._manager, "disconnect_all", _disconnect)
+        monkeypatch.setattr(
+            panel_host, "_schedule",
+            lambda coro, done: done(asyncio.run(coro) is None))
+        monkeypatch.setattr("softae.core.rig_session.release_rig_session",
+                            lambda *a, **k: order.append("release") or True)
+        monkeypatch.setattr("softae.core.run_lock.read_run_lock",
+                            lambda *a, **k: None)
+        monkeypatch.setattr(launch, "spawn_campaign",
+                            lambda argv, *, log_file: order.append("spawn") or 7)
+        monkeypatch.setattr(QMessageBox, "information",
+                            staticmethod(lambda *a, **k: None))
 
-        assert host._execute_campaign(
-            _Spec(), on_event=lambda e: None, aborted_exc=RuntimeError) is None
-        assert host.done and host.done[0][0] is False
-        assert "exploded" in host.done[0][1]
+        panel_host._hand_over_to_a_detached_campaign(self._spec())
+        assert order == ["disconnect", "release", "spawn"]
 
-    def test_abort_is_reported_as_success_not_error(self, host, monkeypatch):
-        """An operator-requested stop is not a failure."""
-        import softae.core.autonomous_wiring as wiring
+    def test_handover_refuses_to_spawn_while_an_instrument_is_still_connected(
+        self, panel_host, monkeypatch
+    ):
+        """Two processes on one set of ports is the collision the lock prevents."""
+        spawned: list = []
+        self._arm(panel_host, monkeypatch, spawned=spawned)
+        monkeypatch.setattr(
+            panel_host._manager, "list_instruments",
+            lambda: [{"name": "syringe", "connected": True}])
+        shown: list[str] = []
+        monkeypatch.setattr(
+            QMessageBox, "critical",
+            staticmethod(lambda p, t, text, *a, **k: shown.append(text)))
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            staticmethod(lambda *a, **k: QMessageBox.StandardButton.Ok))
 
-        class _Aborted(Exception):
-            pass
+        panel_host._hand_over_to_a_detached_campaign(self._spec())
+        assert spawned == []
+        assert "NOT started" in shown[0]
 
-        async def aborted(spec, **kw):
-            raise _Aborted()
+    def test_handover_refuses_to_spawn_while_this_process_still_claims_the_rig(
+        self, panel_host, monkeypatch
+    ):
+        """A surviving claim means the child's own acquire would be refused."""
+        spawned: list = []
+        self._arm(panel_host, monkeypatch, spawned=spawned,
+                  lock=_foreign_lock(pid=1, what="gui:desktop"))
+        shown: list[str] = []
+        monkeypatch.setattr(
+            QMessageBox, "critical",
+            staticmethod(lambda p, t, text, *a, **k: shown.append(text)))
 
-        monkeypatch.setattr(wiring, "run_autonomous_campaign", aborted)
+        panel_host._hand_over_to_a_detached_campaign(self._spec())
+        assert spawned == []
+        assert "still claimed" in shown[0]
 
-        class _Spec:
-            name = "c"
+    def test_handover_asks_before_disconnecting_and_a_refusal_starts_nothing(
+        self, panel_host, monkeypatch
+    ):
+        spawned: list = []
+        self._arm(panel_host, monkeypatch, spawned=spawned)
+        monkeypatch.setattr(
+            panel_host._manager, "list_instruments",
+            lambda: [{"name": "syringe", "connected": True}])
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            staticmethod(lambda *a, **k: QMessageBox.StandardButton.Cancel))
 
-        assert host._execute_campaign(
-            _Spec(), on_event=lambda e: None, aborted_exc=_Aborted) is None
-        assert host.done == [(True, "aborted")]
+        assert panel_host._hand_over_to_a_detached_campaign(self._spec()) is False
+        assert spawned == []
+
+    def test_a_spec_a_file_cannot_carry_is_refused_rather_than_launched(
+        self, panel_host, monkeypatch
+    ):
+        """The cost of shelling out, stated where the operator meets it.
+
+        A composition campaign written to TOML reloads with no
+        ``general_formulation`` *and* no ``vol_params``, so the child would search
+        the composition axes as raw µL volumes and raise nothing. The launch is
+        refused, and the panel state — which is lossless — is written.
+        """
+        spawned: list = []
+        self._arm(panel_host, monkeypatch, spawned=spawned)
+        shown: list[str] = []
+        monkeypatch.setattr(
+            QMessageBox, "warning",
+            staticmethod(lambda p, t, text, *a, **k: shown.append(text)))
+
+        spec = self._spec()
+        object.__setattr__(spec, "prior_mean", lambda params: 0.0)
+
+        assert panel_host._hand_over_to_a_detached_campaign(spec) is False
+        assert spawned == []
+        assert "prior_mean" in shown[0]
+        assert list((panel_host._project_dir() / "launched").glob("*")) == []
+        assert len(list((panel_host._project_dir() / "rejected").glob("*.json"))) == 1
+
+    def test_the_unwritable_refusal_does_not_tell_the_operator_to_retry(
+        self, panel_host, monkeypatch
+    ):
+        """The rig-busy paragraph would; this refusal is not about the rig.
+
+        ``PreservedLaunch.describe`` says "press Run again once the rig is free"
+        and "relaunching it through this tab is the only way" — both written for
+        a *busy* rig, and both false here. Pressing Run will refuse forever, and
+        the tab runs nothing.
+        """
+        self._arm(panel_host, monkeypatch)
+        shown: list[str] = []
+        monkeypatch.setattr(
+            QMessageBox, "warning",
+            staticmethod(lambda p, t, text, *a, **k: shown.append(text)))
+
+        spec = self._spec()
+        object.__setattr__(spec, "prior_mean", lambda params: 0.0)
+        panel_host._hand_over_to_a_detached_campaign(spec)
+
+        assert "once the rig is free" not in shown[0]
+        assert "only way to run the campaign" not in shown[0]
+        assert "Waiting will not help" in shown[0]
+        # …but the setup is still preserved and the file is still named.
+        saved = next((panel_host._project_dir() / "rejected").glob("*.json"))
+        assert str(saved) in shown[0]
+
+    def test_an_unreadable_head_belief_refuses_rather_than_guessing(
+        self, panel_host, monkeypatch
+    ):
+        """The loop drives the head conditionally; a guess costs one wrong flip."""
+        spawned: list = []
+        self._arm(panel_host, monkeypatch, spawned=spawned)
+        monkeypatch.setattr(panel_host, "_head_state_after_gate", lambda: None)
+        monkeypatch.setattr(QMessageBox, "critical",
+                            staticmethod(lambda *a, **k: None))
+
+        assert panel_host._hand_over_to_a_detached_campaign(self._spec()) is False
+        assert spawned == []
+
+    def test_a_failed_spawn_says_the_instruments_were_released(
+        self, panel_host, monkeypatch
+    ):
+        """The one state the operator cannot see for themselves: nothing runs,
+        and the ports this window used to hold are now open to nobody."""
+        import softae.gui.campaign_launch as launch
+
+        self._arm(panel_host, monkeypatch)
+
+        def boom(argv, *, log_file):
+            raise OSError("no such interpreter")
+
+        monkeypatch.setattr(launch, "spawn_campaign", boom)
+        shown: list[str] = []
+        monkeypatch.setattr(
+            QMessageBox, "critical",
+            staticmethod(lambda p, t, text, *a, **k: shown.append(text)))
+
+        panel_host._hand_over_to_a_detached_campaign(self._spec())
+        assert "released" in shown[0] and "Init tab" in shown[0]

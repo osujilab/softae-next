@@ -1,8 +1,9 @@
 """GUI tests for the Live BO Campaign tab (uses the session ``qapp`` fixture).
 
-Kept fast: no full mock campaign runs in the default suite.  The worker wiring
-is exercised by monkeypatching ``run_autonomous_campaign``; a real end-to-end
-smoke is marked ``slow`` and kept tiny.
+Kept fast: nothing here starts a campaign. Since S5.J the tab does not run one —
+it writes a spec, hands the rig over and spawns a detached child — so the launch
+is exercised by intercepting the spawn, and the *attached* half by fabricating a
+run directory and letting the tab read it the way it would read a real one.
 """
 
 from __future__ import annotations
@@ -15,9 +16,9 @@ pytest.importorskip("PySide6")
 
 from PySide6.QtWidgets import QMessageBox
 
-from softae.core.autonomous_wiring import CampaignResult, CampaignSpec
+from softae.core.autonomous_wiring import CampaignSpec
+from softae.core.run_lock import RunLock
 from softae.drivers.mock_factory import create_mock_manager
-from softae.gui.tabs import tab_bo_live
 from softae.gui.tabs._bo_base import BOTabBase
 from softae.gui.tabs.tab_bo_live import LiveBOCampaignTab
 from softae.gui.tabs.tab_bo_simulator import BOSimulatorTab
@@ -26,6 +27,31 @@ from softae.gui.tabs.tab_bo_simulator import BOSimulatorTab
 @pytest.fixture
 def manager():
     return create_mock_manager(config={})
+
+
+def _arm_handover(tab, monkeypatch, *, spawned=None, lock=None):
+    """Let the handover run end-to-end without touching the rig or the OS.
+
+    The scheduler needs the GUI's qasync loop in production, the lock read is the
+    machine's real one, and the spawn starts a process — all three are replaced,
+    and nothing else about the path is.
+    """
+    import asyncio
+
+    import softae.gui.campaign_launch as launch
+
+    spawned = [] if spawned is None else spawned
+    monkeypatch.setattr(tab, "_schedule",
+                        lambda coro, done: done(asyncio.run(coro) is None))
+    monkeypatch.setattr("softae.core.rig_session.release_rig_session",
+                        lambda *a, **k: True)
+    monkeypatch.setattr("softae.core.run_lock.read_run_lock", lambda *a, **k: lock)
+    monkeypatch.setattr(launch, "spawn_campaign",
+                        lambda argv, *, log_file: spawned.append((argv, log_file))
+                        or 24680)
+    monkeypatch.setattr(QMessageBox, "information",
+                        staticmethod(lambda *a, **k: None))
+    return spawned
 
 
 # ── Construction & config ──────────────────────────────────────────────────
@@ -198,54 +224,212 @@ def test_config_roundtrip_panel_state(qapp, manager):
     assert spec.channels == (2, 4)
 
 
-# ── Worker wiring (monkeypatched — no real campaign) ───────────────────────
+# ── Launching: the campaign leaves this process (S5.J) ─────────────────────
 
 
-def test_run_campaign_wiring(qapp, manager, monkeypatch):
-    events: list[dict] = []
+class TestTheCampaignShellsOut:
+    """Run no longer means "start a thread"; it means "hand the rig over".
 
-    async def fake_run(spec, **kwargs):
-        on_event = kwargs["on_event"]
-        on_event({"type": "run_started", "run_id": "r1", "spec": spec.name})
-        on_event({
-            "type": "result", "iteration": 1,
-            "params": {"vol_p0": 10.0, "vol_p1": 10.0}, "objective": 0.5,
-        })
-        events.append({"manager": kwargs.get("manager")})
-        return CampaignResult(
-            run_id="r1", best_params={"vol_p0": 10.0, "vol_p1": 10.0},
-            best_objective=0.5, n_trials=1, final_state="CONVERGED",
-            converged=True, history=[],
+    ``test_run_campaign_wiring`` used to live here. It drove ``_run_campaign``,
+    asserted the loop received *this window's* manager, and read the convergence
+    buffers filled by the in-process ``on_event`` callback. All three describe
+    the execution path this step removes, so the case is rewritten rather than
+    deleted: the same three questions are asked of the new path — what was
+    started, what it was given, and how the tab learns what it did.
+    """
+
+    @staticmethod
+    def _tab(manager, tmp_path):
+        from types import SimpleNamespace
+
+        return LiveBOCampaignTab(
+            manager, data_store=SimpleNamespace(project_dir=tmp_path))
+
+    def test_on_run_spawns_a_child_instead_of_starting_a_worker_thread(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        tab = self._tab(manager, tmp_path)
+        spawned = _arm_handover(tab, monkeypatch)
+        monkeypatch.setattr(tab, "_verify_head_position", lambda *a, **k: True)
+        threads: list = []
+        monkeypatch.setattr(tab, "_start_worker",
+                            lambda *a, **k: threads.append(a))
+
+        tab._on_run()
+
+        assert threads == []
+        assert tab._thread is None
+        assert len(spawned) == 1
+
+    def test_on_run_writes_the_spec_the_child_is_started_from(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        from softae.core.campaign_spec_io import load_campaign_spec
+
+        tab = self._tab(manager, tmp_path)
+        spawned = _arm_handover(tab, monkeypatch)
+        monkeypatch.setattr(tab, "_verify_head_position", lambda *a, **k: True)
+        tab._le_name.setText("bench_run")
+        tab._spin_budget.setValue(11)
+
+        tab._on_run()
+
+        written = sorted((tmp_path / "launched").glob("*.toml"))
+        assert len(written) == 1
+        assert str(written[0]) in spawned[0][0]
+        # The child runs what is on screen, or the launch is refused (below).
+        reloaded = load_campaign_spec(written[0])
+        assert reloaded.name == "bench_run" and reloaded.budget == 11
+
+    def test_on_run_declining_the_head_gate_starts_nothing(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        tab = self._tab(manager, tmp_path)
+        spawned = _arm_handover(tab, monkeypatch)
+        monkeypatch.setattr(tab, "_verify_head_position", lambda *a, **k: False)
+        tab._on_run()
+        assert spawned == []
+        assert not (tmp_path / "launched").exists()
+
+    @staticmethod
+    def _composition_mode(tab, monkeypatch, *, stock_names=("PEO stock",
+                                                            "LiCl stock")):
+        """Put the tab in composition mode over a catalog made for this test.
+
+        The catalog is patched at :func:`softae.core.campaign_spec_fields.catalogs`
+        — the one seam the *loader* resolves stock names through — so the round
+        trip the launch rests on is the real one rather than a stubbed answer.
+        """
+        import softae.core.campaign_spec_fields as fields
+        from softae.core.formulation import (
+            ChemicalCatalog,
+            Solution,
+            SolutionCatalog,
         )
 
-    # Patched at the source module: since P2.4 the campaign is launched from
-    # AutonomousRunMixin._execute_campaign, which imports this at call time.
-    import softae.core.autonomous_wiring as wiring
+        sol = SolutionCatalog()
+        for name in ("PEO stock", "LiCl stock"):
+            sol.add(Solution(name=name))
+        chem = ChemicalCatalog()
+        monkeypatch.setattr(fields, "catalogs", lambda: (chem, sol))
+        monkeypatch.setattr(
+            tab, "_load_stocks",
+            lambda: ({n: Solution(name=n) for n in stock_names},
+                     {n: i for i, n in enumerate(stock_names)}, chem))
+        tab._combo_search_mode.setCurrentIndex(1)
+        tab._axes_editor.add_axis("Molar ratio", a="EO", b="Li",
+                                  low="5", high="40")
 
-    monkeypatch.setattr(wiring, "run_autonomous_campaign", fake_run)
+    def test_a_composition_campaign_launches_now_that_a_file_can_carry_it(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        """The tab's headline mode, and it was unlaunchable.
 
-    tab = LiveBOCampaignTab(manager)
-    spec = tab._build_config()
-    tab._run_campaign(spec)  # synchronous on the test thread
+        ``general_formulation`` could not be written and the child is started
+        *from* a spec file, so composition mode guaranteed a refusal with no way
+        to run the campaign at all. The file carries declared axes and stock
+        names now — and the launch still rests on the round trip proving it, not
+        on a relaxed check.
+        """
+        from softae.core.campaign_spec_io import load_campaign_spec
 
-    assert events and events[0]["manager"] is manager
-    assert tab._result is not None
-    assert tab._result.best_objective == 0.5
-    # convergence buffers received the result event
-    assert tab._xs == [1.0]
-    assert tab._primary_series == [0.5]
+        tab = self._tab(manager, tmp_path)
+        spawned = _arm_handover(tab, monkeypatch)
+        monkeypatch.setattr(tab, "_verify_head_position", lambda *a, **k: True)
+        self._composition_mode(tab, monkeypatch)
 
+        tab._on_run()
 
-# ── Head-position start-gate ───────────────────────────────────────────────
+        assert len(spawned) == 1
+        written = sorted((tmp_path / "launched").glob("*.toml"))
+        gf = load_campaign_spec(written[0]).general_formulation
+        assert gf is not None, "the child must run the campaign on screen"
+        assert [ax.name for ax in gf.axes] == ["ratio_EO_Li"]
+        assert sorted(gf.stocks) == ["LiCl stock", "PEO stock"]
 
+    def test_a_composition_campaign_naming_an_unknown_stock_is_still_refused(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        """The refusal is not weakened, only narrowed to what is genuinely lost.
 
-def test_on_run_aborts_when_head_declined(qapp, manager, monkeypatch):
-    tab = LiveBOCampaignTab(manager)
-    monkeypatch.setattr(tab, "_verify_head_position", lambda: False)
-    started: list = []
-    monkeypatch.setattr(tab, "_start_worker", lambda *a, **k: started.append(a))
-    tab._on_run()
-    assert started == []  # campaign never started
+        A stock the catalog cannot resolve is a composition the solver cannot
+        turn into volumes, so the file does not carry the campaign — refused on a
+        free rig, with the panel state preserved, and **before the head gate**,
+        which prompts the operator and can issue a safety retract.
+        """
+        tab = self._tab(manager, tmp_path)
+        spawned = _arm_handover(tab, monkeypatch)
+        asked: list = []
+        monkeypatch.setattr(tab, "_verify_head_position",
+                            lambda *a, **k: asked.append(True) or True)
+        self._composition_mode(tab, monkeypatch, stock_names=("Unobtainium",))
+        shown: list[str] = []
+        monkeypatch.setattr(
+            QMessageBox, "warning",
+            staticmethod(lambda p, t, text, *a, **k: shown.append(text)))
+
+        tab._on_run()
+
+        assert spawned == []
+        assert asked == []
+        assert "general_formulation" in shown[0]
+        assert len(list((tmp_path / "rejected").glob("*.json"))) == 1
+        assert not (tmp_path / "launched").exists()
+
+    def test_the_spawned_child_is_recorded_without_a_way_to_stop_it(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        """The filed ``self._runner = None`` defect.
+
+        It was never reassigned, so ``_abort_run_impl``'s ``runner.abort()`` was
+        dead for this tab. It is assigned now — to a handle that deliberately has
+        no ``abort``, because the same code path runs from the window's
+        ``closeEvent``.
+        """
+        from softae.gui.campaign_launch import DetachedCampaign
+
+        tab = self._tab(manager, tmp_path)
+        _arm_handover(tab, monkeypatch)
+        monkeypatch.setattr(tab, "_verify_head_position", lambda *a, **k: True)
+
+        tab._on_run()
+
+        assert isinstance(tab._runner, DetachedCampaign)
+        assert tab._runner.pid == 24680
+        assert not hasattr(tab._runner, "abort")
+
+    def test_closing_the_window_does_not_stop_the_detached_campaign(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        """``MainWindow.closeEvent`` calls ``cleanup()`` on every runner tab.
+
+        Against an in-process run that was a cooperative abort. Against a
+        detached one it must be a no-op: the campaign is why the operator was
+        allowed to close the window in the first place.
+        """
+        import softae.core.campaign_events as events
+
+        tab = self._tab(manager, tmp_path)
+        _arm_handover(tab, monkeypatch)
+        monkeypatch.setattr(tab, "_verify_head_position", lambda *a, **k: True)
+        tab._on_run()
+
+        requests: list = []
+        monkeypatch.setattr(events, "write_control_request",
+                            lambda *a, **k: requests.append(a))
+
+        tab.cleanup()          # what the window does on the way out
+
+        assert requests == []          # no abort was asked for
+        assert tab._runner.pid == 24680
+
+    def test_the_tab_offers_no_in_process_abort_that_could_reach_nothing(
+        self, qapp, manager, tmp_path
+    ):
+        """A stop control that greys itself out and does nothing is worse than none."""
+        tab = self._tab(manager, tmp_path)
+        assert not hasattr(tab, "_btn_abort")
+        assert tab._campaign_controls is not None
 
 
 def test_verify_head_position_delegates(qapp, manager, monkeypatch):
@@ -262,6 +446,193 @@ def test_verify_head_position_delegates(qapp, manager, monkeypatch):
     assert tab._verify_head_position() is True
     assert seen["mgr"] is manager
     assert "campaign" in seen["context"]
+
+
+# ── Attaching: the tab follows a campaign it does not own (S5.J) ───────────
+
+
+class TestAttachedView:
+    """The tab reaches its own child by the path every other attach uses.
+
+    A channel that exists only for the GUI-started case is a second safety
+    posture, and the drift between two postures is what this step exists to end.
+    So there is nothing here that a colleague's terminal-started campaign would
+    not also get: the rig lock names the run directory, and the run directory
+    holds the transcript.
+    """
+
+    @staticmethod
+    def _run_dir(tmp_path, records):
+        """A run directory shaped exactly as the campaign narrator leaves one."""
+        from softae.core.campaign_events import EVENTS_FILENAME
+
+        run_dir = tmp_path / "runs" / "20260819T120000Z_demo"
+        run_dir.mkdir(parents=True)
+        (run_dir / EVENTS_FILENAME).write_text(
+            "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+        return run_dir
+
+    @staticmethod
+    def _holding(monkeypatch, run_dir, *, what="campaign:demo:20260819T120000Z_demo"):
+        """Make the rig lock say a campaign owns the rig, as a real child would."""
+        lock = RunLock(pid=98765, what=what,
+                       started_at="2026-08-19T12:00:00+00:00",
+                       host="another-host", log_path=str(run_dir))
+        monkeypatch.setattr("softae.core.campaign_discovery.read_run_lock",
+                            lambda *a, **k: lock)
+        return lock
+
+    def test_the_tab_attaches_through_the_shared_discovery_helper(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        """Patching the *shared* reader is what makes "one path" assertable."""
+        run_dir = self._run_dir(tmp_path, [
+            {"type": "run_started", "run_id": "20260819T120000Z_demo"},
+        ])
+        self._holding(monkeypatch, run_dir)
+        tab = LiveBOCampaignTab(manager)
+
+        tab._poll_campaign_stream()
+
+        assert tab._event_run_dir == str(run_dir)
+        assert any("run 20260819T120000Z_demo started" in line
+                   for line in tab._log.toPlainText().splitlines())
+
+    def test_the_tab_holds_no_private_pointer_at_the_campaign_it_started(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        """It cannot: the run id is minted inside the child.
+
+        So the "no privileged channel" rule is enforced by arithmetic rather than
+        by discipline — this window does not know the run directory until the
+        child publishes it on the lock, exactly like any other observer.
+        """
+        tab = LiveBOCampaignTab(manager,
+                                data_store=type("S", (), {"project_dir": tmp_path})())
+        _arm_handover(tab, monkeypatch)
+        monkeypatch.setattr(tab, "_verify_head_position", lambda *a, **k: True)
+        tab._on_run()
+
+        assert tab._event_run_dir is None
+        assert tab._campaign_controls._explicit_run_dir is None
+
+    def test_a_result_record_from_the_stream_drives_the_convergence_trace(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        run_dir = self._run_dir(tmp_path, [
+            {"type": "objective_resolved", "objective": "mean_abs_z",
+             "direction": "minimize"},
+            {"type": "result", "iteration": 1,
+             "params": {"vol_p0": 10.0, "vol_p1": 10.0}, "objective": 0.5},
+            {"type": "result", "iteration": 2,
+             "params": {"vol_p0": 12.0, "vol_p1": 9.0}, "objective": 0.9},
+        ])
+        self._holding(monkeypatch, run_dir)
+        tab = LiveBOCampaignTab(manager)
+
+        tab._poll_campaign_stream()
+
+        assert tab._xs == [1.0, 2.0]
+        # Direction read from the run, not from this panel: 0.9 is worse than
+        # 0.5 for a minimising campaign, so "best" must not move.
+        assert tab._maximize is False
+        assert tab._primary_series == [0.5, 0.5]
+
+    def test_a_second_poll_reads_only_what_is_new(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        from softae.core.campaign_events import EVENTS_FILENAME
+
+        run_dir = self._run_dir(tmp_path, [
+            {"type": "result", "iteration": 1, "params": {"a": 1.0}, "objective": 1.0},
+        ])
+        self._holding(monkeypatch, run_dir)
+        tab = LiveBOCampaignTab(manager)
+        tab._poll_campaign_stream()
+
+        with (run_dir / EVENTS_FILENAME).open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(
+                {"type": "result", "iteration": 2, "params": {"a": 2.0},
+                 "objective": 2.0}) + "\n")
+        tab._poll_campaign_stream()
+
+        assert tab._xs == [1.0, 2.0]          # not [1, 1, 2]
+
+    def test_a_lock_held_by_something_that_is_not_a_campaign_attaches_to_nothing(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        """A bench sequence publishes no transcript and offers no control channel."""
+        run_dir = self._run_dir(tmp_path, [{"type": "run_started", "run_id": "x"}])
+        self._holding(monkeypatch, run_dir, what="gui:desktop")
+        tab = LiveBOCampaignTab(manager)
+
+        tab._poll_campaign_stream()
+
+        assert tab._event_run_dir is None
+        assert tab._btn_run.isEnabled()
+
+    def test_a_live_campaign_disables_the_run_button_rather_than_racing_it(
+        self, qapp, manager, monkeypatch, tmp_path
+    ):
+        run_dir = self._run_dir(tmp_path, [{"type": "run_started", "run_id": "x"}])
+        self._holding(monkeypatch, run_dir)
+        tab = LiveBOCampaignTab(manager)
+
+        tab._poll_campaign_stream()
+        assert not tab._btn_run.isEnabled()
+
+    def test_an_unreadable_lock_leaves_the_tab_standing(
+        self, qapp, manager, monkeypatch
+    ):
+        def boom(*a, **k):
+            raise OSError("the lock file is on a share that went away")
+
+        monkeypatch.setattr("softae.core.campaign_discovery.read_run_lock", boom)
+        tab = LiveBOCampaignTab(manager)
+        tab._poll_campaign_stream()          # must not raise
+
+
+class TestEveryRecordIsShown:
+    """The filed missing-``else`` defect: ``park`` and ``safe_park`` were dropped.
+
+    They are the two records that say the rig stopped itself, and they fell
+    through a dispatcher whose last branch was ``run_finished``. So did every
+    record added to the campaign after the dispatcher was written.
+    """
+
+    def test_a_park_record_reaches_the_campaign_log(self, qapp, manager):
+        tab = LiveBOCampaignTab(manager)
+        tab._on_campaign_event({"type": "park", "reason": "RH gate never settled"})
+        assert "RH gate never settled" in tab._log.toPlainText()
+
+    def test_a_failed_safe_park_is_not_reported_as_a_completed_one(
+        self, qapp, manager
+    ):
+        tab = LiveBOCampaignTab(manager)
+        tab._on_campaign_event({"type": "safe_park", "ok": False,
+                                "errors": ["heater refused"]})
+        text = tab._log.toPlainText()
+        assert "INCOMPLETE" in text and "heater refused" in text
+
+    def test_a_record_this_window_does_not_know_is_shown_rather_than_dropped(
+        self, qapp, manager
+    ):
+        """An installed GUI meets records added after it shipped."""
+        tab = LiveBOCampaignTab(manager)
+        tab._on_campaign_event({"type": "settle_verdict", "ts": "t", "seq": 4,
+                                "verdict": "suspect"})
+        text = tab._log.toPlainText()
+        assert "settle_verdict" in text and "suspect" in text
+        assert "seq" not in text          # the envelope is not the message
+
+    def test_a_heartbeat_goes_to_the_status_line_not_the_log(self, qapp, manager):
+        """One every 30 s; a transcript that is mostly beats is one nobody reads."""
+        tab = LiveBOCampaignTab(manager)
+        before = tab._log.toPlainText()
+        tab._on_campaign_event({"type": "heartbeat", "phase": "anneal",
+                                "phase_age_s": 4210.0, "iteration": 3})
+        assert tab._log.toPlainText() == before
+        assert "anneal" in tab._lbl_status.text()
 
 
 # ── Single occupancy, and what a refusal costs (S5.I) ──────────────────────
@@ -304,10 +675,11 @@ class TestSingleOccupancyRefusal:
     ):
         tab = self._tab(qapp, manager, tmp_path)
         self._hold_rig(monkeypatch)
-        started: list = []
-        monkeypatch.setattr(tab, "_start_worker", lambda *a, **k: started.append(a))
+        handed: list = []
+        monkeypatch.setattr(tab, "_hand_over_to_a_detached_campaign",
+                            lambda *a, **k: handed.append(a) or True)
         tab._on_run()
-        assert started == []
+        assert handed == []
 
     def test_on_run_with_a_foreign_lock_never_reaches_the_head_gate(
         self, qapp, manager, monkeypatch, tmp_path
@@ -318,7 +690,8 @@ class TestSingleOccupancyRefusal:
         asked: list[bool] = []
         monkeypatch.setattr(tab, "_verify_head_position",
                             lambda *a, **k: asked.append(True) or True)
-        monkeypatch.setattr(tab, "_start_worker", lambda *a, **k: None)
+        monkeypatch.setattr(tab, "_hand_over_to_a_detached_campaign",
+                            lambda *a, **k: True)
         tab._on_run()
         assert asked == []
 
@@ -327,7 +700,8 @@ class TestSingleOccupancyRefusal:
     ):
         tab = self._tab(qapp, manager, tmp_path)
         shown = self._hold_rig(monkeypatch)
-        monkeypatch.setattr(tab, "_start_worker", lambda *a, **k: None)
+        monkeypatch.setattr(tab, "_hand_over_to_a_detached_campaign",
+                            lambda *a, **k: True)
         tab._on_run()
 
         rejected = tmp_path / "rejected"
@@ -346,7 +720,8 @@ class TestSingleOccupancyRefusal:
         tab._combo_search_mode.setCurrentIndex(1)
         tab._axes_editor.add_axis("Molar ratio", a="PEO", b="LiCl", low="5", high="40")
         shown = self._hold_rig(monkeypatch)
-        monkeypatch.setattr(tab, "_start_worker", lambda *a, **k: None)
+        monkeypatch.setattr(tab, "_hand_over_to_a_detached_campaign",
+                            lambda *a, **k: True)
         tab._on_run()
 
         rejected = tmp_path / "rejected"
@@ -369,7 +744,8 @@ class TestSingleOccupancyRefusal:
         tab._le_name.setText("phase_map")
         tab._spin_budget.setValue(23)
         self._hold_rig(monkeypatch)
-        monkeypatch.setattr(tab, "_start_worker", lambda *a, **k: None)
+        monkeypatch.setattr(tab, "_hand_over_to_a_detached_campaign",
+                            lambda *a, **k: True)
         tab._on_run()
 
         saved = next((tmp_path / "rejected").glob("*.json"))
@@ -384,17 +760,23 @@ class TestSingleOccupancyRefusal:
         assert (axes[0].a, axes[0].b, axes[0].low, axes[0].high) == (
             "PEO", "LiCl", 5.0, 40.0)
 
-    def test_a_free_rig_runs_the_campaign_as_before(
+    def test_a_free_rig_hands_the_campaign_over_rather_than_refusing_it(
         self, qapp, manager, monkeypatch, tmp_path
     ):
-        """The refusal must be reachable only from a live foreign lock."""
+        """The refusal must be reachable only from a live foreign lock.
+
+        Was ``..._runs_the_campaign_as_before``, which asserted a worker thread
+        started. Nothing runs in this process any more, so the same guarantee is
+        now stated against the handover.
+        """
         tab = self._tab(qapp, manager, tmp_path)
         monkeypatch.setattr("softae.core.run_lock.foreign_run_lock", lambda *a: None)
         monkeypatch.setattr(tab, "_verify_head_position", lambda *a, **k: True)
-        started: list = []
-        monkeypatch.setattr(tab, "_start_worker", lambda *a, **k: started.append(a))
+        handed: list = []
+        monkeypatch.setattr(tab, "_hand_over_to_a_detached_campaign",
+                            lambda *a, **k: handed.append(a) or True)
         tab._on_run()
-        assert started and not (tmp_path / "rejected").exists()
+        assert handed and not (tmp_path / "rejected").exists()
 
 
 # ── Concurrency invariant (Simulator + Live share a base, own their state) ──

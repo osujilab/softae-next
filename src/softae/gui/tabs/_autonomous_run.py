@@ -2,10 +2,10 @@
 
 `BOTabBase` already shares the *generic GUI* machinery between the two BO tabs —
 worker lifecycle, convergence plot, log pane, config save/load. What it never
-covered is the machinery for actually driving the rig unattended: the
-head-position start-gate, the two board gates, OS shutdown blocking, the overflow
-pre-flight, and campaign execution. All of that lived inside
-``LiveBOCampaignTab``.
+covered is the machinery for actually preparing an unattended run: the
+head-position start-gate, the board gates, the single-occupancy refusal, the
+overflow pre-flight, and the handover that starts the campaign. All of that lived
+inside ``LiveBOCampaignTab``.
 
 That made Live BO the *owner* of autonomous execution rather than one instance of
 it, so a second surface — the general Autonomous tab, or a headless CLI — would
@@ -14,6 +14,16 @@ weaker safety posture than the others. These gates are not incidental UI: the
 board-freshness prompt is what stops a resumed campaign re-casting into used
 wells, and the bounded waits are what stop an unanswered modal from holding a
 multi-day campaign open forever.
+
+**The campaign itself no longer runs here.** It is prepared here and then handed
+to a detached child, which owns the rig for the run's whole length and outlives
+the window that started it. What this mixin kept is the preparation — everything
+that must happen *before* the rig changes hands — and what it lost is the daemon
+thread that used to drive the loop over this process's own instrument sessions.
+The handover itself is :class:`~softae.gui.tabs._campaign_handover.CampaignHandoverMixin`,
+mixed in here so a host gets both from one base: it is a different kind of code
+(irreversible acts on ownership rather than questions put to an operator) and is
+kept separately reviewable for that reason.
 
 This mixin holds that harness so no surface owns it. It deliberately stops short
 of anything Bayesian — no parameter space, optimizer, or convergence plotting —
@@ -39,14 +49,21 @@ from softae.core.autonomous_loop import (
     BoardCheck,
     BoardDecision,
 )
+from softae.gui.tabs._campaign_handover import CampaignHandoverMixin
 
 logger = structlog.get_logger(__name__)
 
 
-class AutonomousRunMixin:
-    """Head gate, board gates, shutdown blocking, pre-flight, and execution."""
+class AutonomousRunMixin(CampaignHandoverMixin):
+    """Head gate, board gates, single occupancy, pre-flight, and the handover."""
 
     #: Worker → GUI modal marshalling. Declared here so every host gets them.
+    #:
+    #: Kept although the shipped campaign now answers its board gates headlessly
+    #: (a detached child has nobody to prompt, so a full board stops the run):
+    #: the marshalling is what any *attended* surface would need, and deleting it
+    #: would make the next one re-derive a bounded wait whose bound carries
+    #: safety meaning.
     _sig_board_prompt = Signal(int)          # board index
     _sig_board_check = Signal(int, object)   # board id, occupied set
 
@@ -59,8 +76,6 @@ class AutonomousRunMixin:
         self._board_check_decision: BoardCheck | None = None
         self._board_check_event = threading.Event()
         self._sig_board_check.connect(self._on_board_check_prompt)
-
-        self._shutdown_hwnd: int = 0
 
     # ── Head-position start-gate ─────────────────────────────────────────────
 
@@ -265,34 +280,6 @@ class AutonomousRunMixin:
         self._board_check_decision = BoardCheck.CANCEL
         self._board_check_event.set()
 
-    # ── OS shutdown blocking (best-effort, Windows) ──────────────────────────
-
-    def _acquire_shutdown_block(self, campaign_name: str) -> None:
-        """Ask the OS not to restart under a running campaign.
-
-        Best-effort — policy can override it — which is why it is one layer
-        alongside park-on-exit and unclean-shutdown detection at next launch.
-        """
-        try:
-            from softae.gui.shutdown_guard import block_shutdown
-
-            win = self.window()
-            hwnd = int(win.winId()) if win is not None else 0
-            self._shutdown_hwnd = hwnd
-            block_shutdown(hwnd, f"SoftAE is running the '{campaign_name}' campaign.")
-        except Exception:
-            logger.warning("shutdown_block_acquire_failed", exc_info=True)
-
-    def _release_shutdown_block(self) -> None:
-        try:
-            from softae.gui.shutdown_guard import unblock_shutdown
-
-            hwnd = getattr(self, "_shutdown_hwnd", 0)
-            if hwnd:
-                unblock_shutdown(hwnd)
-        except Exception:
-            logger.warning("shutdown_block_release_failed", exc_info=True)
-
     # ── Overflow pre-flight ─────────────────────────────────────────────────
 
     def _preflight_overflow_ok(self, spec) -> bool:
@@ -384,66 +371,8 @@ class AutonomousRunMixin:
         """
         return ", ".join(f"{k}={float(v):g}" for k, v in params.items())
 
-    # ── Execution ───────────────────────────────────────────────────────────
-
-    def _execute_campaign(self, spec, *, on_event, aborted_exc: type[Exception]):
-        """Worker thread: run the autonomous loop in a fresh event loop.
-
-        Returns the :class:`CampaignResult`, or ``None`` if the run aborted or
-        raised — in which case ``_sig_done`` has already been emitted, so the
-        caller has nothing left to report.
-        """
-        import asyncio
-
-        from softae.core.autonomous_wiring import run_autonomous_campaign
-
-        # Rebind the manager's per-instrument locks to THIS thread's event loop.
-        try:
-            self._manager.reset_locks()
-        except Exception:
-            pass
-
-        self._acquire_shutdown_block(spec.name)
-        # Claims the rig for the whole run (so the purge timer defers rather
-        # than competing) and returns it to idle rest on every exit path.
-        try:
-            with self._rig_run(f"campaign:{spec.name}"):
-                result = asyncio.run(
-                    run_autonomous_campaign(
-                        spec,
-                        manager=self._manager,
-                        data_store=self._data_store,
-                        objective_extractor=None,
-                        on_event=on_event,
-                        approval_fn=None,
-                        on_board_exchange=self._board_exchange_gate,
-                        on_board_check=self._board_check_gate,
-                    )
-                )
-            best = result.best_objective
-            best_txt = f"; best objective {best:.4g}" if best is not None else ""
-            self._sig_done.emit(
-                True,
-                f"{result.final_state.lower()} after {result.n_trials} trials{best_txt}",
-            )
-            return result
-        except aborted_exc:
-            self._sig_done.emit(True, "aborted")
-            return None
-        except Exception as exc:
-            logger.exception("autonomous_campaign_error", error=str(exc))
-            self._sig_done.emit(False, str(exc))
-            return None
-        finally:
-            self._release_shutdown_block()
-
-    def _rig_run(self, owner: str):
-        """The window's run wrapper — ownership + return-to-idle-rest.
-
-        Falls back to a no-op context if the host window does not provide it, so
-        the mixin stays usable in isolation (and in tests) without the GUI shell.
-        """
-        from contextlib import nullcontext
-
-        factory = getattr(self.window(), "rig_run", None)
-        return factory(owner) if callable(factory) else nullcontext()
+    # `_rig_run` is gone with the in-process execution it wrapped. It claimed
+    # `RigActivity` so the window's idle-purge timer deferred to the campaign,
+    # and restored idle rest afterwards — both of which now belong to the process
+    # that holds the sessions. `tab_experiment.py` keeps its own copy for the HT
+    # path, which still runs in this process and still needs it.

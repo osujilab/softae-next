@@ -198,9 +198,19 @@ class BOTabBase(DaemonRunnerMixin, QWidget):
     # ── Control bar (run / abort / status / progress / config / export) ──────
 
     def _make_control_bar(
-        self, *, run_label: str = "▶  Run", with_export: bool = True
+        self, *, run_label: str = "▶  Run", with_export: bool = True,
+        with_abort: bool = True,
     ) -> QWidget:
-        """Build the shared control bar; register buttons as ``self`` attributes."""
+        """Build the shared control bar; register buttons as ``self`` attributes.
+
+        ``with_abort=False`` omits the in-process Abort. It exists for a surface
+        whose run is **not** in this process: this button sets a cooperative flag
+        a worker thread reads, so against a detached campaign it would grey
+        itself out, log "stopping after current step", and reach nothing at all.
+        A stop control that reports success and does nothing is worse than an
+        absent one — the surface offers the request-based
+        :class:`~softae.gui.widgets.campaign_control.CampaignControlBar` instead.
+        """
         w = QWidget()
         v = QVBoxLayout(w)
         v.setContentsMargins(2, 2, 2, 2)
@@ -210,11 +220,12 @@ class BOTabBase(DaemonRunnerMixin, QWidget):
         self._btn_run.setFixedHeight(34)
         self._btn_run.clicked.connect(self._on_run)
         ctrl.addWidget(self._btn_run)
-        self._btn_abort = QPushButton("■  Abort")
-        self._btn_abort.setFixedHeight(34)
-        self._btn_abort.setEnabled(False)
-        self._btn_abort.clicked.connect(self._on_abort)
-        ctrl.addWidget(self._btn_abort)
+        if with_abort:
+            self._btn_abort = QPushButton("■  Abort")
+            self._btn_abort.setFixedHeight(34)
+            self._btn_abort.setEnabled(False)
+            self._btn_abort.clicked.connect(self._on_abort)
+            ctrl.addWidget(self._btn_abort)
         self._lbl_status = QLabel("Idle")
         self._lbl_status.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred

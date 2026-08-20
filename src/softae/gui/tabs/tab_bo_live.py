@@ -1,15 +1,30 @@
 """Tab: Live BO Campaign.
 
-Drives a **real** closed autonomous loop (``suggest → execute → analyze → tell``)
-via :func:`softae.core.autonomous_wiring.run_autonomous_campaign` over the
-:class:`~softae.server.manager.InstrumentManager`.  With the default mock
-manager every instrument is simulated, so the tab runs a fully functional
-closed loop out of the box; swapping in a real manager is a later config change.
+Configures a **real** closed autonomous loop (``suggest → execute → analyze →
+tell``), hands the rig to a detached child that runs it, and then attaches to
+that child like any other observer.
 
-Shares its daemon-worker plumbing, convergence canvas, log pane and
-button-state helpers with the offline BO Simulator via
-:class:`~softae.gui.tabs._bo_base.BOTabBase`.  All run state is per-instance, so
-a Live run and a Simulator run can execute concurrently in the background.
+**It does not run the campaign.** It used to — on a daemon thread, over this
+window's own :class:`~softae.server.manager.InstrumentManager` — and that cost
+the run its identity (the window's ``gui:desktop`` rig claim absorbed the
+campaign's own re-entrant acquire, so the lock never said which campaign was
+running or where its run directory was) and put two processes on one serial bus.
+Now the tab writes a spec file, releases the instruments, spawns
+``softae-campaign run`` detached (:mod:`softae.gui.campaign_launch`), and follows
+it through ``events.jsonl``. Closing the window does not stop the campaign; the
+stop that reaches it is
+:class:`~softae.gui.widgets.campaign_control.CampaignControlBar`, which writes a
+request into the run directory.
+
+The corollary is that **the tab attaches to its own child by the ordinary path** —
+:func:`softae.core.campaign_discovery.find_running_campaign`, reading the rig
+lock, exactly as it would for a campaign a colleague started from a terminal.
+There is no privileged channel for the GUI-started case, because a channel that
+exists only then is a second safety posture.
+
+Shares its convergence canvas, log pane and button-state helpers with the offline
+BO Simulator via :class:`~softae.gui.tabs._bo_base.BOTabBase`.  All run state is
+per-instance, so a Simulator run and an attached Live view stay independent.
 
 Two prior-informed BO hooks are exposed on the panel and wired into the
 :class:`~softae.core.autonomous_wiring.CampaignSpec`:
@@ -17,7 +32,15 @@ Two prior-informed BO hooks are exposed on the panel and wired into the
 * **Seed observations** — prior ``(params, value)`` points fed to the optimizer
   via ``tell`` before the loop (warm-start), loaded from a JSON file.
 * **Prior mean** — an optional physics model ``m(params) -> float`` the GP models
-  the residual from (a simple built-in "linear (demo)" stand-in is provided).
+  the residual from, chosen by name from
+  :data:`softae.optimizers.prior_means.PRIOR_MEAN_CHOICES`.
+
+Both, and composition mode's ``general_formulation``, are settings a spec file
+must be able to carry: the child is started *from* the file, so a field the file
+cannot say is a field this panel cannot run. The panel therefore offers only
+choices :mod:`softae.core.campaign_spec_fields` can write — a fixed registry of
+prior means, and composition targets **declared as axes** rather than handed over
+as a closure.
 """
 
 from __future__ import annotations
@@ -51,12 +74,19 @@ from PySide6.QtWidgets import (
 
 from softae.config.loader import default_pcb_name, pcb_configs
 from softae.core.autonomous_wiring import CampaignSpec, resolve_direction
+from softae.core.campaign_discovery import find_running_campaign
+from softae.core.campaign_events import EventCursor, read_events
 from softae.core.geometry import electrode_count
 from softae.errors import CampaignError
 from softae.gui.tabs._autonomous_run import AutonomousRunMixin
 from softae.gui.tabs._bo_base import BOTabBase
 from softae.gui.widgets.campaign_control import CampaignControlBar, outcome_note
 from softae.gui.widgets.composition_axes_editor import CompositionAxesEditor
+from softae.optimizers.prior_means import (
+    PRIOR_MEAN_CHOICES,
+    prior_mean_name,
+    resolve_prior_mean,
+)
 
 if TYPE_CHECKING:
     from softae.core.data_store import DataStore
@@ -74,21 +104,17 @@ logger = structlog.get_logger(__name__)
 #: follows whichever is chosen — see :func:`softae.core.autonomous_wiring.resolve_objective`.
 SEARCH_MODES = ["Raw volumes", "Composition targets"]
 
+#: How often the tab re-reads who holds the rig and what they have said since.
+#: Matches :class:`~softae.gui.widgets.campaign_control.CampaignControlBar`'s own
+#: cadence — the two are looking at the same lock and the same run directory, and
+#: two different periods would show the operator two ages of the same campaign.
+_STREAM_POLL_MS = 2000
 
-class _LiveAborted(Exception):
-    """Raised from the event stream to unwind the loop on a user abort."""
 
-
-def _linear_demo_prior(params: dict[str, Any]) -> float:
-    """A stand-in physics model: a deterministic weighted sum of the params.
-
-    Weights ascend with the sorted parameter name so the value is reproducible
-    regardless of dict ordering.  This demonstrates the residual-GP path (the GP
-    learns only the correction to this trend).
-    """
-    return float(
-        sum((i + 1) * float(v) for i, (_, v) in enumerate(sorted(params.items())))
-    )
+#: Picker label → registry key, from the one registry a spec file resolves
+#: against. Built here rather than typed here so a label the file cannot name
+#: cannot appear in the combo.
+_PRIOR_KEY_BY_LABEL = dict(PRIOR_MEAN_CHOICES)
 
 
 class LiveBOCampaignTab(AutonomousRunMixin, BOTabBase):
@@ -133,9 +159,23 @@ class LiveBOCampaignTab(AutonomousRunMixin, BOTabBase):
         self._scatter_c: list[float] = []
         self._scatter_dirty: bool = False
 
+        # Where in the attached campaign's transcript this tab has read to.
+        # ``None`` means "not following anything"; a run directory arriving on the
+        # poll below is what starts a replay from the beginning of the stream.
+        self._event_run_dir: str | None = None
+        self._event_cursor: EventCursor | None = None
+
         self._sig_point.connect(self._on_live_point)
 
         self._build_ui()
+
+        # The campaign this tab shows may start or end without the tab doing
+        # anything — a colleague's terminal run, this window's own child exiting
+        # — so ownership is polled rather than read once at launch.
+        self._stream_timer = QTimer(self)
+        self._stream_timer.setInterval(_STREAM_POLL_MS)
+        self._stream_timer.timeout.connect(self._poll_campaign_stream)
+        self._stream_timer.start()
 
     # ── UI construction ────────────────────────────────────────────────────
 
@@ -167,16 +207,18 @@ class LiveBOCampaignTab(AutonomousRunMixin, BOTabBase):
         wrap_v = QVBoxLayout(wrap)
         wrap_v.setContentsMargins(0, 0, 0, 0)
         wrap_v.addWidget(params, stretch=1)
-        # Live campaigns have no exportable JSON result object → no export button.
+        # Live campaigns have no exportable JSON result object → no export button,
+        # and no in-process Abort: the campaign runs in another process, so the
+        # cooperative flag that button sets would reach nothing while reporting
+        # "stopping after current step". The stop that works is below.
         wrap_v.addWidget(
-            self._make_control_bar(run_label="▶  Run Live Campaign", with_export=False)
+            self._make_control_bar(run_label="▶  Run Live Campaign",
+                                   with_export=False, with_abort=False)
         )
-        # Beside the in-process Abort, and deliberately not merged with it: that
-        # one is a flag this thread reads, and reaches nothing when the campaign
-        # is running in another process. This one is a request written to the
-        # run directory, which is the only thing that reaches a campaign we do
-        # not own. Campaign-scoped, so it belongs in the tab that surfaces the
-        # campaign; the rig-scale stop stays on the toolbar.
+        # The only stop this tab offers, and the only one that can work: a
+        # request written to the campaign's run directory, actioned inside the
+        # process that holds the sessions. Campaign-scoped, so it belongs in the
+        # tab that surfaces the campaign; the rig-scale stop stays on the toolbar.
         self._campaign_controls = CampaignControlBar(parent=wrap)
         self._campaign_controls.acknowledged.connect(self._on_control_ack)
         wrap_v.addWidget(self._campaign_controls)
@@ -436,9 +478,11 @@ class LiveBOCampaignTab(AutonomousRunMixin, BOTabBase):
         form = QFormLayout(grp)
 
         self._combo_prior = QComboBox()
-        self._combo_prior.addItems(["none", "linear (demo)"])
+        self._combo_prior.addItems([label for label, _ in PRIOR_MEAN_CHOICES])
         self._combo_prior.setToolTip(
-            "Prior mean m(params) → objective; the GP models the residual from it."
+            "Prior mean m(params) → objective; the GP models the residual from it.\n"
+            "Only built-in models are offered: the campaign runs from a spec file, "
+            "and a file can carry a prior mean by name but not a function."
         )
         form.addRow("Prior mean:", self._combo_prior)
 
@@ -518,11 +562,6 @@ class LiveBOCampaignTab(AutonomousRunMixin, BOTabBase):
     # Board gates live in AutonomousRunMixin — they carry safety meaning
     # (resume protection, bounded waits) and must not be per-tab.
 
-    def _on_abort(self) -> None:
-        # Release any pending board prompts so the worker unwinds on abort.
-        self._release_board_gates()
-        super()._on_abort()
-
     def _build_right(self) -> QWidget:
         from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
         from matplotlib.figure import Figure
@@ -595,7 +634,8 @@ class LiveBOCampaignTab(AutonomousRunMixin, BOTabBase):
     # ── config <-> UI ──────────────────────────────────────────────────────
 
     def _selected_prior_mean(self):
-        return _linear_demo_prior if self._combo_prior.currentText() == "linear (demo)" else None
+        key = _PRIOR_KEY_BY_LABEL.get(self._combo_prior.currentText(), "")
+        return resolve_prior_mean(key) if key else None
 
     def _read_parameter_space(self) -> tuple[dict[str, dict[str, Any]], tuple[str, ...]]:
         space: dict[str, dict[str, Any]] = {}
@@ -647,7 +687,11 @@ class LiveBOCampaignTab(AutonomousRunMixin, BOTabBase):
             catalog=chem_catalog,
             pump_assignment=pump_assignment,
             target_deposition_uL=self._spin_dep_uL.value(),
-            build_targets=self._axes_editor.build_targets_fn(),
+            # The axes, not a `build_targets` closure over them. The context
+            # derives the callable itself, so the two cannot drift — and the axes
+            # are what the spec file carries, which is what makes a composition
+            # campaign launchable at all.
+            axes=tuple(axes),
             # budget_uL is filled from the board's well capacity by
             # run_autonomous_campaign — the board is the authority on what fits.
         )
@@ -841,6 +885,13 @@ class LiveBOCampaignTab(AutonomousRunMixin, BOTabBase):
         if self._refuse_if_rig_busy(spec):
             return
 
+        # The other refusal, and it belongs beside the first for exactly the same
+        # reason: the campaign is started from a spec file now, so a campaign a
+        # spec file cannot carry is refused — and it must be refused *here*,
+        # before the head gate prompts anyone or retracts anything.
+        if self._refuse_if_spec_is_unwritable(spec):
+            return
+
         # Head-position start-gate (the autonomous loop drives the head via
         # conditional commands, so its belief must match reality first).
         if not self._verify_head_position():
@@ -873,36 +924,98 @@ class LiveBOCampaignTab(AutonomousRunMixin, BOTabBase):
         self._log.clear()
         self._progress.setRange(0, spec.budget)
         self._progress.setValue(0)
-        self._lbl_status.setText(f"Running — budget {spec.budget}")
+        self._lbl_status.setText("Handing the rig over…")
         self._sig_log.emit(
             f"Live campaign '{spec.name}' — {len(spec.parameter_space)} params, "
             f"channels {spec.channels}, budget {spec.budget}"
             + (f", {len(spec.seed_observations)} seed obs" if spec.seed_observations else "")
-            + (", prior=linear(demo)" if spec.prior_mean is not None else "")
+            + (f", prior={prior_mean_name(spec.prior_mean) or 'custom'}"
+               if spec.prior_mean is not None else "")
         )
         self._sig_log.emit(
             f"  objective: {metric} ({direction})"
             + ("" if spec.objective in ("", "auto") else "  [pinned]")
         )
-        self._start_worker(self._run_campaign, spec, name="live-bo")
+        if not self._hand_over_to_a_detached_campaign(spec):
+            self._lbl_status.setText("Idle")
 
-    def _run_campaign(self, spec: CampaignSpec) -> None:
-        """Worker thread: run the campaign through the shared harness."""
-        self._result = self._execute_campaign(
-            spec, on_event=self._on_campaign_event, aborted_exc=_LiveAborted,
-        )
+    def _on_campaign_spawned(self, child) -> None:
+        """The child is running. Record the handle and start following it.
+
+        ``self._runner`` is a :class:`~softae.gui.campaign_launch.DetachedCampaign`,
+        which deliberately has **no** ``abort()``: this is what
+        :meth:`~softae.gui.tabs._bo_base.BOTabBase._abort_run_impl` inspects, and
+        :meth:`~softae.gui.daemon_runner.DaemonRunnerMixin.cleanup` calls that on
+        the window's ``closeEvent``. A handle that *could* stop the run would stop
+        it every time the operator closed the window.
+
+        Nothing here tells the control bar where the child is. It cannot: the run
+        id is minted inside the child, so this process does not know the run
+        directory until the child has published it on the rig lock. Discovery is
+        therefore not a design preference here, it is the only thing that works —
+        which is a convenient way for the "no privileged channel" rule to be
+        enforced by arithmetic rather than by discipline.
+        """
+        self._runner = child
+        self._lbl_status.setText(f"Detached — PID {child.pid}")
+        self._btn_run.setEnabled(False)
+        QMessageBox.information(self, "Campaign running", child.describe())
+        self._poll_campaign_stream()
+
+    # ── Attached view: follow the campaign through its own transcript ────────
+
+    def _poll_campaign_stream(self) -> None:
+        """Re-read who holds the rig, then everything they have said since.
+
+        Discovery and reading are both total: ``find_running_campaign`` is the
+        one implementation the CLI and the control bar also use, and
+        :func:`~softae.core.campaign_events.read_events` never raises. A timer
+        that can take the tab down is worse than one that is briefly behind.
+        """
+        try:
+            target = find_running_campaign()
+        except Exception as exc:
+            logger.warning("campaign_discovery_failed", error=str(exc))
+            return
+
+        if not target.controllable:
+            self._event_run_dir = None
+            self._event_cursor = None
+            self._btn_run.setEnabled(True)
+            return
+
+        self._btn_run.setEnabled(False)
+        if target.run_dir != self._event_run_dir:
+            # A campaign this tab has not been following — its own child, or
+            # somebody else's terminal run. Replay it from the beginning rather
+            # than joining mid-stream: the convergence trace is only meaningful
+            # whole, and `read_events(cursor=None)` is exactly that replay.
+            self._event_run_dir = target.run_dir
+            self._event_cursor = None
+            self._best_obj = None
+            self._reset_convergence()
+            self._reset_scatter([])
+            self._log_line(f"▣ attached to {target.detail}")
+
+        events, self._event_cursor = read_events(
+            target.run_dir, cursor=self._event_cursor)
+        for record in events:
+            self._on_campaign_event(record)
 
     def _on_campaign_event(self, evt: dict[str, Any]) -> None:
-        """``on_event`` callback — runs on the WORKER thread.
+        """Render one record from the campaign's transcript.
 
-        Marshals to the GUI thread via the base signals only; never touches
-        widgets directly.  A cooperative abort unwinds the loop at the next
-        suggestion boundary.
+        Called on the GUI thread, from the poll above, with records
+        :class:`~softae.core.campaign_events.CampaignNarrator` wrote — which are
+        the same dicts the in-process ``on_event`` callback used to receive
+        (``record`` appends ``{"type": ..., **payload}`` verbatim), plus a
+        timestamp and a sequence number.
+
+        The base signals are still used for marshalling rather than touching
+        widgets here, because they coalesce the redraws.
         """
         etype = evt.get("type")
         if etype == "suggestion":
-            if self._abort_requested:
-                raise _LiveAborted()
             self._sig_log.emit(
                 f"  [{evt.get('iteration')}] suggest {self._fmt_params(evt.get('params', {}))}"
             )
@@ -947,6 +1060,41 @@ class LiveBOCampaignTab(AutonomousRunMixin, BOTabBase):
             )
         elif etype == "run_finished":
             self._sig_log.emit(f"■ run finished after {evt.get('n_trials')} trials")
+        elif etype == "objective_resolved":
+            # Read from the run rather than from this panel: an attached view may
+            # be following a campaign it did not configure, and tracking "best"
+            # with the wrong sign would draw a convergence curve that improves
+            # while the campaign gets worse.
+            self._maximize = str(evt.get("direction")) == "maximize"
+            self._sig_log.emit(
+                f"  objective: {evt.get('objective')} ({evt.get('direction')})")
+        elif etype == "park":
+            self._sig_log.emit(f"⛔ PARKED — {evt.get('reason')}")
+        elif etype == "safe_park":
+            ok = evt.get("ok")
+            self._sig_log.emit(
+                f"  park {'completed' if ok else 'INCOMPLETE'}"
+                + (f" — {evt.get('errors')}" if evt.get("errors") else "")
+            )
+        elif etype == "heartbeat":
+            # Thirty seconds apart and there is one per beat, so it goes to the
+            # status line rather than the log — a transcript in which every third
+            # line is "still alive" is one nobody reads to the end.
+            self._lbl_status.setText(
+                f"{evt.get('phase', 'running')} — {evt.get('phase_age_s', 0)}s "
+                f"(iteration {evt.get('iteration')})")
+        elif etype == "control_ack":
+            pass          # reported by CampaignControlBar → `_on_control_ack`
+        else:
+            # The filed defect this replaces: without a final branch, `park` and
+            # `safe_park` — the two records that say the rig stopped itself — were
+            # dropped in silence, and so was every record added to the campaign
+            # after this method was written. An unknown record is now *shown*,
+            # unglossed but present, because a transcript with a hole in it is
+            # indistinguishable from a campaign that had nothing to say.
+            body = {k: v for k, v in evt.items()
+                    if k not in ("type", "ts", "seq")}
+            self._sig_log.emit(f"  · {etype}{f' {body}' if body else ''}")
 
     @staticmethod
     def _fmt_params(params: dict[str, Any]) -> str:
@@ -965,7 +1113,12 @@ class LiveBOCampaignTab(AutonomousRunMixin, BOTabBase):
 
     def _on_live_point(self, params: dict[str, Any], obj: float) -> None:
         if len(self._scatter_axes) < 2:
-            return
+            # An attached view is given no spec, so the axes come from the first
+            # point the campaign reports rather than from this panel — which may
+            # be configured for something else entirely.
+            if len(params) < 2:
+                return
+            self._scatter_axes = tuple(sorted(params))[:2]
         xa, ya = self._scatter_axes[0], self._scatter_axes[1]
         self._scatter_x.append(float(params.get(xa, float("nan"))))
         self._scatter_y.append(float(params.get(ya, float("nan"))))
