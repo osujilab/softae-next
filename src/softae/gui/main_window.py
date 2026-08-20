@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import time
 from contextlib import contextmanager
 from typing import Callable
 
@@ -46,6 +47,7 @@ from softae.gui.widgets.deposition_panel import DepositionPanel
 from softae.gui.widgets.emergency_stop import EmergencyStopButton
 from softae.gui.widgets.instrument_poller import InstrumentPoller
 from softae.gui.widgets.monitor_sidebar import MonitorSidebar
+from softae.gui.widgets.purge_indicator import purge_indicator
 from softae.gui.widgets.rig_owner import foreign_rig_lock, owner_status_line
 from softae.gui.widgets.safe_exit import SafeExitButton
 from softae.gui.widgets.status_indicator import InstrumentStatusBar
@@ -176,6 +178,16 @@ class MainWindow(QMainWindow):
         self._idle_rest = IdleRestState()
         #: Held until an operator clears it; see :meth:`notify_parked`.
         self._park_latch: str | None = None
+        #: The last purge outcome that *said* something, and when. Retained
+        #: because the sidebar badge is permanent while the tick that produces
+        #: an outcome is every 30 s: without this the line could only ever show
+        #: the schedule, never what last happened. See
+        #: :meth:`_on_purge_tick` for which outcomes are worth keeping.
+        self._last_purge_outcome = None
+        self._last_purge_at: float | None = None
+        #: When the operator last acknowledged an overdue purge. Kept here
+        #: rather than in the badge so a widget cannot silence a live problem.
+        self._purge_acknowledged_at: float | None = None
         self._purge_runner = None
         self._purge_timer = None
         if self._purge_scheduler is not None:
@@ -380,6 +392,7 @@ class MainWindow(QMainWindow):
         self._sidebar = MonitorSidebar(self._manager, poller=self._poller, parent=self)
         self._sidebar.set_camera_worker(self._cam_worker)
         self._sidebar.set_webcam_worker(self._webcam_worker)
+        self._sidebar.purge_acknowledged.connect(self._on_purge_acknowledged)
 
         # Splitter: tabs (~85 %) | sidebar (~15 %)
         # Stored as an instance attribute so Python's GC never collects the
@@ -813,7 +826,7 @@ class MainWindow(QMainWindow):
     def _on_campaign_tick(self) -> None:
         """The window's campaign-facing tick. Never raises.
 
-        Three jobs, and the third is why it exists in *both* modes:
+        Four jobs, and the last two are why it exists in *both* modes:
 
         1. poll the campaign's event stream (attached only) and put its two
            strings into the sidebar's existing status slots;
@@ -822,7 +835,11 @@ class MainWindow(QMainWindow):
         3. refresh the park indicator. ``_on_purge_tick`` was its **only**
            periodic caller and the purge timer is not created in attach mode, so
            without this the "PARKED — CLEAR" control would never appear for
-           precisely the unattended, nobody-watching case it exists for.
+           precisely the unattended, nobody-watching case it exists for;
+        4. refresh the purge badge, for the same reason and one more: at 5 s
+           this tick is six times more responsive than the purge tick, and an
+           *overdue* purge grows continuously between ticks of the 30 s timer
+           rather than at them.
 
         Swallowed like the purge tick, and for the same reason: a background
         timer that can kill the GUI is worse than a stale label.
@@ -835,6 +852,7 @@ class MainWindow(QMainWindow):
                 self._sidebar.update_auto_status(stream.auto_status())
             self._refresh_rig_owner()
             self._refresh_park_indicator()
+            self._refresh_purge_indicator()
         except Exception:
             logger.warning("campaign_tick_failed", exc_info=True)
 
@@ -855,6 +873,50 @@ class MainWindow(QMainWindow):
             phase=None if stream is None else stream.phase,
             phase_age_s=None if stream is None else stream.phase_age_s,
         ))
+
+    def _refresh_purge_indicator(self) -> None:
+        """Render the sidebar's purge line. Decides nothing itself.
+
+        Two clocks have to agree for the overdue magnitude to mean anything:
+        :class:`~softae.core.purge.PurgeScheduler` measures its per-pump timers
+        with ``time.monotonic``, so the retention stamp and *now* are read from
+        the same source.
+        """
+        sidebar = getattr(self, "_sidebar", None)
+        if sidebar is None:
+            return
+        sidebar.update_purge(purge_indicator(
+            getattr(self, "_purge_scheduler", None),
+            last_outcome=self._last_purge_outcome,
+            last_at=self._last_purge_at,
+            now=time.monotonic(),
+            acknowledged_at=self._purge_acknowledged_at,
+            attached_holder=self._attached_holder(),
+        ))
+
+    def _attached_holder(self) -> str | None:
+        """Who holds the rig when this window does not — else ``None``.
+
+        Short by design: the badge is one line in a ~130 px column, and the
+        longer sentence already exists as
+        :func:`~softae.gui.widgets.rig_owner.attached_owner_line` for the
+        surfaces that have room for it.
+        """
+        mode = self._launch_mode
+        if mode.owner:
+            return None
+        return f"campaign '{mode.campaign[0]}'" if mode.campaign else "another process"
+
+    def _on_purge_acknowledged(self) -> None:
+        """The operator clicked the purge badge: stop pulsing, for now.
+
+        Only "for now" — :func:`~softae.gui.widgets.purge_indicator.purge_indicator`
+        resumes attention once the purge has been owed a further full interval,
+        because a single click must not be able to silence an unbounded problem.
+        """
+        self._purge_acknowledged_at = time.monotonic()
+        logger.info("purge_overdue_acknowledged")
+        self._refresh_purge_indicator()
 
     # ── Anti-clog purge (P8) ─────────────────────────────────────────────────
 
@@ -926,8 +988,22 @@ class MainWindow(QMainWindow):
         except Exception:
             logger.warning("purge_tick_failed", exc_info=True)
             return
+        # Retain anything that said something. A tick that finds nothing owed
+        # returns an empty outcome, and letting that overwrite the last real one
+        # would wipe "purged 210 µL, 3 min ago" within 30 s of it being true.
+        if outcome.performed or outcome.dry_run or outcome.skipped_reason:
+            self._last_purge_outcome = outcome
+            self._last_purge_at = time.monotonic()
+        if outcome.performed:
+            # One of the two ends of attention (the other is the operator's
+            # click). Dropped rather than kept, so an acknowledgement cannot
+            # carry across into a later overdue episode.
+            self._purge_acknowledged_at = None
         if outcome.performed or outcome.dry_run:
+            # Kept alongside the badge: this fires at the instant of the event,
+            # where the sidebar follows within a campaign tick.
             self.statusBar().showMessage(outcome.summary(), 8000)
+        self._refresh_purge_indicator()
 
     def closeEvent(self, event) -> None:
         """Stop ALL worker threads before closing.

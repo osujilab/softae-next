@@ -11,11 +11,13 @@ import pytest
 
 from softae.core.purge import PurgeScheduler, PurgeSettings
 from softae.core.purge_runner import (
+    PURGE_OWNER,
     IdleRestState,
     PurgeRunner,
     enter_idle_rest,
     leave_idle_rest,
 )
+from softae.core.rig_activity import PURGE_INSTRUMENTS, RigActivity
 
 
 class _Clock:
@@ -770,3 +772,168 @@ class TestScopedClaims:
         activity = self._activity("cast", {"syringe"})
         assert activity.conflicts(PURGE_INSTRUMENTS) == "cast"
         assert activity.conflicts({"espico"}) is None
+
+
+# ── The purge's own claim ────────────────────────────────────────────────────
+
+class _RecordingActivity(RigActivity):
+    """A real ``RigActivity`` that also records the order of calls made to it.
+
+    A real one rather than a fake, because the property under test is an
+    *ordering* between two of its methods, and a fake that answered
+    ``conflicts`` from a hand-set flag could not tell whether the purge's own
+    claim was visible to its own precondition check.
+
+    ``claimed`` is not overridden: the base implementation calls ``self.acquire``
+    and ``self.release``, so it routes through the overrides below for free.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.events: list[tuple[str, str]] = []
+
+    def conflicts(self, instruments):
+        blocker = super().conflicts(instruments)
+        self.events.append(("conflicts", blocker or ""))
+        return blocker
+
+    def acquire(self, owner, instruments=None):
+        self.events.append(("acquire", owner))
+        super().acquire(owner, instruments)
+
+    def release(self, owner):
+        self.events.append(("release", owner))
+        super().release(owner)
+
+
+class _ObservingSyringe(_Syringe):
+    """A syringe that asks who owns the rig at the moment it is commanded.
+
+    This is the manual-control question — *may I drive this?* — asked from the
+    one instant that matters: mid-dispense.
+    """
+
+    def __init__(self, activity, **kw) -> None:
+        super().__init__(**kw)
+        self._activity = activity
+        self.owner_seen: list[str | None] = []
+        self.stage_owner_seen: list[str | None] = []
+
+    def single_pump(self, **kw) -> None:
+        self.owner_seen.append(self._activity.conflicts({"syringe"}))
+        self.stage_owner_seen.append(self._activity.conflicts({"stage"}))
+        super().single_pump(**kw)
+
+
+class TestThePurgeClaimsWhileItPurges:
+    """X6: the one mechanism that moves hardware unasked now says so.
+
+    Before this, ``PurgeRunner`` read the arbitration table every tick and never
+    wrote to it — so a manual jog issued during a purge was permitted straight
+    into a stage that was already moving.
+    """
+
+    def test_the_purge_holds_a_claim_while_it_dispenses(self):
+        activity = _RecordingActivity()
+        syringe = _ObservingSyringe(activity)
+        runner, _, _ = _due_runner(_Manager(syringe), activity=activity)
+
+        assert runner.maybe_purge().performed
+        assert syringe.owner_seen == [PURGE_OWNER] * 3
+        # Scoped to PURGE_INSTRUMENTS, so the stage it may travel with is
+        # covered too — a jog is refused, not just a dispense.
+        assert syringe.stage_owner_seen == [PURGE_OWNER] * 3
+
+    def test_the_claim_is_released_once_the_purge_finishes(self):
+        activity = _RecordingActivity()
+        runner, _, _ = _due_runner(_Manager(), activity=activity)
+
+        runner.maybe_purge()
+
+        assert activity.busy is False
+        assert activity.conflicts(PURGE_INSTRUMENTS) is None
+
+    def test_a_failing_purge_still_releases_the_claim(self, monkeypatch):
+        """A leaked claim disables purging for the session, silently."""
+        activity = _RecordingActivity()
+        runner, _, _ = _due_runner(_Manager(), activity=activity)
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError("driver exploded")
+
+        monkeypatch.setattr(runner, "_dispense", _boom)
+
+        with pytest.raises(RuntimeError):
+            runner.maybe_purge()
+
+        assert activity.busy is False
+
+    def test_the_claim_is_taken_after_the_conflict_check(self):
+        """The trap: a claim held during ``conflicts`` self-blocks forever."""
+        activity = _RecordingActivity()
+        runner, _, _ = _due_runner(_Manager(), activity=activity)
+
+        runner.maybe_purge()
+
+        kinds = [kind for kind, _ in activity.events]
+        assert kinds.index("conflicts") < kinds.index("acquire")
+        # And nothing asks again from inside the claim, which is the only other
+        # way the purge could meet its own owner.
+        assert "conflicts" not in kinds[kinds.index("acquire"):]
+
+    def test_a_repeated_purge_never_defers_against_itself(self):
+        """The end state the trap produces: purging silently off, for good."""
+        activity = _RecordingActivity()
+        runner, _, clock = _due_runner(_Manager(), activity=activity)
+
+        for _ in range(5):
+            assert runner.maybe_purge().performed
+            clock.t += 1000.0
+
+    def test_a_dry_run_claims_nothing(self):
+        """The boundary: the claim guards actuation, and this actuates nothing."""
+        activity = _RecordingActivity()
+        runner, _, _ = _due_runner(_Manager(), activity=activity,
+                                   settings=_settings(actuate=False))
+
+        assert runner.maybe_purge().dry_run
+        assert ("acquire", PURGE_OWNER) not in activity.events
+
+    def test_a_deferred_purge_claims_nothing(self):
+        """The other boundary — refused at the pose check, so never claimed."""
+        activity = _RecordingActivity()
+        runner, _, _ = _due_runner(
+            _Manager(_Syringe(head_up=False), _Stage(pos=WELL)),
+            activity=activity)
+
+        assert runner.maybe_purge().skipped_reason
+        assert ("acquire", PURGE_OWNER) not in activity.events
+
+    def test_an_in_run_purge_claims_alongside_the_run_that_owns_the_rig(self):
+        """``owns_rig`` skips the conflict check; it must not skip the claim.
+
+        The executor's purge window drives the syringe while the run holds the
+        rig, and Manual Control asks ``conflicts`` about *instruments*, not
+        about runs — so without its own claim the purge would be invisible here
+        too, behind an owner that is merely annealing.
+        """
+        activity = _RecordingActivity()
+        activity.acquire("campaign:demo")
+        syringe = _ObservingSyringe(activity, head_up=False)
+        runner, _, _ = _due_runner(_Manager(syringe, _Stage(pos=FLUSH)),
+                                   activity=activity)
+
+        outcome = runner.maybe_purge(context="anneal", allow_positioning=False,
+                                     owns_rig=True)
+
+        assert outcome.performed
+        assert ("acquire", PURGE_OWNER) in activity.events
+        assert activity.owners() == ("campaign:demo",)   # purge claim released
+
+    def test_a_runner_without_an_activity_registry_still_purges(self):
+        """Nothing to claim against is not a reason to refuse to dispense."""
+        syringe = _Syringe()
+        runner, _, _ = _due_runner(_Manager(syringe), activity=None)
+
+        assert runner.maybe_purge().performed
+        assert len(syringe.calls) == 3

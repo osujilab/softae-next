@@ -23,6 +23,7 @@ quietly put its head back down — so that transition is gated, not assumed.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -51,6 +52,15 @@ logger = structlog.get_logger(__name__)
 #: and at info level the two look identical in the log. Four intervals at the
 #: default 15 min cadence.
 DEFAULT_DEFER_ALERT_S = 3600.0
+
+#: The owner a purge claims the rig under while it dispenses.
+#:
+#: A sentence fragment rather than an identifier, because it is rendered
+#: verbatim: :meth:`RigActivity.conflicts` returns the owner string, and every
+#: consumer of it — the purge's own "rig is in use (…)" deferral, Manual
+#: Control's refusal, the sidebar's owner line — prints what it is given. So the
+#: purge needs no vocabulary of its own to be nameable.
+PURGE_OWNER = "anti-clog purge"
 
 
 class IdleRestState:
@@ -316,6 +326,39 @@ class PurgeRunner:
 
     def _perform(self, due: Any, *, context: str,
                  end_at_idle_rest: bool = True) -> PurgeOutcome:
+        """Claim the instruments a purge drives, then dispense them.
+
+        Purging is the one mechanism here that moves hardware unasked, so until
+        it claimed, it was also the one collision nothing could be warned about:
+        it read the arbitration table every tick and never wrote to it, leaving
+        Manual Control free to jog the stage into a purge already in flight.
+
+        **Where the claim goes is the whole of the argument, and it goes here.**
+        :meth:`maybe_purge` consults :meth:`RigActivity.conflicts` in
+        `_blocking_reason` *before* this method is reached, so a claim held any
+        earlier would be found by the purge's own precondition check — the purge
+        would defer against itself on every tick, for the life of the process,
+        which is precisely the self-inflicted deadlock this package's docstring
+        describes as looking "exactly like the harness is off". Nothing inside
+        this call re-reads `conflicts`, so no path can observe its own claim.
+
+        The dry-run branch also returns before this point, so an inert purge
+        claims nothing: the claim exists to guard actuation, and a dry run does
+        not actuate.
+
+        The window is seconds long, so a manual command refused during it is a
+        real, brief, correctly named collision rather than a lockout.
+        """
+        claim = (
+            nullcontext() if self._activity is None
+            else self._activity.claimed(PURGE_OWNER, self._purge_instruments)
+        )
+        with claim:
+            return self._dispense(due, context=context,
+                                  end_at_idle_rest=end_at_idle_rest)
+
+    def _dispense(self, due: Any, *, context: str,
+                  end_at_idle_rest: bool = True) -> PurgeOutcome:
         """Dispense the purge. Best-effort per pump; never raises."""
         errors: list[str] = []
         moved: dict[int, float] = {}

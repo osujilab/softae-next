@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from softae.gui.widgets.purge_badge import PurgeBadge
 from softae.gui.widgets.worker_thread import StoppableWorker
 
 if TYPE_CHECKING:
@@ -118,8 +119,12 @@ class MonitorSidebar(QWidget):
     - Dispenser head status (Retracted ↑ / Descended ↓)
     - Temperature: Stage SP / PV + Chamber (RH-sensor onboard T)
     - Humidity SP / PV
-    - Workflow status: Arrhenius · HT Exp · Autonomous
+    - Workflow status: Arrhenius · HT Exp · Autonomous · anti-clog purge
     """
+
+    #: Re-emitted from the purge badge: the operator acknowledged an overdue
+    #: purge. The window owns the acknowledgement stamp, not this widget.
+    purge_acknowledged = Signal()
 
     def __init__(self, manager: InstrumentManager, *, poller=None, parent: QWidget | None = None):
         super().__init__(parent)
@@ -262,6 +267,12 @@ class MonitorSidebar(QWidget):
         wf_lay.addWidget(self._lbl_wf_arrhenius)
         wf_lay.addWidget(self._lbl_wf_ht)
         wf_lay.addWidget(self._lbl_wf_auto)
+        # Permanently visible, unlike the other three's idle text: the purge is
+        # the one activity here that acts with nobody asking it to, and its
+        # previous surface was an 8 s status-bar message every 15 minutes.
+        self._purge_badge = PurgeBadge()
+        self._purge_badge.acknowledged.connect(self.purge_acknowledged)
+        wf_lay.addWidget(self._purge_badge)
         layout.addWidget(wf_grp)
 
         layout.addStretch()
@@ -483,6 +494,17 @@ class MonitorSidebar(QWidget):
         self._lbl_rig_owner.setStyleSheet(
             "color: #6a1b9a; font-weight: bold; font-size: 8pt;"
         )
+
+    def update_purge(self, indicator) -> None:
+        """Slot for the window's campaign tick — one already-decided indicator.
+
+        Same one-argument shape as :meth:`update_rig_owner`, and for the same
+        reason: the composition lives in
+        :func:`~softae.gui.widgets.purge_indicator.purge_indicator`, which is
+        pure and therefore testable against a virtual clock. Nothing about
+        *which* state applies is decided here.
+        """
+        self._purge_badge.update_purge(indicator)
 
     def update_auto_status(self, text: str) -> None:
         """Slot for AutonomousTab.workflow_status_changed(str)."""
