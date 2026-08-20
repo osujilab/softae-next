@@ -47,17 +47,41 @@ cd softae-next
 python -m venv .venv
 .venv\Scripts\activate
 
-pip install -e .              # core dependencies
-pip install -e ".[dev]"       # + test/lint tools
+pip install -e .              # core dependencies — headless: all 11 CLI tools + analysis
+pip install -e ".[gui]"       # + PySide6, opencv, qasync — required for the desktop GUI
+pip install -e ".[dev]"       # + test/lint tools (includes [gui]; ~50 test files import PySide6)
 pip install -e ".[hardware]"  # + NI-DAQ, Blinka, HID for real instruments
+pip install -e ".[web]"       # + Dash/Plotly for the EIS web visualizer
 ```
+
+**What the bare `pip install -e .` gives you**, since 2026-08-20: the eleven headless console
+scripts — `softae-run`, `softae-campaign`, `softae-commission`, `softae-method`, `softae-web`,
+`softae-shadow`, `softae-thickness`, `softae-equilibration`, `softae-env`, `softae-eis-timing`,
+`softae-eis-validate` — plus the whole EIS analysis pipeline and the DataStore. The Qt stack is
+**no longer a core dependency**. Only the three GUI entry points need the extra:
+
+| Entry point | Needs `[gui]`? |
+|---|---|
+| `softae-gui`, `softae-deposition`, `softae` (the `gui_scripts` launcher) | **yes** |
+| the other eleven console scripts | no |
+
+So a **fresh** install on a headless analysis box or a CI runner now skips PySide6 and OpenCV
+entirely. `.[dev]` self-references `softae[gui]`, so the developer install string is unchanged —
+if you have been typing `pip install -e ".[dev]"`, keep typing it and nothing about your
+environment changes.
+
+> **An existing venv keeps working until you reinstall.** Making a dependency optional does not
+> uninstall it. A venv created before this change still has PySide6 in it and still launches the
+> GUI from a bare `pip install -e .`; the split takes effect on the next fresh install or
+> reinstall into a clean environment. If you want to *verify* the headless path, build a new venv
+> — testing it in the current one proves nothing.
 
 ### Verify installation
 
 ```powershell
-softae-gui --help     # GUI entry point
+softae-gui --help     # GUI entry point   (needs .[gui])
 softae-run --help     # CLI workflow runner
-pytest tests/ -v      # run test suite
+pytest tests/ -v      # run test suite    (needs .[dev])
 ```
 
 ---
@@ -323,6 +347,15 @@ The tab always renders lines 0, 1, and 2 even if config was previously sparse, s
 
 Automatic pico routing: channels 1–16 → pico1, channels 17–32 → pico2 (configurable in `[channel_routing]`).
 
+> **One parser behind every channel field.** The HT tab (`1,3,5-8`), the Arrhenius tab and the
+> Live BO Campaign tab all now delegate to the same `core/channel_spec.py`, so the accepted
+> syntax — comma-separated channels, `lo-hi` inclusive ranges, whitespace ignored — is identical
+> wherever you type it. Each tab keeps its own policy for what to do with a bad token (the HT
+> tab drops silently as it always has; the others raise), and **Live BO now checks entries
+> against the selected board's electrode count** — the bounds check it previously lacked —
+> rejecting an out-of-range channel with a dialog instead of passing it through to
+> `CampaignSpec` unchallenged.
+
 **Formulator + liquid-handling integration:**
 - Volumes applied from **Formulation Manager** feed per-channel dispense steps in generated HT workflows (Pump 0 and Pump 1 are channel-specific; no fixed per-channel dispense constants).
 - Physical liquid-handling correction is optional and controlled by `[liquid_handling]` with `enabled = true|false`.
@@ -492,7 +525,7 @@ instruments.
 | `softae-commission` | Acquire and derive the EIS fixture calibration | [§16](#16-eis-commissioning--calibration) |
 | `softae-deposition` | Standalone deposition-twin GUI | [§14](#14-deposition-digital-twin) |
 | `softae-method` | Method-maturity lifecycle (`status`, `test`, `promote`, `sign-off`, `versions`) | `docs/METHOD_MATURITY_PIPELINE.md` |
-| `softae-web` | EIS web visualizer over the DataStore | `python -m softae.web --help` |
+| `softae-web` | EIS web visualizer over the DataStore — needs the `[web]` extra | `python -m softae.web --help` |
 | `softae-shadow` | Arm and review a shadow campaign | [§20](#20-shadow-campaign-review) |
 | `softae-thickness` | Plan / record an unconfounded thickness series | [§21](#21-thickness-series) |
 | `softae-equilibration` | Measure σ(t) and derive the conditioning hold | [§22](#22-equilibration-characterization) |
@@ -503,6 +536,14 @@ instruments.
 > error on a documented command is almost always this — re-run the editable install, or fall
 > back to `python -m softae.tools.<name>`, which resolves whether or not a script was
 > generated.
+
+> **A missing *extra* is a different failure, and it now says so.** `softae-web` on an install
+> without the `[web]` extra used to die with a raw `ModuleNotFoundError` traceback out of a
+> transitive import. It now names the package it is missing and prints the command that fixes
+> it — `pip install "softae[web]"` — then exits **1**, not 2 (argparse owns 2 for usage errors
+> on that parser; an uninstalled extra is an unmet runtime precondition, not a bad invocation).
+> The probe runs *after* argument parsing and before anything reaches stdout, so
+> `softae-web --help` still works on an install with no web extra at all.
 
 **The first ten resolve in this venv, re-verified 2026-08-14** — each of those ten names
 resolves to a generated `.exe` under `.venv/Scripts/`, and `softae-shadow --help` prints its
@@ -928,6 +969,41 @@ All instrument errors include the instrument name. `SafetyError` includes the re
 | `ht_sensor` | SHT31-D | ✅ | `get_T`, `get_H` |
 | `rh_controller` | Trinket M0 PID | ✅ | `set_setpoint`, `start`, `stop`, `get_H`, `wait` |
 | `piezo` | Trinket piezo controller | ✅ | `set_channel`, `set_frequency`, `set_sweep`, `apply_profile`, `standby`, `reset_config` |
+
+### Device firmware (the two Trinket M0s)
+
+The last two rows are not ordinary drivers: `rh_controller` and `piezo` each talk to an Adafruit
+Trinket M0 running its own CircuitPython program, which executes continuously from power-on and
+needs no host process to keep running. **Since 2026-08-20 that device-side code is versioned in
+this repository** at [`scripts/trinket_firmware/`](../scripts/trinket_firmware/) — byte-exact
+copies of each device's `code.py`, `boot.py` and `boot_out.txt`, with SHA-256 for every file, the
+protocol each device speaks, and both firmware deadman constants written down beside the code that
+implements them.
+
+| Directory | Volume | Role | Firmware deadman |
+|---|---|---|---|
+| `dac0_rh/` | `DAC0` | RH controller — two Aalborg PSV valves, wet/dry mix | **≈ 25 s**, self-recovering |
+| `pwm0_piezo/` | `PWM0` | Piezo driver — two duty-cycled channels | **600 s**, needs a fresh command to clear |
+
+Two rules govern this directory, and both matter more than they look:
+
+> **The device is the truth about what is running; this directory is a record.** Nothing here is
+> imported by `src/softae/`, executed by the test suite, or synced anywhere. If the repo copy and
+> the `CIRCUITPY` volume ever disagree, the volume is right and the copy is stale — re-copy and
+> re-hash rather than assuming. The two boards do not even run the same CircuitPython build
+> (`DAC0` on 9.2.7, `PWM0` on 10.2.1), which is exactly the sort of fact a record has to be read
+> for rather than guessed at.
+
+> **⚠ Editing a file here does not change the device — and redeploying one is hardware
+> actuation.** There is no build step and no deploy hook; deployment is an operator copying
+> `code.py` onto the volume by hand. CircuitPython then restarts the program *mid-loop*, dropping
+> valve or piezo drive at an arbitrary moment. **Do not redeploy while a campaign, a hold or any
+> experiment is running.**
+
+Why version it at all: the deadman constants above were, until this check-in, unreadable alongside
+the host code — and "the firmware is not in the repository" had quietly degraded in these very
+documents into "the firmware has no deadman", which was false on both devices. See
+[§23](#23-environment-hold--softae-env).
 
 ---
 
@@ -2286,15 +2362,26 @@ ambient restore — and a second copy here would be a second path to the same ha
 temperature is *reported* beside the humidity (one `get_TH` transaction returns both) because a
 humidity number without the air temperature is not actionable. Reporting is not driving.
 
-> **⚠ What no software here can close: a hard-killed host leaves the humidifier running.**
-> The RH Trinket latches its last PWM duty until something tells it otherwise, and **there is
-> no firmware deadman** — the Trinket's firmware is not in this repository, so this codebase has
-> no record of what is on the device and cannot add a timeout to it. Every clean exit, every
-> signal, every park and every fault-class stop **now** zeroes the duty, which narrows the
-> window to the paths where no Python runs at all: a `SIGKILL` / *End Task*, a power cut to the
-> host, or a blue screen. The next launch's unclean-shutdown recovery park zeroes it too — but
-> that may be hours later. **Until a firmware deadman exists, treat a hard-killed host as a
-> humidifier still running at its last duty, and check the chamber.**
+> **⚠ A hard-killed host leaves the humidifier running for about 25 seconds — then the device
+> shuts itself off.** The RH Trinket's own firmware carries a **deadman**: twenty consecutive
+> silent reads on a ≈1.25 s loop — **≈25 s** — force its control value to zero, and zero is an
+> explicit auto-shutoff branch that closes both Aalborg PSV valves. It self-recovers the instant
+> a valid value arrives, so it costs a healthy hold nothing. (Operator-written; verified by
+> reading the device volume **2026-08-19**. The piezo Trinket's equivalent timeout is **600 s**.)
+> The paths where no Python runs at all — a `SIGKILL` / *End Task*, a power cut to the host, a
+> blue screen — therefore latch the last duty for about half a minute, **not for hours**.
+>
+> **What the software adds is immediacy and honesty, not the backstop.** Every clean exit, every
+> signal, every park and every fault-class stop zeroes the duty *at once*, so an orderly exit
+> never spends the deadman's 25 s window, and a hold that came off cleanly is distinguishable
+> from one that crashed — a failed zero says so out loud.
+>
+> **The firmware is no longer un-versioned.** Both devices' code is checked in at
+> [`scripts/trinket_firmware/`](../scripts/trinket_firmware/) as of 2026-08-20, hashed and
+> annotated — so the 25 s above is now checkable against the loop that implements it, rather
+> than taken on trust. Its absence from the repository is what let this warning once claim there
+> was no deadman at all. The copies are a record, not a deployment path: see
+> [§10](#10-instruments-reference) before touching either device.
 
 ### Invocation
 
@@ -2341,6 +2428,15 @@ claimant (the GUI, `softae-campaign`). If someone else holds it, the tool **refu
 opens anything** — it checks the lock *before* the store exists, so a refusal over hardware this
 hold never touched leaves **no run row** behind to be mistaken for a hold that started and
 failed. It prints who holds the rig and exits **4**. Nothing was decided; the rig was occupied.
+
+**In practice the usual holder is the GUI**, which now claims the rig for its entire connected
+life — not merely while a run is executing. So `softae-env hold --execute`, and every other
+headless rig tool, will refuse for as long as a connected GUI is open. **The operator practice is
+simply: disconnect in the GUI (or close it), then run the tool.**
+
+> **A refusal here is the single-occupancy rule working, not an error.** Two processes driving
+> the same valves, heater and stage is the failure this prevents; the tool declining to start is
+> the mechanism doing its job. Read the name it prints, free that claimant, and re-run.
 
 `--mock` claims nothing and can neither be refused nor lock out a real run.
 

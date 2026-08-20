@@ -4,6 +4,9 @@ Shared by the GUI (the manual EIS "Channel(s)" field) and anywhere a compact
 multi-channel selection is entered as text.  Accepts comma-separated single
 channels and ``lo-hi`` inclusive ranges; whitespace is ignored.  Returns a
 sorted, de-duplicated list of channels, validated against ``[min_ch, max_ch]``.
+Two keywords relax that default for callers that need it — ``on_invalid="drop"``
+for a forgiving free-text field, and ``order="as-written"`` where channel order
+is measurement order — and both default to the strict contract above.
 
 :func:`format_channel_spec` is the inverse, and it lives here rather than in any
 one tool because the display need recurs everywhere the parse need does — and
@@ -14,7 +17,7 @@ channels are in a run when they are not.
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Iterable, Literal
 
 __all__ = ["parse_channel_spec", "format_channel_spec", "ChannelSpecError"]
 
@@ -23,8 +26,15 @@ class ChannelSpecError(ValueError):
     """Raised when a channel spec is empty, malformed, or out of range."""
 
 
-def parse_channel_spec(spec: str, *, min_ch: int = 1, max_ch: int = 32) -> list[int]:
-    """Parse ``spec`` (e.g. ``"2,4,5-10"``) into a sorted, unique channel list.
+def parse_channel_spec(
+    spec: str,
+    *,
+    min_ch: int = 1,
+    max_ch: int = 32,
+    on_invalid: Literal["raise", "drop"] = "raise",
+    order: Literal["sorted", "as-written"] = "sorted",
+) -> list[int]:
+    """Parse ``spec`` (e.g. ``"2,4,5-10"``) into a unique channel list.
 
     Parameters
     ----------
@@ -33,37 +43,83 @@ def parse_channel_spec(spec: str, *, min_ch: int = 1, max_ch: int = 32) -> list[
         ``"1, 3, 5-8"``.  Whitespace around tokens and hyphens is ignored.
     min_ch, max_ch :
         Inclusive bounds every parsed channel must fall within.
+    on_invalid :
+        ``"raise"`` (default) refuses anything malformed or out of range.
+        ``"drop"`` is the *forgiving* mode a free-text GUI field wants: an
+        empty spec yields ``[]`` rather than raising, non-numeric tokens are
+        skipped, a **single** channel outside the bounds is skipped, and a
+        **range** that straddles a bound is **clamped** to it rather than
+        dropped.  That clamp/drop asymmetry is deliberate — it is the
+        long-standing Experiment-tab behaviour, where ``"0-99"`` at
+        ``max_ch=16`` means "all sixteen", not "nothing".
+    order :
+        ``"sorted"`` (default) returns ascending channels.  ``"as-written"``
+        preserves entry order with first-wins de-duplication, for the callers
+        where channel order *is* measurement order (the Arrhenius sweep and
+        the live BO campaign both drive channels in the order given).
 
     Raises
     ------
     ChannelSpecError
-        If the spec is empty, a token is non-numeric, a range is reversed, or a
-        channel falls outside ``[min_ch, max_ch]``.
+        Under ``on_invalid="raise"``: if the spec is empty, a token is
+        non-numeric, a range is reversed, or a channel falls outside
+        ``[min_ch, max_ch]``.  Never raised under ``"drop"``.
     """
+    if on_invalid not in ("raise", "drop"):
+        raise ValueError(f"on_invalid must be 'raise' or 'drop', not {on_invalid!r}")
+    if order not in ("sorted", "as-written"):
+        raise ValueError(f"order must be 'sorted' or 'as-written', not {order!r}")
+    dropping = on_invalid == "drop"
+
     if spec is None or not str(spec).strip():
+        if dropping:
+            return []
         raise ChannelSpecError("no channels given")
 
-    channels: set[int] = set()
+    channels: list[int] = []
+    seen: set[int] = set()
+
+    def _keep(ch: int) -> None:
+        if ch not in seen:
+            seen.add(ch)
+            channels.append(ch)
+
     for raw in str(spec).split(","):
         token = raw.strip()
         if not token:
             continue  # tolerate trailing/duplicate commas ("2,,4", "2,")
-        if "-" in token.lstrip("-"):  # a range (leave a bare leading '-' to fail as non-numeric)
-            lo_str, _, hi_str = token.partition("-")
-            lo, hi = _as_int(lo_str, token), _as_int(hi_str, token)
-            if lo > hi:
-                raise ChannelSpecError(f"reversed range '{token}' (low > high)")
-            for ch in range(lo, hi + 1):
+        try:
+            if "-" in token.lstrip("-"):  # a range (bare leading '-' fails as non-numeric)
+                lo_str, _, hi_str = token.partition("-")
+                lo, hi = _as_int(lo_str, token), _as_int(hi_str, token)
+                if dropping:
+                    # Clamp to the bounds; a reversed range yields an empty
+                    # range() and so contributes nothing, without erroring.
+                    for ch in range(max(min_ch, lo), min(max_ch, hi) + 1):
+                        _keep(ch)
+                    continue
+                if lo > hi:
+                    raise ChannelSpecError(f"reversed range '{token}' (low > high)")
+                for ch in range(lo, hi + 1):
+                    _check_bounds(ch, min_ch, max_ch)
+                    _keep(ch)
+            else:
+                ch = _as_int(token, token)
+                if dropping:
+                    if min_ch <= ch <= max_ch:
+                        _keep(ch)
+                    continue
                 _check_bounds(ch, min_ch, max_ch)
-                channels.add(ch)
-        else:
-            ch = _as_int(token, token)
-            _check_bounds(ch, min_ch, max_ch)
-            channels.add(ch)
+                _keep(ch)
+        except ChannelSpecError:
+            if not dropping:
+                raise  # "drop" swallows the malformed token and moves on
 
     if not channels:
+        if dropping:
+            return []
         raise ChannelSpecError("no channels given")
-    return sorted(channels)
+    return sorted(channels) if order == "sorted" else channels
 
 
 def format_channel_spec(channels: Iterable[int]) -> str:

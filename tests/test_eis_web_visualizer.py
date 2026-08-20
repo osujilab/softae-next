@@ -388,3 +388,82 @@ def test_cli_help_exits_zero():
     )
     assert result.returncode == 0
     assert "softae" in result.stdout.lower() or "port" in result.stdout.lower()
+
+
+# ---------------------------------------------------------------------------
+# Tests: the package survives a base install (dash is an optional extra)
+# ---------------------------------------------------------------------------
+
+#: Prepended to a subprocess's source to make dash *look* uninstalled, which is
+#: the base-install case the dev venv (which has ``[web]``) cannot otherwise
+#: reproduce.  A meta_path finder is the honest simulation: it fails at exactly
+#: the point a real missing distribution would, with the same exception type
+#: and the same ``.name``.
+_BLOCK_DASH = """
+import sys
+
+
+class _NoDash:
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] in ("dash", "dash_bootstrap_components"):
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        return None
+
+
+sys.meta_path.insert(0, _NoDash())
+for _m in [m for m in sys.modules if m.split(".")[0].startswith("dash")]:
+    del sys.modules[_m]
+"""
+
+
+def _run_without_dash(argv: list[str], code: str | None = None):
+    """Run a subprocess with dash blocked — either ``-c code`` or ``argv``."""
+    cmd = [sys.executable]
+    if code is not None:
+        cmd += ["-c", _BLOCK_DASH + code]
+    else:
+        cmd += ["-c", _BLOCK_DASH + (
+            "import runpy, sys\n"
+            f"sys.argv = {argv!r}\n"
+            "runpy.run_module('softae.web', run_name='__main__')\n"
+        )]
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+
+
+def test_web_package_imports_without_dash():
+    """``import softae.web`` must not require the optional [web] extra.
+
+    It is imported by ``__main__`` after argument parsing, so a module-scope
+    dash import here turns a base install into a raw ModuleNotFoundError
+    traceback the moment anyone runs ``softae-web``.
+    """
+    result = _run_without_dash(
+        [],
+        code=(
+            "import softae.web, sys\n"
+            "assert 'dash' not in sys.modules, 'dash leaked into softae.web'\n"
+            "print('softae.web is dash-free')\n"
+        ),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "softae.web is dash-free" in result.stdout
+
+
+def test_web_cli_without_dash_exits_nonzero_with_install_hint():
+    result = _run_without_dash(["softae.web", "--no-browser"])
+    assert result.returncode == 1, (result.returncode, result.stdout, result.stderr)
+    assert "softae[web]" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_create_app_still_reachable_from_package():
+    """PEP 562 laziness must not amputate the documented public name."""
+    from softae.web import create_app
+
+    assert callable(create_app)
+    assert "create_app" in dir(sys.modules["softae.web"])

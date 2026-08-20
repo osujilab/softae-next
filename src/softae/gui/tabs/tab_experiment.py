@@ -673,27 +673,14 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
 
             "1,3,5-8,12"  →  [1, 3, 5, 6, 7, 8, 12]
 
-        Channels outside ``[1, max_ch]`` are silently clamped / ignored.
+        Delegates to the one shared parser.  This field is deliberately
+        *silent-drop* — bad tokens and out-of-bounds singles are ignored,
+        ranges are clamped to ``[1, max_ch]`` — because the result drives a
+        checkbox selection, where "nothing got selected" is visible on screen.
         """
-        channels: set[int] = set()
-        for token in spec.replace(" ", "").split(","):
-            if not token:
-                continue
-            if "-" in token:
-                parts = token.split("-", 1)
-                try:
-                    lo, hi = int(parts[0]), int(parts[1])
-                    channels.update(range(max(1, lo), min(max_ch, hi) + 1))
-                except ValueError:
-                    continue
-            else:
-                try:
-                    ch = int(token)
-                    if 1 <= ch <= max_ch:
-                        channels.add(ch)
-                except ValueError:
-                    continue
-        return sorted(channels)
+        from softae.core.channel_spec import parse_channel_spec
+
+        return parse_channel_spec(spec, max_ch=max_ch, on_invalid="drop")
 
     def _on_channel_entry(self) -> None:
         """Apply the comma-delimited channel field to the checkboxes."""

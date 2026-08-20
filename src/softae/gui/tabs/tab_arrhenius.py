@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from softae.core.channel_spec import parse_channel_spec
 from softae.gui.daemon_runner import DaemonRunnerMixin
 
 if TYPE_CHECKING:
@@ -490,42 +491,17 @@ class ArrheniusTab(DaemonRunnerMixin, QWidget):
         self._spin_eis_mv_dc.setValue(p.get("mv_dc", 0))
 
     def _parse_channels(self) -> list[int]:
-        """Parse the channels field supporting range notation, e.g. "1, 3-6, 9"."""
-        raw = self._le_channels.text()
-        channels: list[int] = []
-        for part in raw.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            if "-" in part:
-                bounds = part.split("-", 1)
-                try:
-                    lo, hi = int(bounds[0].strip()), int(bounds[1].strip())
-                except ValueError:
-                    raise ValueError(f"Invalid channel range: '{part}'")
-                if lo > hi:
-                    raise ValueError(f"Range start must be <= end: '{part}'")
-                channels.extend(range(lo, hi + 1))
-            else:
-                try:
-                    channels.append(int(part))
-                except ValueError:
-                    raise ValueError(f"Invalid channel number: '{part}'")
-        # Deduplicate while preserving order, then validate bounds
-        seen: set[int] = set()
-        result: list[int] = []
-        for ch in channels:
-            if ch not in seen:
-                seen.add(ch)
-                result.append(ch)
-        if not result:
-            raise ValueError("At least one channel must be specified.")
-        bad = [ch for ch in result if ch < 1 or ch > self._max_channel]
-        if bad:
-            raise ValueError(
-                f"Channel(s) {bad} are outside valid range 1\u2013{self._max_channel}"
-            )
-        return result
+        """Parse the channels field supporting range notation, e.g. "1, 3-6, 9".
+
+        Entry order is preserved because for a sweep it *is* measurement order.
+        Raises ``ChannelSpecError`` (a ``ValueError``) on anything malformed,
+        empty, or outside the board's ``[1, self._max_channel]``.
+        """
+        return parse_channel_spec(
+            self._le_channels.text(),
+            max_ch=self._max_channel,
+            order="as-written",
+        )
 
     def set_pcb_channel_count(self, n: int) -> None:
         """Slot: called when the Init tab selects a different PCB."""

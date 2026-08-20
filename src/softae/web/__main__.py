@@ -77,7 +77,22 @@ def main(argv: list[str] | None = None) -> None:
                         db_path = str(db_candidate)
                         break
 
-    from softae.web import run_server
+    try:
+        # Resolve the app factory here too, rather than letting the optional
+        # extra go missing halfway through ``run_server``: the package import
+        # is deliberately dash-free (PEP 562 __getattr__ in web/__init__.py),
+        # so this attribute access is what actually probes the extra — and it
+        # does so before anything is printed to stdout.
+        from softae.web import create_app, run_server  # noqa: F401
+    except ImportError as exc:
+        # Exit 1, not 2: argparse owns 2 for usage errors on this parser, and
+        # this is an unmet runtime precondition, not a bad invocation.
+        print(
+            f"softae-web needs the optional web extra ({exc.name} is not installed).\n"
+            '  pip install "softae[web]"',
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 
     print(f"Starting softae EIS Visualizer on http://localhost:{args.port}")
     if db_path:

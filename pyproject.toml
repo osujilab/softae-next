@@ -22,8 +22,8 @@ dependencies = [
     "nidaqmx",            # NI-DAQ device control (syringe head)
 
     # --- Async ---
-    "nest-asyncio",
-    "qasync",
+    "nest-asyncio",       # server/base_instrument.py's sync __enter__ path —
+                          # server layer, not GUI, so NOT in the [gui] extra
 
     # --- Analysis / math ---
     "numpy",
@@ -39,8 +39,7 @@ dependencies = [
                           # so payload writes raise ImportError without this line
 
     # --- UI ---
-    "PySide6>=6.6",
-    "opencv-python",
+    # (PySide6 / opencv-python / qasync live in the optional [gui] extra below.)
 
     # --- Configuration ---
     "tomli-w",            # TOML writing (tomllib for reading is stdlib 3.11+)
@@ -72,7 +71,19 @@ hardware = [
     # "palmsens",            # installed from PalmSens wheel
 ]
 
+# The desktop GUI. Every PySide6 import in the tree lives under src/softae/gui/,
+# and opencv only in gui/widgets/webcam_worker.py plus one lazy call site in
+# drivers/async_camera.py — so the CLI tools, the workflow runner and the web
+# visualizer all run without this. nest-asyncio is NOT here: it is the server
+# layer's sync context-manager path (server/base_instrument.py:140).
+gui = [
+    "PySide6>=6.6",
+    "opencv-python",
+    "qasync",
+]
+
 dev = [
+    "softae[gui]",        # ~50 test files import PySide6; pytest-qt below needs it
     "pytest",
     "pytest-asyncio",
     "pytest-qt",

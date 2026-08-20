@@ -82,3 +82,52 @@ class TestDaemonShutdown:
         assert tab._abort_requested is True
         assert tab._sweep_thread.is_alive()  # signal-only: not joined
         tab.cleanup()  # teardown join
+
+
+class TestChannelParsing:
+    """The channels field feeds ``ArrheniusSweepConfig(channels=...)`` directly.
+
+    Order matters here in a way it does not elsewhere: for a sweep, channel
+    order *is* measurement order, so these pin order preservation as hard as
+    they pin validation.  ``_parse_channels`` delegates to the shared parser,
+    which raises ``ChannelSpecError`` — a ``ValueError`` subclass, which is
+    what the ``except (ValueError, TypeError)`` at the save-config call site
+    catches.
+    """
+
+    def test_arrhenius_parse_channels_preserves_entry_order(self, tab: ArrheniusTab):
+        tab.set_pcb_channel_count(32)
+        tab._le_channels.setText("10, 2, 3-5")
+        assert tab._parse_channels() == [10, 2, 3, 4, 5]
+
+    def test_arrhenius_parse_channels_dedups_first_wins(self, tab: ArrheniusTab):
+        tab.set_pcb_channel_count(32)
+        tab._le_channels.setText("3, 1-3")
+        assert tab._parse_channels() == [3, 1, 2]
+
+    def test_arrhenius_parse_channels_bad_token_raises_a_value_error(
+        self, tab: ArrheniusTab
+    ):
+        from softae.core.channel_spec import ChannelSpecError
+
+        tab._le_channels.setText("1, x")
+        with pytest.raises(ValueError):          # the call site's except clause
+            tab._parse_channels()
+        tab._le_channels.setText("1, x")
+        with pytest.raises(ChannelSpecError):    # ...and it is the specific one
+            tab._parse_channels()
+
+    def test_arrhenius_parse_channels_empty_raises(self, tab: ArrheniusTab):
+        tab._le_channels.setText("   ")
+        with pytest.raises(ValueError):
+            tab._parse_channels()
+
+    def test_arrhenius_parse_channels_enforces_the_board_channel_bound(
+        self, tab: ArrheniusTab
+    ):
+        tab.set_pcb_channel_count(8)
+        tab._le_channels.setText("1, 9")
+        with pytest.raises(ValueError):
+            tab._parse_channels()
+        tab.set_pcb_channel_count(16)
+        assert tab._parse_channels() == [1, 9]   # same text, wider board

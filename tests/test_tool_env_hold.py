@@ -288,9 +288,9 @@ class TestArguments:
 class TestRigClaim:
     def test_a_mock_hold_takes_no_claim(self, project, no_claim, monkeypatch,
                                         capsys):
-        """``session_is_simulated`` short-circuits, so a dry run cannot become an
-        outage for a real one — and the busy peek is skipped for the same reason:
-        a hold that claims nothing must not be refused over a lock it never wants.
+        """``--mock`` claims nothing, so a dry run cannot become an outage for a
+        real one — and the busy peek is skipped for the same reason: a hold that
+        claims nothing must not be refused over a lock it never wants.
         """
         def _boom(*_a, **_k):
             raise AssertionError("a --mock hold must not consult the rig lock")
@@ -299,6 +299,47 @@ class TestRigClaim:
         code = main(["hold", "--rh", "45", "--duration-s", "0",
                      "--execute", "--yes", "--mock"])
         assert code == EXIT_OK
+
+    def test_the_mock_gate_is_the_tools_own_flag_not_a_name_heuristic(
+            self, project, monkeypatch):
+        """The gate itself, pinned — so nobody "simplifies" it away as redundant.
+
+        `held_rig_session` has its own exemption for a fully simulated manager,
+        and on today's drivers it would reach the same answer, which is exactly
+        why the gate looks removable and is not. Per SESSION_MAIL [e6] §1,
+        measured rather than argued: `session_is_simulated` recognises a mock by
+        the `Mock` prefix on its class **name**, so a legitimately-named mock
+        *subclass* reads as REAL. `eis-validate --mock` installs that shape and
+        an unconditional claim there took the machine-scope `~/.softae/rig.lock`
+        for a run touching no hardware, refusing the operator's GUI. This tool's
+        mocks happen to be prefix-named, which makes the delegated form correct
+        by coincidence; one mock subclass added later would silently make a
+        `--mock` hold contend with a real one.
+
+        So: `held_rig_session` must not even be *reached* under `--mock`. The
+        second assertion is the counterfactual it is protected from — the
+        exemption's own verdict on a subclass, which is the wrong one.
+        """
+        from softae.core.rig_session import session_is_simulated
+        from softae.drivers.mock_rh_controller import MockRHController
+
+        def _boom(*_a, **_k):
+            raise AssertionError("a --mock hold must not reach the rig claim")
+
+        monkeypatch.setattr("softae.core.rig_session.held_rig_session", _boom)
+        monkeypatch.setattr("softae.core.run_lock.foreign_run_lock", _boom)
+
+        assert main(["hold", "--rh", "45", "--duration-s", "0",
+                     "--execute", "--yes", "--mock"]) == EXIT_OK
+
+        class FastMockRHController(MockRHController):
+            """[e6]'s shape: fully simulated, no `Mock` prefix on the name."""
+
+        subclassed = MagicMock()
+        subclassed.names = ["rh_controller"]
+        subclassed.get.return_value = FastMockRHController.__new__(
+            FastMockRHController)
+        assert session_is_simulated(subclassed) is False
 
     def test_a_foreign_holder_refuses_with_exit_busy(self, project, monkeypatch,
                                                     capsys):

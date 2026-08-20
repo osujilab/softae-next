@@ -76,6 +76,7 @@ from softae.config.loader import default_pcb_name, pcb_configs
 from softae.core.autonomous_wiring import CampaignSpec, resolve_direction
 from softae.core.campaign_discovery import find_running_campaign
 from softae.core.campaign_events import EventCursor, read_events
+from softae.core.channel_spec import parse_channel_spec
 from softae.core.geometry import electrode_count
 from softae.errors import CampaignError
 from softae.gui.tabs._autonomous_run import AutonomousRunMixin
@@ -611,25 +612,19 @@ class LiveBOCampaignTab(AutonomousRunMixin, BOTabBase):
     # ── Channels parsing ─────────────────────────────────────────────────────
 
     def _parse_channels(self) -> tuple[int, ...]:
-        raw = self._le_channels.text()
-        out: list[int] = []
-        for part in raw.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            if "-" in part:
-                lo_s, hi_s = part.split("-", 1)
-                lo, hi = int(lo_s.strip()), int(hi_s.strip())
-                if lo > hi:
-                    raise ValueError(f"range start must be <= end: '{part}'")
-                out.extend(range(lo, hi + 1))
-            else:
-                out.append(int(part))
-        seen: set[int] = set()
-        result = [c for c in out if not (c in seen or seen.add(c))]
-        if not result:
-            raise ValueError("at least one channel must be specified")
-        return tuple(result)
+        """Channels for the campaign, in entry order — which is drive order.
+
+        Bounded by the selected board's electrode count: a channel the board
+        does not have is refused here rather than reaching ``CampaignSpec``.
+        Raises ``ChannelSpecError`` (a ``ValueError``) on empty or malformed.
+        """
+        return tuple(
+            parse_channel_spec(
+                self._le_channels.text(),
+                max_ch=self._pcb_electrode_count(),
+                order="as-written",
+            )
+        )
 
     # ── config <-> UI ──────────────────────────────────────────────────────
 

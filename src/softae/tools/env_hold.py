@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import signal
 import sys
 import threading
@@ -457,9 +458,9 @@ def _cmd_hold(args) -> int:
     # `tools/campaign.py`'s ordering and for the same reason: a refusal over
     # hardware this hold never touched must not leave an `aborted` run row
     # behind, because that row is indistinguishable from a hold that started and
-    # failed. Gated on `--mock` to mirror `held_rig_session`, which skips the
-    # claim entirely for a simulated session — a mock hold that takes no lock
-    # must not be refused over one either.
+    # failed. Gated on `args.mock`, the same flag the claim below is gated on and
+    # for the same reason: a mock hold that takes no lock must not be refused
+    # over one either.
     #
     # The residual race is deliberately accepted: a holder that arrives between
     # this peek and the claim below still raises `RunLockHeld` after the row
@@ -481,9 +482,23 @@ def _cmd_hold(args) -> int:
     finalize = run_finalizer(store, run_id)
 
     try:
-        # `held_rig_session` skips the claim entirely when every driver is a
-        # mock, so `--mock` claims nothing and cannot lock out a real run.
-        with held_rig_session(manager, what=f"{CLAIM_KIND}:{run_id}"):
+        # `--mock` claims nothing, and the gate is **this tool's own flag** rather
+        # than `held_rig_session`'s `session_is_simulated` exemption, which would
+        # otherwise reach the same answer here today. Per SESSION_MAIL [e6] §1,
+        # measured rather than argued: that exemption recognises a mock by the
+        # `Mock` prefix on its class *name*, so a legitimately-named mock
+        # **subclass** reads as real — `eis-validate --mock` installs exactly that
+        # shape, and an unconditional claim there took the machine-scope
+        # `~/.softae/rig.lock` for a run that touches no hardware, refusing the
+        # operator's GUI on the way. This tool's `--mock` happens to install
+        # prefix-named mocks, which makes the unconditional form correct by
+        # coincidence and not by construction; one mock subclass introduced here
+        # later would silently turn a dry run into an outage for a real one.
+        # The flag is the invariant's own evidence, so it is what the invariant
+        # is gated on. Same shape as `tools/eis_validate.py`'s `_rig_claim`.
+        claim = (contextlib.nullcontext() if args.mock
+                 else held_rig_session(manager, what=f"{CLAIM_KIND}:{run_id}"))
+        with claim:
             return _run_hold(args, manager, store, run_id, finalize, seconds,
                              RHHoldWatch=RHHoldWatch,
                              thresholds=rh_watchdog_config(),
