@@ -38,6 +38,17 @@ to start on exactly the conditions that most need a hold. The default here is
 going to be taken anyway yields an apex histogram for the whole strip **before a
 single reference sweep is spent**, which is what makes the setpoint -- the lever
 that actually decides whether the run produces evidence -- decidable in advance.
+
+**The settle gate proves the RIG stopped moving; the soak is for the SAMPLE.**
+Chamber air, the stage's thermal mass and the RH sensor settle on one timescale;
+a polymer film taking up or shedding water at a new RH settles on its own, far
+longer one. ``SettleTracker`` watches sigma across rounds and so does see the
+sample -- but it certifies *the trailing window is flat*, which a slow uptake can
+satisfy locally while the film is still hours from equilibrium. Measuring there
+confounds the scout-vs-reference comparison this harness exists to make, and it
+would surface as *trend* in the drift re-checks rather than as noise, which is
+the one failure mode paired differences cannot absorb. :func:`soak_phase` closes
+that gap: a floor on **continuous time at condition** before the first spectrum.
 """
 
 from __future__ import annotations
@@ -59,6 +70,27 @@ DEFAULT_TEMP_DESCENT_TIMEOUT_S = 5400.0
 DEFAULT_SETTLE_MAX_HOLD_S = 5400.0
 DEFAULT_MIN_TREATMENT = 6
 DEFAULT_DRIFT_CHECK = 3
+
+#: No soak unless one is asked for. Every invocation and every test written
+#: before the soak existed must behave exactly as it did, and 0 is the only
+#: default that guarantees it.
+DEFAULT_SOAK_S = 0.0
+#: How much wall-clock the soak may spend *beyond* the soak itself, recovering
+#: from excursion restarts, before it refuses. Not a knob: it is
+#: :func:`_approach_one`'s "one bounded retry, then refuse" policy expressed in
+#: time rather than in attempts, because excursions come in blips of unequal
+#: length and counting them would refuse a run over three harmless ones while
+#: tolerating one long enough to matter.
+SOAK_CEILING_FACTOR = 2.0
+#: Between-poll interval during a soak. Matches ``approach_condition``'s own
+#: default, and must stay well under the excursion grace windows (120 s
+#: temperature, 600 s RH) or a sustained excursion could never accumulate the
+#: two consecutive samples ``sustained_above`` needs to span one.
+SOAK_POLL_INTERVAL_S = 30.0
+#: One progress line per this many polls -- 5 min at the default interval. A
+#: four-hour soak printing every poll is 480 lines of nothing happening, which
+#: is how an operator learns to stop reading the console.
+SOAK_PRINT_EVERY_N_POLLS = 10
 
 TEMP_CONTROLLER = "temp_controller"
 RH_CONTROLLER = "rh_controller"
@@ -122,6 +154,11 @@ class ValidationPlan:
     temp_approach_timeout_s: float = DEFAULT_TEMP_APPROACH_TIMEOUT_S
     settle: bool = True
     settle_max_hold_s: float = DEFAULT_SETTLE_MAX_HOLD_S
+    #: Seconds of **continuous time at condition** required before the first
+    #: spectrum. Set from ``--soak-h``, stored in seconds so it is uniform with
+    #: every other duration on this plan. The settle phase runs at condition and
+    #: therefore counts against it -- see :func:`soak_phase`.
+    soak_s: float = DEFAULT_SOAK_S
     end_state: str = "park"
     retries: int = 1
     max_consecutive_failures: int = 3
@@ -147,13 +184,26 @@ class ValidationPlan:
         channel set or condition moved would append one experiment's
         observations to another's, which corrupts both and is not visible in
         the resulting data.
+
+        **``soak_s`` is in, and every other duration is out.** The line is not
+        seconds-versus-not, it is ceiling-versus-floor. ``settle_max_hold_s`` and
+        the approach timeouts are *ceilings on waiting for a criterion*: the
+        criterion decides the sample's state and the ceiling only decides how
+        long the harness is willing to wait for it, so moving one cannot move
+        what was measured. ``soak_s`` is a **floor that sets the state
+        directly** -- a film 30 min into an RH step and the same film 6 h in are
+        different specimens, and pooling their cells is the exact corruption
+        this hash exists to refuse. The operator-facing cost is stated rather
+        than hidden: ``--resume`` must repeat the soak it started with, and a
+        resume that simply forgets the flag is refused instead of quietly
+        measuring an unsoaked sample into a soaked dataset.
         """
         import hashlib
 
         parts = "|".join(str(p) for p in (
             self.validation_name, self.channels, self.rh_setpoint_pct,
             self.temp_setpoint_c, self.baseline_preset, self.reference_preset,
-            self.order, self.max_follow_ups, self.visit,
+            self.order, self.max_follow_ups, self.visit, self.soak_s,
         ))
         return hashlib.sha256(parts.encode("utf-8")).hexdigest()[:16]
 
@@ -169,7 +219,7 @@ class ValidationPlan:
 def validate_plan(plan: ValidationPlan) -> None:
     """Refuse impossible plans **before** anything is heated.
 
-    One check today, and it is not hypothetical: ``settle_check`` requires at
+    Two checks today, and neither is hypothetical: ``settle_check`` requires at
     least ``DEFAULT_SETTLE_MIN_CHANNELS`` participating channels, so a run on
     fewer than that can never return ``settled`` -- it runs every round to the
     ceiling and then refuses. Caught late that costs the full
@@ -178,6 +228,15 @@ def validate_plan(plan: ValidationPlan) -> None:
     """
     from softae.analysis.equilibration import DEFAULT_SETTLE_MIN_CHANNELS
 
+    # A negative soak would sail through `soak_phase` as "already satisfied" and
+    # read on the projection as a *shortened* run, so it is refused rather than
+    # clamped: the operator who typed it meant something, and silently meaning 0
+    # is the reading least likely to be it.
+    if plan.soak_s < 0:
+        raise RefuseToStart(
+            f"--soak-h is negative ({plan.soak_s / 3600:g} h). A soak is a floor "
+            "on time at condition; there is no such thing as a negative one."
+        )
     if plan.settle and len(plan.channels) < DEFAULT_SETTLE_MIN_CHANNELS:
         raise RefuseToStart(
             f"{len(plan.channels)} channel(s) is below the settle gate's "
@@ -300,6 +359,16 @@ def render_projection(plan: ValidationPlan, projection: Projection) -> str:
                     f"(~{projection.settle_round_s:.0f} s/round)")
     add(f"  {settle_label:<44}{'25 - 45 min':>14}"
         f"{plan.settle_max_hold_s / 60:>7.0f} min")
+    # Its own row, always, including at 0. The operator reads this table and
+    # types "yes" against it, so a soak that did not appear here would be hours
+    # the projection lied about -- and an absent soak is itself a decision worth
+    # seeing. `time` is what the soak will *add* (settle time already counts
+    # against it, so a settle longer than the soak adds nothing); `bound` is the
+    # ceiling the excursion restarts are held under.
+    soak_add = ("0 min" if plan.soak_s <= 0
+                else f"0 - {plan.soak_s / 60:.0f} min")
+    add(f"  {'soak       hold at condition (--soak-h)':<44}{soak_add:>14}"
+        f"{plan.soak_s * SOAK_CEILING_FACTOR / 60:>7.0f} min")
     add("  " + "-" * 68)
     add(f"  R   reference   {plan.reference_preset:<12}"
         f"{projection.reference_s / 60:>8.1f} min")
@@ -325,6 +394,16 @@ def render_projection(plan: ValidationPlan, projection: Projection) -> str:
     add("  at 85 C was MEASURED at ~5000 s (2026-08-11). The shipped default would")
     add("  refuse to start on exactly the conditions that most need a hold.")
     add("")
+    if plan.soak_s > 0:
+        add(f"  SOAK {plan.soak_s / 3600:.2f} h: the settle gate proves the RIG "
+            "stopped moving; this")
+        add("  is the SAMPLE's own equilibration. The clock starts when the "
+            "condition is")
+        add("  ESTABLISHED -- i.e. when the approach completes -- so the settle "
+            "rounds,")
+        add("  which run at condition, count against it and only the remainder "
+            "is waited.")
+        add("")
     add(f"  RESOLVING WINDOW: apex in [{plan.ref_close_hz:.2f}, "
         f"{plan.baseline_ok_hz:.2f}) Hz -- "
         f"{math.log10(plan.baseline_ok_hz / plan.ref_close_hz):.2f} decades.")
@@ -586,6 +665,155 @@ def assert_settle_licensed(outcome: SettleOutcome) -> None:
               "and the decision-rule outcome will be WITHHELD.")
 
 
+# ── The soak ─────────────────────────────────────────────────────────────────
+
+@dataclass
+class SoakOutcome:
+    """What the soak actually delivered, as opposed to what was asked."""
+
+    #: Continuous time at condition credited when the first spectrum was
+    #: licensed. Never less than ``plan.soak_s`` on a return.
+    soaked_s: float
+    #: Wall-clock spent inside :func:`soak_phase`. Zero when the settle phase
+    #: already covered the soak.
+    waited_s: float
+    #: Time at condition inherited from the settle phase, which runs there.
+    settle_credit_s: float
+    #: How many times a warn-grade excursion reset the continuity clock.
+    restarts: int = 0
+
+
+def soak_phase(
+    plan: ValidationPlan,
+    watch: Any,
+    *,
+    established_at: float,
+    sleep: Any = None,
+    now: Any = None,
+    poll_interval_s: float = SOAK_POLL_INTERVAL_S,
+    on_poll: Callable[[int, float, float, int], None] | None = None,
+    on_restart: Callable[[int, float, float], None] | None = None,
+) -> SoakOutcome:
+    """Hold the established condition for ``plan.soak_s`` before any spectrum.
+
+    **The clock starts when the condition is ESTABLISHED, not when this is
+    called.** *established_at* is the instant ``approach_condition`` returned, so
+    the settle rounds -- which run at condition, for 25-45 minutes -- count
+    against the soak, and only the remainder is waited. The alternative, starting
+    the clock where this function sits in the sequence, was rejected: it charges
+    the operator twice for time the sample has already spent at the new RH, and
+    the quantity the soak asserts is *time at condition*, which is indifferent to
+    whether a Quick round was running during it. Time spent *approaching*
+    setpoint is excluded for the mirror-image reason -- it is not time at
+    condition at all.
+
+    **It runs with ``--settle off`` too, and that is when it matters most.**
+    Disabling the settle gate removes the only evidence that anything stopped
+    moving; the soak is then the sole thing standing between the approach and the
+    first sweep, and it is the instrument by which an operator who has taken the
+    equilibration judgement into their own hands actually exercises it. Skipping
+    the soak because the outcome will be withheld anyway was rejected on those
+    grounds. It falls out of the clock rule with no special case: a disabled
+    settle returns immediately, so the credit is ~0 and the full soak is waited.
+
+    **The soak watches; it does not sit idle.** A soak that drifted out of
+    tolerance and then measured anyway would be worse than no soak at all -- it
+    would attach a *claim* of equilibration to a sample that had been moved. So
+    ``watch.poll()`` runs on the same cadence the approach uses, which gives the
+    two graded verdicts their existing consequences for free:
+
+    ``fault``
+        :class:`~softae.errors.SafetyError` propagates out of ``poll`` and the
+        runner parks and exits non-zero. No new path.
+    ``warn``
+        **restarts the continuity clock.** The soak asserts *continuous* time at
+        condition and an excursion is the negation of continuity, so an elapsed
+        count that survived one would be a false certificate. Recorded and
+        continued -- the shipped posture, and the one this harness keeps
+        elsewhere -- was rejected here for that reason, and aborting outright was
+        rejected because ``HoldWatch``'s temperature warn is an *instantaneous*
+        test and a single blip is not evidence that the condition cannot be held.
+        Restarts are bounded by :data:`SOAK_CEILING_FACTOR`; a condition that
+        cannot hold itself for the soak will not hold for the measurement block
+        either, so exceeding the ceiling refuses rather than proceeding.
+
+    **The two observers, and why they are hooks rather than prints.**
+    *on_poll* ``(polls, soaked_s, target_s, restarts)`` fires after every poll and
+    *on_restart* ``(restart, lost_s, target_s)`` after every excursion reset.
+    They exist because a soak is hours of a process saying nothing to anyone not
+    standing at the terminal, and
+    :mod:`softae.tools.eis_validate_narrate` turns them into the run's published
+    stream and its ``conditions.json``. Injected rather than imported so this
+    module keeps knowing nothing about sidecars, and **swallowed** rather than
+    propagated: an observer is a monitoring convenience, and a monitoring
+    convenience must never be the reason a soak refuses.
+    """
+    sleep = sleep or time.sleep
+    now = now or time.monotonic
+
+    def observe(hook: Any, *args: Any) -> None:
+        if hook is None:
+            return
+        try:
+            hook(*args)
+        except Exception:                                 # pragma: no cover
+            logger.warning("eis_validate_soak_observer_failed", exc_info=True)
+
+    target = float(plan.soak_s)
+    entered = float(now())
+    credit = entered - float(established_at)
+    if target <= 0:
+        return SoakOutcome(soaked_s=credit, waited_s=0.0, settle_credit_s=credit)
+
+    ceiling = entered + target * SOAK_CEILING_FACTOR
+    clock_start = float(established_at)
+    restarts = 0
+    polls = 0
+    print(f"[soak  ] holding at condition for {target / 60:.0f} min; "
+          f"{max(0.0, credit) / 60:.1f} min of it already spent at condition "
+          f"during approach-to-settle.", flush=True)
+
+    while True:
+        elapsed = float(now()) - clock_start
+        if elapsed >= target:
+            break
+        if float(now()) >= ceiling:
+            raise RefuseToStart(
+                f"the soak could not accumulate {target / 60:.0f} min of "
+                f"unbroken time at condition within "
+                f"{target * SOAK_CEILING_FACTOR / 60:.0f} min of waiting "
+                f"({restarts} excursion restart(s), best run "
+                f"{elapsed / 60:.1f} min). A condition that cannot hold itself "
+                "through the soak will not hold through the measurement block "
+                "-- refusing to start."
+            )
+        sleep(max(0.0, min(float(poll_interval_s), target - elapsed)))
+        polls += 1
+
+        if watch is not None:
+            watch.poll()                      # a fault raises; the runner parks
+            if watch.excursion:
+                restarts += 1
+                clock_start = float(now())
+                print(f"[soak  ] EXCURSION at {elapsed / 60:.1f} min -- the soak "
+                      f"clock restarts (restart {restarts}); continuity is the "
+                      "quantity being asserted.", flush=True)
+                observe(on_restart, restarts, elapsed, target)
+                continue
+        observe(on_poll, polls, float(now()) - clock_start, target, restarts)
+        if polls % SOAK_PRINT_EVERY_N_POLLS == 0:
+            print(f"[soak  ] {(float(now()) - clock_start) / 60:6.1f} / "
+                  f"{target / 60:.0f} min at condition", flush=True)
+
+    soaked = float(now()) - clock_start
+    print(f"[soak  ] complete: {soaked / 60:.1f} min of unbroken time at "
+          f"condition, {restarts} restart(s).", flush=True)
+    return SoakOutcome(
+        soaked_s=soaked, waited_s=float(now()) - entered,
+        settle_credit_s=credit, restarts=restarts,
+    )
+
+
 # ── The hold ─────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -737,10 +965,12 @@ def _round_fit(channel: int, eis: Any) -> Any:
 __all__ = [
     "DEFAULT_DRIFT_CHECK", "DEFAULT_MIN_TREATMENT",
     "DEFAULT_RH_APPROACH_TIMEOUT_S", "DEFAULT_SETTLE_MAX_HOLD_S",
-    "DEFAULT_TEMP_APPROACH_TIMEOUT_S", "DEFAULT_TEMP_DESCENT_TIMEOUT_S",
+    "DEFAULT_SOAK_S", "DEFAULT_TEMP_APPROACH_TIMEOUT_S",
+    "DEFAULT_TEMP_DESCENT_TIMEOUT_S", "SOAK_CEILING_FACTOR",
+    "SOAK_POLL_INTERVAL_S", "SOAK_PRINT_EVERY_N_POLLS",
     "ApproachReport", "HoldWatch", "Projection", "RefuseToStart",
-    "SettleOutcome", "ValidationPlan", "VirtualClock",
+    "SettleOutcome", "SoakOutcome", "ValidationPlan", "VirtualClock",
     "approach_condition", "assert_settle_licensed", "classify_apex",
     "population_thresholds", "project", "render_arc_watch",
-    "render_projection", "settle_phase", "validate_plan",
+    "render_projection", "settle_phase", "soak_phase", "validate_plan",
 ]

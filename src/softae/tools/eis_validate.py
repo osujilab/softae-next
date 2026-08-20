@@ -29,11 +29,20 @@ INSUFFICIENT outcome all follow from that one fact.
 Ordering
 --------
 1. resolve the plan; print the projection; **thermal confirmation**
-2. approach temperature -> approach RH        (refuses on timeout)
-3. settle phase -> arc-capture watch          (refuses on ceiling/not_evaluable)
-4. per channel, **interleaved**: reference, then adaptive, then the next channel
-5. drift check: re-run the reference on the first N channels
-6. park (default) or hold; disconnect
+2. start (or re-enter) the run row, **open the stream**, **claim the rig**, connect
+3. approach temperature -> approach RH        (refuses on timeout)
+4. settle phase -> arc-capture watch          (refuses on ceiling/not_evaluable)
+5. soak: hold the established condition       (``--soak-h``, default 0)
+6. per channel, **interleaved**: reference, then adaptive, then the next channel
+7. drift check: re-run the reference on the first N channels
+8. park (default) or hold; disconnect; **release the claim**; close the stream
+
+Step 5 exists because step 4 answers a different question than it appears to.
+The settle gate certifies that **the rig** stopped moving; a film taking up water
+at a new RH moves on a far longer timescale and can hold a locally flat trailing
+window while it is still hours from equilibrium. ``--soak-h`` is a floor on
+*continuous time at condition*, clocked from the moment the approach completes --
+so the settle rounds, which run at condition, count against it.
 
 Interleaved, not blocked, because running every cell's reference first would
 leave ~30 minutes between the paired measurements the entire primary metric is
@@ -54,11 +63,38 @@ response to an unknown head position is to add no motion to it.
 A park drives the heater to 10 C and suspends anti-clog purging, so **a park
 ends the condition** -- and ``--resume`` therefore re-runs the full approach and
 settle gate before taking a single sweep. No flag skips it.
+
+The run also **claims the rig** for its whole connected life, as
+``tool:eis-validate:<run_id>`` via
+:func:`~softae.core.rig_session.held_rig_session` -- taken before
+``connect_all`` and given back after ``disconnect_all``. Until it did, an
+operator who opened the desktop GUI mid-sweep got a window whose own claim
+*succeeded*, because this tool claimed nothing, and which then connected onto
+the serial ports this tool was mid-sweep on. Closing the run row
+(``owner_pid``) made the **record** of such a run safe; only the claim makes its
+**ports** safe.
+
+Watching one, mid-run
+---------------------
+The claim answered "may I take the rig"; it did not answer the operator's other
+question at hour two, which is *"is it still at setpoint, and how far along is
+it?"*. So the run now publishes the two sidecars a campaign publishes --
+``events.jsonl`` and ``conditions.json``, beside the run, both best-effort --
+through :mod:`softae.tools.eis_validate_narrate`, and the claim's ``log_path``
+names that directory so a watcher can find it at all. The narration is opened
+**before** the claim, so the directory the lock advertises already holds this
+run's own stream rather than a promise of one.
+
+Read that module before changing anything here: the beat is a thread rather than
+an asyncio task because this runner is synchronous, and ``conditions.json`` is
+published from the capture :func:`persist` already performs rather than from a
+second reader competing for the serial lock a sweep is using.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import time
@@ -74,7 +110,10 @@ from softae.tools.eis_validate_hold import (
     DEFAULT_MIN_TREATMENT,
     DEFAULT_RH_APPROACH_TIMEOUT_S,
     DEFAULT_SETTLE_MAX_HOLD_S,
+    DEFAULT_SOAK_S,
     DEFAULT_TEMP_APPROACH_TIMEOUT_S,
+    SOAK_CEILING_FACTOR,
+    SOAK_PRINT_EVERY_N_POLLS,
     HoldWatch,
     RefuseToStart,
     ValidationPlan,
@@ -86,7 +125,20 @@ from softae.tools.eis_validate_hold import (
     render_arc_watch,
     render_projection,
     settle_phase,
+    soak_phase,
     validate_plan,
+)
+from softae.tools.eis_validate_narrate import (
+    PHASE_APPROACH,
+    PHASE_CELLS,
+    PHASE_DRIFT,
+    PHASE_FINISHED,
+    PHASE_PARK,
+    PHASE_REPORT,
+    PHASE_SETTLE,
+    PHASE_SOAK,
+    RunNarration,
+    open_narration,
 )
 from softae.tools.eis_validate_report import (
     ARM_FOLLOW_UP,
@@ -111,6 +163,14 @@ EXIT_INTERRUPTED = 130
 #: (``pico2_range = [17, 32]``, remapped by ``mod_channel_restart`` to pico2's
 #: 2-16). Channel 18 is the one bench-verified for segmented scripts.
 EXAMPLE_CHANNELS = "18-32"
+
+#: ``<kind>:<name>:<run_id>`` -- the grammar ``core.rig_session`` documents,
+#: whose shipped siblings are ``campaign:<name>:<run_id>`` and
+#: ``tool:env-hold:<run_id>``. The third field is **filled**, unlike the GUI's
+#: ``gui:desktop`` which omits it because a window is not a run: this tool has a
+#: real run id, and a bare ``tool:eis-validate:`` in a lock file would assert
+#: "there is a run id and it is blank".
+CLAIM_KIND = "tool:eis-validate"
 
 
 def _no_run_to_finalize(status: str) -> None:
@@ -185,6 +245,9 @@ def build_plan(args: argparse.Namespace) -> ValidationPlan:
         temp_approach_timeout_s=float(args.temp_approach_timeout_s),
         settle=(args.settle == "on"),
         settle_max_hold_s=float(args.settle_max_hold_s),
+        # Hours in, seconds on the plan: the flag is in the operator's unit and
+        # every field beside it is in the arithmetic's.
+        soak_s=float(args.soak_h) * 3600.0,
         end_state=args.end_state,
         retries=int(args.retries),
         max_consecutive_failures=int(args.max_consecutive_failures),
@@ -212,6 +275,16 @@ class RunContext:
     seq: dict[str, int] = field(default_factory=dict)
     consecutive_failures: int = 0
     n_recorded: int = 0
+    #: Where this run says what it is doing. Defaulted to an **inert** narration
+    #: rather than to ``None`` so every call site is a plain method call: a
+    #: context built directly -- in a test, or by a future caller -- narrates
+    #: nothing and works unchanged, and no null check can be forgotten inside a
+    #: run block that drives a heater.
+    narration: Any = None
+
+    def __post_init__(self) -> None:
+        if self.narration is None:
+            self.narration = RunNarration(self.run_dir)
 
     def next_seq(self, cell: str) -> int:
         self.seq[cell] = self.seq.get(cell, 0) + 1
@@ -286,7 +359,6 @@ def persist(ctx: RunContext, eis: Any, arm: str) -> int:
     """
     from softae.analysis.eis.arc import arc_closure
     from softae.analysis.eis.engine import analyze_spectrum
-    from softae.core.conditions_capture import read_environment
 
     channel = int(eis.channel)
     cell = ctx.plan.cell_key(channel)
@@ -337,9 +409,14 @@ def persist(ctx: RunContext, eis: Any, arm: str) -> int:
     except Exception as exc:
         logger.warning("eis_validate_fit_failed", channel=channel, arm=arm,
                        error=str(exc))
+    # ONE read, two consumers: the `conditions` row and the run's
+    # `conditions.json` slot. `capture` performs the same
+    # `read_environment(manager)` this line always did and publishes what it got,
+    # so a watcher sees the rig without a single extra serial transaction on the
+    # bus the next sweep is about to use.
     try:
         ctx.data_store.record_conditions(
-            measurement_id, "measurement", **read_environment(ctx.manager))
+            measurement_id, "measurement", **ctx.narration.capture(ctx.manager))
     except Exception as exc:                              # pragma: no cover
         logger.warning("eis_validate_conditions_failed", error=str(exc))
 
@@ -440,6 +517,10 @@ def run_cells(ctx: RunContext, planner: Any, channels: list[int]) -> None:
                               f"{'follow-up':<10} "
                               f"{follow_up.measurement_time_s:6.1f} s", flush=True)
             ctx.consecutive_failures = 0
+            # Counts, never results: which cell this is out of how many. What the
+            # sweep FOUND is in the DataStore, which is the only thing that can
+            # say what it means.
+            ctx.narration.progress(PHASE_CELLS, index, total, channel=channel)
         except Exception as exc:
             ctx.consecutive_failures += 1
             logger.warning("eis_validate_cell_failed", channel=channel,
@@ -447,6 +528,9 @@ def run_cells(ctx: RunContext, planner: Any, channels: list[int]) -> None:
                            consecutive=ctx.consecutive_failures)
             print(f"  ! ch{channel} failed ({exc}); "
                   f"{ctx.consecutive_failures} consecutive", flush=True)
+            ctx.narration.progress(PHASE_CELLS, index, total, channel=channel,
+                                   failed=True,
+                                   consecutive=ctx.consecutive_failures)
             if ctx.consecutive_failures >= ctx.plan.max_consecutive_failures:
                 raise RuntimeError(
                     f"{ctx.consecutive_failures} consecutive cell failures"
@@ -462,16 +546,21 @@ def drift_check(ctx: RunContext, channels: list[int]) -> None:
     INSUFFICIENT, because a moving sample means the paired differences are not
     what they claim to be.
     """
-    for channel in channels[: max(0, int(ctx.plan.drift_check))]:
+    rechecks = channels[: max(0, int(ctx.plan.drift_check))]
+    for index, channel in enumerate(rechecks, start=1):
         if ctx.watch is not None:
             ctx.watch.poll()
         try:
             eis = measure_reference(ctx, channel, ARM_REFERENCE_END)
             print(f"[drift ] ch{channel}  {ctx.plan.reference_preset:<10} "
                   f"{eis.measurement_time_s:6.1f} s", flush=True)
+            ctx.narration.progress(PHASE_DRIFT, index, len(rechecks),
+                                   channel=channel)
         except Exception as exc:
             logger.warning("eis_validate_drift_failed", channel=channel,
                            error=str(exc))
+            ctx.narration.progress(PHASE_DRIFT, index, len(rechecks),
+                                   channel=channel, failed=True)
 
 
 # ── Resume ───────────────────────────────────────────────────────────────────
@@ -570,6 +659,25 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--settle", choices=("on", "off"), default="on")
     run.add_argument("--settle-max-hold-s", type=float,
                      default=DEFAULT_SETTLE_MAX_HOLD_S)
+    # `--soak-h`, not `--settle-min-hold-s`. Three reasons, in the order they
+    # decided it. (1) The name is already taken: `settle_phase` has a
+    # `min_hold_first_s` parameter, sourced from the shipped
+    # `DEFAULT_MIN_HOLD_FIRST_S`, and it *is* the settle gate's minimum hold --
+    # a floor below which `settled` will not be declared, with Quick rounds
+    # sweeping throughout. A flag named `--settle-min-hold-s` would name that
+    # parameter and mean something else. (2) The two are different quantities:
+    # the settle gate's criterion is rig stability, and this is the sample's
+    # equilibration, which no criterion on this rig can observe. (3) HOURS, not
+    # seconds, against the file's own `_s` convention -- deliberately. This knob
+    # is set in hours, and of the two 60x slips only one is caught: entering
+    # 14400 for minutes shows up in the projection as 240 h and the operator
+    # declines, while entering 2 for hours-as-seconds silently produces a run
+    # with no soak that looks exactly like a correct one.
+    run.add_argument("--soak-h", type=float, default=DEFAULT_SOAK_S / 3600.0,
+                     help="HOURS to hold the established condition before the "
+                          "first spectrum. Default 0. The settle gate proves "
+                          "the RIG stopped moving; the soak is the SAMPLE's own "
+                          "equilibration. Settle time counts against it")
     run.add_argument("--end-state", choices=("park", "hold"), default="park")
     run.add_argument("--retries", type=int, default=1)
     run.add_argument("--max-consecutive-failures", type=int, default=3)
@@ -600,10 +708,57 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _rig_claim(manager: Any, plan: ValidationPlan, run_id: str,
+               log_path: str = "") -> Any:
+    """Hold the rig while this process holds the ports -- or, under ``--mock``,
+    hold nothing at all.
+
+    ``log_path`` **now names this run's directory**, and the objection that kept
+    it empty is what changed rather than the argument.
+    :func:`~softae.core.rig_session.claim_rig_session` leaves the field empty by
+    default because it advertises a run directory carrying an ``events.jsonl``
+    stream, and offering one that holds some *other* run's stream -- a live lock
+    plus a present file does not make the file the lock's -- is a lie. This
+    harness published no stream at all, so the same objection applied here in its
+    strongest form. It now publishes its own, into its own run directory, opened
+    **before** the claim is taken; the field is what lets a watcher discover the
+    run at all, so leaving it blank would now be withholding rather than
+    caution. It falls back to empty when the stream could not be opened -- see
+    :attr:`~softae.tools.eis_validate_narrate.RunNarration.log_path`.
+
+    **Why the ``--mock`` gate is here and not left to ``held_rig_session``.**
+    ``tools/env_hold.py``, the tool this follows, passes its manager in
+    unconditionally on the stated grounds that ``held_rig_session`` "skips the
+    claim entirely when every driver is a mock, so ``--mock`` claims nothing and
+    cannot lock out a real run". That invariant is true there and **false here**,
+    measured rather than assumed: ``session_is_simulated`` recognises a mock by
+    the ``Mock`` prefix on its class name, and ``--mock`` in this tool swaps in
+    :mod:`~softae.tools.eis_validate_mock`'s ``GridAwareMockPico``,
+    ``FastMockTempController`` and ``FastMockRHController`` -- legitimately-named
+    subclasses of the shipped mocks, none of which carries that prefix. An
+    unconditional claim would therefore read a fully simulated manager as
+    **real** and take ``~/.softae/rig.lock`` for a run that touches no hardware:
+    precisely the "a mock run holding the rig turns a dry run into an outage for
+    a real one" the exemption exists to prevent, and it would refuse the
+    operator's GUI on the way.
+
+    Repairing the predicate is the better fix and it belongs to
+    ``core/rig_session.py``, which this file may import and must not edit. So the
+    divergence is stated here and reported there, not patched around silently.
+    """
+    if plan.mock:
+        return contextlib.nullcontext()
+    from softae.core.rig_session import held_rig_session
+
+    return held_rig_session(manager, what=f"{CLAIM_KIND}:{run_id}",
+                            log_path=log_path)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     from softae.core.data_store import DataStore
     from softae.core.eis_scout_scripts import ScoutPlanner
     from softae.core.hardware_safety import assert_hardware_armed
+    from softae.core.run_lock import RunLockHeld, busy_rig_message, foreign_run_lock
     from softae.core.safe_park import safe_park
     from softae.drivers.factory import create_manager
 
@@ -645,6 +800,32 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Do not delete this as dead code; a test pins it for exactly that reason.
     assert_hardware_armed(
         manager, action=f"run EIS validation on channels {args.channels}")
+
+    # Ask who holds the rig **before the store is opened**, which is
+    # `tools/env_hold.py`'s ordering and `tools/campaign.py`'s before it: a
+    # refusal over hardware this run never touched must leave nothing behind.
+    # That matters more here than there, because `_enter_run` does not only start
+    # a row -- it writes the campaign checkpoint, and a non-`--resume` invocation
+    # REPLACES it. A refusal taken one step later would destroy a validation's
+    # existing resume point on its way to saying "the rig is busy". Asking before
+    # `_confirm` for the same reason in the operator's currency: nobody should
+    # read a nine-hour projection and type "yes" into a run that is already lost.
+    #
+    # The residual race is accepted, not closed: a holder arriving between this
+    # peek and the claim below still raises `RunLockHeld`, and that path
+    # finalizes its row. `acquire_run_lock`'s exclusive create is what makes the
+    # claim safe; the peek only keeps the common refusal free of side effects.
+    #
+    # `foreign_run_lock`, never `read_run_lock` -- the latter reports this
+    # process's own claim as a holder, which is how the Calibration Launcher came
+    # to refuse itself once the GUI started claiming.
+    if not plan.mock:
+        holder = foreign_run_lock()
+        if holder is not None:
+            print(f"\nREFUSING TO START: "
+                  f"{busy_rig_message(holder, action='This validation')}")
+            return EXIT_FAILED
+
     if not args.mock and not _confirm(plan, projection, assume_yes=args.yes):
         return EXIT_DECLINED
 
@@ -654,38 +835,108 @@ def cmd_run(args: argparse.Namespace) -> int:
     # is adopted, and stamping the *previous* plan's row would be a lie about a
     # run this process never entered.
     finalize = _no_run_to_finalize
+    # The claim is entered part-way through the `try` -- its `what` needs a run id
+    # that does not exist at the head of the block -- and given back in the
+    # `finally` **after** `disconnect_all`. `core.rig_session`'s rule is "acquire
+    # when the ports open, release when they close", and a claim dropped before
+    # the park would leave another process free to connect on top of a park still
+    # in progress. An `ExitStack` is what lets one lexical block own a lifetime it
+    # cannot open at its own head; `close()` on a stack that never entered
+    # anything -- the `RunLockHeld` path -- is a no-op.
+    claim = contextlib.ExitStack()
+    # Inert until `_enter_run` yields a run directory to write into -- the same
+    # null-object shape as `_no_run_to_finalize` above, and for the same reason:
+    # the `except`/`finally` arms are reachable before there is anything to
+    # narrate, and a `None` there is an AttributeError inside a harness that
+    # drives a heater.
+    narration: Any = RunNarration(Path(store.project_dir))
+    # Bound before the `try` for the same reason: the `finally` reads it, and
+    # `_enter_run` is the first statement that can raise.
+    ctx: RunContext | None = None
+    # How this run ended, as the stream will say it. Set by whichever arm below
+    # wins and emitted **once**, in the `finally`, so `run_finished` is the last
+    # record on every path -- including the ones no `except` names -- and lands
+    # after the park rather than before it.
+    outcome: dict[str, Any] = {"status": "error"}
     try:
         import asyncio
 
-        asyncio.run(manager.connect_all())
+        # `_enter_run` **before** the claim, and so before `connect_all`. It needs
+        # no hardware: it starts (or re-enters) the `experiments` row and writes
+        # the resume checkpoint, both pure DataStore work, and it touches
+        # `manager` only to hand it to the `RunContext`. Running it first is what
+        # makes the claim's run id available before a single port is opened, and
+        # it moves `--resume`'s `ResumeMismatch` *earlier*: it now raises before
+        # anything is claimed or connected, which is stricter than before, never
+        # looser.
         ctx = _enter_run(store, manager, plan, args)
         finalize = run_finalizer(store, ctx.run_id)
+        # The stream opens **first**, and that ordering is the whole reason the
+        # claim below may name a `log_path` at all: by the time the lock file is
+        # written, the directory it advertises already holds THIS run's
+        # `events.jsonl` with `run_started` in it. Entered on the same stack, and
+        # first, so it is closed LAST -- after the park, after the disconnect and
+        # after the claim is given back, which is what lets `run_finished` be a
+        # true statement rather than an optimistic one.
+        narration = claim.enter_context(open_narration(ctx.run_dir))
+        ctx.narration = narration
+        narration.record(
+            "run_started", run_id=ctx.run_id, validation=plan.validation_name,
+            channels=len(plan.channels), rh_setpoint_pct=plan.rh_setpoint_pct,
+            temp_setpoint_C=plan.temp_setpoint_c, soak_s=plan.soak_s,
+            hold_epoch=ctx.hold_epoch, resume=bool(args.resume),
+            mock=bool(plan.mock))
+        claim.enter_context(
+            _rig_claim(manager, plan, ctx.run_id, narration.log_path))
+        asyncio.run(manager.connect_all())
         remaining = _remaining_channels(store, plan, resume=bool(args.resume))
         if not remaining:
             print("Every planned cell is already complete; nothing to measure.")
+            outcome = {"status": "done", "reason": "nothing to measure"}
             finalize("done")
             return EXIT_OK
 
+        # `ctx.watch` is now built inside `_establish_condition`: the soak needs
+        # it before the first sweep, and a watch created afterwards would have no
+        # series across the hours it was meant to be watching.
         _establish_condition(ctx, plan, remaining)
-        ctx.watch = HoldWatch(manager=manager, plan=plan)
         planner = ScoutPlanner(site="validation", actuate=True)
+        narration.state(PHASE_CELLS, channels=len(remaining))
         run_cells(ctx, planner, remaining)
+        narration.state(PHASE_DRIFT, channels=plan.drift_check)
         drift_check(ctx, remaining)
+        narration.state(PHASE_REPORT)
         _write_report(store, plan, args)
+        outcome = {"status": "done"}
         finalize("done")
         return EXIT_OK
+    except RunLockHeld as held:
+        # The peek above makes this the race rather than the routine case: a
+        # holder that arrived in the moment between asking and claiming. Refused
+        # with the harness's own vocabulary, and `aborted` for the same reason the
+        # arm below is -- the harness declined; nothing was interrupted. The row
+        # exists by this point, so closing it is not optional: an unfinished row
+        # is byte-for-byte what a crash looks like.
+        outcome = {"status": "aborted", "reason": "rig claimed by another process"}
+        finalize("aborted")
+        print(f"\nREFUSING TO START: "
+              f"{busy_rig_message(held.lock, action='This validation')}")
+        return EXIT_FAILED
     except RefuseToStart as exc:
         # A refusal is a decision, not an accident: the harness declined to spend
         # the measurement block. `aborted`, never `interrupted` -- nothing was
         # interrupted, and this row is the only place the distinction survives.
+        outcome = {"status": "aborted", "reason": str(exc)}
         finalize("aborted")
         print(f"\nREFUSING TO START: {exc}")
         return EXIT_FAILED
     except KeyboardInterrupt:
+        outcome = {"status": "interrupted"}
         finalize("interrupted")
         print("\nInterrupted. Recorded rows stand; nothing new was started.")
         return EXIT_INTERRUPTED
     except Exception as exc:
+        outcome = {"status": "error", "reason": str(exc)}
         finalize("error")
         logger.error("eis_validate_run_failed", error=str(exc))
         print(f"\nRUN FAILED: {exc}")
@@ -699,6 +950,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         # Every exit path, success included. `retract_head=None` because absent
         # an operator the correct response to an unknown is to add no motion to
         # it -- `safe_park`'s default is reversed for exactly this caller class.
+        narration.state(PHASE_PARK, end_state=plan.end_state)
         if plan.end_state == "park":
             result = safe_park(manager, reason="eis validation complete",
                                retract_head=None)
@@ -706,15 +958,34 @@ def cmd_run(args: argparse.Namespace) -> int:
             print("         A PARK ENDS THE CONDITION: the heater is driven to "
                   "10 C and anti-clog purging is suspended. --resume "
                   "re-equilibrates from scratch.")
+            # `park` is the campaign's own record for exactly this act, and the
+            # park is the longest thing left in the process -- so a watcher that
+            # sees it knows the measurement block is over and the rig is on its
+            # way to safe, rather than inferring it from a silence.
+            narration.record("park", reason="eis validation complete",
+                             ok=bool(getattr(result, "ok", True)))
         else:
             print("\n[hold  ] --end-state hold: the heater and humidifier are "
                   "STILL DRIVEN. You are expected to be standing there.")
+            narration.record("park", reason="--end-state hold: not parked",
+                             ok=False, held=True)
         try:
             import asyncio
 
             asyncio.run(manager.disconnect_all())
         except Exception:                                 # pragma: no cover
             pass
+        # After the disconnect, so it is the truth rather than a prediction, and
+        # before `claim.close()` -- which unwinds the narration itself.
+        narration.state(PHASE_FINISHED)
+        narration.record("run_finished", status=outcome.get("status", "error"),
+                         n_recorded=int(getattr(ctx, "n_recorded", 0)),
+                         **{k: v for k, v in outcome.items() if k != "status"})
+        # Last, and deliberately after the disconnect: the claim outlives the
+        # ports it was taken for, so no other process can open them in the gap
+        # between the park and the close. The narration was entered *before* the
+        # claim, so this same call closes the stream last of all.
+        claim.close()
 
 
 def _confirm(plan: ValidationPlan, projection: Any, *, assume_yes: bool) -> bool:
@@ -740,14 +1011,24 @@ def _confirm(plan: ValidationPlan, projection: Any, *, assume_yes: bool) -> bool
         rh_approach_timeout_s=plan.rh_approach_timeout_s,
         approach_timeout_s=plan.temp_approach_timeout_s,
     )
-    disclosure = (
+    disclosures = [(
         "hours above cover APPROACH + SETTLE only; the measurement block adds",
         "0 min",
         f"{projection.measurement_low_s / 60:.0f} - "
         f"{projection.measurement_high_s / 60:.0f} min",
-    )
+    )]
+    # Disclosed here as well as in the projection, because `confirm_thermal`
+    # builds its own hours from an `EquilibrationConfig`, which has no soak in
+    # it -- so on the one screen where the operator commits, an undisclosed soak
+    # would be hours the banner's own number silently omits.
+    if plan.soak_s > 0:
+        disclosures.append((
+            "and a SOAK is held at condition before the first sweep, bounded at",
+            f"{plan.soak_s / 3600:.2f} h",
+            f"{plan.soak_s * SOAK_CEILING_FACTOR / 3600:.2f} h",
+        ))
     return confirm_thermal(config, assume_yes=assume_yes,
-                           plan_overrides=[disclosure])
+                           plan_overrides=disclosures)
 
 
 def _enter_run(store: Any, manager: Any, plan: ValidationPlan,
@@ -815,29 +1096,62 @@ def _remaining_channels(store: Any, plan: ValidationPlan, *, resume: bool) -> li
 
 def _establish_condition(ctx: RunContext, plan: ValidationPlan,
                          channels: list[int]) -> None:
-    """Approach, settle, arc-capture watch -- then and only then, measure.
+    """Approach, settle, arc-capture watch, soak -- then and only then, measure.
 
     Under ``--mock`` the *pacing* is collapsed and nothing else is: the same
     ``approach_setpoint``, the same ``SettleTracker``, the same verdicts and the
     same refusals run, but the waits between polls and between rounds go to
     zero. A 25-minute minimum hold is a statement about a real thermal mass, and
     there isn't one; keeping it would only mean the mock path never gets
-    exercised.
+    exercised. The soak inherits the same clock, so ``--mock --soak-h 6``
+    exercises every branch of :func:`~softae.tools.eis_validate_hold.soak_phase`
+    in milliseconds; a test that really slept for a soak would be a defect.
+
+    The soak sits **after** the min-treatment refusal, not before it. Both are
+    gates on the same first spectrum, and the free one goes first: refusing on a
+    setpoint that projects too few TREATMENT cells costs nothing, while doing it
+    on the far side of a six-hour soak spends the soak to learn something that
+    was knowable before it started.
     """
     clock = VirtualClock() if plan.mock else None
     pacing: dict[str, Any] = (
         {"sleep": clock.sleep, "now": clock} if clock else {}
     )
-    for report in approach_condition(ctx.manager, plan, **pacing):
+    narration = ctx.narration
+    narration.state(PHASE_APPROACH, rh_setpoint_pct=plan.rh_setpoint_pct,
+                    temp_setpoint_C=plan.temp_setpoint_c)
+    reports = approach_condition(ctx.manager, plan, **pacing)
+    for index, report in enumerate(reports, start=1):
         print(f"[approach] {report.axis:<12} -> {report.target:g}  "
               f"PV {report.pv_final:g}  {report.elapsed_s / 60:.1f} min")
+        # The axis and how long it took, not the PV it reached. A PV is a
+        # reading, and readings belong in `conditions` rows and in
+        # `conditions.json` -- both of which this run already writes.
+        narration.progress(PHASE_APPROACH, index, len(reports),
+                           axis=report.axis, elapsed_s=round(report.elapsed_s, 1),
+                           attempts=report.attempts)
+
+    # THE MOMENT THE CONDITION EXISTS, and so the moment the soak clock starts.
+    # Everything before this line is an approach: the chamber was on its way to
+    # a setpoint the sample had not yet seen. Everything after it -- the settle
+    # rounds included -- is time the film is actually spending at the new RH.
+    established_at = float(clock() if clock else time.monotonic())
 
     settle_pacing: dict[str, Any] = (
         {"sleep": clock.sleep, "now": clock, "min_hold_first_s": 0.0}
         if clock else {}
     )
+    narration.state(PHASE_SETTLE, max_hold_s=plan.settle_max_hold_s)
     outcome = settle_phase(ctx.manager, plan, lambda ch: _settle_sweep(ctx, ch),
                            **settle_pacing)
+    # `settle_verdict` is `run_autonomous_campaign`'s own record for this, and
+    # what rides on it is the gate's answer -- did the rig stop moving, over how
+    # many rounds, in how long. The apex histogram beside it is deliberately NOT
+    # here: that is a finding about the samples, and findings live in the
+    # DataStore.
+    narration.record("settle_verdict", verdict=outcome.verdict,
+                     rounds=outcome.n_rounds,
+                     elapsed_s=round(outcome.elapsed_s, 1))
     assert_settle_licensed(outcome)
     ctx.hold_certified = outcome.verdict
     print(render_arc_watch(outcome, plan))
@@ -853,6 +1167,65 @@ def _establish_condition(ctx: RunContext, plan: ValidationPlan,
             "window for 4.3x the reference cost). Stopping now rather than "
             "spending the measurement block to report INSUFFICIENT."
         )
+
+    # The watch is built here rather than in `cmd_run` so the soak has something
+    # to watch, and so its series begins at the condition rather than at the
+    # first sweep. Under `--mock` it shares the virtual clock: a series stamped
+    # from the wall while the soak advances a virtual clock would collapse every
+    # grace window to zero span and make a sustained excursion unobservable.
+    ctx.watch = HoldWatch(manager=ctx.manager, plan=plan,
+                          **({"now": clock} if clock else {}))
+    narration.state(PHASE_SOAK, target_s=plan.soak_s,
+                    credit_s=round(max(0.0, (clock() if clock else time.monotonic())
+                                       - established_at), 1))
+    soak_phase(plan, ctx.watch, established_at=established_at,
+               on_poll=_soak_observer(ctx), on_restart=_soak_restart(ctx),
+               **pacing)
+
+
+def _soak_observer(ctx: RunContext) -> Any:
+    """Publish the rig, and narrate the wait, from inside the soak.
+
+    The soak is this run's longest silence and exactly what an operator at hour
+    two is asking about -- and it is also the only long phase with an **idle
+    bus**, because no sweep runs during it. ``HoldWatch`` is already polling both
+    controllers every 30 s here, so a :func:`~softae.core.conditions_capture.read_environment`
+    on the same cadence adds five Modbus reads per 30 s to a bus with nothing
+    else on it: the same order as what the watch already spends there. Nothing
+    comparable is added anywhere a sweep is in flight -- ``run_cells`` and
+    ``drift_check`` publish only the capture :func:`persist` was already taking.
+
+    The ``progress`` record rides the **console's** cadence rather than the
+    poll's, so the stream and the terminal say the same thing at the same
+    moments, and a four-hour soak costs ~48 records instead of ~480.
+    """
+    def observe(polls: int, soaked_s: float, target_s: float,
+                restarts: int) -> None:
+        ctx.narration.capture(ctx.manager)
+        if polls % SOAK_PRINT_EVERY_N_POLLS == 0:
+            ctx.narration.progress(PHASE_SOAK, int(soaked_s), int(target_s),
+                                   unit="s", restarts=restarts)
+    return observe
+
+
+def _soak_restart(ctx: RunContext) -> Any:
+    """Narrate an excursion that reset the continuity clock.
+
+    Its own record rather than one more ``progress`` line, because it is the one
+    thing in the soak that is not monotone: a watcher reading progress alone
+    would see the count go backwards with no account of why, and *a soak whose
+    clock restarted* is precisely what somebody checking at hour two needs to be
+    told rather than left to infer.
+    """
+    def restarted(restart: int, lost_s: float, target_s: float) -> None:
+        ctx.narration.record("soak_restart", restart=int(restart),
+                             lost_s=round(float(lost_s), 1),
+                             target_s=round(float(target_s), 1))
+        # `soak_phase` skips the per-poll observer on a restart, and this is the
+        # one poll whose conditions are most worth having: republished here so an
+        # excursion is visible in the rig reading, not only in the narration.
+        ctx.narration.capture(ctx.manager)
+    return restarted
 
 
 def _settle_sweep(ctx: RunContext, channel: int) -> Any:

@@ -538,6 +538,32 @@ def test_checkpoint_spec_is_read_back(tmp_path):
     assert R.load_checkpoint(db, "v")["fingerprint"] == "abc"
 
 
+def test_report_states_how_long_the_sample_soaked(tmp_path):
+    """A reader of the verdict must be able to tell an equilibrated film from
+    one measured on the drying transient. The two produce the same-looking
+    report, so the soak is stated in the condition header rather than inferred.
+    """
+    records = _treatment_cell(1, d_scout=-0.3, d_adaptive=-0.1)
+    payload = R.build_payload(
+        records, _cells(records),
+        {"rh_setpoint_pct": 30.0, "temp_setpoint_c": 25.0, "soak_s": 14400.0},
+        R.evaluate(_cells(records)))
+    assert "soak            4.00 h held at condition" in R.render(payload)
+
+
+def test_report_soak_zero_is_stated_as_none_not_omitted():
+    """No soak is itself the finding, so the row appears at zero as well."""
+    assert "none" in R._soak_line({"soak_s": 0.0})
+    assert "settle gate directly" in R._soak_line({"soak_s": 0})
+
+
+def test_report_soak_absent_from_the_spec_is_not_stated_never_zero():
+    """A validation recorded before `--soak-h` existed made no soak claim at
+    all, which is a different assertion from having made one of zero."""
+    assert "not stated" in R._soak_line({})
+    assert "not stated" in R._soak_line({"soak_s": "nonsense"})
+
+
 def test_quantiles_and_median_on_small_samples():
     assert R._median([1.0]) == 1.0
     assert R._median([1.0, 3.0]) == 2.0

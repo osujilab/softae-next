@@ -235,6 +235,12 @@ def render(payload: dict[str, Any]) -> str:
     add(f"  validation      {payload['validation_name']}")
     add(f"  condition       RH {spec.get('rh_setpoint_pct', '?')} %  "
         f"T {spec.get('temp_setpoint_c', '?')} C")
+    # How long the SAMPLE sat at that condition before the first spectrum. The
+    # line above states what was commanded; without this one a reader cannot
+    # tell a film measured on the drying transient from an equilibrated one, and
+    # the two produce the same-looking report. Printed even at zero, because
+    # "no soak" is the finding in that case.
+    add(f"  soak            {_soak_line(spec)}")
     add(f"  baseline        {spec.get('baseline_preset', '?')}  "
         f"(resolved from {spec.get('baseline_source', 'unknown')})")
     add(f"  reference       {spec.get('reference_preset', '?')}")
@@ -334,6 +340,27 @@ def render(payload: dict[str, Any]) -> str:
             add(("  * " if i == 0 else "    ") + line)
     add("")
     return "\n".join(out)
+
+
+def _soak_line(spec: dict[str, Any]) -> str:
+    """How long the sample was held at condition before the first spectrum.
+
+    ``soak_s`` reaches the reporter for free: it is a ``ValidationPlan`` field,
+    so ``as_dict`` carries it into the campaign checkpoint's ``spec_json`` and
+    ``load_checkpoint`` reads it back. A validation recorded before the soak
+    existed has no such key -- reported as *not stated*, never as zero, because
+    those are different claims and only one of them was made.
+    """
+    if "soak_s" not in spec:
+        return "not stated (recorded before --soak-h existed)"
+    try:
+        seconds = float(spec.get("soak_s") or 0.0)
+    except (TypeError, ValueError):
+        return "not stated"
+    if seconds <= 0:
+        return "none -- the first spectrum followed the settle gate directly"
+    return (f"{seconds / 3600:.2f} h held at condition before the first "
+            "spectrum")
 
 
 def _add_spread(add: Any, spread: dict[str, Any], label: str) -> None:
