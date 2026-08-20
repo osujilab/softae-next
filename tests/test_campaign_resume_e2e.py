@@ -222,10 +222,15 @@ async def test_a_crash_marked_run_resumes_with_its_streak_intact(
     store = DataStore(tmp_path / "proj")
     cp = await _park_on_a_failure_streak(connected, store)
 
-    # What TerminateProcess leaves behind: the row was never finalized.
+    # What TerminateProcess leaves behind: the row was never finalized, and its
+    # owner is gone — `owner_pid` NULL is the *unknown* case, which
+    # `unfinished_runs()` reads exactly as it read every row before that column
+    # existed. Left at this process's own live PID it would (correctly) not be
+    # reported as crashed at all, and there would be nothing for the sweep below
+    # to recover.
     store._conn.execute(
-        "UPDATE experiments SET finished_at = NULL, status = 'running' "
-        "WHERE run_id = ?", (cp["run_id"],))
+        "UPDATE experiments SET finished_at = NULL, status = 'running', "
+        "owner_pid = NULL WHERE run_id = ?", (cp["run_id"],))
     store._conn.commit()
     # ...and what the next launch does about it — the real recovery path, so this
     # tracks `record_unclean_shutdown` rather than hard-coding the string it writes.

@@ -18,6 +18,7 @@ The DataStore manages:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from collections import Counter
 from collections.abc import Sequence
@@ -33,6 +34,17 @@ from softae.analysis.conditions import resolve_temperature_C
 from softae.analysis.eis.calibration import MEASUREMENT_ROLES
 from softae.analysis.eis.geometry import THICKNESS_METHODS, CellConstant
 from softae.analysis.eis_data import EISResult
+
+# The liveness predicate is IMPORTED, not re-implemented. `softae.core.run_lock`
+# owns "is this process still alive?" — it already handles the Windows
+# `OpenProcess`/`GetExitCodeProcess` path, the unreadable-answer case, and the
+# PID-reuse caveat, all argued in its own docstrings. A second copy here would be
+# free to disagree with the one the rig lock uses, and the two answers are read
+# side by side by `gui/widgets/unclean_shutdown` and `tools/campaign`. The
+# underscore is kept rather than promoted: it says this predicate is borrowed
+# from its owning module, not published as a second public API — and run_lock.py
+# is another session's in-flight file, so this costs it no edit.
+from softae.core.run_lock import _pid_alive
 
 logger = structlog.get_logger(__name__)
 
@@ -153,7 +165,20 @@ CREATE TABLE IF NOT EXISTS experiments (
     -- populated array means *these wells are not real*. A DEFAULT '[]' would
     -- stamp "nothing was skipped" onto every historical row, which is the exact
     -- false claim this column exists to stop the store making.
-    skipped_channels    TEXT
+    skipped_channels    TEXT,
+    -- The OS process id that opened this run, so `unfinished_runs()` can tell a
+    -- *live* run from a *crashed* one. Declared here as well as in
+    -- `_migrate_experiment_owner_pid`, with that migration's declaration
+    -- verbatim, for the reason the block above gives.
+    --
+    -- NO DEFAULT, deliberately, and for the same reason as `skipped_channels`:
+    -- an absent owner is a FACT (this row predates the column, or its writer
+    -- does not declare one), not a value. NULL is read as *unknown*, and unknown
+    -- keeps the pre-column behaviour — the row counts as unfinished. Unknown
+    -- must never resolve to "alive", because that would silently stop reporting
+    -- real crashes, which is the one thing this table is the durable evidence
+    -- for.
+    owner_pid           INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_experiments_started_at ON experiments(started_at);
@@ -458,6 +483,24 @@ def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
+def _owner_is_gone(owner_pid: Any) -> bool:
+    """Whether an ``experiments.owner_pid`` no longer names a running process.
+
+    ``True`` for the two cases that mean *this row is evidence of a crash*: a
+    PID the OS no longer knows, and a value that names no PID at all — ``NULL``
+    on every row written before the column existed, and anything uncoercible
+    that reached the column some other way. Both are *unknown*, and unknown
+    keeps the pre-column reading rather than resolving to "alive": a row wrongly
+    read as live is a crash that is never reported, and this table is its only
+    durable record.
+    """
+    try:
+        pid = int(owner_pid)
+    except (TypeError, ValueError):
+        return True
+    return not _pid_alive(pid)
+
+
 def _as_channel(value: Any) -> Any:
     """Normalise a channel identifier to ``int`` where it truly is one.
 
@@ -730,6 +773,9 @@ class DataStore:
         self._migrate_annotation()
         # Migrate existing databases: record which channels a run abandoned.
         self._migrate_experiment_skipped_channels()
+        # Migrate existing databases: record which process owns a run, so an
+        # unfinished row can say whether it is live or crashed.
+        self._migrate_experiment_owner_pid()
         # Migrate existing databases: add pump2_uL to formulations if missing.
         self._migrate_formulation_pump2()
         # Migrate existing databases: add stage_temp_pv_C to conditions if missing.
@@ -832,8 +878,9 @@ class DataStore:
             """INSERT INTO experiments
                (run_id, started_at, workflow_name, workflow_mode,
                 campaign, quality, pcb_name, eis_preset,
-                config_snapshot_json, config_hash, annotation, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')""",
+                config_snapshot_json, config_hash, annotation, status,
+                owner_pid)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)""",
             (
                 run_id,
                 _now_iso(),
@@ -846,6 +893,12 @@ class DataStore:
                 config_snapshot,
                 config_hash,
                 annotation,
+                # Who to ask, later, whether this run is still going. Stamped at
+                # the one place a run row is created, so no writer has to
+                # remember: the row itself carries the answer that
+                # `unfinished_runs()` otherwise has to get from the rig lock —
+                # an external oracle that several tools never populate.
+                os.getpid(),
             ),
         )
         self._conn.commit()
@@ -1834,19 +1887,53 @@ class DataStore:
     # ── Unclean-shutdown detection ──────────────────────────────────────
 
     def unfinished_runs(self) -> list[dict]:
-        """Runs still marked in-flight — evidence of an unclean stop.
+        """Runs that stopped without finalizing — evidence of an unclean stop.
 
-        Every terminal path finalizes its run row (see
-        ``run_autonomous_campaign._finalize_run``), so a row left with
-        ``finished_at`` NULL means the process died without unwinding: a crash, a
-        power cut, or an OS-forced restart.  On the next start-up this is the
-        only durable signal that the rig may have been left mid-experiment.
+        Every terminal path finalizes its run row (the campaign's
+        ``_finalize_run``, and the three rig CLIs' shared ``run_finalizer``), so
+        a row left with ``finished_at`` NULL means the process did not unwind: a
+        crash, a power cut, or an OS-forced restart. On the next start-up this
+        is the durable signal that the rig may have been left mid-experiment.
+
+        **A row whose owner is still running is not that.** ``finished_at IS
+        NULL`` alone cannot tell a *crashed* run from a *live* one — they are
+        byte-for-byte identical — and every caller of this query goes on to
+        relabel what it gets ``interrupted`` and offer to park the rig. Asked by
+        a second process while the first is mid-experiment, the bare query
+        therefore consumed the running run's row and parked the rig underneath
+        it. So the owner recorded by :meth:`start_run` is asked whether it still
+        exists, and rows whose owner does are not returned.
+
+        Three values of ``owner_pid`` and three answers:
+
+        ``NULL``
+            Unknown — the row predates the column, or its writer declared no
+            owner. **Returned**, which is the pre-column behaviour exactly.
+            Unknown must not become "alive": that would silently stop reporting
+            real crashes, and this table is the only durable record of them.
+        a dead PID
+            Returned. The run's process is gone and its row was never closed,
+            which is the definition of the thing being detected.
+        a live PID
+            **Not returned**, including this process's own. A run this process
+            is itself driving is not a crashed one, and no reader here is ever
+            asking about a run it is currently performing (both call it before
+            starting theirs).
+
+        The liveness limit is the rig lock's, inherited with the predicate: if
+        the OS has reissued a dead run's PID, its row reads as live and is
+        skipped. That **defers rather than discards** — the row is durable and
+        never clears itself, so the next launch that does not collide reports
+        it. Guessing the other way would park a rig that is working.
         """
         rows = self._conn.execute(
-            "SELECT run_id, workflow_name, started_at, status FROM experiments "
-            "WHERE finished_at IS NULL ORDER BY started_at DESC"
+            "SELECT run_id, workflow_name, started_at, status, owner_pid "
+            "FROM experiments WHERE finished_at IS NULL ORDER BY started_at DESC"
         ).fetchall()
-        return [dict(r) for r in rows]
+        # Filtered in Python, not SQL: `_pid_alive` is a Python predicate, and
+        # keeping the SQL a plain SELECT keeps the liveness rule in the one
+        # module that owns it.
+        return [dict(r) for r in rows if _owner_is_gone(r["owner_pid"])]
 
     # ── Alerts (durable operator-facing notifications) ──────────────────
 
@@ -2165,6 +2252,42 @@ class DataStore:
         if "skipped_channels" not in cols:
             self._conn.execute(
                 "ALTER TABLE experiments ADD COLUMN skipped_channels TEXT"
+            )
+            self._conn.commit()
+
+    def _migrate_experiment_owner_pid(self) -> None:
+        """Add ``owner_pid`` to ``experiments`` if it is missing.
+
+        Same shape as :meth:`_migrate_experiment_skipped_channels`, on the same
+        table, for the same reason: the DDL is a bare ``CREATE TABLE IF NOT
+        EXISTS``, so no store that already exists gains the column from it, and
+        :meth:`start_run` would fail with ``no such column`` on the first run
+        after the upgrade.
+
+        **NO DEFAULT.** ``NULL`` means *this row's writer declared no owner* —
+        the exact truth about every historical row — and
+        :meth:`unfinished_runs` reads it as *unknown*, which keeps the
+        pre-column behaviour of counting the row as unfinished. A default would
+        assert an owner nobody recorded; and the direction that matters is that
+        unknown must never resolve to "alive", because that turns a real crash
+        into silence.
+
+        **No backfill.** Nothing recoverable after the fact says which process
+        wrote a 2026-05 row, and the process it named is long gone in any case.
+
+        **No new ``SCHEMA_EPOCHS`` row**, following
+        :meth:`_migrate_experiment_skipped_channels`: this changes the table's
+        *shape*, not the meaning of any recorded measurement — no stored value's
+        interpretation moves — which is the condition T2.3 set for skipping an
+        epoch row.
+        """
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(experiments)").fetchall()
+        }
+        if "owner_pid" not in cols:
+            self._conn.execute(
+                "ALTER TABLE experiments ADD COLUMN owner_pid INTEGER"
             )
             self._conn.commit()
 

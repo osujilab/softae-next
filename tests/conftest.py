@@ -47,6 +47,53 @@ def rig_lock_scope(tmp_path_factory):
     mp.undo()
 
 
+@pytest.fixture(scope="session")
+def dead_owner_pid() -> int:
+    """A PID whose process is genuinely gone, obtained without killing anything.
+
+    ``experiments.owner_pid`` is what tells :meth:`DataStore.unfinished_runs` a
+    *crashed* run from a *live* one, so any test about crash recovery needs a
+    dead PID. Producing one by signalling a process would be a
+    ``taskkill``-shaped act against a number the suite does not own (CLAUDE.md
+    §5); instead a trivial child is **spawned and reaped**, so the number was
+    ours and its process is provably finished.
+
+    The value is re-checked at each use, because a session lasts long enough
+    for the OS to reissue the number.
+    """
+    import subprocess
+    import sys
+
+    proc = subprocess.Popen([sys.executable, "-c", ""],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc.wait()                      # reaped: terminated, and by us
+    return proc.pid
+
+
+@pytest.fixture
+def crashed_run(dead_owner_pid):
+    """Start a run row and leave it in the state a hard kill leaves it in.
+
+    ``start_run`` stamps ``os.getpid()``, so a row a test creates is owned by
+    the *live* pytest process and is correctly **excluded** from
+    ``unfinished_runs()``. A test about crash recovery therefore has to say that
+    the owner is gone, and this is the one place that knows how.
+    """
+    from softae.core.run_lock import _pid_alive
+
+    def _crashed(store, workflow_name: str = "wf", **kwargs) -> str:
+        run_id = store.start_run(workflow_name, **kwargs)
+        # A negative PID is refused by `_pid_alive` before it asks the OS
+        # anything, so it is the safe fallback if the number came back round.
+        pid = dead_owner_pid if not _pid_alive(dead_owner_pid) else -1
+        store._conn.execute(
+            "UPDATE experiments SET owner_pid = ? WHERE run_id = ?", (pid, run_id))
+        store._conn.commit()
+        return run_id
+
+    return _crashed
+
+
 @pytest.fixture
 def settle_qt():
     """Join a widget's one-shot command workers, then deliver what they emitted.

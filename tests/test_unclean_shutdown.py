@@ -57,8 +57,8 @@ def _patch_dialog(monkeypatch, click: str | None):
 
 
 class TestDetection:
-    def test_unfinished_run_is_detected(self, store):
-        store.start_run("wf")                       # never finished
+    def test_unfinished_run_is_detected(self, store, crashed_run):
+        crashed_run(store, "wf")                    # never finished
         assert len(store.unfinished_runs()) == 1
 
     def test_finished_run_is_not_flagged(self, store):
@@ -66,12 +66,24 @@ class TestDetection:
         store.finish_run(rid, "done")
         assert store.unfinished_runs() == []
 
-    def test_detection_survives_reopen(self, tmp_path: Path):
+    def test_detection_survives_reopen(self, tmp_path: Path, crashed_run):
         """The whole point: the evidence outlives the process that died."""
         with DataStore(tmp_path / "p") as ds:
-            ds.start_run("interrupted_wf")
+            crashed_run(ds, "interrupted_wf")
         with DataStore(tmp_path / "p") as ds2:
             assert len(ds2.unfinished_runs()) == 1
+
+    def test_a_live_owners_row_is_not_reported_as_unfinished(self, store):
+        """The row of a run that is *still going* is not evidence of a crash.
+
+        ``start_run`` stamps the owning PID, so this row is owned by the live
+        pytest process — the same shape as a headless tool's row read by a GUI
+        that has just started. Without the owner check the two are
+        indistinguishable and this row would be relabelled ``interrupted``
+        underneath a working run.
+        """
+        store.start_run("still_running")
+        assert store.unfinished_runs() == []
 
 
 # ── Start-up handling ──────────────────────────────────────────────────────
@@ -87,8 +99,28 @@ class TestStartupCheck:
     def test_no_store_is_a_noop(self, qapp):
         assert check_unclean_shutdown(None, MagicMock(), None) is False
 
-    def test_park_when_operator_accepts(self, qapp, store, monkeypatch):
-        store.start_run("wf")
+    def test_a_live_run_survives_when_no_lock_names_its_owner(
+            self, qapp, store, monkeypatch):
+        """The regression this column exists for, with the lock removed.
+
+        ``foreign_run_lock`` was the only thing standing between a live run and
+        a relabelled row, and it is an *external* oracle: a tool that holds no
+        lock — or any tool at all when the lock is unreadable — left the GUI
+        free to walk over its row. Here nothing holds the rig (the session lock
+        scope is empty), so the guard passes and the row itself has to be the
+        thing that refuses.
+        """
+        rid = store.start_run("headless_tool_that_took_no_lock")
+        monkeypatch.setattr(QMessageBox, "exec", lambda self: 0)
+        monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: None)
+
+        assert check_unclean_shutdown(None, MagicMock(), store) is False
+        assert store.run_outcome(rid) == {"status": "running", "finished": False}
+        assert store.query_alerts() == []
+
+    def test_park_when_operator_accepts(self, qapp, store, monkeypatch,
+                                        crashed_run):
+        crashed_run(store, "wf")
         _patch_dialog(monkeypatch, "Park now")
         mgr = MagicMock()
         for name in ("syringe", "temp_controller", "lamp"):
@@ -98,7 +130,7 @@ class TestStartupCheck:
         assert mgr.get.return_value.halt_pump.call_count == 3
 
     def test_the_recovery_park_does_not_move_the_head(self, qapp, store,
-                                                      monkeypatch):
+                                                      monkeypatch, crashed_run):
         """The sharpest case for the policy, and this dialog already argues it.
 
         The belief here comes from a session that was *killed*: the dialog's own
@@ -107,7 +139,7 @@ class TestStartupCheck:
         the head down. So the recovery park commands no head motion and the
         operator's own inspection — which the dialog demands — is the sensor.
         """
-        store.start_run("wf")
+        crashed_run(store, "wf")
         _patch_dialog(monkeypatch, "Park now")
         mgr = MagicMock()
         mgr.get.return_value.is_connected = True
@@ -116,15 +148,15 @@ class TestStartupCheck:
         mgr.get.return_value.head_retract.assert_not_called()
         mgr.get.return_value.head_flip.assert_not_called()
 
-    def test_no_park_when_declined(self, qapp, store, monkeypatch):
-        store.start_run("wf")
+    def test_no_park_when_declined(self, qapp, store, monkeypatch, crashed_run):
+        crashed_run(store, "wf")
         _patch_dialog(monkeypatch, "Skip")
         mgr = MagicMock()
         assert check_unclean_shutdown(None, mgr, store) is False
         mgr.get.return_value.head_retract.assert_not_called()
 
-    def test_records_a_durable_alert(self, qapp, store, monkeypatch):
-        store.start_run("wf")
+    def test_records_a_durable_alert(self, qapp, store, monkeypatch, crashed_run):
+        crashed_run(store, "wf")
         _patch_dialog(monkeypatch, "Skip")
         check_unclean_shutdown(None, MagicMock(), store)
 
@@ -132,7 +164,8 @@ class TestStartupCheck:
         assert len(alerts) == 1
         assert alerts[0]["kind"] == "unclean_shutdown"
 
-    def test_alert_reports_the_unknown_head_position(self, qapp, store, monkeypatch):
+    def test_alert_reports_the_unknown_head_position(self, qapp, store, monkeypatch,
+                                                     crashed_run):
         """The head does not self-retract, so reporting IS the mitigation.
 
         Operator decision (2026-07-30): rather than race the OS with a
@@ -140,7 +173,7 @@ class TestStartupCheck:
         stop is accepted as a known state and reported. The durable alert has to
         carry it, because a dialog can be dismissed and forgotten.
         """
-        store.start_run("wf")
+        crashed_run(store, "wf")
         _patch_dialog(monkeypatch, "Skip")
         check_unclean_shutdown(None, MagicMock(), store)
 
@@ -148,9 +181,10 @@ class TestStartupCheck:
         assert "lowered" in alert["message"]
         assert "electrode" in alert["message"]
 
-    def test_reported_once_not_every_launch(self, qapp, store, monkeypatch):
+    def test_reported_once_not_every_launch(self, qapp, store, monkeypatch,
+                                            crashed_run):
         """Stale runs are marked, so the warning does not repeat forever."""
-        store.start_run("wf")
+        crashed_run(store, "wf")
         _patch_dialog(monkeypatch, "Skip")
 
         check_unclean_shutdown(None, MagicMock(), store)
@@ -161,7 +195,7 @@ class TestStartupCheck:
         assert len(store.query_alerts()) == 1
 
     def test_the_row_is_not_relabelled_before_the_operator_is_asked(
-            self, qapp, store, monkeypatch):
+            self, qapp, store, monkeypatch, crashed_run):
         """The stamp used to run in a loop *above* the dialog.
 
         ``finish_run`` is an UPDATE with no unset, so a row relabelled
@@ -171,7 +205,7 @@ class TestStartupCheck:
         inside ``exec`` because that is the only instant at which "asked" and
         "not yet answered" are both true.
         """
-        rid = store.start_run("wf")
+        rid = crashed_run(store, "wf")
         seen: list[dict] = []
         monkeypatch.setattr(QMessageBox, "exec",
                             lambda self: seen.append(store.run_outcome(rid)) or 0)
@@ -185,13 +219,13 @@ class TestStartupCheck:
         assert store.run_outcome(rid)["status"] == "interrupted"
 
     def test_a_dialog_that_never_appeared_relabels_nothing(
-            self, qapp, store, monkeypatch):
+            self, qapp, store, monkeypatch, crashed_run):
         """No display, no QApplication, a teardown race — none of it is an ask.
 
         The report is durable, so deferring costs one launch; stamping on a
         dialog nobody saw costs the record permanently.
         """
-        rid = store.start_run("wf")
+        rid = crashed_run(store, "wf")
         monkeypatch.setattr(QMessageBox, "exec",
                             lambda self: (_ for _ in ()).throw(RuntimeError("no gui")))
 
@@ -216,38 +250,38 @@ class TestTheRecoveryParkReport:
     rig had just been made safe.
     """
 
-    def _accept_and_capture(self, monkeypatch, store, mgr):
+    def _accept_and_capture(self, monkeypatch, store, mgr, crashed_run):
         _patch_dialog(monkeypatch, "Park now")
         warned: list[str] = []
         monkeypatch.setattr(
             QMessageBox, "warning",
             staticmethod(lambda *a, **k: warned.append(a[2])))
-        store.start_run("wf")
+        crashed_run(store, "wf")
         check_unclean_shutdown(None, mgr, store)
         return warned
 
     def test_a_recovery_park_that_commanded_something_warns_about_nothing(
-        self, qapp, store, monkeypatch
+        self, qapp, store, monkeypatch, crashed_run
     ):
         mgr = MagicMock()
         mgr.get.return_value.is_connected = True
-        assert self._accept_and_capture(monkeypatch, store, mgr) == []
+        assert self._accept_and_capture(monkeypatch, store, mgr, crashed_run) == []
 
     def test_a_recovery_park_that_commanded_nothing_warns_that_nothing_was_sent(
-        self, qapp, store, monkeypatch
+        self, qapp, store, monkeypatch, crashed_run
     ):
         from softae.core.safe_park import HEADLINE_NOTHING
 
         mgr = MagicMock()
         mgr.get.return_value.is_connected = False
 
-        warned = self._accept_and_capture(monkeypatch, store, mgr)
+        warned = self._accept_and_capture(monkeypatch, store, mgr, crashed_run)
 
         assert warned and HEADLINE_NOTHING in warned[0]
         assert "not connected" in warned[0]      # describe() names each one
 
     def test_a_recovery_park_that_refused_still_says_partial_stop(
-        self, qapp, store, monkeypatch
+        self, qapp, store, monkeypatch, crashed_run
     ):
         from softae.core.safe_park import HEADLINE_PARTIAL
 
@@ -255,7 +289,7 @@ class TestTheRecoveryParkReport:
         mgr.get.return_value.is_connected = True
         mgr.get.return_value.off.side_effect = RuntimeError("lamp: no reply")
 
-        warned = self._accept_and_capture(monkeypatch, store, mgr)
+        warned = self._accept_and_capture(monkeypatch, store, mgr, crashed_run)
 
         assert warned and HEADLINE_PARTIAL in warned[0]
         assert "no reply" in warned[0]

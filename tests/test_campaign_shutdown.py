@@ -293,9 +293,10 @@ class TestSignalPark:
 # ── Next-launch recovery, keyed on the unfinished run row ────────────────────
 
 class TestUncleanShutdownRecovery:
-    def test_an_unfinished_row_is_what_marks_a_hard_kill(self, tmp_path: Path):
+    def test_an_unfinished_row_is_what_marks_a_hard_kill(self, tmp_path: Path,
+                                                         crashed_run):
         store = DataStore(tmp_path / "proj")
-        run_id = store.start_run("killed_campaign", mode="autonomous")
+        run_id = crashed_run(store, "killed_campaign", mode="autonomous")
 
         unfinished = detect_unfinished_runs(store)
 
@@ -311,9 +312,10 @@ class TestUncleanShutdownRecovery:
         assert detect_unfinished_runs(store) is None
         store.close()
 
-    def test_recovery_alerts_marks_and_parks(self, tmp_path: Path, spy_park):
+    def test_recovery_alerts_marks_and_parks(self, tmp_path: Path, spy_park,
+                                             crashed_run):
         store = DataStore(tmp_path / "proj")
-        run_id = store.start_run("killed_campaign", mode="autonomous")
+        run_id = crashed_run(store, "killed_campaign", mode="autonomous")
         lines: list[str] = []
 
         result = recover_from_unclean_shutdown(_manager(), store, report=lines.append)
@@ -329,9 +331,9 @@ class TestUncleanShutdownRecovery:
         store.close()
 
     def test_it_is_reported_once_not_at_every_launch(self, tmp_path: Path,
-                                                     spy_park):
+                                                     spy_park, crashed_run):
         store = DataStore(tmp_path / "proj")
-        store.start_run("killed_campaign", mode="autonomous")
+        crashed_run(store, "killed_campaign", mode="autonomous")
 
         recover_from_unclean_shutdown(_manager(), store)
 
@@ -341,7 +343,7 @@ class TestUncleanShutdownRecovery:
         store.close()
 
     def test_the_recovery_park_does_not_consume_the_shutdown_guards_claim(
-            self, tmp_path: Path, spy_park):
+            self, tmp_path: Path, spy_park, crashed_run):
         """The recovery park belongs to the *previous* run.
 
         Spending the guard's single claim on it would leave the run about to
@@ -349,7 +351,7 @@ class TestUncleanShutdownRecovery:
         priority exists to close, one launch later.
         """
         store = DataStore(tmp_path / "proj")
-        store.start_run("killed_campaign", mode="autonomous")
+        crashed_run(store, "killed_campaign", mode="autonomous")
         mgr = _manager()
         guard = ParkGuard(mgr)
 
@@ -489,10 +491,10 @@ class TestSignalOrdering:
         assert spy_park[0]["connected"] is True
 
     def test_an_unfinished_row_is_recovered_after_the_rig_connects(
-            self, tmp_path, monkeypatch, spy_park, capsys):
+            self, tmp_path, monkeypatch, spy_park, capsys, crashed_run):
         """Detection is early (so it is reported); the park waits for sessions."""
         store = DataStore(tmp_path / "proj")
-        store.start_run("killed_campaign", mode="autonomous")
+        crashed_run(store, "killed_campaign", mode="autonomous")
         store.close()
 
         async def _fake(spec, **kwargs):

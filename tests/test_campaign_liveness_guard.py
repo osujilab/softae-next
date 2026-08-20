@@ -299,16 +299,22 @@ class TestHeadlessRecoveryOrdering:
     """A live run's row must never be consumed as a crashed one's."""
 
     def test_a_live_campaigns_row_is_not_marked_interrupted(
-            self, tmp_path, capsys, _isolated_scope):
+            self, tmp_path, capsys, _isolated_scope, crashed_run):
         """The destructive case, on the one path that still reaches recovery.
 
         `--mock` is exempt from the refusal because it touches no hardware — but it
         shares the DataStore, and marking the live campaign's row `interrupted` is
         just as corrupting from a simulated process as from a real one.
+
+        The row is given a **dead** owner deliberately. `experiments.owner_pid`
+        is a second, independent defence — a live owner's row is not returned by
+        `unfinished_runs()` at all — and a row that both defences protect cannot
+        say which one worked. Here only the lock ordering stands between the row
+        and the recovery sweep, which is what this test is for.
         """
         project = tmp_path / "proj"
         with DataStore(project) as ds:
-            live_run = ds.start_run("the_campaign_that_is_running")
+            live_run = crashed_run(ds, "the_campaign_that_is_running")
 
         _write_foreign(_isolated_scope, what=f"campaign:x:{live_run}")
 
@@ -323,7 +329,7 @@ class TestHeadlessRecoveryOrdering:
         assert "skipping unclean-shutdown recovery" in out
 
     def test_a_genuinely_crashed_run_is_still_recovered(
-            self, tmp_path, capsys, _isolated_scope):
+            self, tmp_path, capsys, _isolated_scope, crashed_run):
         """Positive control: the guard defers, it does not disable recovery.
 
         Without this the test above could be satisfied by breaking recovery
@@ -331,7 +337,7 @@ class TestHeadlessRecoveryOrdering:
         """
         project = tmp_path / "proj"
         with DataStore(project) as ds:
-            crashed = ds.start_run("died_last_night")
+            crashed = crashed_run(ds, "died_last_night")
 
         # No lock at all — nobody is running, so the row means what it says.
         rc = cli.main(["run", _spec_file(tmp_path), "--mock", "--yes",
@@ -351,15 +357,20 @@ class TestHeadlessRecoveryOrdering:
 
 class TestGuiRecoveryOrdering:
     def test_opening_the_gui_does_not_park_a_running_headless_campaign(
-            self, qapp, tmp_path, _isolated_scope):
-        """The mirror case. The GUI cannot refuse to open, so it skips instead."""
+            self, qapp, tmp_path, _isolated_scope, crashed_run):
+        """The mirror case. The GUI cannot refuse to open, so it skips instead.
+
+        Dead owner for the reason the headless twin above gives: the lock
+        ordering is what is on trial, so the row's own liveness must not be
+        able to save it.
+        """
         pytest.importorskip("PySide6")
         from unittest.mock import MagicMock
 
         from softae.gui.widgets.unclean_shutdown import check_unclean_shutdown
 
         with DataStore(tmp_path / "proj") as ds:
-            live_run = ds.start_run("headless_campaign_in_flight")
+            live_run = crashed_run(ds, "headless_campaign_in_flight")
             _write_foreign(_isolated_scope, what=f"campaign:x:{live_run}")
             manager = MagicMock()
 
@@ -370,7 +381,7 @@ class TestGuiRecoveryOrdering:
         manager.get.assert_not_called()
 
     def test_the_gui_still_recovers_when_nothing_holds_the_rig(
-            self, qapp, tmp_path, monkeypatch, _isolated_scope):
+            self, qapp, tmp_path, monkeypatch, _isolated_scope, crashed_run):
         """Positive control for the GUI path, mirroring the headless one."""
         pytest.importorskip("PySide6")
         from unittest.mock import MagicMock
@@ -383,7 +394,7 @@ class TestGuiRecoveryOrdering:
         monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: None)
 
         with DataStore(tmp_path / "proj") as ds:
-            ds.start_run("died_last_night")
+            crashed_run(ds, "died_last_night")
 
             check_unclean_shutdown(None, MagicMock(), ds)
 
@@ -391,7 +402,7 @@ class TestGuiRecoveryOrdering:
             assert [a["kind"] for a in ds.query_alerts()] == ["unclean_shutdown"]
 
     def test_an_unreadable_lock_defers_rather_than_breaking_startup(
-            self, qapp, tmp_path, monkeypatch, _isolated_scope):
+            self, qapp, tmp_path, monkeypatch, _isolated_scope, crashed_run):
         """Two rules meet here, and both are kept.
 
         This check must never stop the GUI opening, so it cannot raise; and it
@@ -410,7 +421,7 @@ class TestGuiRecoveryOrdering:
         monkeypatch.setattr(gui_mod, "foreign_run_lock", _boom)
 
         with DataStore(tmp_path / "proj") as ds:
-            run = ds.start_run("might_be_live")
+            run = crashed_run(ds, "might_be_live")
 
             assert check_unclean_shutdown(None, MagicMock(), ds) is False
             assert [r["run_id"] for r in ds.unfinished_runs()] == [run]

@@ -15,6 +15,7 @@ Coverage:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -2012,3 +2013,222 @@ class TestNonFiniteFloatsNeverReachAJsonColumn:
         assert _safe_json({"f_peak_hz": float("nan")}) == '{"f_peak_hz": null}'
         assert _safe_json([float("inf"), 2.0]) == "[null, 2.0]"
         assert _safe_json(np.array([np.nan, 1.0])) == "[null, 1.0]"
+
+
+class TestRunOwnerLiveness:
+    """``experiments.owner_pid`` — what tells a *crashed* run from a *live* one.
+
+    ``unfinished_runs()`` was a bare ``finished_at IS NULL``, and its three
+    readers all go on to relabel what it returns ``interrupted`` and offer to
+    park the rig. A live run's row and a crashed run's row are byte-for-byte
+    identical, so the only thing separating a working headless tool from being
+    parked out from under it was ``foreign_run_lock()`` — an external oracle
+    several tools never populated. The row now carries its own answer.
+    """
+
+    #: ``experiments`` exactly as it stood before ``owner_pid`` was declared.
+    #: The store's own DDL is a bare ``CREATE TABLE IF NOT EXISTS``, so a table
+    #: that already exists in this shape is what every real database looks like
+    #: on the first open after the upgrade.
+    _LEGACY_DDL = (
+        "CREATE TABLE experiments ("
+        " run_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT,"
+        " workflow_name TEXT NOT NULL,"
+        " workflow_mode TEXT NOT NULL DEFAULT 'unknown',"
+        " campaign TEXT NOT NULL DEFAULT 'dev',"
+        " quality TEXT NOT NULL DEFAULT 'explore',"
+        " pcb_name TEXT, eis_preset TEXT,"
+        " config_snapshot_json TEXT NOT NULL DEFAULT '{}',"
+        " config_hash TEXT NOT NULL DEFAULT '',"
+        " annotation TEXT NOT NULL DEFAULT '',"
+        " status TEXT NOT NULL DEFAULT 'running', skipped_channels TEXT)"
+    )
+
+    #: A run row the pre-column code wrote: in flight, and naming no owner
+    #: because there was nowhere to name one.
+    _LEGACY_RUN = "20260501T010203Z_ran_before_the_upgrade"
+
+    def _pre_column_store(self, project: Path) -> str:
+        """Build a database in the shape it had before this column existed.
+
+        Written with raw sqlite3 rather than by mutating a fresh store, because
+        ``ALTER TABLE ... DROP COLUMN`` re-parses the stored schema and this
+        table's DDL is heavily commented. The point stands either way: the
+        migration is tested against a database created *before* the change.
+        """
+        import sqlite3
+
+        (project / "db").mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(project / "db" / "softae.db"))
+        conn.execute(self._LEGACY_DDL)
+        conn.execute(
+            "INSERT INTO experiments (run_id, started_at, workflow_name)"
+            " VALUES (?, '2026-05-01T01:02:03Z', 'ran_before_the_upgrade')",
+            (self._LEGACY_RUN,))
+        conn.commit()
+        conn.close()
+        return self._LEGACY_RUN
+
+    @staticmethod
+    def _owner_of(store: DataStore, run_id: str):
+        return store._conn.execute(
+            "SELECT owner_pid FROM experiments WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+
+    # ── The column ─────────────────────────────────────────────────────────
+
+    def test_a_fresh_database_has_the_owner_column(self, tmp_path: Path) -> None:
+        """The DDL and the migration must not drift; only one gets exercised."""
+        with DataStore(tmp_path / "fresh") as store:
+            cols = {
+                r[1] for r in store._conn.execute(
+                    "PRAGMA table_info(experiments)").fetchall()
+            }
+            assert "owner_pid" in cols
+
+    def test_the_column_carries_no_default(self, tmp_path: Path) -> None:
+        """An absent owner is a *fact*, not a value.
+
+        A ``DEFAULT`` would stamp an owner onto rows nobody recorded one for.
+        ``_pid_alive(0)`` is False so ``DEFAULT 0`` would happen to be harmless
+        today — but the harm is not what the number does, it is the claim that
+        the row said something it never said.
+        """
+        with DataStore(tmp_path / "fresh") as store:
+            declared = {
+                r[1]: r[4] for r in store._conn.execute(
+                    "PRAGMA table_info(experiments)").fetchall()
+            }
+            assert declared["owner_pid"] is None
+
+    def test_start_run_stamps_this_process_as_the_owner(self, store) -> None:
+        run_id = store.start_run("wf")
+        assert self._owner_of(store, run_id) == os.getpid()
+
+    # ── The migration, against a database created before the change ────────
+
+    def test_a_pre_column_database_gains_the_column_on_open(
+        self, tmp_path: Path
+    ) -> None:
+        project = tmp_path / "legacy_experiments"
+        self._pre_column_store(project)
+
+        with DataStore(project) as store:
+            cols = {
+                r[1] for r in store._conn.execute(
+                    "PRAGMA table_info(experiments)").fetchall()
+            }
+            assert "owner_pid" in cols
+
+    def test_a_pre_column_row_survives_the_migration_with_no_owner(
+        self, tmp_path: Path
+    ) -> None:
+        """No backfill. Nothing recoverable says which process wrote it."""
+        project = tmp_path / "legacy_experiments"
+        run_id = self._pre_column_store(project)
+
+        with DataStore(project) as store:
+            assert store.run_outcome(run_id) == {"status": "running",
+                                                 "finished": False}
+            assert self._owner_of(store, run_id) is None
+
+    def test_reopening_a_migrated_database_is_a_noop(self, tmp_path: Path) -> None:
+        """Idempotent: the PRAGMA guard, not the ALTER, is what runs twice."""
+        project = tmp_path / "legacy_experiments"
+        run_id = self._pre_column_store(project)
+
+        with DataStore(project):
+            pass
+        with DataStore(project) as store:                # third open
+            owners = store._conn.execute(
+                "SELECT owner_pid FROM experiments").fetchall()
+            assert [r[0] for r in owners] == [None]
+            assert store.run_outcome(run_id)["status"] == "running"
+
+    # ── What `unfinished_runs()` now means ─────────────────────────────────
+
+    def test_a_row_with_no_owner_is_still_reported_unfinished(
+        self, tmp_path: Path
+    ) -> None:
+        """Historical behaviour, preserved exactly.
+
+        Unknown must never resolve to "alive": that would silently stop
+        reporting the crashes this table is the only durable record of.
+        """
+        project = tmp_path / "legacy_experiments"
+        run_id = self._pre_column_store(project)
+
+        with DataStore(project) as store:
+            assert [r["run_id"] for r in store.unfinished_runs()] == [run_id]
+
+    def test_a_dead_owners_row_is_reported_unfinished(
+        self, store, crashed_run
+    ) -> None:
+        run_id = crashed_run(store, "died_last_night")
+        assert [r["run_id"] for r in store.unfinished_runs()] == [run_id]
+
+    def test_a_live_owners_row_is_not_reported_unfinished(self, store) -> None:
+        """The defect. This row's owner is the running pytest process."""
+        store.start_run("still_going")
+        assert store.unfinished_runs() == []
+
+    def test_this_processs_own_row_is_excluded_like_any_other_live_one(
+        self, store
+    ) -> None:
+        """Self-exclusion is deliberate, and it is the same rule, not an exception.
+
+        Unlike ``foreign_run_lock`` — which asks *is someone else driving?* and
+        so must ignore itself — this query asks *did this run die?*. Being alive
+        is proof that it did not, and a long-lived GUI that starts a run and
+        later re-runs the start-up check must not relabel its own live row.
+        """
+        mine = store.start_run("this_very_process")
+        assert self._owner_of(store, mine) == os.getpid()
+        assert store.unfinished_runs() == []
+
+    def test_a_finished_row_is_never_reported_whatever_its_owner(
+        self, store, crashed_run
+    ) -> None:
+        """``finished_at`` still decides first; liveness only filters."""
+        run_id = crashed_run(store, "crashed_then_stamped")
+        store.finish_run(run_id, "interrupted")
+        assert store.unfinished_runs() == []
+
+    def test_the_reported_row_carries_the_owner_it_was_judged_on(
+        self, store, crashed_run
+    ) -> None:
+        """The dead PID is evidence an operator can act on, so it is returned."""
+        run_id = crashed_run(store, "died_last_night")
+        row = store.unfinished_runs()[0]
+        assert row["run_id"] == run_id
+        assert row["owner_pid"] is not None
+
+    def test_an_owner_value_that_names_no_pid_is_treated_as_unknown(
+        self, store
+    ) -> None:
+        """SQLite columns are dynamically typed, so the value may not be a PID.
+
+        Unknown resolves the same way ``NULL`` does — reported — because the
+        alternative is that one unreadable value silences crash reporting for
+        the whole database: all three readers wrap this call in a bare
+        ``except`` and return nothing at all if it raises.
+        """
+        run_id = store.start_run("wf")
+        store._conn.execute(
+            "UPDATE experiments SET owner_pid = 'not-a-pid' WHERE run_id = ?",
+            (run_id,))
+        store._conn.commit()
+
+        assert [r["run_id"] for r in store.unfinished_runs()] == [run_id]
+
+    def test_the_liveness_predicate_is_the_rig_locks_own(self) -> None:
+        """One definition of "alive", shared with the rig lock.
+
+        A second copy here would be free to disagree with the one
+        ``foreign_run_lock`` uses, and both answers are read side by side by
+        ``gui/widgets/unclean_shutdown`` and ``tools/campaign``.
+        """
+        from softae.core import data_store as ds_mod
+        from softae.core import run_lock
+
+        assert ds_mod._pid_alive is run_lock._pid_alive
