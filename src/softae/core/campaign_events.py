@@ -823,6 +823,33 @@ def write_control_request(
     return request
 
 
+def ack_answers_request(ack: dict[str, Any], request: Any) -> bool:
+    """Whether *ack* is the campaign's answer to *request*.
+
+    Two surfaces now wait on an ack — the Pause/Abort bar
+    (:class:`softae.gui.widgets.campaign_control.CampaignControlRequester`) and
+    the E-Stop ladder's rung 2 — and the rule has one subtlety, so it lives here
+    once rather than in each of them. A watcher that matched acks its own way
+    would resolve a press against somebody else's answer, which is the failure
+    mode this whole channel exists to remove.
+
+    **The subtlety.** An ack normally quotes the ``seq`` of the request it
+    answers, and that is the only thing worth matching on. The exception is
+    :meth:`ControlWatcher._ack` called with no request at all — the
+    :data:`CONTROL_UNREADABLE` case, where the file could not be parsed and so
+    *has* no seq to quote. That ack is matched by outcome instead, which is sound
+    only because the caller snapshots its cursor **before** it writes: there is
+    one ``control.json`` per run directory, ours is the newest thing written to
+    it, and an ``unreadable`` recorded after our write is about our write.
+    Dropping it for carrying no seq would silently swallow exactly the answer the
+    operator most needs — that the campaign never read what they asked for.
+    """
+    seq = ack.get("seq")
+    if seq is None:
+        return ack.get("outcome") == CONTROL_UNREADABLE
+    return seq == getattr(request, "seq", None)
+
+
 class ControlWatcher:
     """Poll ``control.json`` and dispatch what it finds. Never raises.
 

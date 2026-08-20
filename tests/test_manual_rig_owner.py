@@ -25,10 +25,12 @@ import structlog
 
 from softae.core.run_lock import RunLock
 from softae.drivers.mock_factory import create_mock_manager
+from softae.gui.launch_mode import decide_launch_mode
 from softae.gui.tabs import tab_manual as tm
-from softae.gui.tabs.tab_manual import ManualControlTab
+from softae.gui.tabs.tab_manual import REFUSED_WHILE_ATTACHED, ManualControlTab
 from softae.gui.widgets import rig_owner
 from softae.gui.widgets.rig_owner import (
+    ATTACHED,
     OCCUPIED,
     campaign_identity,
     foreign_rig_lock,
@@ -70,6 +72,44 @@ def tab(qapp, monkeypatch):
 
 def _hold_rig(monkeypatch, lock: RunLock | None) -> None:
     monkeypatch.setattr(rig_owner, "foreign_rig_lock", lambda: lock)
+
+
+def _attached_mode(lock: RunLock | None = None):
+    """The launch decision an attached window is built with.
+
+    Produced by the real :func:`decide_launch_mode` rather than assembled field
+    by field, so these tests exercise the same object the launcher passes in —
+    including its ``reason``, which is what the banner's tooltip shows.
+    """
+    return decide_launch_mode(lock_reader=lambda: lock or _foreign_lock())
+
+
+@pytest.fixture
+def attached_tab(qapp, monkeypatch):
+    """A Manual tab launched *attached* — no session of its own, anywhere.
+
+    The rig lock reads as **free** for its whole life, deliberately: the refusal
+    proved here must come from the launch decision and from nothing else, and a
+    lock left in place would let a lock-derived implementation pass.
+    """
+    monkeypatch.setattr(rig_owner, "foreign_rig_lock", lambda: None)
+    widget = ManualControlTab(create_mock_manager(config={}), launch_mode=_attached_mode())
+    yield widget
+    widget.cleanup()
+    widget.close()
+
+
+#: One entry per actuating family whose ownership note is the slot's first act,
+#: mirroring `TestActuationIsNeverRefused` case for case.
+_ACTUATIONS = [
+    ("stage go-to", "stage", "move_to", lambda t: t._on_goto()),
+    ("stage jog", "stage", "move_by", lambda t: t._on_jog(1, 0)),
+    ("temperature setpoint", "temp_controller", "write_sp", lambda t: t._on_set_temp()),
+    ("humidity setpoint", "rh_controller", "set_setpoint", lambda t: t._on_set_rh()),
+    ("dispenser head descend", "syringe", "head_descend", lambda t: t._on_head_descend()),
+    ("dispenser head retract", "syringe", "head_retract", lambda t: t._on_head_retract()),
+    ("lamp on", "lamp", "on", lambda t: t._on_lamp_on()),
+]
 
 
 # ── One vocabulary for ownership ─────────────────────────────────────────────
@@ -354,3 +394,183 @@ class TestOverlapIsRecorded:
             if "_note_manual_actuation" not in body:
                 missing.append(name)
         assert missing == [], f"actuating handlers with no ownership note: {missing}"
+
+
+# ── Attach mode: nothing to command, said out loud ───────────────────────────
+
+
+class TestAttachedWindowRefuses:
+    """A window launched attached opened no session, so its controls reach nothing.
+
+    This is not the refusal the operator forbade. That one is *"a foreign
+    campaign holds the lock"*, which is a live rig's normal state while manual
+    control is legitimately in use — every case in
+    `TestActuationIsNeverRefused` above still actuates through exactly that
+    condition, unmodified, and their passing is the proof this predicate is a
+    different one. What is refused here is a command with no session to travel
+    down; what replaces it is a sentence naming the run that has them.
+    """
+
+    def test_manual_control_in_attach_mode_names_the_campaign_and_does_not_actuate(
+            self, attached_tab, monkeypatch, settle_qt):
+        calls = []
+        stage = attached_tab._manager.get("stage")
+        monkeypatch.setattr(stage, "move_to", lambda x, y: calls.append((x, y)))
+
+        attached_tab._spin_x.setValue(3.0)
+        attached_tab._on_goto()
+        settle_qt(attached_tab)
+
+        assert calls == []
+        for surface in (attached_tab._lbl_rig_owner.text(),
+                        attached_tab._lbl_last_command.text()):
+            assert "phase_map" in surface                    # which campaign
+            assert "20260817T090000Z_phase_map" in surface   # which run
+
+    @pytest.mark.parametrize(
+        "action,instrument,method,press", _ACTUATIONS, ids=[a[0] for a in _ACTUATIONS])
+    def test_attached_actuating_slot_refuses_and_calls_no_driver(
+            self, attached_tab, monkeypatch, settle_qt, action, instrument, method, press):
+        calls = []
+        driver = attached_tab._manager.get(instrument)
+        monkeypatch.setattr(driver, method, lambda *a, **k: calls.append((a, k)))
+
+        press(attached_tab)
+        settle_qt(attached_tab)
+
+        assert calls == []
+        assert action in attached_tab._lbl_last_command.text()
+        assert "Refused" in attached_tab._lbl_last_command.text()
+
+    def test_attached_pump_refuses_before_any_fluid_is_commanded(
+            self, attached_tab, monkeypatch, settle_qt):
+        """The one that would cost a board — driven exactly as its owner-mode twin."""
+        calls = []
+        syr = attached_tab._manager.get("syringe")
+        monkeypatch.setattr(syr, "single_pump", lambda **kw: calls.append(kw))
+
+        attached_tab._chk_apply_correction.setChecked(False)
+        attached_tab._pump_widgets[0]["vol"].setValue(12.0)
+        attached_tab._on_infuse(0)
+        settle_qt(attached_tab)
+
+        assert calls == []
+
+    def test_attached_note_returns_the_refusal_sentinel_not_a_lock(self, attached_tab):
+        """The answer the 16 call sites branch on, pinned at the seam itself."""
+        assert attached_tab._note_manual_actuation("stage go-to") is REFUSED_WHILE_ATTACHED
+
+    def test_attached_refusal_holds_with_no_rig_lock_at_all(self, attached_tab, monkeypatch):
+        """The predicate is the launch decision, never a lock read at press time.
+
+        A lock-derived implementation passes every other test in this class and
+        fails this one, which is the whole point of it.
+        """
+        _hold_rig(monkeypatch, None)
+        assert attached_tab._note_manual_actuation("stage jog") is REFUSED_WHILE_ATTACHED
+
+    def test_attached_banner_survives_the_campaign_lock_disappearing(
+            self, attached_tab, monkeypatch):
+        """The campaign ending does not hand this window the sessions.
+
+        A banner that cleared with the lock would leave controls refusing with
+        nothing on screen to say why.
+        """
+        _hold_rig(monkeypatch, None)
+        attached_tab.refresh_rig_owner()
+
+        assert not attached_tab._lbl_rig_owner.isHidden()
+        assert ATTACHED in attached_tab._lbl_rig_owner.text()
+
+    def test_attached_refusal_leaves_a_log_line_naming_the_run(self, attached_tab):
+        with structlog.testing.capture_logs() as logs:
+            attached_tab._note_manual_actuation("pump 0 dispense")
+
+        entry = next(e for e in logs
+                     if e["event"] == "manual_actuation_refused_while_attached")
+        assert entry["action"] == "pump 0 dispense"
+        assert entry["campaign"] == "phase_map"
+        assert entry["run_id"] == "20260817T090000Z_phase_map"
+
+    def test_attached_refusal_opens_no_modal_dialog(self, attached_tab, monkeypatch):
+        """A modal here blocks the event loop of a window whose only job is to
+        keep rendering a live campaign — and a queued one wedges the test run."""
+        def boom(*a, **k):
+            raise AssertionError("the refusal must not open a dialog")
+
+        monkeypatch.setattr(tm.QMessageBox, "warning", boom)
+        monkeypatch.setattr(tm.QMessageBox, "information", boom)
+        attached_tab._on_head_descend()
+
+    def test_attached_to_a_non_campaign_holder_refuses_without_inventing_a_campaign(
+            self, qapp, monkeypatch):
+        """A bench sequence holds the rig: still attached, still nothing to command."""
+        monkeypatch.setattr(rig_owner, "foreign_rig_lock", lambda: None)
+        mode = _attached_mode(_foreign_lock(what="workflow 'blank_short'", pid=77))
+        tab = ManualControlTab(create_mock_manager(config={}), launch_mode=mode)
+        try:
+            assert tab._note_manual_actuation("lamp on") is REFUSED_WHILE_ATTACHED
+            assert "another process" in tab._lbl_rig_owner.text()
+            assert "campaign '" not in tab._lbl_rig_owner.text()
+        finally:
+            tab.cleanup()
+            tab.close()
+
+
+class TestOwnerModeIsUnchangedByTheAttachPredicate:
+    """The two predicates that would have been easier, and why they are illegal."""
+
+    def test_an_explicit_owner_launch_mode_still_actuates_over_a_foreign_lock(
+            self, qapp, monkeypatch, settle_qt):
+        """Passing a mode is not what refuses — being attached is."""
+        monkeypatch.setattr(rig_owner, "foreign_rig_lock", lambda: _foreign_lock())
+        owner = decide_launch_mode(lock_reader=lambda: None)
+        assert owner.owner
+        tab = ManualControlTab(create_mock_manager(config={}), launch_mode=owner)
+        try:
+            calls = []
+            monkeypatch.setattr(tab._manager.get("lamp"), "on", lambda: calls.append("on"))
+            tab._on_lamp_on()
+            assert calls == ["on"]
+        finally:
+            tab.cleanup()
+            tab.close()
+
+    def test_the_mock_rig_is_disconnected_so_connection_cannot_be_the_predicate(self, tab):
+        """Why "this process holds no connected instruments" was rejected.
+
+        Nothing calls `connect_all()` on the fixture's manager, so every
+        instrument reports disconnected — and every case in
+        `TestActuationIsNeverRefused` deliberately actuates one anyway. A
+        connection-state refusal would refuse all eight.
+        """
+        assert not any(status.get("connected")
+                       for status in tab._manager.status_all().values())
+
+
+class TestAttachedReadOnlySurfaces:
+    """Renders stay; instrument *reads* do not.
+
+    An attached window may read, narrate and request — but a driver read is a
+    serial transaction on a bus the owning process is mid-anneal on, which is why
+    `MainWindow._instrument_source` already declines to make one. This tab has
+    its own polling worker, so it has to decline separately.
+    """
+
+    def test_attached_tab_starts_no_instrument_polling_worker(self, attached_tab):
+        assert attached_tab._pv_worker is None
+
+    def test_owner_tab_still_starts_its_instrument_polling_worker(self, tab):
+        assert tab._pv_worker is not None
+
+    def test_attached_head_label_reports_the_owner_not_a_registered_belief(
+            self, attached_tab):
+        """`is_head_up()` is state *this* process registered, and it registered none."""
+        text = attached_tab._lbl_head_status.text()
+        assert "Retracted" not in text and "Descended" not in text
+        assert "phase_map" in text
+
+    def test_attached_readouts_keep_their_placeholders_rather_than_guessing(
+            self, attached_tab):
+        assert "--" in attached_tab._lbl_temp_pv.text()
+        assert "?" in attached_tab._lbl_pos.text()

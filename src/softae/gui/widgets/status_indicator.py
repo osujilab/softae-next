@@ -46,6 +46,15 @@ _COLORS = {
     "CONNECTING": "#FF9800",    # orange
     "DISCONNECTED": "#9E9E9E",  # grey
     "ERROR": "#f44336",         # red
+    # "Another process owns this instrument" — an attached window holds no
+    # session, so the four states above cannot describe what it is looking at.
+    # Without this the fallback is the grey of DISCONNECTED, which on a rig
+    # actively running an eight-hour anneal reads as "the rig is off": the one
+    # reading that would send an operator to power-cycle a live experiment. The
+    # purple is the attach vocabulary's, shared with the toolbar's ATTACHED
+    # notice and the sidebar's owner line, and the word itself comes from
+    # ``rig_owner.OCCUPIED`` so the surfaces cannot drift apart.
+    "OCCUPIED": "#6a1b9a",      # purple
 }
 
 

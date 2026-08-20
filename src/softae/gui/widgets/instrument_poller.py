@@ -14,11 +14,27 @@ and pass it as the ``poller=`` keyword argument to :class:`MonitoringTab`,
 :class:`MonitorSidebar`, and :class:`InstrumentStatusBar`.  Each consumer
 connects its existing slot to one of the three emitted signals; no slot
 signature changes are required.
+
+Where the numbers come from — the *source*
+------------------------------------------
+An attached window (:mod:`softae.gui.launch_mode`) holds no instrument sessions,
+so it must not read the instruments: a read is a serial transaction on a bus the
+campaign that owns the rig is using. It still has to show the operator what the
+rig is doing.
+
+The seam for that is **one injected source with one method**, not a second
+consumer path. :class:`LiveInstrumentSource` is what this poller has always done;
+:class:`~softae.gui.widgets.conditions_source.ConditionsFileSource` fills the same
+three dicts from the campaign's ``conditions.json``. The three consumer widgets
+are therefore untouched by the attach work, and that is the test of whether the
+abstraction sits in the right layer: if one of them needs a change to render an
+attached rig, the source is in the wrong place.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Protocol
 
 from PySide6.QtCore import QMutex, QWaitCondition, Signal
 
@@ -26,6 +42,29 @@ from softae.gui.widgets.worker_thread import StoppableWorker
 
 if TYPE_CHECKING:
     from softae.server.manager import InstrumentManager
+
+
+@dataclass(frozen=True)
+class PollReading:
+    """One cycle's answer, in the three shapes the three consumers already take.
+
+    ``statuses`` is ``None`` rather than ``{}`` when the status row could not be
+    read at all, because the two mean different things to
+    :class:`~softae.gui.widgets.status_indicator.InstrumentStatusBar`: ``{}``
+    would be "no instruments", while ``None`` leaves the dots showing the last
+    thing that was actually true.
+    """
+
+    statuses: dict[str, Any] | None = None
+    sidebar: dict[str, Any] = field(default_factory=dict)
+    monitor: dict[str, Any] = field(default_factory=dict)
+
+
+class PollSource(Protocol):
+    """One method. Implementations must not raise — see :meth:`read`."""
+
+    def read(self) -> PollReading:
+        """One cycle's readings. Called on the poller's thread, never the GUI's."""
 
 
 class InstrumentPoller(StoppableWorker):
@@ -50,11 +89,26 @@ class InstrumentPoller(StoppableWorker):
     sidebar_ready = Signal(dict)   # → MonitorSidebar._on_poll_done
     monitor_ready = Signal(dict)   # → MonitoringTab._on_poll_done
 
-    def __init__(self, manager: "InstrumentManager", parent=None) -> None:
+    def __init__(
+        self,
+        manager: "InstrumentManager",
+        *,
+        source: PollSource | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self._manager = manager
+        # Chosen once, with the launch mode. An owner window reads instruments;
+        # an attached one reads the campaign's sidecar. The poller itself does
+        # not know which, and must not learn.
+        self._source: PollSource = source or LiveInstrumentSource(manager)
         self._mutex = QMutex()
         self._condition = QWaitCondition()
+
+    @property
+    def source(self) -> PollSource:
+        """Where the readings come from — for tests and for logging, not to swap."""
+        return self._source
 
     def poke(self) -> None:
         """Wake the timed sleep for an immediate poll (safe to call from any thread)."""
@@ -71,15 +125,42 @@ class InstrumentPoller(StoppableWorker):
             self._condition.wait(self._mutex, 2000)
             self._mutex.unlock()
 
-    def _do_poll(self) -> None:  # noqa: C901
+    def _do_poll(self) -> None:
+        """Ask the source once and fan the answer out. Never raises.
+
+        The guard is the thread's life: an exception here ends ``run()``, and a
+        poller that stopped looks exactly like a rig with nothing to report.
+        """
+        try:
+            reading = self._source.read()
+        except Exception:
+            return
+        if reading.statuses is not None:
+            self.status_ready.emit(reading.statuses)
+        self.sidebar_ready.emit(reading.sidebar)
+        self.monitor_ready.emit(reading.monitor)
+
+
+class LiveInstrumentSource:
+    """The four-instrument read this poller has always done, unchanged.
+
+    Every failure is per-instrument and swallowed: one unplugged sensor must not
+    blank the other three, and a monitoring read must never be the thing that
+    takes the GUI down.
+    """
+
+    def __init__(self, manager: "InstrumentManager") -> None:
+        self._manager = manager
+
+    def read(self) -> PollReading:  # noqa: C901
         import math
 
         # ── Status (InstrumentStatusBar) ──────────────────────────────────
+        statuses: dict | None
         try:
             statuses = self._manager.status_all()
-            self.status_ready.emit(statuses)
         except Exception:
-            pass
+            statuses = None
 
         # ── Shared instrument readings — one call per instrument ───────────
         sidebar: dict = {}
@@ -151,5 +232,4 @@ class InstrumentPoller(StoppableWorker):
         except Exception:
             pass
 
-        self.sidebar_ready.emit(sidebar)
-        self.monitor_ready.emit(monitor)
+        return PollReading(statuses=statuses, sidebar=sidebar, monitor=monitor)

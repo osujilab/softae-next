@@ -249,6 +249,13 @@ class MonitorSidebar(QWidget):
         wf_grp.setFlat(True)
         wf_lay = QVBoxLayout(wf_grp)
         wf_lay.setContentsMargins(4, 2, 4, 2)
+        # Who owns the rig, when it is not this process. First in the group and
+        # hidden until there is something to say: on a free rig a permanent
+        # "nobody else" label is noise, and on a held one this is the line that
+        # explains why everything below it is somebody else's.
+        self._lbl_rig_owner = self._status_label("")
+        self._lbl_rig_owner.setVisible(False)
+        wf_lay.addWidget(self._lbl_rig_owner)
         self._lbl_wf_arrhenius = self._status_label("Arrhenius: Idle")
         self._lbl_wf_ht = self._status_label("HT Exp: Idle")
         self._lbl_wf_auto = self._status_label("Autonomous: Idle")
@@ -459,6 +466,22 @@ class MonitorSidebar(QWidget):
         self._lbl_wf_ht.setText(f"HT Exp: {text}")
         self._lbl_wf_ht.setStyleSheet(
             f"color: {'#666' if idle else '#2277bb'}; font-size: 8pt;"
+        )
+
+    def update_rig_owner(self, text: str) -> None:
+        """Slot for the window's rig-owner poll — one line, or hidden.
+
+        Deliberately the same shape as :meth:`update_ht_status` and
+        :meth:`update_auto_status`: the composition lives in
+        :func:`~softae.gui.widgets.rig_owner.owner_status_line`, shared with the
+        Init tab and the Manual Control banner, so this widget renders a
+        sentence rather than deciding one. Empty means nobody else holds the rig.
+        """
+        text = text or ""
+        self._lbl_rig_owner.setText(text)
+        self._lbl_rig_owner.setVisible(bool(text))
+        self._lbl_rig_owner.setStyleSheet(
+            "color: #6a1b9a; font-weight: bold; font-size: 8pt;"
         )
 
     def update_auto_status(self, text: str) -> None:

@@ -66,6 +66,7 @@ from softae.core.campaign_discovery import (
 from softae.core.campaign_events import (
     CONTROL_UNREADABLE,
     EventCursor,
+    ack_answers_request,
     read_events,
     write_control_request,
 )
@@ -127,17 +128,13 @@ class CampaignControlRequester:
     Headless on purpose — no Qt here, so the ack-matching rule is testable
     without a window, and a script that wants the same guarantee can reuse it.
 
-    **The matching rule, and its one subtlety.** An ack normally carries the
-    ``seq`` of the request it answers, so a pending request is resolved by seq
-    and nothing else. The exception is
-    :meth:`~softae.core.campaign_events.ControlWatcher._ack` called with no
-    request at all — the ``unreadable`` case, where the file could not be parsed
-    and so *has* no seq to quote. That ack is matched by outcome instead, and it
-    is sound because the cursor is snapshotted at write time: there is one
-    ``control.json`` per run directory, ours is the newest thing written to it,
-    and an ``unreadable`` recorded after our write is about our write. Dropping
-    it because it carries no seq would silently swallow exactly the answer the
-    operator most needs.
+    **The matching rule** — including its one subtlety, the ``unreadable`` ack
+    that carries no seq — is
+    :func:`~softae.core.campaign_events.ack_answers_request`, shared with the
+    E-Stop ladder's rung 2 rather than restated here. What this class adds is the
+    half the rule depends on: the cursor is snapshotted **before** the write, so
+    an ack already on disk — the previous operator's, or this run's answer to the
+    CLI — can never be mistaken for the answer to this press.
     """
 
     def __init__(
@@ -208,10 +205,7 @@ class CampaignControlRequester:
         return None
 
     def _answers_pending(self, ack: dict[str, Any]) -> bool:
-        seq = ack.get("seq")
-        if seq is None:
-            return ack.get("outcome") == CONTROL_UNREADABLE
-        return seq == getattr(self._pending, "seq", None)
+        return ack_answers_request(ack, self._pending)
 
 
 class CampaignControlBar(QGroupBox):

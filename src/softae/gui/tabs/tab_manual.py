@@ -46,6 +46,7 @@ from softae.config.loader import (
     piezo_config,
     syringe_parallel_count,
 )
+from softae.gui.launch_mode import OWNER_MODE
 from softae.gui.widgets.worker_thread import StoppableWorker
 
 if TYPE_CHECKING:
@@ -54,8 +55,29 @@ if TYPE_CHECKING:
     from softae.core.data_store import DataStore
     from softae.core.eis_scout_scripts import ScoutPlanner
     from softae.core.run_lock import RunLock
+    from softae.gui.launch_mode import LaunchMode
     from softae.gui.widgets.camera_worker import CameraWorker
     from softae.server.manager import InstrumentManager
+
+
+class _AttachRefusal:
+    """The answer :meth:`ManualControlTab._note_manual_actuation` gives instead of
+    a lock when this window is attached to a campaign it does not own.
+
+    A sentinel rather than a bool because the method's two existing answers are
+    already ``None`` (the rig is free) and the lock itself (someone else holds it,
+    and we actuate anyway) — both of which mean *proceed*. Identity-compared at
+    the call sites, so no truthiness accident can turn a refusal into a go-ahead.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<manual actuation refused: this window is attached>"
+
+
+#: Singleton of :class:`_AttachRefusal`; see :meth:`ManualControlTab._note_manual_actuation`.
+REFUSED_WHILE_ATTACHED = _AttachRefusal()
 
 
 def _manual_scout_default() -> bool:
@@ -347,7 +369,15 @@ class _ManualPollingWorker(StoppableWorker):
 
 
 class ManualControlTab(QWidget):
-    """Hands-on instrument control panel."""
+    """Hands-on instrument control panel.
+
+    Owner mode is the whole of its history and is untouched by attach mode: the
+    rig may be occupied by another process and every control here still acts, by
+    ruling (see :mod:`softae.gui.widgets.rig_owner`). What changes is a window
+    launched *attached* — one that opened no instrument session at all. Its
+    controls actuate nothing whatever they do, so they say so instead; see
+    :meth:`_note_manual_actuation`.
+    """
 
     def __init__(
         self,
@@ -355,10 +385,18 @@ class ManualControlTab(QWidget):
         parent: QWidget | None = None,
         *,
         data_store: DataStore | None = None,
+        launch_mode: LaunchMode | None = None,
     ):
         super().__init__(parent)
         self._manager = manager
         self._data_store = data_store
+        # Injected, not read: the decision is made once before any port is opened
+        # (:mod:`softae.gui.launch_mode`), and there is deliberately no setter —
+        # construction *branches* on it (an attached tab starts no polling
+        # thread), so a tab that could be re-moded afterwards would carry a mode
+        # its own wiring did not match. `None` means owner mode, which is what a
+        # tab constructed directly by a test, a tool or a script gets.
+        self._launch_mode = launch_mode if launch_mode is not None else OWNER_MODE
         self._cam_worker: CameraWorker | None = None
         self._eis_thread: QThread | None = None
         self._eis_worker: _ManualEisWorker | None = None
@@ -373,15 +411,37 @@ class ManualControlTab(QWidget):
         # A campaign can start (or end) in another process while this tab sits
         # open, so ownership is polled rather than read once. 2 s matches the Init
         # tab's cadence, so the two views cannot be more than one tick apart.
+        # An attached tab does not poll: its banner comes from the launch
+        # decision, which by construction cannot change while the window lives.
         self._rig_owner_timer = QTimer(self)
         self._rig_owner_timer.setInterval(2000)
         self._rig_owner_timer.timeout.connect(self.refresh_rig_owner)
-        self._rig_owner_timer.start()
+        if self._launch_mode.owner:
+            self._rig_owner_timer.start()
         self.refresh_rig_owner()
         # Reflect the driver's registered head belief (may already have been set
         # by the launch-time verification prompt before this tab is shown).
         self.refresh_head_label()
         self.refresh_stock_labels()
+
+    @property
+    def launch_mode(self) -> "LaunchMode":
+        """Owner or attached — read-only, mirroring
+        :attr:`softae.gui.main_window.MainWindow.launch_mode` and for its reason.
+        """
+        return self._launch_mode
+
+    @property
+    def _attached(self) -> bool:
+        """Whether this window opened none of the sessions these controls reach.
+
+        The **only** predicate the refusal below is allowed to use. Not "a foreign
+        campaign holds the lock" — that is the refusal the operator forbade, and
+        it is a live rig's normal state while manual control is legitimately in
+        use. Not "no instrument is connected" either: a mock manager reports
+        every instrument disconnected and must still actuate.
+        """
+        return self._launch_mode.attached
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -920,7 +980,21 @@ class ManualControlTab(QWidget):
     # --- PV polling -----------------------------------------------------------
 
     def _start_pv_polling(self) -> None:
-        """Start background PV polling thread (keeps driver calls off main thread)."""
+        """Start background PV polling thread (keeps driver calls off main thread).
+
+        Not started at all when this window is attached — the worker is never
+        constructed, so nothing later can ``.start()`` it. Its four
+        ``manager.get(...)`` reads are the same ones
+        :meth:`softae.gui.main_window.MainWindow._instrument_source` declines to
+        make in attach mode, for the same reason: a read is a serial transaction
+        on a bus the owning process is mid-anneal on, and each one would in any
+        case fail into its own ``except`` and leave the labels at ``--``. The
+        labels keep their placeholders, which is the truth — this window cannot
+        see those values; the Monitoring tab, fed from the campaign's
+        ``conditions.json``, can.
+        """
+        if self._attached:
+            return
         self._pv_worker = _ManualPollingWorker(self._manager, parent=self)
         self._pv_worker.poll_done.connect(self._on_pv_poll_done)
         self._pv_worker.start()
@@ -988,6 +1062,14 @@ class ManualControlTab(QWidget):
         than duplicating them**: the owner named here is another *process*, and a
         Pause button wired to nothing would be worse than no button. It reports
         and points; it does not promise what it cannot honour.
+
+        The one exception is an *attached* window, which owns no session for any
+        of these controls to reach. Its banner is rendered from the launch
+        decision and never from a lock read here — see :attr:`_attached` — and it
+        stays up for the window's whole life, including after the campaign that
+        caused it has finished: this window does not acquire the sessions when
+        that lock disappears, so a banner that cleared with the lock would leave
+        controls refusing with nothing on screen to say why.
         """
         from softae.gui.widgets.rig_owner import (
             OCCUPIED,
@@ -995,6 +1077,10 @@ class ManualControlTab(QWidget):
             foreign_rig_lock,
             owner_line,
         )
+
+        if self._attached:
+            self._show_attach_banner()
+            return None
 
         lock = foreign_rig_lock()
         if lock is None:
@@ -1020,14 +1106,49 @@ class ManualControlTab(QWidget):
         self._lbl_rig_owner.setVisible(True)
         return lock
 
-    def _note_manual_actuation(self, action: str) -> "RunLock | None":
-        """Record — and never refuse — a manual *action* issued over a live run.
+    def _show_attach_banner(self) -> None:
+        """The attached window's standing statement, in the shared vocabulary.
 
-        Returns the foreign lock when there was one, so a caller can annotate its
-        own status line. **The caller proceeds either way.** This exists so that a
-        collision, if one happens, is in the log with a timestamp and an owner
-        beside it rather than being reconstructed afterwards from a ruined board.
+        Same words as the toolbar's ATTACHED notice and the monitoring sidebar's
+        owner line, because they are generated from the same module: three
+        surfaces describing one fact in three phrasings is how an operator ends
+        up unsure which of them is stale.
         """
+        from softae.gui.widgets.rig_owner import ATTACHED, attached_refusal_line
+
+        mode = self._launch_mode
+        sentence = attached_refusal_line(mode.campaign, mode.holder)
+        self._lbl_rig_owner.setText(
+            sentence.replace(ATTACHED, f"<b style='color:#6a1b9a'>{ATTACHED}</b>", 1)
+        )
+        self._lbl_rig_owner.setToolTip(mode.reason)
+        self._lbl_rig_owner.setVisible(True)
+
+    def _note_manual_actuation(self, action: str) -> "RunLock | None | _AttachRefusal":
+        """Record a manual *action*, and refuse it only if nothing could receive it.
+
+        Three answers, and the caller acts on exactly one of them:
+
+        ==========================  ================================================
+        ``None``                    the rig is free — proceed, nothing to say
+        the foreign :class:`RunLock`  someone else is running — **proceed anyway**,
+                                    with the collision logged and named, because
+                                    the operator at the bench is the authority
+        :data:`REFUSED_WHILE_ATTACHED`  this window opened no sessions — stop, and
+                                    say which run has them
+        ==========================  ================================================
+
+        The middle answer is the ruled one and it is unchanged: a lock is never a
+        reason to refuse. The third is not derived from a lock at all (see
+        :attr:`_attached`); it is the launch decision, and what it reports is not
+        "you may not" but "there is nothing here to command".
+
+        This is the seam because every actuating slot already routes through it —
+        pinned by ``test_every_actuating_slot_reports_before_it_acts`` — so a
+        control added later cannot be added *past* the refusal.
+        """
+        if self._attached:
+            return self._refuse_while_attached(action)
         lock = self.refresh_rig_owner()
         if lock is None:
             return None
@@ -1046,6 +1167,34 @@ class ManualControlTab(QWidget):
         )
         return lock
 
+    def _refuse_while_attached(self, action: str) -> "_AttachRefusal":
+        """Say — on screen and in the log — why *action* was not sent.
+
+        No modal dialog. The refusal has to be readable from a slot that a
+        background thread's signal can reach, and a message box there blocks the
+        event loop of a window whose *only* remaining job is to keep showing a
+        live campaign. The banner is already on screen and the status line is
+        where every other outcome of a manual command is reported.
+        """
+        from softae.gui.widgets.rig_owner import attached_refusal_line
+
+        mode = self._launch_mode
+        self._show_attach_banner()
+
+        import structlog
+
+        campaign = mode.campaign or (None, None)
+        structlog.get_logger(__name__).warning(
+            "manual_actuation_refused_while_attached",
+            action=action, campaign=campaign[0], run_id=campaign[1],
+            msg="manual control was not sent: this window is attached and holds "
+                "no instrument session, so the command would reach nothing",
+        )
+        self._lbl_last_command.setText(
+            f"Refused: {action} — {attached_refusal_line(mode.campaign, mode.holder)}"
+        )
+        return REFUSED_WHILE_ATTACHED
+
     # --- Slots ----------------------------------------------------------------
 
     def _safe_run(self, fn, error_title: str = "Error") -> None:
@@ -1056,7 +1205,8 @@ class ManualControlTab(QWidget):
             QMessageBox.warning(self, error_title, str(exc))
 
     def _on_goto(self) -> None:
-        self._note_manual_actuation("stage go-to")
+        if self._note_manual_actuation("stage go-to") is REFUSED_WHILE_ATTACHED:
+            return
         x, y = self._spin_x.value(), self._spin_y.value()
         self._btn_goto.setEnabled(False)
 
@@ -1074,7 +1224,8 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_jog(self, dx: float, dy: float) -> None:
-        self._note_manual_actuation("stage jog")
+        if self._note_manual_actuation("stage jog") is REFUSED_WHILE_ATTACHED:
+            return
         step = self._spin_jog_step.value()
         for b in self._jog_buttons:
             b.setEnabled(False)
@@ -1097,7 +1248,8 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_set_temp(self) -> None:
-        self._note_manual_actuation("temperature setpoint")
+        if self._note_manual_actuation("temperature setpoint") is REFUSED_WHILE_ATTACHED:
+            return
         sp = self._spin_temp.value()
         self._btn_set_temp.setEnabled(False)
 
@@ -1114,7 +1266,8 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_ramp(self) -> None:
-        self._note_manual_actuation("temperature ramp")
+        if self._note_manual_actuation("temperature ramp") is REFUSED_WHILE_ATTACHED:
+            return
         end = self._spin_ramp_end.value()
         rate = self._spin_ramp_rate.value()
         self._btn_ramp.setEnabled(False)
@@ -1137,7 +1290,8 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_set_rh(self) -> None:
-        self._note_manual_actuation("humidity setpoint")
+        if self._note_manual_actuation("humidity setpoint") is REFUSED_WHILE_ATTACHED:
+            return
         sp = self._spin_rh.value()
         self._btn_set_rh.setEnabled(False)
 
@@ -1153,7 +1307,8 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_rh_start(self) -> None:
-        self._note_manual_actuation("humidity control start")
+        if self._note_manual_actuation("humidity control start") is REFUSED_WHILE_ATTACHED:
+            return
         sp = self._spin_rh.value()
         self._btn_rh_start.setEnabled(False)
 
@@ -1170,7 +1325,8 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_rh_stop(self) -> None:
-        self._note_manual_actuation("humidity control stop")
+        if self._note_manual_actuation("humidity control stop") is REFUSED_WHILE_ATTACHED:
+            return
         self._btn_rh_stop.setEnabled(False)
 
         def _do():
@@ -1185,7 +1341,8 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_head_retract(self) -> None:
-        self._note_manual_actuation("dispenser head retract")
+        if self._note_manual_actuation("dispenser head retract") is REFUSED_WHILE_ATTACHED:
+            return
         self._btn_head_retract.setEnabled(False)
 
         def _do():
@@ -1202,7 +1359,8 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_head_descend(self) -> None:
-        self._note_manual_actuation("dispenser head descend")
+        if self._note_manual_actuation("dispenser head descend") is REFUSED_WHILE_ATTACHED:
+            return
         self._btn_head_descend.setEnabled(False)
 
         def _do():
@@ -1224,7 +1382,22 @@ class ManualControlTab(QWidget):
         The single source of truth is ``syringe.is_head_up()``; this reflects
         state changed elsewhere (launch/start-gate verification prompts) so the
         label never drifts from the driver.  Best-effort — never raises.
+
+        In attach mode there is no belief worth showing: ``is_head_up()`` is a
+        *registered* state, and this process registered none — it never ran the
+        launch-time head verification, and the campaign flipping the head in
+        another process cannot update it. A green "Head: Retracted" that is
+        really "nobody here has ever looked" is the one thing a head label must
+        not say, so it says the campaign owns the head instead.
         """
+        if self._attached:
+            from softae.gui.widgets.rig_owner import attached_owner_line
+
+            self._lbl_head_status.setText(
+                f"Head: not known here — {attached_owner_line(self._launch_mode.campaign)}"
+            )
+            self._lbl_head_status.setStyleSheet("font-weight: bold; color: #6a1b9a;")
+            return
         try:
             syr = self._manager.get("syringe")
             is_up = bool(getattr(syr, "is_head_up")())
@@ -1374,7 +1547,8 @@ class ManualControlTab(QWidget):
         # Noted here rather than at the top of the slot: everything above can
         # still decline, and the log line should mean "fluid was commanded", not
         # "a button was pressed".
-        self._note_manual_actuation(f"pump {pump_id} dispense")
+        if self._note_manual_actuation(f"pump {pump_id} dispense") is REFUSED_WHILE_ATTACHED:
+            return
         btn.setEnabled(False)
 
         def _do():
@@ -1412,7 +1586,8 @@ class ManualControlTab(QWidget):
     def _on_piezo_a_on(self) -> None:
         if not self._piezo_enabled_cfg:
             return
-        self._note_manual_actuation("piezo channel A on")
+        if self._note_manual_actuation("piezo channel A on") is REFUSED_WHILE_ATTACHED:
+            return
         self._ensure_piezo_capability_status()
         self._btn_piezo_a_on.setEnabled(False)
         self._btn_piezo_a_off.setEnabled(False)
@@ -1436,7 +1611,8 @@ class ManualControlTab(QWidget):
     def _on_piezo_a_off(self) -> None:
         if not self._piezo_enabled_cfg:
             return
-        self._note_manual_actuation("piezo channel A off")
+        if self._note_manual_actuation("piezo channel A off") is REFUSED_WHILE_ATTACHED:
+            return
         self._ensure_piezo_capability_status()
         self._btn_piezo_a_on.setEnabled(False)
         self._btn_piezo_a_off.setEnabled(False)
@@ -1460,7 +1636,8 @@ class ManualControlTab(QWidget):
     def _on_piezo_apply_settings(self) -> None:
         if not self._piezo_enabled_cfg:
             return
-        self._note_manual_actuation("piezo profile")
+        if self._note_manual_actuation("piezo profile") is REFUSED_WHILE_ATTACHED:
+            return
         self._ensure_piezo_capability_status()
         if not self._piezo_config_supported:
             self._lbl_piezo_status.setText("Profile settings unavailable on legacy piezo firmware.")
@@ -1542,7 +1719,8 @@ class ManualControlTab(QWidget):
         except ValueError as exc:
             self._lbl_eis_status.setText(f"Routing error: {exc}")
             return
-        self._note_manual_actuation("manual EIS")
+        if self._note_manual_actuation("manual EIS") is REFUSED_WHILE_ATTACHED:
+            return
         preset = self._combo_eis_preset.currentText()
         auto_fit = self._chk_autofit.isChecked()
         fit_model = self._combo_fit_model.currentText()
@@ -1750,7 +1928,8 @@ class ManualControlTab(QWidget):
             self._lbl_cam_image.setPixmap(pixmap)
 
     def _on_lamp_on(self) -> None:
-        self._note_manual_actuation("lamp on")
+        if self._note_manual_actuation("lamp on") is REFUSED_WHILE_ATTACHED:
+            return
 
         def go():
             lamp = self._manager.get("lamp")
@@ -1758,7 +1937,8 @@ class ManualControlTab(QWidget):
         self._safe_run(go, "Lamp Error")
 
     def _on_lamp_off(self) -> None:
-        self._note_manual_actuation("lamp off")
+        if self._note_manual_actuation("lamp off") is REFUSED_WHILE_ATTACHED:
+            return
 
         def go():
             lamp = self._manager.get("lamp")
@@ -1797,8 +1977,11 @@ class ManualControlTab(QWidget):
     def showEvent(self, event) -> None:
         if self._pv_worker is not None and not self._pv_worker.isRunning():
             self._pv_worker.start()
-        # Who owns the rig may have changed entirely while this tab was hidden.
-        self._rig_owner_timer.start()
+        # Who owns the rig may have changed entirely while this tab was hidden —
+        # unless this window is attached, in which case what it may do was
+        # settled before it existed and no poll can revise it.
+        if self._launch_mode.owner:
+            self._rig_owner_timer.start()
         self.refresh_rig_owner()
         # A start-gate on another tab may have changed the head belief while
         # this tab was hidden; re-sync the label when it becomes visible.

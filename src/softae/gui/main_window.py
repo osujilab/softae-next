@@ -24,6 +24,7 @@ from typing import Callable
 import structlog
 
 from softae.config import loader
+from softae.gui.campaign_stream import CampaignStreamView
 from softae.gui.launch_mode import OWNER_MODE, LaunchMode
 from softae.core.formulation import ChemicalCatalog, SolutionCatalog
 from softae.gui.tabs.tab_analysis import AnalysisTab
@@ -40,10 +41,12 @@ from softae.gui.tabs.tab_process_studio import ProcessStudioTab
 from softae.gui.widgets.camera_worker import CameraWorker
 from softae.gui.widgets.catalog_browser import CatalogBrowser
 from softae.gui.widgets.catalog_manager import CatalogManager
+from softae.gui.widgets.conditions_source import ConditionsFileSource
 from softae.gui.widgets.deposition_panel import DepositionPanel
 from softae.gui.widgets.emergency_stop import EmergencyStopButton
 from softae.gui.widgets.instrument_poller import InstrumentPoller
 from softae.gui.widgets.monitor_sidebar import MonitorSidebar
+from softae.gui.widgets.rig_owner import foreign_rig_lock, owner_status_line
 from softae.gui.widgets.safe_exit import SafeExitButton
 from softae.gui.widgets.status_indicator import InstrumentStatusBar
 from softae.gui.widgets.webcam_worker import WebcamWorker
@@ -58,6 +61,22 @@ logger = structlog.get_logger(__name__)
 #: than the purge interval itself: a tick that finds the rig busy must not push
 #: the purge out by a whole period, and the runner is cheap when nothing is due.
 _PURGE_POLL_MS = 30_000
+
+#: How often the window re-reads who owns the rig, and — when attached — the
+#: campaign's event stream.
+#:
+#: The number is a real cost, not a preference. ``read_events`` deliberately
+#: keeps no byte offset (an offset is meaningless across a rotation) and does not
+#: hold the handle between polls (a held handle makes ``os.replace`` fail on
+#: Windows and silently turns the 32 MB cap off), so **every poll reads the whole
+#: live stream** — ~2.5 MB after a week, 32 MB at the cap.
+#:
+#: 5 s is the floor below which the extra reads buy nothing: the heartbeat is
+#: 30 s and the conditions sidecar republishes at 5 s, so a 1 s poll re-reads
+#: megabytes to redisplay the same strings. It is also six times *more*
+#: responsive than what it replaces — the park indicator's only periodic caller
+#: was the 30 s purge tick, which an attached window does not have.
+_CAMPAIGN_POLL_MS = 5_000
 
 
 def _park_nothing() -> None:
@@ -204,16 +223,57 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("SoftAE — Soft-matter Autonomous Experimentation")
         self.setMinimumSize(1200, 800)
 
+        # What an attached window knows about the run. `None` in owner mode, and
+        # also when the holder is not a campaign — something owns the rig but
+        # publishes no stream, so there is nothing to follow and the window says
+        # only that it is occupied.
+        self._attach_stream: CampaignStreamView | None = None
+        if self._launch_mode.attached and self._launch_mode.run_dir:
+            self._attach_stream = CampaignStreamView(
+                self._launch_mode.run_dir, campaign=self._launch_mode.campaign
+            )
+
         # Shared instrument poller — single background thread that replaces the
         # three independent polling workers previously running in tab_monitor,
-        # monitor_sidebar, and status_indicator.
-        self._poller = InstrumentPoller(self._manager, parent=self)
+        # monitor_sidebar, and status_indicator. Its *source* is chosen with the
+        # launch mode; the three consumer widgets do not know there is a choice.
+        self._poller = InstrumentPoller(
+            self._manager, source=self._instrument_source(), parent=self
+        )
 
         self._build_ui()
         self._build_menu()
         self._build_toolbar()
         self._build_statusbar()
+
+        # The window's other periodic tick, and in attach mode its only one. See
+        # `_CAMPAIGN_POLL_MS` for the cadence and `_on_campaign_tick` for the
+        # three jobs it does.
+        self._campaign_timer = QTimer(self)
+        self._campaign_timer.setInterval(_CAMPAIGN_POLL_MS)
+        self._campaign_timer.timeout.connect(self._on_campaign_tick)
+        self._campaign_timer.start()
+        self._on_campaign_tick()   # paint once rather than start blank
+
         self._poller.start()
+
+    def _instrument_source(self):
+        """Where the poller's readings come from — decided once, with the mode.
+
+        Owner mode reads the instruments it opened. Attached mode reads the
+        campaign's ``conditions.json`` and **no instrument at all**: a read is a
+        serial transaction on a bus the owning process is using, and the four
+        ``manager.get(...)`` calls would in any case fail one by one into their
+        own exception handlers, leaving the operator a rig that renders as
+        disconnected while it runs an eight-hour anneal.
+
+        A run directory of ``None`` — occupied by something that is not a
+        campaign — is the honest degenerate case: the instruments are reported
+        as the holder's and every value is unknown.
+        """
+        if self._launch_mode.owner:
+            return None
+        return ConditionsFileSource(self._launch_mode.run_dir, manager=self._manager)
 
     @property
     def launch_mode(self) -> LaunchMode:
@@ -245,7 +305,13 @@ class MainWindow(QMainWindow):
         # --- Full tab stack ---
         self._tab_init = InitCalibrationTab(self._manager, data_store=self._data_store)
         self._tab_liquid_model = LiquidModelTab(self._manager)
-        self._tab_manual = ManualControlTab(self._manager, data_store=self._data_store)
+        # The launch mode is passed, not looked up: Manual Control's controls are
+        # the ones that would command sessions this window may not have opened,
+        # and the tab branches on the answer at construction (it starts no
+        # polling thread when attached).
+        self._tab_manual = ManualControlTab(
+            self._manager, data_store=self._data_store, launch_mode=self._launch_mode
+        )
         self._tab_monitor = MonitoringTab(self._manager, poller=self._poller)
         self._tab_experiment = ExperimentBuilderTab(self._manager, data_store=self._data_store)
         self._tab_arrhenius = ArrheniusTab(self._manager, data_store=self._data_store)
@@ -340,18 +406,25 @@ class MainWindow(QMainWindow):
             self._tab_arrhenius.set_pcb_channel_count
         )
 
-        # Bridge: HT Experiment workflow status → sidebar
-        self._tab_experiment.workflow_status_changed.connect(
-            self._sidebar.update_ht_status
-        )
+        # Bridges: HT Experiment + Autonomous workflow status → sidebar.
+        #
+        # These two slots are the window's campaign-status line, and in attach
+        # mode the campaign is in another process — so the *source* is swapped
+        # and the slots are driven from the event stream in `_on_campaign_tick`
+        # instead. Same two slots, same kind of string; the sidebar never learns
+        # that attach exists. Nothing in-process can drive them in that mode
+        # anyway: every workflow goes through `WorkflowExecutor`, which refuses
+        # while another process holds the rig lock.
+        if self._attach_stream is None:
+            self._tab_experiment.workflow_status_changed.connect(
+                self._sidebar.update_ht_status
+            )
+            self._tab_autonomous.workflow_status_changed.connect(
+                self._sidebar.update_auto_status
+            )
 
         # Bridge: catalog edits (via the shared FormulationPanel opener) → refresh hook
         self._tab_experiment.catalogs_changed.connect(self._on_catalogs_changed)
-
-        # Bridge: Autonomous workflow status → sidebar
-        self._tab_autonomous.workflow_status_changed.connect(
-            self._sidebar.update_auto_status
-        )
 
         layout.addWidget(body_splitter)
         self.setCentralWidget(central)
@@ -468,8 +541,14 @@ class MainWindow(QMainWindow):
         toolbar.setMovable(False)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
 
-        # Emergency stop — always visible, prominent
-        self._estop = EmergencyStopButton(self._manager)
+        # Emergency stop — always visible, prominent. The launch mode goes in
+        # because the button's *guarantee* depends on it: an attached window
+        # holds no sessions, so a press cannot park and must instead climb the
+        # escalation ladder to the campaign that can. Which rungs that ladder can
+        # reach is decided in the constructor and written into the label, so the
+        # operator reads it before they press rather than discovering it after.
+        self._estop = EmergencyStopButton(
+            self._manager, launch_mode=self._launch_mode)
         self._estop.parked.connect(self.notify_parked)
         toolbar.addWidget(self._estop)
 
@@ -535,12 +614,17 @@ class MainWindow(QMainWindow):
         mode, names the holder, and carries the launch decision's own sentence as
         its tooltip — so the missing park control and the reason for it arrive
         together.
+
+        The headline itself comes from :func:`~softae.gui.widgets.rig_owner.attached_owner_line`,
+        which the Manual Control tab's refusal banner also starts from: two
+        surfaces describing one fact must not describe it in two phrasings.
         """
         from PySide6.QtWidgets import QLabel
 
+        from softae.gui.widgets.rig_owner import attached_owner_line
+
         mode = self._launch_mode
-        who = f"campaign '{mode.campaign[0]}'" if mode.campaign else "another process"
-        label = QLabel(f"ATTACHED — {who} owns the rig")
+        label = QLabel(attached_owner_line(mode.campaign))
         label.setToolTip(
             mode.reason
             + "\n\nNothing here can park the rig, so Safe Exit is not offered. "
@@ -704,17 +788,73 @@ class MainWindow(QMainWindow):
         )
 
     def _park_reason(self) -> str | None:
-        """Aggregate park state — the window latch, or a running campaign's."""
+        """Aggregate park state — the window latch, or a running campaign's.
+
+        A campaign that parked itself overnight is the case this exists for, and
+        *where* that campaign is decides where the fact comes from: in attach
+        mode it is another process's park, which arrives as a ``park`` record on
+        the event stream; in owner mode it is the in-process tab's.
+        """
         latched = getattr(self, "_park_latch", None)
         if latched:
             return latched
-        # A campaign that parked itself overnight is the case this exists for.
+        stream = getattr(self, "_attach_stream", None)
+        if stream is not None:
+            return stream.park_reason
         tab = getattr(self, "_tab_bo_live", None)
         try:
             reason = getattr(tab, "park_reason", None)
             return reason() if callable(reason) else reason
         except Exception:
             return None
+
+    # ── Who owns the rig, and what it is doing (attach render) ───────────────
+
+    def _on_campaign_tick(self) -> None:
+        """The window's campaign-facing tick. Never raises.
+
+        Three jobs, and the third is why it exists in *both* modes:
+
+        1. poll the campaign's event stream (attached only) and put its two
+           strings into the sidebar's existing status slots;
+        2. re-read who holds the rig and render the owner line — a foreign lock
+           can appear at any time, including under an owner-mode window;
+        3. refresh the park indicator. ``_on_purge_tick`` was its **only**
+           periodic caller and the purge timer is not created in attach mode, so
+           without this the "PARKED — CLEAR" control would never appear for
+           precisely the unattended, nobody-watching case it exists for.
+
+        Swallowed like the purge tick, and for the same reason: a background
+        timer that can kill the GUI is worse than a stale label.
+        """
+        try:
+            stream = self._attach_stream
+            if stream is not None:
+                stream.poll()
+                self._sidebar.update_ht_status(stream.ht_status())
+                self._sidebar.update_auto_status(stream.auto_status())
+            self._refresh_rig_owner()
+            self._refresh_park_indicator()
+        except Exception:
+            logger.warning("campaign_tick_failed", exc_info=True)
+
+    def _refresh_rig_owner(self) -> None:
+        """Render the sidebar's owner line from the lock plus the stream.
+
+        The lock is re-read every tick because this is a *view*: it is what makes
+        the line appear when a campaign starts underneath an idle window and
+        disappear when one ends. It decides nothing — the launch decision is
+        made once and is never re-derived from this read.
+        """
+        sidebar = getattr(self, "_sidebar", None)
+        if sidebar is None:
+            return
+        stream = self._attach_stream
+        sidebar.update_rig_owner(owner_status_line(
+            foreign_rig_lock(),
+            phase=None if stream is None else stream.phase,
+            phase_age_s=None if stream is None else stream.phase_age_s,
+        ))
 
     # ── Anti-clog purge (P8) ─────────────────────────────────────────────────
 
@@ -815,6 +955,15 @@ class MainWindow(QMainWindow):
         if getattr(self, "_purge_timer", None) is not None:
             try:
                 self._purge_timer.stop()
+            except Exception:
+                pass
+
+        # 0b. …and the campaign tick, which reads files: a poll that fires
+        #     during teardown would be reading a stream to update widgets that
+        #     are being destroyed.
+        if getattr(self, "_campaign_timer", None) is not None:
+            try:
+                self._campaign_timer.stop()
             except Exception:
                 pass
 
