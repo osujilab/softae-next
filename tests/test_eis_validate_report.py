@@ -440,6 +440,269 @@ def test_mock_report_refuses_a_go():
     assert "(MOCK)" in R.render(payload)
 
 
+# ── Absent data is INSUFFICIENT, and moves nothing ───────────────────────────
+#
+# The first hardware run (probe-3ch-v3, 3 cells, none resolved) printed
+#
+#     [PASS] T1 sum(t_adaptive) / sum(t_control)        observed n/a
+#
+# off two zero sums. A criterion that could not be evaluated must say so rather
+# than borrow a verdict -- and, because this is a PRE-REGISTERED rule, saying so
+# must not change which runs are declared GO. Every test below therefore pins the
+# status AND the outcome together.
+
+def _passing_run() -> list[R.SweepRecord]:
+    """D1-D4, H1-H3 and T1 all evaluable and all satisfied: the GO route."""
+    return [
+        r for i in range(10, 16)
+        for r in _treatment_cell(i, d_scout=-0.40, d_adaptive=-0.10)
+    ] + _controls(20) + _drift_row()
+
+
+def _treatment_without_deviations() -> list[R.SweepRecord]:
+    """TREATMENT cells carrying no sigma at all.
+
+    D1, D2 and D4 lose their input entirely while D3's CONTROL noise floor and
+    H3's drift check stay evaluable -- so the routing reaches the D1 branch and
+    the three unevaluable criteria are isolated from the two that are not.
+    """
+    records = [r for i in range(10, 16)
+               for r in _treatment_cell(i, d_scout=-0.40, d_adaptive=-0.10)]
+    for row in records:
+        if row.arm == R.ARM_SCOUT:
+            row.sigma, row.r1_ohm = None, None
+    return records + _controls(20) + _drift_row()
+
+
+def _costing_nothing(records):
+    """Every sweep records 0 s, so sum(t_control) is 0 and no ratio exists."""
+    for row in records:
+        row.seconds = 0.0
+    return records
+
+
+def _unresolved_cell(index: int) -> list[R.SweepRecord]:
+    """An extend_low cell whose own reference never closed: no accuracy number."""
+    cell, channel = f"{index}:30:25:1", index
+    return [
+        _record(measurement_id=index * 10, channel=channel, cell=cell,
+                arm=R.ARM_REFERENCE, sigma=1e-6, arc_state="closed", band=0.4,
+                apex_hz=4.0, f_lo_hz=1.351, seconds=120.42),
+        _record(measurement_id=index * 10 + 1, channel=channel, cell=cell,
+                arm=R.ARM_SCOUT, sigma=1e-4, verdict="extend_low",
+                arc_state="open", band=0.0, f_lo_hz=6.475, seconds=17.5),
+    ]
+
+
+def _probe_3ch_shape() -> list[R.SweepRecord]:
+    """The first real run: three cells, not one of them resolved."""
+    return [r for i in (1, 2, 3) for r in _unresolved_cell(i)]
+
+
+def _criteria_block(report: str) -> str:
+    """Section 8's criterion rows: past its own heading, short of the banner."""
+    body = report.split("-- 8.")[1].split("  " + "=" * 70)[0]
+    return body.split("\n", 1)[1]
+
+
+def test_t1_with_zero_control_time_reports_insufficient_not_pass():
+    """0/0 is not 'within budget'. The ratio does not exist, and says so."""
+    verdict = R.evaluate(
+        _cells(_costing_nothing(_passing_run())), min_treatment=6)
+    t1 = next(c for c in verdict.criteria if c.name.startswith("T1"))
+    assert t1.status == R.INSUFFICIENT
+    assert "sum_control = 0 s" in t1.observed
+    # ...and the pre-registered routing is untouched: an absent ratio never
+    # vetoed a GO before this change and does not start to now.
+    assert verdict.outcome == R.OUTCOME_GO
+
+
+def test_t1_with_no_ratio_cells_names_the_missing_population():
+    records = _probe_3ch_shape()
+    verdict = R.evaluate(_cells(records), min_treatment=6)
+    t1 = next(c for c in verdict.criteria if c.name.startswith("T1"))
+    assert t1.status == R.INSUFFICIENT
+    assert t1.observed == "no CONTROL or TREATMENT cells"
+    assert verdict.outcome == R.OUTCOME_INSUFFICIENT
+
+
+def test_h3_without_drift_rows_reports_insufficient():
+    records = [r for r in _passing_run() if r.arm != R.ARM_REFERENCE_END]
+    verdict = R.evaluate(_cells(records), min_treatment=6)
+    assert _status(verdict, "H3") == R.INSUFFICIENT
+    assert "no drift-check rows" in _observed(verdict, "H3")
+    assert verdict.outcome == R.OUTCOME_INSUFFICIENT
+
+
+def test_d3_without_control_cells_reports_insufficient():
+    records = [
+        r for i in range(10, 16)
+        for r in _treatment_cell(i, d_scout=-0.40, d_adaptive=-0.10)
+    ] + _drift_row()
+    verdict = R.evaluate(_cells(records), min_treatment=6)
+    assert _status(verdict, "D3") == R.INSUFFICIENT
+    assert _observed(verdict, "D3") == "no CONTROL cells (n=0)"
+    assert verdict.outcome == R.OUTCOME_INSUFFICIENT
+
+
+def test_d1_d2_d4_without_deviations_report_insufficient_not_fail():
+    """Rounding 'no evidence' to FAIL is the same error as rounding it to PASS."""
+    verdict = R.evaluate(
+        _cells(_treatment_without_deviations()), min_treatment=6)
+    for name in ("D1", "D2", "D4"):
+        assert _status(verdict, name) == R.INSUFFICIENT, name
+        assert "no TREATMENT" in _observed(verdict, name), name
+    # d1_ok stayed False, so the D1-failed branch still routes exactly as before.
+    assert verdict.outcome == R.OUTCOME_MECHANISM_LIMITED
+
+
+def test_h1_without_a_certified_row_reports_insufficient_not_fail():
+    records = _passing_run()
+    for row in records:
+        row.params["eis_validation_hold_certified"] = ""
+    verdict = R.evaluate(_cells(records), min_treatment=6)
+    assert _status(verdict, "H1") == R.INSUFFICIENT
+    assert verdict.outcome == R.OUTCOME_INSUFFICIENT
+
+
+def test_h2_with_no_cells_at_all_reports_insufficient_not_fail():
+    """Nothing was measured, so the absence of a fault grade is not evidence."""
+    verdict = R.evaluate([], min_treatment=6)
+    assert _status(verdict, "H2") == R.INSUFFICIENT
+    assert _observed(verdict, "H2") == "no cells recorded"
+
+
+def test_h2_with_every_cell_excluded_still_fails():
+    """Cells exist and every one sat in a warn-grade window: a finding, not a gap."""
+    records = _passing_run()
+    for row in records:
+        row.params["eis_validation_hold_excursion"] = True
+    verdict = R.evaluate(_cells(records), min_treatment=6)
+    assert _status(verdict, "H2") == R.FAIL
+
+
+def test_a_fully_evaluable_run_reports_no_insufficient_criterion():
+    """The new status appears only where the input was missing."""
+    verdict = R.evaluate(_cells(_passing_run()), min_treatment=6)
+    assert [c.status for c in verdict.criteria] == [R.PASS] * 8
+    below = R.evaluate(_cells(_nine_treatment([0.09] * 6)), min_treatment=6)
+    assert _status(below, "D1") == R.FAIL          # real data still FAILs
+
+
+#: (name, records, min_treatment, mock) -> outcome, characterised BEFORE the
+#: INSUFFICIENT status existed and required to be identical after it. Every
+#: absent-data combination the status touches is represented.
+def _outcome_matrix():
+    veto = _passing_run()
+    for row in veto:
+        if row.arm == R.ARM_FOLLOW_UP and row.channel == 10:
+            row.gate_verdict = "reject"
+    disabled = _passing_run()
+    for row in disabled:
+        row.params["eis_validation_hold_certified"] = "disabled"
+    uncertified = _passing_run()
+    for row in uncertified:
+        row.params["eis_validation_hold_certified"] = ""
+    excursion = _passing_run()
+    for row in excursion:
+        row.params["eis_validation_hold_excursion"] = True
+    short_reach = _nine_treatment([0.0] * 6) + _control_cell(90, d_scout=0.01)
+    for row in short_reach:
+        if row.arm == R.ARM_FOLLOW_UP:
+            row.params["eis_validation_f_lo_hz"] = 6.0
+        if row.arm == R.ARM_REFERENCE:
+            row.params["eis_validation_apex_hz"] = 14.0
+    return [
+        # -- populated and evaluable ---------------------------------------
+        ("go", _passing_run(), 6, False, R.OUTCOME_GO),
+        ("t1_fails", _nine_treatment([0.30] * 6) + _controls(1), 6, False,
+         R.OUTCOME_CONDITIONAL_GO),
+        ("d4_inverted", [r for i in range(10, 16)
+                         for r in _treatment_cell(i, d_scout=+0.40,
+                                                  d_adaptive=+0.10)]
+         + _controls(20) + _drift_row(), 6, False, R.OUTCOME_CONDITIONAL_GO),
+        ("veto", veto, 6, False, R.OUTCOME_NO_GO),
+        ("short_reach", short_reach, 6, False, R.OUTCOME_MECHANISM_LIMITED),
+        ("d3_fails", _nine_treatment([0.30] * 6)
+         + _control_cell(90, d_scout=0.20), 6, False, R.OUTCOME_INSUFFICIENT),
+        ("h3_fails", [r for r in _nine_treatment([0.30] * 6)
+                      if r.arm != R.ARM_REFERENCE_END]
+         + _control_cell(90, d_scout=0.01) + _drift_row(delta=0.4), 6, False,
+         R.OUTCOME_INSUFFICIENT),
+        ("min_treatment", _nine_treatment([0.30] * 2)
+         + _control_cell(90, d_scout=0.01), 6, False, R.OUTCOME_INSUFFICIENT),
+        ("h1_disabled", disabled, 6, False, R.OUTCOME_WITHHELD),
+        ("mock", _passing_run(), 6, True, R.OUTCOME_WITHHELD),
+        # -- absent data ----------------------------------------------------
+        ("h1_uncertified", uncertified, 6, False, R.OUTCOME_INSUFFICIENT),
+        ("no_cells", [], 6, False, R.OUTCOME_INSUFFICIENT),
+        ("no_cells_min0", [], 0, False, R.OUTCOME_INSUFFICIENT),
+        ("all_unresolved", _probe_3ch_shape(), 6, False,
+         R.OUTCOME_INSUFFICIENT),
+        ("all_unresolved_min0", _probe_3ch_shape(), 0, False,
+         R.OUTCOME_INSUFFICIENT),
+        ("h3_absent", [r for r in _passing_run()
+                       if r.arm != R.ARM_REFERENCE_END], 6, False,
+         R.OUTCOME_INSUFFICIENT),
+        ("d3_absent", [r for i in range(10, 16)
+                       for r in _treatment_cell(i, d_scout=-0.40,
+                                                d_adaptive=-0.10)]
+         + _drift_row(), 6, False, R.OUTCOME_INSUFFICIENT),
+        ("d1_d2_d4_absent", _treatment_without_deviations(), 6, False,
+         R.OUTCOME_MECHANISM_LIMITED),
+        ("d1_d2_d4_absent_min0", _treatment_without_deviations(), 0, False,
+         R.OUTCOME_MECHANISM_LIMITED),
+        ("t1_absent_zero_time", _costing_nothing(_passing_run()), 6, False,
+         R.OUTCOME_GO),
+        ("t1_absent_no_ratio_cells", _probe_3ch_shape() + _drift_row(), 0,
+         False, R.OUTCOME_INSUFFICIENT),
+        ("all_cells_excursion", excursion, 6, False, R.OUTCOME_INSUFFICIENT),
+    ]
+
+
+@pytest.mark.parametrize(
+    "name,records,min_treatment,mock,expected", _outcome_matrix(),
+    ids=lambda v: v if isinstance(v, str) else "")
+def test_outcome_routing_is_unchanged_by_the_insufficient_status(
+    name, records, min_treatment, mock, expected
+):
+    """The hard constraint: a display change may not move a pre-registered verdict."""
+    verdict = R.evaluate(_cells(records), min_treatment=min_treatment, mock=mock)
+    assert verdict.outcome == expected, name
+
+
+def test_render_aligns_insufficient_with_pass_in_the_status_column():
+    """A third status must not shove its own row two characters right."""
+    records = _probe_3ch_shape()
+    payload = R.build_payload(records, _cells(records), {},
+                              R.evaluate(_cells(records), min_treatment=6))
+    block = _criteria_block(R.render(payload))
+    headers = [ln for ln in block.splitlines() if ln.startswith("  [")]
+    assert {ln.index("]") for ln in headers} == {R.STATUS_WIDTH + 3}
+    assert any(ln.startswith("  [INSUFFICIENT] ") for ln in headers)
+    assert any(ln.startswith(f"  [{R.PASS:<{R.STATUS_WIDTH}}] ") for ln in headers)
+    # every detail line hangs from one column, whatever the status above it
+    details = [ln for ln in block.splitlines()
+               if ln.strip() and not ln.startswith("  [") and ln.startswith(" ")]
+    assert {len(ln) - len(ln.lstrip()) for ln in details} == {R.STATUS_WIDTH + 5}
+    assert max(len(ln) for ln in block.splitlines()) <= 83
+
+
+def test_render_states_why_an_insufficient_criterion_could_not_be_evaluated():
+    """`n/a` is not a reason. The reader's next question is always 'why'."""
+    records = _probe_3ch_shape()
+    payload = R.build_payload(records, _cells(records), {},
+                              R.evaluate(_cells(records), min_treatment=6))
+    block = _criteria_block(R.render(payload))
+    assert "n/a" not in block
+    for reason in ("no CONTROL or TREATMENT cells", "no CONTROL cells (n=0)",
+                   "no drift-check rows (n=0)"):
+        assert reason in block, reason
+    # the load-bearing operator guidance survives the rewrite
+    assert "counts the scout sweep on EVERY cell" in block
+    assert "PRE-REGISTERED SIGN" in block
+
+
 # ── Reading the database ─────────────────────────────────────────────────────
 
 def _seed_db(path, rows):
@@ -575,3 +838,7 @@ def test_quantiles_and_median_on_small_samples():
 
 def _status(verdict: R.Verdict, prefix: str) -> str:
     return next(c.status for c in verdict.criteria if c.name.startswith(prefix))
+
+
+def _observed(verdict: R.Verdict, prefix: str) -> str:
+    return next(c.observed for c in verdict.criteria if c.name.startswith(prefix))

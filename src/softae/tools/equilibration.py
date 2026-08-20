@@ -59,7 +59,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import logging
 import math
 import sys
 import time
@@ -92,7 +91,12 @@ from softae.core.channel_spec import (
     parse_channel_spec,
 )
 from softae.core.hardware_safety import ARM_ENV_VAR, HardwareNotArmedError
-from softae.tools import run_finalizer, use_utf8_console
+from softae.tools import (
+    add_verbosity_flag,
+    configure_logging,
+    run_finalizer,
+    use_utf8_console,
+)
 from softae.workflows.equilibration import (
     DEFAULT_APPROACH_TIMEOUT_S,
     DEFAULT_DOWN_APPROACH_TIMEOUT_S,
@@ -2492,45 +2496,6 @@ def _add_analysis_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mock", action="store_true")
 
 
-def _add_verbosity(parser: argparse.ArgumentParser) -> None:
-    """``-v`` on the top-level parser *and* on every subcommand.
-
-    ``default=argparse.SUPPRESS`` is load-bearing, not tidiness: a subparser
-    copies its own defaults over the outer namespace after it parses, so a plain
-    ``default=False`` here would silently discard
-    ``python -m softae.tools.equilibration -v run ...`` — the exact spelling an
-    operator reaches for when a run is misbehaving.
-    """
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        default=argparse.SUPPRESS,
-                        help="DEBUG logging, overriding [logging] level. Noisy: "
-                             "the RH controller logs a duty cycle on every update.")
-
-
-def configure_logging(verbose: bool = False) -> int:
-    """Filter the log stream once, and return the level applied.
-
-    Nothing else configures structlog on this path. The GUI does it at
-    ``gui/app.py``; a headless entry point that skips it inherits structlog's
-    default ``PrintLogger``, which emits **every** level — including
-    ``rh_duty_sent``, logged on each RH control update. Over a six-hour
-    unattended run that buries the run's own reporting in DEBUG.
-
-    It does not touch that reporting. :class:`ProgressRenderer` writes the
-    milestones, hold verdicts, telemetry lines and the live status line straight
-    to stdout, and the workflow's milestone log calls are ``info``/``warning``.
-    Filtering at INFO leaves every one of them visible, which is the whole point:
-    the operator loses the spam and keeps the run.
-    """
-    from softae.config import loader
-
-    level = (logging.DEBUG if verbose
-             else getattr(logging, loader.log_level(), logging.INFO))
-    logging.basicConfig(level=level, format="%(message)s")
-    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(level))
-    return level
-
-
 class _RecordingParser(argparse.ArgumentParser):
     """An ``ArgumentParser`` that keeps the argv it was handed.
 
@@ -2558,7 +2523,7 @@ def build_parser() -> argparse.ArgumentParser:
                f"report. Invoke as '{CLI}': the '{CONSOLE_SCRIPT}' console script "
                f"is declared in pyproject.toml but is not installed in this venv.",
     )
-    _add_verbosity(p)
+    add_verbosity_flag(p)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     plan = sub.add_parser("plan", help="the design, the budget, and what will refuse")
@@ -2602,7 +2567,7 @@ def build_parser() -> argparse.ArgumentParser:
     rep.set_defaults(func=_cmd_report)
 
     for parser in (plan, run, fit, rep):
-        _add_verbosity(parser)
+        add_verbosity_flag(parser)
     return p
 
 

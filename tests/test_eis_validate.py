@@ -18,6 +18,7 @@ from softae.tools import eis_validate_hold as H
 from softae.tools import eis_validate_mock as M
 from softae.tools import eis_validate_narrate as N
 from softae.tools import eis_validate_report as R
+from softae.tools import eis_validate_trend as T
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -142,6 +143,113 @@ def test_approach_timeout_refuses_to_start(tmp_path, monkeypatch):
     assert _rows(tmp_path, "to") == []
 
 
+def test_mock_run_commands_the_rh_loop_before_the_temperature_approach(
+        tmp_path, monkeypatch):
+    """`--mock` collapses the PACING, never the sequence.
+
+    The overlap is degenerate under the mock -- `FastMockRHController` advances
+    per read and nothing reads RH during the heat -- so a mock run cannot show
+    the saving. It can and must show that the same early `start` ran on the same
+    code path, with no branch on `plan.mock` anywhere near it.
+    """
+    order: list[str] = []
+    real_start, real_pv = M.FastMockRHController.start, M.FastMockTempController.get_pv
+
+    monkeypatch.setattr(M.FastMockRHController, "start",
+                        lambda self: order.append("rh.start") or real_start(self))
+    monkeypatch.setattr(
+        M.FastMockTempController, "get_pv",
+        lambda self, n_avg=1: order.append("temp.get_pv") or real_pv(self, n_avg))
+
+    assert V.main(["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
+                   "--temp-setpoint-c", "25", "--validation-name", "ovl",
+                   "--project", str(tmp_path), "--mock", "--min-treatment", "1",
+                   "--drift-check", "0"]) == V.EXIT_OK
+    assert order.index("rh.start") < order.index("temp.get_pv")
+
+
+def test_mock_run_reports_a_nonzero_lead_for_the_rh_axis(tmp_path):
+    """The virtual clock is what makes the mock's degenerate overlap measurable.
+
+    `--mock` hands `approach_condition` a `VirtualClock` that advances only when
+    the code under it waits, so the temperature approach's simulated seconds are
+    real seconds of lead -- which is how `lead_s` gets exercised at all without
+    a rig, and how a regression that reset it to zero would be caught.
+    """
+    from softae.core.campaign_events import read_events
+
+    assert V.main(["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
+                   "--temp-setpoint-c", "25", "--validation-name", "led",
+                   "--project", str(tmp_path), "--mock", "--min-treatment", "1",
+                   "--drift-check", "0"]) == V.EXIT_OK
+    run_dir = next((Path(tmp_path) / "runs").iterdir())
+    events, _cursor = read_events(run_dir)
+    approach = {e["axis"]: e for e in events
+                if e["type"] == "progress" and e["phase"] == "approach"}
+    assert approach["temperature"]["lead_s"] == 0.0
+    assert approach["rh"]["lead_s"] > 0.0
+
+
+def test_temperature_refusal_releases_the_rh_loop_and_still_parks(
+        tmp_path, monkeypatch):
+    """Failure independence, end to end: the loop is down and the park still runs.
+
+    The temperature arm refuses with the humidifier already driving. Before this
+    change there was nothing to release; now the arm that started it early takes
+    it down, and `cmd_run`'s `finally` parks on top of that as it always did.
+    """
+    import softae.core.safe_park as SP
+    import softae.workflows.equilibration as EQ
+    from softae.workflows.equilibration import ApproachOutcome
+
+    parks, offs = [], []
+    monkeypatch.setattr(SP, "safe_park",
+                        lambda manager, **kw: parks.append(kw) or _ParkResult())
+    monkeypatch.setattr(M.FastMockRHController, "safe_off",
+                        lambda self: offs.append(self._setpoint))
+    monkeypatch.setattr(
+        EQ, "approach_setpoint",
+        lambda read_pv, target, *, axis, **kw: ApproachOutcome(
+            axis=axis, target=target, reached=False, elapsed_s=1.0,
+            pv_final=99.0, n_samples=1))
+
+    assert V.main(["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
+                   "--temp-setpoint-c", "25", "--validation-name", "rel",
+                   "--project", str(tmp_path), "--mock",
+                   "--min-treatment", "1"]) == V.EXIT_FAILED
+    # Released by the approach itself -- at the run's own setpoint, so it is the
+    # loop this run started that came down.
+    assert offs == [30.0]
+    assert parks and parks[-1]["retract_head"] is None
+    assert _rows(tmp_path, "rel") == []
+
+
+def test_temperature_refusal_releases_the_rh_loop_under_end_state_hold(
+        tmp_path, monkeypatch):
+    """The path with no park behind it -- the reason the release exists at all."""
+    import softae.core.safe_park as SP
+    import softae.workflows.equilibration as EQ
+    from softae.workflows.equilibration import ApproachOutcome
+
+    parks, offs = [], []
+    monkeypatch.setattr(SP, "safe_park",
+                        lambda manager, **kw: parks.append(kw) or _ParkResult())
+    monkeypatch.setattr(M.FastMockRHController, "safe_off",
+                        lambda self: offs.append(self._setpoint))
+    monkeypatch.setattr(
+        EQ, "approach_setpoint",
+        lambda read_pv, target, *, axis, **kw: ApproachOutcome(
+            axis=axis, target=target, reached=False, elapsed_s=1.0,
+            pv_final=99.0, n_samples=1))
+
+    assert V.main(["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
+                   "--temp-setpoint-c", "25", "--validation-name", "hld",
+                   "--project", str(tmp_path), "--mock", "--min-treatment", "1",
+                   "--end-state", "hold"]) == V.EXIT_FAILED
+    assert offs == [30.0]                 # the humidifier is down anyway
+    assert parks == []                    # and nothing else took it down
+
+
 @pytest.mark.parametrize("verdict", ["ceiling", "not_evaluable"])
 def test_settle_ceiling_refuses_to_start(verdict):
     """The campaign path records these and continues; this harness refuses."""
@@ -225,6 +333,297 @@ def test_rh_approach_timeout_default_is_not_the_shipped_1800(tmp_path):
     assert plan.rh_approach_timeout_s == 5400.0
     text = H.render_projection(plan, H.project(plan))
     assert "5000 s" in text and "1800 s" in text
+
+
+class TestApproachOverlap:
+    """The RH loop is commanded with the heat; RH ARRIVAL is still judged after it.
+
+    Two things used to be welded together and are now separate: **when the loop
+    starts actuating** and **when arrival is judged**. Everything in this class
+    pins one side of that seam, because collapsing them again in either direction
+    is a silent change -- one costs 13 minutes a run, the other accepts an RH
+    reading against a floor that is about to move.
+    """
+
+    def _rig(self, log, *, rh_pv=30.0, temp_pv=25.0):
+        """A manager whose two controllers record every call, in order."""
+
+        class _Temp:
+            def write_sp(self, value):
+                log.append(("temp.write_sp", value))
+
+            def get_pv(self, _channel=1):
+                log.append(("temp.get_pv",))
+                return temp_pv
+
+        class _RH:
+            def set_setpoint(self, value):
+                log.append(("rh.set_setpoint", value))
+
+            def start(self):
+                log.append(("rh.start",))
+
+            def stop(self):
+                log.append(("rh.stop",))
+
+            def safe_off(self):
+                log.append(("rh.safe_off",))
+
+            def get_H(self):
+                log.append(("rh.get_H",))
+                return rh_pv
+
+        instruments = {H.TEMP_CONTROLLER: _Temp(), H.RH_CONTROLLER: _RH()}
+
+        class _Manager:
+            def get(self, name):
+                return instruments[name]
+
+        return _Manager()
+
+    def _fake_approach(self, log, clock, *, reached=("temperature", "rh"),
+                       cost_s=None):
+        """Stands in for the shared `approach_setpoint`, on a virtual clock."""
+        from softae.workflows.equilibration import ApproachOutcome
+
+        costs = {"temperature": 600.0, "rh": 60.0}
+        costs.update(cost_s or {})
+
+        def _fake(read_pv, target, *, axis, instrument, tolerance, timeout_s,
+                  poll_interval_s=30.0, sleep=None, now=None, **_kw):
+            log.append(("judge", axis, float(timeout_s)))
+            pv = read_pv()
+            clock.t += costs[axis]
+            return ApproachOutcome(axis=axis, target=target,
+                                   reached=axis in reached,
+                                   elapsed_s=costs[axis], pv_final=pv,
+                                   n_samples=1)
+
+        return _fake
+
+    def _run(self, tmp_path, monkeypatch, log, clock, **kw):
+        import softae.workflows.equilibration as EQ
+
+        monkeypatch.setattr(EQ, "approach_setpoint",
+                            self._fake_approach(log, clock, **kw))
+        return H.approach_condition(self._rig(log), _plan(tmp_path),
+                                    sleep=clock.sleep, now=clock)
+
+    # -- the loop starts early -------------------------------------------------
+
+    def test_approach_condition_rh_setpoint_written_before_temperature_judged(
+            self, tmp_path, monkeypatch, capsys):
+        """The whole point: the humidifier is working while the block heats."""
+        log, clock = [], H.VirtualClock()
+        self._run(tmp_path, monkeypatch, log, clock)
+        capsys.readouterr()
+
+        names = [entry[0] for entry in log]
+        assert names.index("rh.set_setpoint") < names.index("judge")
+        assert names.index("rh.start") < names.index("judge")
+        # And it is the run's own target, not some inherited one.
+        assert ("rh.set_setpoint", 30.0) in log
+
+    def test_approach_condition_temperature_setpoint_is_still_written_first(
+            self, tmp_path, monkeypatch, capsys):
+        """`set_setpoint` can refuse an over-max target; the heater write leads.
+
+        A rejected RH setpoint must leave exactly the state it left before --
+        heater commanded, loop never started -- only ~13 min sooner.
+        """
+        log, clock = [], H.VirtualClock()
+        self._run(tmp_path, monkeypatch, log, clock)
+        capsys.readouterr()
+
+        names = [entry[0] for entry in log]
+        assert names.index("temp.write_sp") < names.index("rh.set_setpoint")
+
+    # -- arrival is still judged after temperature -----------------------------
+
+    def test_approach_condition_rh_arrival_is_judged_only_after_temperature(
+            self, tmp_path, monkeypatch, capsys):
+        """The evidence-backed ordering, unchanged: no RH PV is graded early.
+
+        The attainable RH floor RISES with temperature, so an RH reading accepted
+        before the block is hot is accepted against a floor about to move.
+        """
+        log, clock = [], H.VirtualClock()
+        reports = self._run(tmp_path, monkeypatch, log, clock)
+        capsys.readouterr()
+
+        assert [r.axis for r in reports] == ["temperature", "rh"]
+        judged = [entry[1] for entry in log if entry[0] == "judge"]
+        assert judged == ["temperature", "rh"]
+        # Not one RH reading is taken for grading before temperature is judged.
+        names = [entry[0] for entry in log]
+        assert names.index("rh.get_H") > names.index("temp.get_pv")
+
+    # -- what `elapsed_s` means ------------------------------------------------
+
+    def test_approach_report_elapsed_s_is_the_judged_window_not_the_lead(
+            self, tmp_path, monkeypatch, capsys):
+        """`elapsed_s` is the window the timeout bounds; the lead is beside it.
+
+        The rejected alternative -- starting the RH timeout clock at the setpoint
+        write -- would charge up to 3600 s of temperature attempts against a
+        5400 s budget calibrated from a descent measured *at* temperature, and
+        would refuse an RH approach that was descending exactly as measured.
+        """
+        log, clock = [], H.VirtualClock()
+        temp, rh = self._run(tmp_path, monkeypatch, log, clock)
+        capsys.readouterr()
+
+        assert temp.elapsed_s == pytest.approx(600.0)
+        assert temp.lead_s == 0.0 and temp.driven_s == pytest.approx(600.0)
+        # The RH loop ran for the whole heat, and none of it is charged to the
+        # judged window.
+        assert rh.elapsed_s == pytest.approx(60.0)
+        assert rh.lead_s == pytest.approx(600.0)
+        assert rh.driven_s == pytest.approx(660.0)
+
+    def test_approach_condition_rh_timeout_is_not_reduced_by_the_lead(
+            self, tmp_path, monkeypatch, capsys):
+        """The bound handed to the shared unit is the plan's, undiminished."""
+        log, clock = [], H.VirtualClock()
+        plan = _plan(tmp_path)
+        self._run(tmp_path, monkeypatch, log, clock)
+        capsys.readouterr()
+
+        bounds = {axis: value for _kind, axis, value in
+                  (e for e in log if e[0] == "judge")}
+        assert bounds["rh"] == plan.rh_approach_timeout_s == 5400.0
+        assert bounds["temperature"] == plan.temp_approach_timeout_s
+
+    # -- failure independence --------------------------------------------------
+
+    def test_approach_condition_temperature_refusal_releases_the_rh_loop(
+            self, tmp_path, monkeypatch, capsys):
+        """The arm that opened the loop early closes it when nothing will judge it.
+
+        `safe_off`, not `stop`: `stop` can return cleanly having sent nothing when
+        the PID thread is wedged, and under `--end-state hold` there is no park
+        behind it.
+        """
+        log, clock = [], H.VirtualClock()
+        with pytest.raises(H.RefuseToStart) as excinfo:
+            self._run(tmp_path, monkeypatch, log, clock, reached=("rh",))
+        capsys.readouterr()
+
+        assert ("rh.safe_off",) in log
+        # Exactly one bounded retry, and the RH axis is never judged.
+        assert [e[1] for e in log if e[0] == "judge"] == [
+            "temperature", "temperature"]
+        assert "temperature never reached" in str(excinfo.value)
+
+    def test_approach_condition_temperature_refusal_omits_a_lead_it_never_had(
+            self, tmp_path, monkeypatch, capsys):
+        """Temperature is judged from its own write, so it has no head start.
+
+        The lead clause is conditional rather than always-printed for exactly
+        this reason: a temperature refusal claiming a head start would be a
+        falsehood about which axis was given time.
+        """
+        log, clock = [], H.VirtualClock()
+        with pytest.raises(H.RefuseToStart) as excinfo:
+            self._run(tmp_path, monkeypatch, log, clock, reached=())
+        capsys.readouterr()
+        # Temperature refuses first, and it had no head start of its own.
+        assert "head start" not in str(excinfo.value)
+        assert "already driving" not in str(excinfo.value)
+
+    def test_approach_condition_rh_refusal_leaves_the_loop_as_it_always_did(
+            self, tmp_path, monkeypatch, capsys):
+        """The asymmetry is deliberate: only the NEW exposure is closed here.
+
+        An RH refusal reaches the same park it always reached, with the loop in
+        the same state the sequential form left it in. Closing it here too would
+        be an unrelated behaviour change riding along with this one.
+        """
+        log, clock = [], H.VirtualClock()
+        with pytest.raises(H.RefuseToStart) as excinfo:
+            self._run(tmp_path, monkeypatch, log, clock,
+                      reached=("temperature",))
+        capsys.readouterr()
+
+        assert ("rh.safe_off",) not in log
+        assert ("rh.stop",) not in log
+        # The lead IS named, because it changes what the refusal means.
+        assert "already driving for 10 min" in str(excinfo.value)
+
+    def test_approach_condition_release_failure_does_not_mask_the_refusal(
+            self, tmp_path, monkeypatch, capsys):
+        """A humidifier that cannot be zeroed must not become a different error."""
+        log, clock = [], H.VirtualClock()
+        manager = self._rig(log)
+        rh = manager.get(H.RH_CONTROLLER)
+        monkeypatch.setattr(type(rh), "safe_off",
+                            lambda self: (_ for _ in ()).throw(
+                                OSError("serial port vanished")), raising=False)
+        import softae.workflows.equilibration as EQ
+
+        monkeypatch.setattr(EQ, "approach_setpoint",
+                            self._fake_approach(log, clock, reached=()))
+        with pytest.raises(H.RefuseToStart):
+            H.approach_condition(manager, _plan(tmp_path),
+                                 sleep=clock.sleep, now=clock)
+        capsys.readouterr()
+
+    # -- narration -------------------------------------------------------------
+
+    def test_approach_condition_reports_each_setpoint_write_to_the_observer(
+            self, tmp_path, monkeypatch, capsys):
+        """The write is a distinct fact from the arrival, and fires before it."""
+        log, clock = [], H.VirtualClock()
+        import softae.workflows.equilibration as EQ
+
+        monkeypatch.setattr(EQ, "approach_setpoint",
+                            self._fake_approach(log, clock))
+        H.approach_condition(self._rig(log), _plan(tmp_path),
+                             sleep=clock.sleep, now=clock,
+                             on_command=lambda axis, target:
+                                 log.append(("commanded", axis, target)))
+        capsys.readouterr()
+
+        commanded = [(axis, target) for kind, axis, target in
+                     (e for e in log if e[0] == "commanded")]
+        assert commanded == [("temperature", 25.0), ("rh", 30.0)]
+        names = [entry[0] for entry in log]
+        assert names.index("commanded") < names.index("judge")
+
+    def test_approach_condition_observer_failure_never_fails_the_approach(
+            self, tmp_path, monkeypatch, capsys):
+        """`_observe`'s guarantee, at the newest hook: monitoring never refuses."""
+        log, clock = [], H.VirtualClock()
+        import softae.workflows.equilibration as EQ
+
+        monkeypatch.setattr(EQ, "approach_setpoint",
+                            self._fake_approach(log, clock))
+
+        def _boom(_axis, _target):
+            raise OSError("no space left on device")
+
+        reports = H.approach_condition(self._rig(log), _plan(tmp_path),
+                                       sleep=clock.sleep, now=clock,
+                                       on_command=_boom)
+        capsys.readouterr()
+        assert [r.axis for r in reports] == ["temperature", "rh"]
+
+    # -- the projection --------------------------------------------------------
+
+    def test_render_projection_declares_the_overlap_without_promising_a_saving(
+            self, tmp_path):
+        """The operator types `yes` against this table; it must not over-claim."""
+        plan = _plan(tmp_path)
+        text = H.render_projection(plan, H.project(plan))
+
+        assert "commanded with temperature" in text
+        assert "BOTH SETPOINTS ARE COMMANDED AT THE START" in text
+        assert "judged only AFTER temperature is satisfied" in text
+        assert "projects no saving" in text
+        # The bounds themselves are untouched -- the timeout still starts when
+        # judging starts, so the printed ceilings still mean what they meant.
+        assert f"{plan.rh_approach_timeout_s / 60:.0f} min" in text
+        assert text.isascii()
 
 
 def test_warn_excursion_stamps_only_the_rows_inside_the_window(tmp_path):
@@ -324,6 +723,313 @@ def test_apex_histogram_comes_from_the_settle_rounds(tmp_path):
     # Every sweep taken was a settle round's; none was extra, and none persisted.
     assert len(sweeps) == 3 * outcome.n_rounds
     assert _rows(tmp_path) == []
+
+
+# ── S-series: what the settle gate says while it is holding ──────────────────
+#
+# Two live attempts (2026-08-20) died in this gate having acquired no spectrum
+# at all -- 1 h 44 m to `ceiling`, then 64 min interrupted at a spread of 0.48 --
+# and afterwards neither could be diagnosed. The histogram printed only on
+# success, the console line named no channel and no threshold, and the rounds
+# reached no file. Everything below is about the diagnosis, not the gate: the
+# criterion itself is unchanged and `test_settle_deviations_agree_with_the_gates
+# _own_maximum` is what says so.
+
+def _sweep_at(r_ohms: float):
+    """A Debye semicircle whose low-frequency real part is *r_ohms*.
+
+    `_round_fit` reads `z_real[-1]` and nothing else, so this is the smallest
+    object that makes one channel's sigma controllable to the digit -- which is
+    what a test about *which channel is worst* needs and a mock rig, drifting
+    every channel identically, cannot give.
+    """
+    from types import SimpleNamespace
+
+    freq = np.logspace(5.0, 0.81, 24)
+    z = float(r_ohms) / (1.0 + 1j * 2.0 * np.pi * freq * 1e-6)
+    return SimpleNamespace(frequency=freq, z_real=z.real, z_imag_neg=-z.imag,
+                           phase=np.degrees(np.angle(z)))
+
+
+def _scripted_settle(tmp_path, series, **overrides):
+    """Run `settle_phase` over a scripted per-channel R series. No rig, no sleep."""
+    plan = _plan(tmp_path, channels=",".join(str(c) for c in series))
+    plan.settle_max_hold_s = 270.0                 # four rounds at 90 s
+    rounds = {"n": -1}
+
+    def measure(channel):
+        if channel == plan.channels[0]:
+            rounds["n"] += 1
+        values = series[channel]
+        return _sweep_at(values[min(rounds["n"], len(values) - 1)])
+
+    clock = H.VirtualClock()
+    return plan, H.settle_phase(_manager(), plan, measure, sleep=clock.sleep,
+                                now=clock, min_hold_first_s=0.0, **overrides)
+
+
+def test_settle_line_names_the_quantity_the_threshold_and_the_worst_channel(
+        tmp_path, capsys):
+    """`spread 0.130` was read as %RH, and 1.0 was nearly typed as the tolerance.
+
+    1.0 is 100 % relative deviation -- a film whose conductivity doubled between
+    rounds, accepted. So the line names the quantity, carries its threshold
+    beside it in the same unit, and identifies the one cell holding the gate:
+    `settle_check` takes the MAX across channels, so a single bad cell blocks all
+    fifteen and used to do it anonymously.
+    """
+    _plan_used, outcome = _scripted_settle(tmp_path, {
+        18: [100.0], 19: [100.0], 20: [100.0, 100.0, 130.0]})
+    line = [ln for ln in capsys.readouterr().out.splitlines()
+            if ln.startswith("[settle] round 3")][0]
+
+    assert not outcome.certified                   # ch20 moved 17 %; 10 % is the tol
+    assert "sigma drift" in line and "%RH" in line
+    assert "(tol 10.00%)" in line
+    assert "worst ch20" in line
+    assert " 16.67%" in line                       # the same units as the tolerance
+    assert "spread 0.130" not in line              # the old, unitless, anonymous form
+
+
+def test_settle_deviations_agree_with_the_gates_own_maximum(tmp_path):
+    """The per-channel numbers are `settle_check`'s arithmetic, restated.
+
+    `SettleCheck` exposes the max and not the channel that produced it, and
+    `analysis/equilibration.py` is shared with the equilibration workflow -- so
+    the deviations are computed here instead. This is the test that keeps the
+    restatement honest: same window, same participants, same number on top.
+    """
+    from softae.analysis.equilibration import RoundFit, settle_check
+
+    window = [
+        [RoundFit(18, 0.010, 100.0), RoundFit(19, 0.020, 50.0),
+         RoundFit(20, 0.0100, 100.0)],
+        [RoundFit(18, 0.010, 100.0), RoundFit(19, 0.021, 47.6),
+         RoundFit(20, 0.0100, 100.0)],
+        [RoundFit(18, 0.010, 100.0), RoundFit(19, 0.019, 52.6),
+         RoundFit(20, 0.0077, 130.0)],
+    ]
+    check = settle_check(window)
+    deviations = H.settle_deviations(window, check.participating)
+
+    assert sorted(deviations) == check.participating == [18, 19, 20]
+    assert max(deviations, key=deviations.__getitem__) == 20
+    assert max(deviations.values()) == pytest.approx(check.max_deviation_rel)
+    assert deviations[18] == pytest.approx(0.0)
+    # A channel the gate excluded carries no deviation: participation is exactly
+    # the guarantee that every round of the window has a finite sigma.
+    absent = [[RoundFit(18, None, None)] + r[1:] for r in window]
+    assert 18 not in H.settle_deviations(absent, settle_check(
+        absent).participating)
+
+
+def test_arc_watch_lists_each_cell_and_bounds_the_listing(tmp_path):
+    """Counts alone do not say WHICH cells to move the setpoint for."""
+    plan = _plan(tmp_path, channels=V.EXAMPLE_CHANNELS)
+    apexes = {channel: 5.0 for channel in plan.channels}
+    apexes[31], apexes[32] = 30.0, 200.0
+    outcome = H.SettleOutcome("ceiling", 11, 5886.0, apexes,
+                              H._project_populations(apexes, plan))
+
+    text = H.render_arc_watch(outcome, plan)
+    assert "apex (Hz) by channel:" in text
+    assert "ch31 30.0" in text and "ch32 200.0" in text
+    # Thirteen UNRESOLVED cells do not become an unreadable line.
+    assert "(+5 more)" in text
+    assert all(len(line) < 120 for line in text.splitlines())
+
+
+@pytest.mark.parametrize("verdict, min_treatment", [("ceiling", 1), ("settled", 6)])
+def test_arc_watch_is_printed_before_every_settle_refusal(
+        tmp_path, monkeypatch, capsys, verdict, min_treatment):
+    """The histogram is built from sweeps already taken, at zero extra cost --
+    and it is the single most useful thing to know when settle fails, because it
+    says whether the cells are even in the resolving window.
+
+    Both refusals are covered: the gate's own, and the min-treatment one below
+    it. Neither printed it before; both do now.
+    """
+    manager = _manager()
+    plan = _plan(tmp_path, channels="18,19,20", min_treatment=min_treatment)
+    ctx = _context(tmp_path, manager, plan)
+    apexes = {18: 5.0, 19: 5.0, 20: 5.0}
+    monkeypatch.setattr(V, "settle_phase", lambda *a, **k: H.SettleOutcome(
+        verdict, 11, 5886.0, apexes, H._project_populations(apexes, plan)))
+
+    with pytest.raises(H.RefuseToStart):
+        V._establish_condition(ctx, plan, list(plan.channels))
+    out = capsys.readouterr().out
+    assert "[watch ] apex histogram" in out
+    assert "ch18 5.0" in out
+    assert _rows(tmp_path) == []                   # and still nothing was measured
+
+
+def test_a_failing_round_observer_never_fails_the_settle_phase(tmp_path):
+    """A monitoring convenience must not be why a gate refuses."""
+    def _boom(_payload):
+        raise OSError("no space left on device")
+
+    _plan_used, outcome = _scripted_settle(
+        tmp_path, {18: [100.0], 19: [100.0], 20: [100.0]}, on_round=_boom)
+    assert outcome.certified
+
+
+# ── T-series: the per-channel trend table ────────────────────────────────────
+#
+# The `[settle]` line reports `max|sigma - mean| / |mean|` -- a MAGNITUDE, with
+# the sign discarded. It cannot distinguish a film still taking up water from
+# one jittering around a value it already reached, and those two want opposite
+# decisions from the operator. The table adds the sign. It adds nothing else:
+# `test_trend_table_leaves_every_settle_verdict_bit_identical` is what says so.
+
+def _fits(channel, *sigmas):
+    """One channel's history as rounds of `RoundFit`, one fit per round."""
+    from softae.analysis.equilibration import RoundFit
+
+    return [[RoundFit(channel=channel, sigma=s, r1_ohms=None if s is None
+                      else 1.0 / s)] for s in sigmas]
+
+
+def test_trend_alpha_is_derived_from_the_settle_window_length():
+    """Not a round number picked by hand: `alpha = 2/(N+1)` off the gate's own N.
+
+    An EMA built with it has the same centre of mass as the N-point window the
+    gate judges, so widening `DEFAULT_SETTLE_N_ROUNDS` moves both views together
+    instead of leaving them silently disagreeing about what `recent` means.
+    """
+    from softae.analysis.equilibration import DEFAULT_SETTLE_N_ROUNDS
+
+    assert T.TREND_ALPHA == pytest.approx(2.0 / (DEFAULT_SETTLE_N_ROUNDS + 1.0))
+    legend = T.render_trend_legend()
+    assert f"{T.TREND_ALPHA:.2f} = 2/(N+1)" in legend
+    assert f"N = {DEFAULT_SETTLE_N_ROUNDS}" in legend
+
+
+def test_trend_ema_excludes_the_current_reading_from_its_own_baseline():
+    """A baseline that has absorbed the sample cannot show departure from it.
+
+    Two flat rounds then a doubling: excluded, the baseline stays at the flat
+    value and the departure is the whole +100 %. Folded in, the baseline moves
+    halfway to the new reading and reports a third of the real motion -- and it
+    understates worst exactly when the reading is most anomalous.
+    """
+    rounds = _fits(7, 1.0e-4, 1.0e-4, 2.0e-4)
+    row = T.trend_rows(rounds, [7])[0]
+
+    assert row.sigma == pytest.approx(2.0e-4)
+    assert row.ema == pytest.approx(1.0e-4)
+    assert row.n_prior == 2
+    assert row.departure_rel == pytest.approx(1.0)
+
+    folded, n = T.prior_ema([1.0e-4, 1.0e-4, 2.0e-4])
+    assert (folded, n) == (pytest.approx(1.5e-4), 3)
+    assert (2.0e-4 - folded) / folded == pytest.approx(1.0 / 3.0)
+
+
+def test_trend_first_round_reports_no_baseline_rather_than_a_comparison():
+    """Round 1 has nothing to compare against, and must not appear to.
+
+    Round 2 does have a baseline, but it is one reading rather than an average,
+    so the `n` column carries the count on every row -- a departure against
+    n = 1 is a round-over-round change and is not the smoothed comparison the
+    later rounds show.
+    """
+    first = T.trend_rows(_fits(7, 1.0e-4), [7])[0]
+    assert (first.ema, first.n_prior, first.departure_rel) == (None, 0, None)
+
+    body = T.render_trend_table([first]).splitlines()[1]
+    assert body.count("n/a") == 2          # the EMA cell and the departure cell
+    assert "%" not in body                 # nothing that could read as a change
+
+    second = T.trend_rows(_fits(7, 1.0e-4, 1.1e-4), [7])[0]
+    assert second.n_prior == 1
+    assert second.ema == pytest.approx(1.0e-4)
+
+    legend = T.render_trend_legend()
+    assert "NOT a calibrated conductivity" in legend
+    assert "PROVISIONAL" in legend         # the band is a pre-equilibration read
+    assert "Console only" in legend
+
+
+def test_trend_excluded_channel_is_flagged_with_the_gates_own_reason():
+    """A channel the gate is not counting must not read as one that counts."""
+    from softae.analysis.equilibration import RoundFit
+
+    rounds = [[RoundFit(7, 1.0e-4, 1e4), RoundFit(8, 2.0e-4, 5e3),
+               RoundFit(9, None, None)]]
+    rows = T.trend_rows(rounds, [7, 8, 9, 10],
+                        excluded={9: "sigma_null"}, participating=[7, 8])
+
+    assert {row.channel: row.note for row in rows} == {
+        7: "", 8: "", 9: "sigma_null",
+        10: "absent",                      # never in the window at all
+    }
+    text = T.render_trend_table(rows)
+    assert [line.split()[0] for line in text.splitlines()[1:]] == [
+        "7", "8", "!", "!"]
+    assert "sigma_null" in text and "absent" in text
+
+    # Before any window is judged there is no exclusion news, and inventing some
+    # would flag every channel on round 1.
+    assert all(row.note == "" for row in T.trend_rows(rounds, [7, 8, 9, 10]))
+
+
+def test_trend_departure_sign_follows_the_direction_of_travel():
+    """The sign is the whole addition: the gate's magnitude is blind to it."""
+    rising = _fits(7, 1.0e-4, 1.1e-4, 1.3e-4)
+    falling = _fits(7, 1.3e-4, 1.1e-4, 1.0e-4)
+
+    assert T.trend_rows(rising, [7])[0].departure_rel > 0
+    assert T.trend_rows(falling, [7])[0].departure_rel < 0
+    assert "+" in T.render_trend_table(T.trend_rows(rising, [7]))
+    assert "-" in T.render_trend_table(T.trend_rows(falling, [7]))
+
+    # And this is why it is worth printing: the quantity the `[settle]` line
+    # reports is identical for the two, to the digit.
+    assert H.settle_deviations(rising, [7])[7] == pytest.approx(
+        H.settle_deviations(falling, [7])[7])
+
+
+def test_trend_table_leaves_every_settle_verdict_bit_identical(
+        tmp_path, monkeypatch, capsys):
+    """A view, never a decision. Same rounds, same verdict, same `[settle]` text.
+
+    Also pins the cadence: the legend once, the column header under every round.
+    """
+    series = {18: [100.0], 19: [100.0], 20: [100.0, 100.0, 130.0]}
+    _plan_shown, shown = _scripted_settle(tmp_path, series)
+    with_table = capsys.readouterr().out
+
+    monkeypatch.setattr(H, "_print_trend", lambda *a, **k: None)
+    _plan_hidden, hidden = _scripted_settle(tmp_path, series)
+    without_table = capsys.readouterr().out
+
+    assert (shown.verdict, shown.n_rounds, shown.projected,
+            shown.apex_by_channel) == (hidden.verdict, hidden.n_rounds,
+                                       hidden.projected, hidden.apex_by_channel)
+    settle_lines = lambda text: [ln for ln in text.splitlines()      # noqa: E731
+                                 if ln.startswith("[settle]")]
+    assert settle_lines(with_table) == settle_lines(without_table)
+
+    assert "[trend ]" not in without_table
+    assert with_table.count("[trend ]    ch") == shown.n_rounds
+    assert with_table.count("PROVISIONAL") == 1
+    # Channel rows indent past the legend's; three channels under every round,
+    # and narrow enough that a terminal does not wrap them.
+    rows = [ln for ln in with_table.splitlines() if ln.startswith(" " * 12)]
+    assert len(rows) == 3 * shown.n_rounds
+    assert all(len(line) < 100 for line in rows)
+
+
+def test_a_failing_trend_render_never_fails_the_settle_phase(tmp_path, monkeypatch):
+    """Same guarantee the round observer already carries, for the same reason."""
+    def _boom(*_args, **_kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(H, "_print_trend", _boom)
+    _plan_used, outcome = _scripted_settle(
+        tmp_path, {18: [100.0], 19: [100.0], 20: [100.0]})
+    assert outcome.certified
 
 
 # ── Q-series: the acquisition sequence ───────────────────────────────────────
@@ -1893,8 +2599,110 @@ class TestRunNarration:
             encoding="utf-8").lower()
         for forbidden in ("r1", "sigma", "z_real", "z_imag", "frequency",
                           "apex", "eis_params", "fit", "ohms", "impedance",
-                          "spectrum", "arc_state", "scout_verdict", "deviation"):
+                          "spectrum", "arc_state", "scout_verdict"):
             assert forbidden not in text, forbidden
+
+    def test_gate_state_is_narrated_and_the_observable_behind_it_is_not(
+            self, tmp_path):
+        """Where the line falls, now that the settle rounds are narrated.
+
+        `deviation` came OFF the forbidden list above and `sigma` and `apex`
+        stayed on it, which is the whole distinction stated as an assertion. A
+        per-channel relative deviation is a ratio of a channel to ITSELF --
+        dimensionless, geometry-free, not invertible to the sigma it came from --
+        and it is the number the gate compared against its own tolerance, i.e.
+        the answer to "why is this run still not measuring?". The sigma itself is
+        the observable and stays out; so does the apex frequency, which is a
+        reading taken off a pre-equilibration sweep this harness deliberately
+        does not persist.
+
+        `campaign_events` excludes measurements on the grounds that "every
+        scientific fact in the stream is already in a table or a sidecar". For
+        these rounds that premise is false -- settle sweeps are not persisted --
+        which is why the gate's own state is admitted here and nowhere else.
+        """
+        assert self._run(tmp_path, "gate") == V.EXIT_OK
+        events = _stream(_only_run_dir(tmp_path))
+
+        rounds = [e for e in events if e["type"] == "settle_round"]
+        assert rounds, "a settle round must survive the run that took it"
+        assert all(0.0 <= value <= 10.0
+                   for e in rounds
+                   for value in e["deviation_rel_by_channel"].values())
+
+        bands = [e for e in events if e["type"] == "settle_bands"]
+        assert len(bands) == 1
+        assert set(bands[0]["by_channel"]) == {"18", "19", "20"}
+        assert set(bands[0]["by_channel"].values()) <= {
+            R.CONTROL, R.TREATMENT, R.UNRESOLVED}
+        # The band, never the frequency that decided it.
+        assert all(isinstance(value, str)
+                   for value in bands[0]["by_channel"].values())
+
+    def test_a_settle_round_reaches_the_stream_with_its_per_channel_detail(
+            self, tmp_path):
+        """v2 narrated `state`, `progress` x2 and 140 heartbeats -- and nothing
+        per-round or per-channel. Which channel sat at 0.48 existed only in
+        console scrollback, so the question could not be asked again.
+        """
+        assert self._run(tmp_path, "rounds") == V.EXIT_OK
+        rounds = [e for e in _stream(_only_run_dir(tmp_path))
+                  if e["type"] == "settle_round"]
+
+        assert [e["round"] for e in rounds] == list(range(1, len(rounds) + 1))
+        assert set(rounds[-1]) == {
+            "ts", "seq", "type", "round", "elapsed_s", "rh_median_pct",
+            "rh_spread_pct", "tol_rel", "worst_deviation_rel", "worst_channel",
+            "deviation_rel_by_channel", "participating", "n_channels",
+            "evaluable", "settled", "reason"}
+
+        judged = rounds[-1]                        # the round the gate acted on
+        assert judged["settled"] is True
+        assert judged["tol_rel"] == pytest.approx(0.10)
+        assert judged["participating"] == [18, 19, 20]
+        assert judged["n_channels"] == 3
+        assert set(judged["deviation_rel_by_channel"]) == {"18", "19", "20"}
+        assert judged["worst_channel"] in (18, 19, 20)
+        assert judged["worst_deviation_rel"] == pytest.approx(
+            max(judged["deviation_rel_by_channel"].values()), abs=1e-5)
+        # The first rounds carry no trailing window yet, and say so as an
+        # absence rather than as a zero.
+        assert rounds[0]["worst_channel"] is None
+        assert rounds[0]["evaluable"] is None
+
+    def test_a_narration_failure_inside_the_settle_gate_does_not_fail_the_run(
+            self, tmp_path, monkeypatch):
+        """Same contract the soak observers keep, at the gate that now uses it."""
+        def _boom(self, event_type, **payload):
+            if event_type == "settle_round":
+                raise OSError("no space left on device")
+
+        monkeypatch.setattr(N.RunNarration, "record", _boom)
+        assert self._run(tmp_path, "boom") == V.EXIT_OK
+        assert _rows(tmp_path, "boom")                    # the science landed
+
+    def test_approach_commanded_records_precede_the_arrival_they_belong_to(
+            self, tmp_path):
+        """A watcher can see the RH loop is live before RH ever arrives.
+
+        The `progress` record for the RH axis is emitted on ARRIVAL, which on a
+        real chamber is an hour or more after the humidifier started. Without
+        `approach_commanded` the gap reads as an idle humidifier.
+        """
+        assert self._run(tmp_path, "cmd") == V.EXIT_OK
+        events = _stream(_only_run_dir(tmp_path))
+        at = [i for i, e in enumerate(events) if e["type"] == "approach_commanded"]
+        commanded = [events[i] for i in at]
+
+        assert [e["axis"] for e in commanded] == ["temperature", "rh"]
+        assert [e["target"] for e in commanded] == [25.0, 30.0]
+        assert [e["judged_after_temperature"] for e in commanded] == [False, True]
+
+        # Both writes land before the FIRST arrival is published -- that is the
+        # whole claim, and an ordering assertion is the only thing that pins it.
+        first_arrival = next(i for i, e in enumerate(events)
+                             if e["type"] == "progress" and e["phase"] == "approach")
+        assert max(at) < first_arrival
 
     def test_progress_records_carry_counts_and_never_readings(self, tmp_path):
         """An approach record says which axis and how long, not what PV it hit.
@@ -1907,7 +2715,8 @@ class TestRunNarration:
                     if e["type"] == "progress" and e["phase"] == "approach"]
         assert [e["axis"] for e in approach] == ["temperature", "rh"]
         assert all(set(e) == {"ts", "seq", "type", "phase", "done", "total",
-                              "axis", "elapsed_s", "attempts"} for e in approach)
+                              "axis", "elapsed_s", "lead_s", "attempts"}
+                   for e in approach)
 
     # -- conditions.json ------------------------------------------------------
 

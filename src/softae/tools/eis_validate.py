@@ -120,6 +120,7 @@ from softae.tools.eis_validate_hold import (
     VirtualClock,
     approach_condition,
     assert_settle_licensed,
+    band_by_channel,
     population_thresholds,
     project,
     render_arc_watch,
@@ -1143,18 +1144,31 @@ def _establish_condition(ctx: RunContext, plan: ValidationPlan,
     )
     narration.state(PHASE_SETTLE, max_hold_s=plan.settle_max_hold_s)
     outcome = settle_phase(ctx.manager, plan, lambda ch: _settle_sweep(ctx, ch),
-                           **settle_pacing)
+                           on_round=_settle_observer(ctx), **settle_pacing)
     # `settle_verdict` is `run_autonomous_campaign`'s own record for this, and
     # what rides on it is the gate's answer -- did the rig stop moving, over how
-    # many rounds, in how long. The apex histogram beside it is deliberately NOT
-    # here: that is a finding about the samples, and findings live in the
-    # DataStore.
+    # many rounds, in how long.
     narration.record("settle_verdict", verdict=outcome.verdict,
                      rounds=outcome.n_rounds,
                      elapsed_s=round(outcome.elapsed_s, 1))
+    # The BAND each cell projects onto, and not the apex frequency that decided
+    # it. The band is gate state -- it is the quantity `--min-treatment` refuses
+    # on, and it is the answer to "why did this run stop", which is what a
+    # stream is for. The apex in Hz is a reading taken off a PRE-EQUILIBRATION
+    # sweep this harness deliberately does not persist, and putting it here
+    # would invite exactly the analysis the settle gate exists to prevent.
+    narration.record("settle_bands", counts=dict(outcome.projected),
+                     by_channel={str(channel): band for channel, band
+                                 in band_by_channel(outcome.apex_by_channel,
+                                                    plan).items()})
+    # BEFORE the refusal, not after it. The histogram is built from sweeps
+    # already taken, at zero extra cost, and it is the single most useful thing
+    # to know when settle fails -- it says whether the cells are even in the
+    # resolving window. Printed only on success, it was missing from both of the
+    # 2026-08-20 runs that died in this gate.
+    print(render_arc_watch(outcome, plan))
     assert_settle_licensed(outcome)
     ctx.hold_certified = outcome.verdict
-    print(render_arc_watch(outcome, plan))
 
     projected = outcome.projected.get(TREATMENT, 0)
     if plan.settle and projected < plan.min_treatment:
@@ -1181,6 +1195,33 @@ def _establish_condition(ctx: RunContext, plan: ValidationPlan,
     soak_phase(plan, ctx.watch, established_at=established_at,
                on_poll=_soak_observer(ctx), on_restart=_soak_restart(ctx),
                **pacing)
+
+
+def _settle_observer(ctx: RunContext) -> Any:
+    """Put each settle round on disk, where console scrollback is not.
+
+    Two runs (2026-08-20) spent 1 h 44 m and 64 min in this gate and acquired
+    nothing, and the ``eis/`` directory was empty afterwards because settle
+    sweeps are deliberately not persisted. *Which* channel was at 0.48 existed
+    in exactly one place -- the terminal -- so the question could not be asked
+    again. One record per round answers it.
+
+    **This is gate state, not scientific record**, and the distinction is where
+    the stream's own rule is drawn. ``campaign_events`` excludes measurements
+    because "every scientific fact in the stream is already in a table or a
+    sidecar"; for these rounds that premise is simply false, and the deviations
+    recorded here are *ratios of a channel to itself* -- dimensionless,
+    geometry-free, and not invertible to the sigma they came from. The sigma
+    itself stays out: it is the observable, it has units, and admitting it would
+    make this file a second, schema-less measurement record.
+
+    ``progress`` rather than ``record`` is deliberately not used: a settle phase
+    has no denominator. It runs until the material stops moving or until the
+    ceiling, and ``done/total`` would be a completion claim the gate cannot make.
+    """
+    def observe(payload: dict[str, Any]) -> None:
+        ctx.narration.record("settle_round", **payload)
+    return observe
 
 
 def _soak_observer(ctx: RunContext) -> Any:

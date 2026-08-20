@@ -9,7 +9,7 @@ nothing, so the arithmetic that will judge the rig sits in one file, is pinned b
 its own tests against hand-built records, and cannot be reached through a
 rendering change.
 
-Two rules govern everything below:
+Three rules govern everything below:
 
 1. **Offset and scatter are never combined into an RMS.** The failure mode under
    test is *biased, not scattered*. A median near zero with wide scatter means
@@ -20,6 +20,22 @@ Two rules govern everything below:
    arithmetic that would produce one is still exercised in full -- that is what
    the grid-aware backend in :mod:`softae.tools.eis_validate_mock` is for -- but
    :func:`evaluate` routes the outcome to WITHHELD.
+3. **A criterion that cannot be evaluated says so, and does not move the
+   outcome.** What a criterion *displays* and what it *contributes to the
+   routing* are two different things, and this file keeps them apart on purpose::
+
+       <name>_ok   a bool, pre-registered, the ONLY thing the routing reads
+       status      PASS / FAIL / INSUFFICIENT, what a human reads
+
+   The routing booleans below are exactly what they were when the rule was
+   registered -- an absent T1 ratio still satisfies ``t1_ok``, an absent D1
+   median still fails ``d1_ok`` -- because changing which runs are declared GO is
+   a scientific decision, not a reporting one. The *status* is separate, computed
+   by :func:`_status`, and reports INSUFFICIENT wherever the input was simply not
+   there. Rounding "no evidence" to PASS is what let the first hardware run print
+   ``[PASS] T1 ... observed n/a`` off two zero sums; rounding it to FAIL, as D1,
+   D2 and D4 did, is the same error pointed the other way. Neither is a verdict,
+   so neither is printed as one.
 
 Rendered by :mod:`softae.tools.eis_validate_report`, which is also the single
 import surface these names are re-exported through.
@@ -134,6 +150,20 @@ class Criterion:
         }
 
 
+def _status(ok: bool, evaluable: bool) -> str:
+    """The status a criterion *displays* -- never what the routing reads.
+
+    ``ok`` is the pre-registered boolean, passed through untouched; ``evaluable``
+    says whether there was anything to apply it to. When there was not, the
+    criterion reports INSUFFICIENT rather than borrowing whichever verdict its
+    own ``or None`` / ``and not None`` phrasing happened to fall to. The caller
+    keeps using ``ok`` for the outcome, so this cannot move a verdict.
+    """
+    if not evaluable:
+        return INSUFFICIENT
+    return PASS if ok else FAIL
+
+
 @dataclass
 class Verdict:
     outcome: str
@@ -215,27 +245,30 @@ def evaluate(
     h1_ok = bool(certifications) and certifications <= {"settled"}
     criteria.append(Criterion(
         "H1 settle certified before the first reference sweep",
-        "settled", ", ".join(sorted(certifications)) or "(no rows)",
-        PASS if h1_ok else FAIL,
+        "settled", ", ".join(sorted(certifications)) or "no rows carry one",
+        _status(h1_ok, bool(certifications)),
         "" if h1_ok else "ceiling / not_evaluable / disabled withholds the outcome",
     ))
 
     criteria.append(Criterion(
         "H2 no fault-grade excursion", "0 fault-grade",
         f"{n_excluded} cell(s) EXCLUDED from the accuracy tables "
-        f"(warn-grade window), {len(usable)} usable",
-        PASS if usable else FAIL,
+        f"(warn-grade window), {len(usable)} usable" if cells
+        else "no cells recorded",
+        _status(bool(usable), bool(cells)),
         "a fault-grade excursion parks the run, so its absence is implied by "
         "there being rows at all; warn-grade cells are excluded above and "
         "counted here, which is why the count and not just the grade is printed",
     ))
 
     h3_ok = hold.median is None or hold.median <= H3_MAX_HOLD_DRIFT_DEC
+    h3_status = _status(h3_ok, bool(hold.n))
     criteria.append(Criterion(
         "H3 median |Delta_hold| on the drift-check subset",
         f"<= {H3_MAX_HOLD_DRIFT_DEC:.2f} dec",
-        _fmt(hold.median, "dec") + f" (n={hold.n})",
-        PASS if hold.n and h3_ok else (INSUFFICIENT if not hold.n else FAIL),
+        _fmt(hold.median, "dec") + f" (n={hold.n})" if hold.n
+        else "no drift-check rows (n=0)",
+        h3_status,
         "" if hold.n else
         "no reference_end rows: --drift-check 0 makes H3 UNEVALUABLE. The "
         "spec routes H3 *failure* to INSUFFICIENT and does not say where "
@@ -252,8 +285,9 @@ def evaluate(
     criteria.append(Criterion(
         "D3 median |Delta_scout| on CONTROL (the noise floor)",
         f"<= {D3_MAX_CONTROL_DEVIATION_DEC:.2f} dec",
-        _fmt(d_scout_control_abs.median, "dec") + f" (n={d_scout_control_abs.n})",
-        PASS if d3_ok else (INSUFFICIENT if not d_scout_control_abs.n else FAIL),
+        _fmt(d_scout_control_abs.median, "dec") + f" (n={d_scout_control_abs.n})"
+        if d_scout_control_abs.n else "no CONTROL cells (n=0)",
+        _status(d3_ok, bool(d_scout_control_abs.n)),
         "no improvement below this floor can be believed",
     ))
 
@@ -264,8 +298,9 @@ def evaluate(
     criteria.append(Criterion(
         "D1 median improvement on TREATMENT",
         f">= +{D1_MIN_MEDIAN_IMPROVEMENT_DEC:.2f} dec",
-        _fmt(improvement.median, "dec") + f" (n={improvement.n})",
-        PASS if d1_ok else FAIL,
+        _fmt(improvement.median, "dec") + f" (n={improvement.n})"
+        if improvement.n else "no TREATMENT cell yielded an improvement (n=0)",
+        _status(d1_ok, bool(improvement.n)),
     ))
 
     frac = improvement.positive_fraction
@@ -273,9 +308,9 @@ def evaluate(
     criteria.append(Criterion(
         "D2 fraction of TREATMENT cells with improvement > 0",
         f">= {D2_MIN_POSITIVE_FRACTION:.3f}",
-        (f"{frac:.3f}" if frac is not None else "n/a")
-        + f" ({improvement.n_positive}/{improvement.n})",
-        PASS if d2_ok else FAIL,
+        f"{frac:.3f} ({improvement.n_positive}/{improvement.n})"
+        if frac is not None else "no TREATMENT cell yielded an improvement (0/0)",
+        _status(d2_ok, frac is not None),
         "separates a real shift from a tail",
     ))
 
@@ -283,8 +318,9 @@ def evaluate(
     criteria.append(Criterion(
         "D4 median Delta_scout on TREATMENT is negative",
         "< 0 (direction only)",
-        _fmt(d_scout_treat.median, "dec"),
-        PASS if d4_negative else FAIL,
+        _fmt(d_scout_treat.median, "dec") if d_scout_treat.n
+        else "no TREATMENT deviation (n=0)",
+        _status(d4_negative, bool(d_scout_treat.n)),
         "PRE-REGISTERED SIGN: R1 extrapolated past the apex is OVERestimated "
         "(x1.598), and sigma = K/R, so the plain preset must read sigma LOW "
         "against the reference (-0.204 dec). Reported as a FLAG, not a hard "
@@ -295,12 +331,16 @@ def evaluate(
     sum_adaptive = sum(c.t_adaptive() for c in ratio_cells)
     sum_control = sum(c.t_control() for c in ratio_cells)
     ratio = (sum_adaptive / sum_control) if sum_control > 0 else None
+    # `t1_ok` keeps its pre-registered phrasing -- an absent ratio does not veto
+    # a GO -- while the status below refuses to call that absence a pass.
     t1_ok = ratio is None or ratio <= T1_MAX_TIME_RATIO
     criteria.append(Criterion(
         "T1 sum(t_adaptive) / sum(t_control)",
         f"<= {T1_MAX_TIME_RATIO:.1f}x",
-        (f"{ratio:.3f}x" if ratio is not None else "n/a"),
-        PASS if t1_ok else FAIL,
+        f"{ratio:.3f}x" if ratio is not None
+        else ("no CONTROL or TREATMENT cells" if not ratio_cells
+              else "sum_control = 0 s"),
+        _status(t1_ok, ratio is not None),
         "counts the scout sweep on EVERY cell, including accepted ones",
     ))
 
@@ -340,7 +380,7 @@ def evaluate(
             "than the noise floor on cells the scout says are fine, so the "
             "reference is not resolving anything."
         )
-    elif criteria[2].status != PASS:                     # H3
+    elif h3_status != PASS:
         outcome = OUTCOME_INSUFFICIENT
         reasons.append(
             "H3 failed or was unevaluable: a moving sample means the paired "

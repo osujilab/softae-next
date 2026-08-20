@@ -121,6 +121,23 @@ class VirtualClock:
         self.t += max(0.0, float(seconds))
 
 
+def _observe(hook: Any, event: str, *args: Any) -> None:
+    """Call an observer hook and **swallow whatever it does**.
+
+    Both long phases publish themselves through injected hooks rather than
+    imported sidecars, so this module keeps knowing nothing about narration --
+    and a monitoring convenience must never be the reason a phase refuses. One
+    implementation, because two copies of "never raise" is one copy too many for
+    the guarantee to stay true.
+    """
+    if hook is None:
+        return
+    try:
+        hook(*args)
+    except Exception:                                     # pragma: no cover
+        logger.warning(event, exc_info=True)
+
+
 class RefuseToStart(RuntimeError):
     """The condition was never established, so no sweep may be taken.
 
@@ -520,6 +537,7 @@ def settle_phase(
     round_period_s: float | None = None,
     sleep: Any = None,
     now: Any = None,
+    on_round: Callable[[dict[str, Any]], None] | None = None,
 ) -> SettleOutcome:
     """Quick rounds until the *material* stops moving -- and an apex histogram.
 
@@ -532,6 +550,14 @@ def settle_phase(
 
     *measure* takes a channel and returns an ``EISResult``; the caller owns
     acquisition so this stays testable without a rig.
+
+    *on_round* ``(payload)`` fires once per round with the gate's own state --
+    the same hook shape :func:`soak_phase` uses, injected for the same reason
+    and **swallowed** for the same one. Two runs (2026-08-20) died in this gate
+    without acquiring a single spectrum, and the only place the per-round
+    numbers ever existed was console scrollback: the settle sweeps are not
+    persisted, so *which* channel held the gate was unrecoverable afterwards.
+    :mod:`softae.tools.eis_validate` turns this into the run's published stream.
     """
     from softae.analysis.eis.arc import arc_closure
     from softae.analysis.equilibration import (
@@ -580,18 +606,50 @@ def settle_phase(
         rh_median = _read_rh(rh)
         check = tracker.observe(fits, rh_median_pct=rh_median)
         elapsed = float(now()) - start
-        spread = (check.max_deviation_rel
-                  if check is not None and check.max_deviation_rel is not None
-                  else float("nan"))
+        deviations = settle_deviations(
+            tracker.rounds[-tracker.n_rounds:],
+            check.participating if check is not None else [])
+        worst_channel = (max(deviations, key=deviations.__getitem__)
+                         if deviations else None)
+        drift = (check.max_deviation_rel
+                 if check is not None and check.max_deviation_rel is not None
+                 else float("nan"))
         rh_text = "  n/a" if rh_median is None else f"{rh_median:5.1f}"
         state = "SETTLED" if tracker.settled else "not yet"
         n_in = (f"{len(check.participating)}" if check is not None
                 else "-")   # no trailing window yet: not zero channels, no verdict
-        spread_text = "  n/a" if math.isnan(spread) else f"{spread:5.3f}"
-        print(f"[settle] round {rounds:<3} RH {rh_text} %  spread {spread_text}  "
-              f"channels {n_in}/{len(plan.channels)}  -> {state}", flush=True)
+        # Named, bounded and attributed. `spread 0.130` was read as %RH by an
+        # operator who then nearly loosened the tolerance to 1.0 -- which is
+        # 100 % relative deviation, i.e. accepting a film whose conductivity
+        # doubled between rounds. It is a relative deviation of sigma from its
+        # own window mean, the threshold belongs beside it, and a single bad
+        # cell holds all fifteen (`settle_check` takes the max), so the cell is
+        # named. `settle_check`'s own reason string already formats it this way.
+        drift_text = "    n/a" if math.isnan(drift) else f"{drift * 100:6.2f}%"
+        worst_text = "n/a " if worst_channel is None else f"ch{worst_channel:<3}"
+        print(f"[settle] round {rounds:<3} RH {rh_text} %RH  "
+              f"sigma drift {drift_text} (tol {tracker.tol_rel * 100:.2f}%)  "
+              f"worst {worst_text} channels {n_in}/{len(plan.channels)}  "
+              f"-> {state}", flush=True)
         if check is not None and not check.evaluable:
             print(f"         not evaluable: {check.reason}", flush=True)
+        _observe(on_round, "eis_validate_settle_observer_failed", {
+            "round": rounds,
+            "elapsed_s": round(elapsed, 1),
+            "rh_median_pct": None if rh_median is None else round(rh_median, 2),
+            "rh_spread_pct": (None if tracker.rh_spread_pct is None
+                              else round(tracker.rh_spread_pct, 3)),
+            "tol_rel": tracker.tol_rel,
+            "worst_deviation_rel": None if math.isnan(drift) else round(drift, 5),
+            "worst_channel": worst_channel,
+            "deviation_rel_by_channel": {str(ch): round(value, 5)
+                                         for ch, value in sorted(deviations.items())},
+            "participating": list(check.participating) if check is not None else [],
+            "n_channels": len(plan.channels),
+            "evaluable": None if check is None else bool(check.evaluable),
+            "settled": bool(tracker.settled),
+            "reason": "" if check is None else check.reason,
+        })
 
         if tracker.settled and elapsed >= floor_s:
             stopped_early = True
@@ -609,32 +667,106 @@ def settle_phase(
     )
 
 
+def settle_deviations(window: Any, participating: Any) -> dict[int, float]:
+    """Per-channel relative deviation over *window* -- the max of which is the
+    gate's own ``max_deviation_rel``.
+
+    :class:`~softae.analysis.equilibration.SettleCheck` reports the **max**
+    across participating channels and not which channel produced it, so one bad
+    cell holding all fifteen is invisible in the verdict. The arithmetic is
+    restated here rather than asked for there because
+    :mod:`softae.analysis.equilibration` is shared with the equilibration
+    workflow, and it is three lines: ``max|sigma - mean| / |mean|`` over the
+    channel's own window, exactly as ``settle_check`` computes it. A test pins
+    the two against each other, which is what keeps the restatement honest.
+
+    Only *participating* channels are considered -- and they are the only ones
+    for which the quantity exists, since participation is precisely the
+    guarantee that every round in the window carries a finite, non-railed sigma.
+    """
+    wanted = {int(channel) for channel in participating}
+    if not wanted:
+        return {}
+    series: dict[int, list[float]] = {channel: [] for channel in wanted}
+    for fits in window:
+        for fit in fits:
+            channel = int(fit.channel)
+            if channel in wanted and fit.sigma is not None:
+                series[channel].append(float(fit.sigma))
+    deviations: dict[int, float] = {}
+    for channel, sigmas in series.items():
+        if not sigmas:
+            continue
+        mean = sum(sigmas) / len(sigmas)
+        if math.isfinite(mean) and mean != 0.0:
+            deviations[channel] = max(abs(s - mean) for s in sigmas) / abs(mean)
+    return deviations
+
+
+def band_by_channel(
+    apexes: dict[int, float], plan: ValidationPlan
+) -> dict[int, str]:
+    """Which side of the resolving window each channel projects onto.
+
+    One implementation for the three callers that need it -- the projected
+    counts, the console histogram, and the run's narration -- so a channel
+    cannot be CONTROL in one of them and TREATMENT in another.
+    """
+    return {int(channel): classify_apex(
+                apexes.get(int(channel), float("nan")), plan)
+            for channel in plan.channels}
+
+
 def _project_populations(
     apexes: dict[int, float], plan: ValidationPlan
 ) -> dict[str, int]:
     from softae.tools.eis_validate_report import CONTROL, TREATMENT, UNRESOLVED
 
     counts = {CONTROL: 0, TREATMENT: 0, UNRESOLVED: 0}
-    for channel in plan.channels:
-        apex = apexes.get(int(channel), float("nan"))
-        counts[classify_apex(apex, plan)] += 1
+    for band in band_by_channel(apexes, plan).values():
+        counts[band] += 1
     return counts
 
 
-def render_arc_watch(outcome: SettleOutcome, plan: ValidationPlan) -> str:
-    """The histogram, from spectra that were going to be taken anyway."""
+def render_arc_watch(outcome: SettleOutcome, plan: ValidationPlan, *,
+                     max_per_band: int = 8) -> str:
+    """The histogram, from spectra that were going to be taken anyway.
+
+    **Printed on every path, including the refusals**, because it is built from
+    sweeps already taken and it is the single most useful thing to know when the
+    settle gate fails: whether the cells are even in the resolving window. The
+    per-channel listing is here for the same reason -- an operator deciding
+    whether to move the setpoint needs to know *which* cells are where, not only
+    how many -- and is bounded at *max_per_band* entries so fifteen channels do
+    not become an unreadable line.
+    """
     from softae.tools.eis_validate_report import CONTROL, TREATMENT, UNRESOLVED
 
     counts = outcome.projected
-    return (
+    bands: dict[str, list[str]] = {UNRESOLVED: [], TREATMENT: [], CONTROL: []}
+    for channel, band in band_by_channel(outcome.apex_by_channel, plan).items():
+        apex = outcome.apex_by_channel.get(channel, float("nan"))
+        shown = f"{apex:.1f}" if (math.isfinite(apex) and apex > 0) else "n/a"
+        bands[band].append(f"ch{channel} {shown}")
+
+    lines = [
         f"[watch ] apex histogram: <{plan.ref_close_hz:.1f} Hz: "
         f"{counts.get(UNRESOLVED, 0)} | {plan.ref_close_hz:.1f}-"
         f"{plan.baseline_ok_hz:.1f} Hz: {counts.get(TREATMENT, 0)} | "
-        f">{plan.baseline_ok_hz:.1f} Hz: {counts.get(CONTROL, 0)}\n"
+        f">{plan.baseline_ok_hz:.1f} Hz: {counts.get(CONTROL, 0)}",
         f"         projected  UNRESOLVED {counts.get(UNRESOLVED, 0)}  "
         f"TREATMENT {counts.get(TREATMENT, 0)}  CONTROL {counts.get(CONTROL, 0)}"
-        f"   (no extra sweeps were taken to build this)"
-    )
+        f"   (no extra sweeps were taken to build this)",
+        "         apex (Hz) by channel:",
+    ]
+    for band in (UNRESOLVED, TREATMENT, CONTROL):
+        entries = bands[band]
+        if not entries:
+            continue
+        head, rest = entries[:max_per_band], entries[max_per_band:]
+        tail = f"  (+{len(rest)} more)" if rest else ""
+        lines.append(f"         {band:<11}" + "  ".join(head) + tail)
+    return "\n".join(lines)
 
 
 def assert_settle_licensed(outcome: SettleOutcome) -> None:
@@ -752,12 +884,7 @@ def soak_phase(
     now = now or time.monotonic
 
     def observe(hook: Any, *args: Any) -> None:
-        if hook is None:
-            return
-        try:
-            hook(*args)
-        except Exception:                                 # pragma: no cover
-            logger.warning("eis_validate_soak_observer_failed", exc_info=True)
+        _observe(hook, "eis_validate_soak_observer_failed", *args)
 
     target = float(plan.soak_s)
     entered = float(now())
@@ -970,7 +1097,8 @@ __all__ = [
     "SOAK_POLL_INTERVAL_S", "SOAK_PRINT_EVERY_N_POLLS",
     "ApproachReport", "HoldWatch", "Projection", "RefuseToStart",
     "SettleOutcome", "SoakOutcome", "ValidationPlan", "VirtualClock",
-    "approach_condition", "assert_settle_licensed", "classify_apex",
-    "population_thresholds", "project", "render_arc_watch",
-    "render_projection", "settle_phase", "soak_phase", "validate_plan",
+    "approach_condition", "assert_settle_licensed", "band_by_channel",
+    "classify_apex", "population_thresholds", "project", "render_arc_watch",
+    "render_projection", "settle_deviations", "settle_phase", "soak_phase",
+    "validate_plan",
 ]

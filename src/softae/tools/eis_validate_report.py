@@ -107,6 +107,15 @@ from softae.tools.eis_validate_rule import (
 #: JSON payload schema, mirroring ``"softae.eis_timing/1"``.
 REPORT_SCHEMA = "softae.eis_validate/1"
 
+#: Width of section 8's status column, derived from the statuses themselves so
+#: that ``INSUFFICIENT`` -- a criterion that could not be evaluated, which is
+#: neither a pass nor a failure -- lines up with ``PASS`` and ``FAIL`` instead of
+#: shoving its own row two characters right. A literal here would misalign
+#: silently the next time the rule grows a status.
+STATUS_WIDTH = max(len(s) for s in (PASS, FAIL, INSUFFICIENT, "VETO"))
+#: Column the criterion's own detail lines hang from: ``"  ["`` + status + ``"] "``.
+_DETAIL_INDENT = " " * (STATUS_WIDTH + 5)
+
 
 # ── The machine-readable report ──────────────────────────────────────────────
 
@@ -316,14 +325,11 @@ def render(payload: dict[str, Any]) -> str:
     add("")
     add("-- 8. THE DECISION RULE " + "-" * 50)
     for entry in payload["decision_rule"]:
-        add(f"  [{entry['status']:<12}] {entry['criterion']}")
-        add(f"                 threshold {entry['threshold']}   "
-            f"observed {entry['observed']}")
-        if entry["note"]:
-            for line in _wrap(entry["note"], 66):
-                add(f"                 {line}")
+        add(f"  [{entry['status']:<{STATUS_WIDTH}}] {entry['criterion']}")
+        for line in _criterion_detail(entry):
+            add(f"{_DETAIL_INDENT}{line}")
     for veto in payload["vetoes"]:
-        add(f"  [VETO        ] {veto}")
+        add(f"  [{'VETO':<{STATUS_WIDTH}}] {veto}")
 
     add("")
     add("  " + "=" * 70)
@@ -340,6 +346,27 @@ def render(payload: dict[str, Any]) -> str:
             add(("  * " if i == 0 else "    ") + line)
     add("")
     return "\n".join(out)
+
+
+def _criterion_detail(entry: dict[str, Any]) -> list[str]:
+    """The threshold/observed line and the note, wrapped to the block width.
+
+    ``observed`` is a sentence, not a number, whenever a criterion could not be
+    evaluated -- ``no CONTROL cells (n=0)`` rather than ``n/a``, because the
+    reader's next question after INSUFFICIENT is always *why*. Those sentences
+    are long enough to overflow the block and get re-wrapped by the terminal at
+    an arbitrary column, which is exactly what a fixed-width report is for
+    avoiding, so an overlong pair is split here instead.
+    """
+    threshold, observed = entry["threshold"], entry["observed"]
+    joined = f"threshold {threshold}   observed {observed}"
+    if len(joined) <= 66:
+        lines = [joined]
+    else:
+        lines = [f"threshold {threshold}"] + _wrap(f"observed {observed}", 66)
+    if entry["note"]:
+        lines += _wrap(entry["note"], 66)
+    return lines
 
 
 def _soak_line(spec: dict[str, Any]) -> str:
@@ -510,7 +537,7 @@ __all__ = [
     "H3_MAX_HOLD_DRIFT_DEC", "INSUFFICIENT", "OUTCOME_CONDITIONAL_GO",
     "OUTCOME_GO", "OUTCOME_INSUFFICIENT", "OUTCOME_MECHANISM_LIMITED",
     "OUTCOME_NO_GO", "OUTCOME_WITHHELD", "PASS", "REPORT_SCHEMA",
-    "T1_MAX_TIME_RATIO", "TREATMENT", "UNRESOLVED",
+    "STATUS_WIDTH", "T1_MAX_TIME_RATIO", "TREATMENT", "UNRESOLVED",
     "Cell", "Criterion", "Spread", "SweepRecord", "Verdict",
     "assemble_cells", "build_payload", "checkpoint_campaign", "cmd_report",
     "describe", "evaluate", "evaluate_vetoes", "generate", "load_checkpoint",

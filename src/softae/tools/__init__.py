@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import logging
 import sys
 from typing import Any, Callable
 
@@ -38,6 +40,56 @@ def use_utf8_console() -> None:
             # A redirected or wrapped stream may refuse. Losing the nicer encoding is
             # acceptable; failing to start the tool is not.
             pass
+
+
+def add_verbosity_flag(parser: argparse.ArgumentParser) -> None:
+    """Add ``-v`` / ``--verbose`` — on the top-level parser *and* on every subcommand.
+
+    ``default=argparse.SUPPRESS`` is load-bearing, not tidiness: a subparser
+    copies its own defaults over the outer namespace after it parses, so a plain
+    ``default=False`` here would silently discard
+    ``python -m softae.tools.equilibration -v run ...`` — the exact spelling an
+    operator reaches for when a run is misbehaving. Callers therefore read the
+    flag as ``getattr(args, "verbose", False)``, since a namespace that nobody
+    supplied it to does not carry the attribute at all.
+    """
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        default=argparse.SUPPRESS,
+                        help="DEBUG logging, overriding [logging] level. Noisy: "
+                             "the RH controller logs a duty cycle on every update.")
+
+
+def configure_logging(verbose: bool = False) -> int:
+    """Filter the log stream once, and return the level applied.
+
+    Nothing else configures structlog on a headless path. The GUI does it at
+    ``gui/app.py``; a headless entry point that skips it inherits structlog's
+    default ``PrintLogger``, which emits **every** level — including
+    ``rh_duty_sent``, logged on each RH control update. Over a six-hour
+    unattended run that buries the run's own reporting in DEBUG. It is shared
+    here rather than owned by one tool because the RH controller is shared: any
+    CLI that brings the chamber to condition inherits the same flood.
+
+    It does not touch that reporting. ``ProgressRenderer`` and its siblings write
+    the milestones, hold verdicts, telemetry lines and the live status line
+    straight to stdout, and the workflows' milestone log calls are
+    ``info``/``warning``. Filtering at INFO leaves every one of them visible,
+    which is the whole point: the operator loses the spam and keeps the run.
+
+    Safe to call twice, and safe after the GUI has already configured: both
+    ``structlog.configure`` and the explicit ``setLevel`` are last-writer-wins
+    rather than additive. The ``setLevel`` is not redundant with
+    ``basicConfig`` — ``basicConfig`` returns early once the root logger has a
+    handler, so on any second call it would apply no level at all.
+    """
+    from softae.config import loader
+
+    level = (logging.DEBUG if verbose
+             else getattr(logging, loader.log_level(), logging.INFO))
+    logging.basicConfig(level=level, format="%(message)s")
+    logging.getLogger().setLevel(level)
+    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(level))
+    return level
 
 
 def run_finalizer(store: Any, run_id: str) -> Callable[[str], None]:
@@ -79,4 +131,5 @@ def run_finalizer(store: Any, run_id: str) -> Callable[[str], None]:
     return _finalize
 
 
-__all__ = ["run_finalizer", "use_utf8_console"]
+__all__ = ["add_verbosity_flag", "configure_logging", "run_finalizer",
+           "use_utf8_console"]

@@ -45,7 +45,12 @@ from softae.analysis.eis.calibration import (
 )
 from softae.analysis.eis.policy import RE_STATES
 from softae.core.hardware_safety import ARM_ENV_VAR, HardwareNotArmedError
-from softae.tools import run_finalizer, use_utf8_console
+from softae.tools import (
+    add_verbosity_flag,
+    configure_logging,
+    run_finalizer,
+    use_utf8_console,
+)
 from softae.workflows.commissioning import (
     ARTIFACT_SETUP,
     CommissioningError,
@@ -709,6 +714,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Order by value per hour of bench time: "
                "short blank -> load blank -> reference capacitor.",
     )
+    add_verbosity_flag(p)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     st = sub.add_parser("status", help="what is calibrated and what to run next")
@@ -785,12 +791,17 @@ def build_parser() -> argparse.ArgumentParser:
                       help="project directory (default: [data] project_dir)")
     hist.set_defaults(func=_cmd_history)
 
+    for parser in (st, run, imp, der, hist):
+        add_verbosity_flag(parser)
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     use_utf8_console()
     args = build_parser().parse_args(argv)
+    # Before dispatch, so every subcommand is covered and there is exactly one
+    # place the level is decided.
+    configure_logging(getattr(args, "verbose", False))
     try:
         return int(args.func(args))
     except KeyboardInterrupt:
