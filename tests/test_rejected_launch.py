@@ -150,14 +150,24 @@ class TestItNeverCostsMoreThanItSaves:
         assert out.panel_state_path.name.startswith("campaign_")
 
 
-@pytest.mark.parametrize("field,value", [("seed", None), ("rh_stability_pct", None)])
-def test_preserve_an_explicitly_disabled_setting_offers_no_command(
-    tmp_path, field, value
+@pytest.mark.parametrize("field", ["seed", "rh_stability_pct"])
+def test_preserve_an_explicitly_disabled_setting_survives_into_the_command(
+    tmp_path, field
 ):
     """``rh_stability_pct = None`` switches the RH gate OFF; the default switches
-    it back on. A written file cannot say ``None``, so it cannot say this."""
+    it back on.
+
+    TOML has no null, so the writer used to drop the ``None`` and this offered no
+    command rather than one that re-enabled the gate. The file names its explicit
+    nothings now, so the command *is* offered — and the reloaded spec still has
+    the gate off, which is the thing that actually had to be true.
+    """
+    from softae.core.campaign_spec_io import load_campaign_spec
+
     spec = _plain_spec()
-    setattr(spec, field, value)
+    setattr(spec, field, None)
     out = preserve_rejected_launch(project_dir=tmp_path, spec=spec, now=WHEN)
-    assert out.command is None
-    assert field in out.completeness.missing
+
+    assert out.command is not None
+    assert out.completeness.complete
+    assert getattr(load_campaign_spec(out.toml_path), field) is None

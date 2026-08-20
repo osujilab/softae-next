@@ -6,11 +6,21 @@ cannot represent faithfully** rather than loading a partial spec that looks
 complete.
 
 That refusal is the whole design. A spec carries live Python objects
-(``prior_mean`` is an arbitrary callable; ``formulation`` and ``run_plan`` are
-rich objects), and a loader that quietly dropped them would hand back a spec that
-runs a *different experiment* from the one the file describes — the same failure
-the resume path refuses by fingerprint. An unknown key is an error for the same
-reason: a typo'd field name would otherwise silently take its default.
+(``formulation`` and ``run_plan`` are rich objects), and a loader that quietly
+dropped them would hand back a spec that runs a *different experiment* from the
+one the file describes — the same failure the resume path refuses by fingerprint.
+An unknown key is an error for the same reason: a typo'd field name would
+otherwise silently take its default.
+
+**Refusing is not free, though, and three fields were being refused wrongly.**
+Since a campaign runs in a detached child started *from a file*, a field a file
+cannot carry is a field that cannot be run at all — and ``general_formulation``,
+``prior_mean`` and ``seed_observations`` are exactly what the Live BO tab's
+composition mode and its Prior-informed group box set. Each of those turned out
+to be representable once asked the right question (declared axes rather than a
+callable; a registry *name* rather than a function object; primitives already),
+so they now cross the boundary through :mod:`softae.core.campaign_spec_fields`.
+Everything genuinely unrepresentable still raises.
 
 Example::
 
@@ -48,6 +58,8 @@ from typing import Any
 
 import structlog
 
+from softae.core.campaign_spec_fields import OBJECT_FIELDS, UNREPRESENTABLE
+
 logger = structlog.get_logger(__name__)
 
 
@@ -55,17 +67,28 @@ class SpecLoadError(Exception):
     """The file does not describe a runnable campaign."""
 
 
-#: Fields that cannot round-trip through a file. Naming them explicitly (rather
-#: than skipping unknown types) means a file that sets one gets a clear error
-#: instead of a spec that silently differs from what it says.
+#: Fields that cannot round-trip through a file **at all**. Naming them
+#: explicitly (rather than skipping unknown types) means a file that sets one
+#: gets a clear error instead of a spec that silently differs from what it says.
+#:
+#: Contrast :data:`~softae.core.campaign_spec_fields.OBJECT_FIELDS`, which are
+#: *conditionally* representable: those load, and are reported field-by-field by
+#: :func:`spec_toml_completeness` when a particular value cannot be written.
 _UNSUPPORTED = {
-    "prior_mean": "a Python callable",
     "formulation": "a FormulationContext object",
-    "general_formulation": "a GeneralFormulation object",
     "run_plan": "a RunPlan object",
     "piezo": "a PiezoPlan object",
-    "seed_observations": "a list of (params, value) pairs",
 }
+
+#: Top-level array naming fields the file sets to **nothing**.
+#:
+#: TOML has no null, and absence already means "take the default" — which for
+#: ``rh_stability_pct`` is the *opposite* of what ``None`` means (``None``
+#: switches the RH gate off; the default switches it back on) and for ``seed``
+#: turns an unseeded campaign into a seeded one. Dropping a ``None`` on the way
+#: out was therefore a gate silently re-enabling itself across a round trip, so
+#: an explicit nothing is written down rather than omitted.
+_EXPLICIT_NONE_KEY = "explicit_none"
 
 #: Fields the dataclass declares as tuples; TOML gives lists.
 _TUPLE_FIELDS = {
@@ -81,7 +104,6 @@ _LEGACY_MEASUREMENT_FIELDS = ("eis_preset", "eis_overrides", "measure_eis")
 
 def load_campaign_spec(path: "str | Path") -> Any:
     """Read a :class:`CampaignSpec` from a TOML file."""
-    from softae.core.autonomous_wiring import CampaignSpec
 
     p = Path(path)
     if not p.exists():
@@ -110,6 +132,7 @@ def spec_from_dict(data: dict[str, Any], *, source: str = "<dict>") -> Any:
 
     known = {f.name for f in dataclass_fields(CampaignSpec)}
     supplied = dict(data)
+    nulls = _pop_explicit_none(supplied, known, source)
 
     for key, what in _UNSUPPORTED.items():
         if key in supplied:
@@ -140,6 +163,16 @@ def spec_from_dict(data: dict[str, Any], *, source: str = "<dict>") -> Any:
         if key in supplied and isinstance(supplied[key], list):
             supplied[key] = tuple(supplied[key])
 
+    # Live objects rebuilt from what the file *names* (S5.K). A decode that
+    # cannot mean what the file says raises here rather than substituting a
+    # default, for the reason the unknown-key check exists one block above.
+    for key, codec in OBJECT_FIELDS.items():
+        if key in supplied:
+            try:
+                supplied[key] = codec.decode(supplied[key])
+            except (TypeError, ValueError) as exc:
+                raise SpecLoadError(f"{source}: '{key}': {exc}") from exc
+
     # `[measurement]` (T2.4). The legacy `eis_*` keys keep working alongside it;
     # the conflict rule lives in CampaignSpec.__post_init__ and surfaces here as
     # the ValueError branch below, so both spellings disagreeing is a spec error
@@ -152,6 +185,11 @@ def spec_from_dict(data: dict[str, Any], *, source: str = "<dict>") -> Any:
                 supplied["measurement"])
         except (TypeError, ValueError) as exc:
             raise SpecLoadError(f"{source}: [measurement]: {exc}") from exc
+
+    # Applied last: a name in `explicit_none` means the field is set to nothing,
+    # so it must not then be handed to a decoder or a tuple coercion.
+    for key in nulls:
+        supplied[key] = None
 
     try:
         spec = CampaignSpec(**supplied)
@@ -169,6 +207,35 @@ def spec_from_dict(data: dict[str, Any], *, source: str = "<dict>") -> Any:
         modality=spec.measurement.modality,
     )
     return spec
+
+
+def _pop_explicit_none(
+    supplied: dict[str, Any], known: set[str], source: str
+) -> tuple[str, ...]:
+    """Take :data:`_EXPLICIT_NONE_KEY` off *supplied* and validate it.
+
+    Popped before the unknown-field check, since it is a directive about fields
+    rather than a field itself. A name that is both listed here and given a value
+    is refused rather than resolved by precedence: the file says two things about
+    one field, and picking either would be a guess.
+    """
+    raw = supplied.pop(_EXPLICIT_NONE_KEY, None)
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(n, str) for n in raw):
+        raise SpecLoadError(
+            f"{source}: '{_EXPLICIT_NONE_KEY}' must be an array of field names")
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise SpecLoadError(
+            f"{source}: '{_EXPLICIT_NONE_KEY}' names unknown field(s) {unknown}")
+    both = sorted(set(raw) & set(supplied))
+    if both:
+        raise SpecLoadError(
+            f"{source}: {both} are given a value *and* listed in "
+            f"'{_EXPLICIT_NONE_KEY}' — the file says two things about the same "
+            f"field, and neither can be preferred silently")
+    return tuple(raw)
 
 
 def _validate_parameter_space(space: dict[str, Any], source: str) -> None:
@@ -207,32 +274,35 @@ def spec_to_dict(spec: Any) -> dict[str, Any]:
     alongside it: they carry no information the block does not, and a file
     holding both would deprecation-warn on every reload of something this
     function itself produced.
+
+    An **explicit** ``None`` on a field whose default is not ``None`` is written
+    to :data:`_EXPLICIT_NONE_KEY` rather than dropped. Dropping it (which this
+    used to do, by testing for ``None`` *before* comparing against the default)
+    meant ``seed = None`` reloaded as ``42`` and a deliberately disabled RH gate
+    reloaded enabled — a gate silently re-enabling itself across a round trip.
     """
     from softae.core.autonomous_wiring import CampaignSpec
-    from softae.core.measurement_spec import MeasurementSpec
 
     out: dict[str, Any] = {}
-    defaults = CampaignSpec(name="_", parameter_space={"_": {"type": "float",
-                                                            "low": 0, "high": 1}})
+    nulls: list[str] = []
+    defaults = _default_spec()
     for f in dataclass_fields(CampaignSpec):
         if f.name in _UNSUPPORTED or f.name in _LEGACY_MEASUREMENT_FIELDS:
             continue
         value = getattr(spec, f.name)
-        current_default = getattr(defaults, f.name, object())
-        if isinstance(value, MeasurementSpec):
-            value = value.as_dict()
-            current_default = (current_default.as_dict()
-                               if isinstance(current_default, MeasurementSpec)
-                               else current_default)
-        if isinstance(value, tuple):
-            value = list(value)
-        if value is None:
+        if f.name in ("name", "parameter_space"):
+            out[f.name] = _writable(value)      # always written
             continue
-        if isinstance(current_default, tuple):
-            current_default = list(current_default)
-        if f.name not in ("name", "parameter_space") and value == current_default:
+        if _is_default(value, getattr(defaults, f.name, object())):
             continue      # keep written files to what was actually chosen
-        out[f.name] = value
+        if value is None:
+            nulls.append(f.name)                # and the default is not None
+            continue
+        encoded = _encode(f.name, value)
+        if encoded is not UNREPRESENTABLE:
+            out[f.name] = encoded
+    if nulls:
+        out[_EXPLICIT_NONE_KEY] = sorted(nulls)
     return out
 
 
@@ -240,12 +310,17 @@ def spec_to_dict(spec: Any) -> dict[str, Any]:
 #
 # `spec_to_dict` is honest about being *a* part of the spec, and the loader is
 # loud about what it refuses — but the two are asymmetric, and dangerously so:
-# *reading* a file that sets `general_formulation` raises by explicit design
+# *reading* a file that sets `run_plan` raises by explicit design
 # (`_UNSUPPORTED`), while *writing* a spec that has one omits it in silence. A
 # caller that writes a file and then hands back the command to run it would hand
-# back a command that runs a **different experiment** and raises nothing — the
-# composition campaign reloads with neither `general_formulation` nor
-# `vol_params`, and `resolved_vol_params()` reads its axes as raw µL volumes.
+# back a command that runs a **different experiment** and raises nothing.
+#
+# The asymmetry survives `general_formulation` becoming representable, and is if
+# anything sharper for it: a composition context is now written *when it declares
+# its axes* and omitted when it carries only a callable — so "did the write keep
+# it?" is a per-value question, not a per-field one, and only this check answers
+# it. A spec whose axes went unwritten reloads with neither `general_formulation`
+# nor `vol_params`, and `resolved_vol_params()` reads its axes as raw µL volumes.
 #
 # So a file may only stand in for a spec once something has *proved* it carries
 # the whole thing. That proof is here, next to the writer it checks, rather than
@@ -269,6 +344,14 @@ class SpecCompleteness:
         return "\n".join(f"  - {r}" for r in self.reasons)
 
 
+def _default_spec() -> Any:
+    """A spec holding nothing but the shipped defaults, to compare against."""
+    from softae.core.autonomous_wiring import CampaignSpec
+
+    return CampaignSpec(name="_", parameter_space={"_": {"type": "float",
+                                                         "low": 0, "high": 1}})
+
+
 def _writable(value: Any) -> Any:
     """*value* in the shape :func:`spec_to_dict` would write it.
 
@@ -286,6 +369,20 @@ def _writable(value: Any) -> Any:
     return value
 
 
+def _encode(name: str, value: Any) -> Any:
+    """*value* as the file carries it, or :data:`UNREPRESENTABLE`."""
+    codec = OBJECT_FIELDS.get(name)
+    return codec.encode(value) if codec is not None else _writable(value)
+
+
+def _is_default(value: Any, default: Any) -> bool:
+    """Whether the spec left this field alone. An unanswerable compare is *not*."""
+    try:
+        return bool(_writable(value) == _writable(default))
+    except Exception:
+        return False      # an answer we cannot get is not "unchanged"
+
+
 def _chosen_fields(spec: Any) -> tuple[str, ...]:
     """Fields set to something other than the shipped default.
 
@@ -295,22 +392,26 @@ def _chosen_fields(spec: Any) -> tuple[str, ...]:
     """
     from softae.core.autonomous_wiring import CampaignSpec
 
-    defaults = CampaignSpec(name="_", parameter_space={"_": {"type": "float",
-                                                            "low": 0, "high": 1}})
-    chosen: list[str] = []
-    for f in dataclass_fields(CampaignSpec):
-        if f.name in _LEGACY_MEASUREMENT_FIELDS or f.name in ("name",
-                                                              "parameter_space"):
-            continue
-        value = _writable(getattr(spec, f.name))
-        default = _writable(getattr(defaults, f.name, object()))
-        try:
-            same = bool(value == default)
-        except Exception:
-            same = False      # an answer we cannot get is not "unchanged"
-        if not same:
-            chosen.append(f.name)
-    return tuple(chosen)
+    defaults = _default_spec()
+    return tuple(
+        f.name for f in dataclass_fields(CampaignSpec)
+        if f.name not in _LEGACY_MEASUREMENT_FIELDS
+        and f.name not in ("name", "parameter_space")
+        and not _is_default(getattr(spec, f.name),
+                            getattr(defaults, f.name, object()))
+    )
+
+
+def _written_fields(written: dict[str, Any]) -> set[str]:
+    """Which spec fields *written* actually carries.
+
+    A field set to an explicit nothing is carried by name inside
+    :data:`_EXPLICIT_NONE_KEY` rather than as a key of its own, so reading the
+    top-level keys alone would report every deliberate ``None`` as a silent loss
+    — the very thing that key exists to stop being one.
+    """
+    names = set(written) - {_EXPLICIT_NONE_KEY}
+    return names | set(written.get(_EXPLICIT_NONE_KEY, ()))
 
 
 def _why_missing(spec: Any, name: str) -> str:
@@ -318,9 +419,8 @@ def _why_missing(spec: Any, name: str) -> str:
     if name in _UNSUPPORTED:
         return (f"{name} is {_UNSUPPORTED[name]} and cannot be written to a "
                 f"file at all")
-    if getattr(spec, name, "") is None:
-        return (f"{name} is set to an explicit None, which the writer drops — "
-                f"the file would reload with the default instead")
+    if name in OBJECT_FIELDS:
+        return f"{name} is {OBJECT_FIELDS[name].why_not}"
     return f"{name} would not be written"
 
 
@@ -331,10 +431,9 @@ def spec_toml_completeness(spec: Any) -> SpecCompleteness:
     it as a stand-in for what is on screen:
 
     1. **Coverage** — is every field this spec chose actually written? This is
-       what catches an unrepresentable object (``general_formulation``) and an
-       explicit ``None`` on a field whose default is not ``None`` (``seed``,
-       ``rh_stability_pct`` — where ``None`` is the documented way to switch the
-       RH gate *off*, and the default would switch it back on).
+       what catches a value none of the codecs can name: a ``general_formulation``
+       carrying a ``build_targets`` callable instead of declared axes, a
+       ``prior_mean`` that is not a built-in, a ``run_plan``.
     2. **Encodability** — is the written part valid TOML? Nothing else checks
        this, so an unencodable value would surface as a traceback at write time.
     3. **Round trip** — does reloading the file write the same file back? That
@@ -345,7 +444,8 @@ def spec_toml_completeness(spec: Any) -> SpecCompleteness:
     path where something has already gone wrong.
     """
     written = spec_to_dict(spec)
-    missing = tuple(f for f in _chosen_fields(spec) if f not in written)
+    carried = _written_fields(written)
+    missing = tuple(f for f in _chosen_fields(spec) if f not in carried)
     reasons = [_why_missing(spec, f) for f in missing]
 
     text: str | None = None

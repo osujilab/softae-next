@@ -38,7 +38,6 @@ from softae.core.composition_axes import (
     AXIS_LABELS,
     CompositionAxis,
     axes_parameter_space,
-    build_targets_from_axes,
     validate_axes,
 )
 
@@ -268,9 +267,9 @@ class CompositionAxesEditor(QWidget):
         """The searchable axes as a campaign ``parameter_space``."""
         return axes_parameter_space(self.axes())
 
-    def build_targets_fn(self):
-        """``params -> targets`` for :class:`GeneralFormulation`."""
-        return build_targets_from_axes(self.axes())
+    # No `build_targets_fn` here, deliberately: a closure over these rows cannot
+    # be written to a spec file, so a campaign built from one cannot be launched.
+    # `GeneralFormulation(axes=...)` derives the callable from the axes instead.
 
     def issues(self) -> list[str]:
         return validate_axes(self.axes(), n_stocks=self._n_stocks)

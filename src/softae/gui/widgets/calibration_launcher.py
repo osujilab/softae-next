@@ -7,14 +7,21 @@ sequence dies with the window, so the operator has to leave a desktop session op
 hours and cannot restart the GUI to look at anything.
 
 So this dialog does not run anything. It **hands the rig over**: releases the GUI's
-instruments, spawns a detached child, and gets out of the way. Closing the dialog — or
-the whole application — leaves the child running.
+instruments *and its rig claim*, spawns a detached child, and gets out of the way.
+Closing the dialog — or the whole application — leaves the child running.
 
 The handover is explicit, and that is the design's one opinion. Two processes cannot
 share the rig (see :mod:`softae.core.run_lock`), so *something* has to give up the
 instruments. Doing it silently on launch would mean a button that quietly disconnects
 hardware, which is exactly the kind of side effect that gets discovered at 2 a.m., so
 the button says what it does: **Release instruments and launch**.
+
+"And its rig claim" is not a detail. Since :mod:`softae.core.rig_session` the GUI
+claims ``gui:desktop`` for the whole connected life of the window, so this dialog
+must hand back two things rather than one — and it must stop treating that claim as
+somebody else's. Reading it as "the rig is busy" disabled the launch button
+permanently; leaving it standing at spawn time would have the child refused its own
+rig lock and exit into a log file while this dialog reported a PID.
 """
 
 from __future__ import annotations
@@ -27,7 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -45,7 +52,24 @@ from PySide6.QtWidgets import (
 # the rig is one physical object per machine, `WorkflowExecutor.run()` acquires at
 # ``~/.softae/rig.lock``, and a project-scoped read would have looked in a different
 # file, found nothing, and reported "Free" for the entire length of a running sequence.
-from softae.core.run_lock import break_run_lock, read_run_lock
+#
+# **Two questions, two readers, and they are not interchangeable.**
+#
+# ``foreign_run_lock`` asks *may this window act* — is the rig held by somebody
+# **else**? Since :mod:`softae.core.rig_session`, this process claims ``gui:desktop``
+# for the whole connected life of the window, so ``read_run_lock`` answers "yes,
+# held" continuously and a refusal built on it disabled this dialog's launch button
+# permanently. That is the same distinction
+# :meth:`softae.gui.tabs.tab_init.InitCalibrationTab._refuse_if_rig_held` and
+# :func:`softae.gui.launch_mode.decide_launch_mode` already make.
+#
+# ``read_run_lock`` asks *is the rig free for the child* — and there, **our own claim
+# counts against us**: the child's ``acquire_run_lock`` is re-entrant only within one
+# process, so a claim this window forgot to release refuses the child outright and it
+# dies with ``EXIT_BUSY`` into a log nobody is watching. It stays load-bearing in
+# `_after_release`, which is the last gate before the spawn.
+from softae.core.rig_session import release_rig_session
+from softae.core.run_lock import break_run_lock, foreign_run_lock, read_run_lock
 
 if TYPE_CHECKING:
     from softae.server.manager import InstrumentManager
@@ -252,7 +276,16 @@ class CalibrationLauncherDialog(QDialog):
         self._plan.setVisible(bool(spec.get("needs_plan")))
 
     def _refresh_state(self) -> None:
-        lock = read_run_lock()
+        """Who owns the rig, and therefore whether this dialog may hand it over.
+
+        A **foreign** claim is the only one that means busy. This window's own
+        ``gui:desktop`` claim is not somebody else driving the rig — it is this
+        session holding its ports, which is exactly what the launch button
+        releases, so reporting it as busy disabled the button for the whole life
+        of the window.
+        """
+        foreign = foreign_run_lock()
+        mine = read_run_lock() if foreign is None else None
         held = 0
         try:
             held = sum(1 for s in self._manager.list_instruments()
@@ -260,26 +293,32 @@ class CalibrationLauncherDialog(QDialog):
         except Exception:
             pass
 
-        if lock is not None:
+        if foreign is not None:
             self._state_label.setText(
-                f"<b style='color:#b00020'>Busy.</b> {lock.describe()}")
+                f"<b style='color:#b00020'>Busy.</b> {foreign.describe()}")
             self._btn_break.setEnabled(True)
             self._btn_launch.setEnabled(False)
             self._btn_launch.setText("Rig is busy")
+            return
+
+        self._btn_break.setEnabled(False)
+        self._btn_launch.setEnabled(True)
+        if held or mine is not None:
+            what = (f"<b>{held}</b> instrument(s)" if held
+                    else "the rig claim for this session")
+            self._state_label.setText(
+                f"Free. This window holds {what} — launching releases "
+                f"{'them' if held else 'it'} first.")
+            self._btn_launch.setText("Release instruments and launch")
         else:
-            self._btn_break.setEnabled(False)
-            self._btn_launch.setEnabled(True)
-            if held:
-                self._state_label.setText(
-                    f"Free. This window holds <b>{held}</b> instrument(s) — launching "
-                    f"releases them first.")
-                self._btn_launch.setText("Release instruments and launch")
-            else:
-                self._state_label.setText("Free. No instruments held here.")
-                self._btn_launch.setText("Launch")
+            self._state_label.setText("Free. No instruments held here.")
+            self._btn_launch.setText("Launch")
 
     def _on_break_lock(self) -> None:
-        lock = read_run_lock()
+        # Foreign, for the same reason: "take over (owner is gone)" is meaningless
+        # against this window's own claim, and breaking it would leave the session
+        # holding open ports while the lock file says the rig is free.
+        lock = foreign_run_lock()
         if lock is None:
             return
         # PID reuse means a lock can read as live when its owner is long gone, so an
@@ -338,7 +377,10 @@ class CalibrationLauncherDialog(QDialog):
         if argv is None:
             return
 
-        lock = read_run_lock()
+        # The button reflects a 2 s poll; this is the check that decides. Foreign
+        # only — our own session claim is not a second owner, it is what we are
+        # about to give back.
+        lock = foreign_run_lock()
         if lock is not None:
             QMessageBox.warning(self, "Rig is busy", lock.describe())
             self._refresh_state()
@@ -366,11 +408,37 @@ class CalibrationLauncherDialog(QDialog):
             # happen in its completion callback rather than after a blocking wait.
             self._btn_launch.setEnabled(False)
             self._btn_launch.setText("Releasing instruments…")
-            self._schedule(self._manager.disconnect_all(),
+            self._schedule(self._release_rig_for_handover(),
                            lambda ok: self._after_release(ok, argv))
             return
 
-        self._spawn(argv)
+        # Nothing open, but the claim may still be ours — the session claim
+        # outlives the last disconnect only by mistake, and a claim that outlives
+        # it here would refuse the child we are about to start.
+        release_rig_session()
+        self._after_release(True, argv)
+
+    async def _release_rig_for_handover(self) -> None:
+        """Close the sessions, then give the rig back — in that order.
+
+        Mirrors ``InitCalibrationTab._disconnect_all_and_release`` and
+        :class:`~softae.gui.tabs._campaign_handover.CampaignHandoverMixin`'s
+        method of the same name exactly, including the ``finally``.
+
+        **Releasing the claim is not optional here**, and it is the half this
+        dialog was missing once the GUI began claiming ``gui:desktop`` for its
+        connected life. ``WorkflowExecutor.run()`` in the child acquires the rig
+        lock, re-entrancy is per-process, so a claim still standing when the child
+        starts refuses it — and the failure is invisible: the child exits into a
+        log file while this dialog reports "Started as PID nnnn".
+
+        Order matters in the other direction too: releasing *first* would
+        advertise a free rig while these ports are still closing.
+        """
+        try:
+            await self._manager.disconnect_all()
+        finally:
+            release_rig_session()
 
     def _default_schedule(self, coro: Any, done: Any) -> None:
         import asyncio
@@ -388,7 +456,13 @@ class CalibrationLauncherDialog(QDialog):
         task.add_done_callback(_cb)
 
     def _after_release(self, ok: bool, argv: list[str]) -> None:
-        """Spawn only once the instruments are genuinely gone."""
+        """Spawn only once this process genuinely holds nothing.
+
+        Two conditions, not one. No open session is the obvious half; **no rig
+        claim at all** — ours included, hence :func:`read_run_lock` rather than
+        :func:`foreign_run_lock` — is the half that decides whether the child can
+        start, because its own acquire would refuse it outright.
+        """
         still_held = []
         try:
             still_held = [s.get("name") for s in self._manager.list_instruments()
@@ -396,15 +470,25 @@ class CalibrationLauncherDialog(QDialog):
         except Exception:
             ok = False
 
+        try:
+            claim = read_run_lock()
+        except Exception:
+            logger.warning("run_lock_unreadable_before_spawn", exc_info=True)
+            claim = "unreadable"
+
         self._refresh_state()
-        if not ok or still_held:
+        if not ok or still_held or claim is not None:
             QMessageBox.critical(
                 self, "Could not release",
-                "The instruments did not disconnect cleanly"
-                + (f" ({', '.join(str(h) for h in still_held)} still connected)"
-                   if still_held else "")
-                + ", so the sequence was NOT started. Launching anyway would put two "
-                  "processes on the same ports.")
+                "The sequence was NOT started.\n\n"
+                + ("The instruments did not disconnect cleanly"
+                   + (f" ({', '.join(str(h) for h in still_held)} still connected)"
+                      if still_held else "") + ".\n"
+                   if not ok or still_held else "")
+                + (f"The rig is still claimed — {claim}.\n"
+                   if claim is not None else "")
+                + "\nLaunching anyway would put two processes on the same ports, "
+                  "or hand the child a rig it will be refused.")
             return
         self._spawn(argv)
 

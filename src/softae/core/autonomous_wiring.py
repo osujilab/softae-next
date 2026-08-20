@@ -39,6 +39,7 @@ import structlog
 
 if TYPE_CHECKING:  # annotation-only; the settle criterion is imported on use
     from softae.analysis.equilibration import RoundFit
+    from softae.core.composition_axes import CompositionAxis
 
 from softae.config import loader
 from softae.core.autonomous_loop import (
@@ -262,15 +263,45 @@ class GeneralFormulation:
 
         lambda p: [MolarRatioTarget("PEO", "LiCl", p["eo_li"]),
                    DriedFractionTarget("SiO2", p["silica"], Basis.VOLUME)]
+
+    **Prefer declaring** :attr:`axes`. A callable cannot be written to a spec
+    file, and a campaign is started from one — so a context that carries only
+    ``build_targets`` cannot be launched at all (it is reported by
+    :func:`~softae.core.campaign_spec_io.spec_toml_completeness` rather than
+    silently written without its targets). Given ``axes`` and no
+    ``build_targets``, the callable is derived from the axes, which is also what
+    makes the two incapable of drifting apart.
     """
 
     stocks: dict[str, Solution]
     catalog: ChemicalCatalog
     pump_assignment: dict[str, int]        # stock name → pump index
     target_deposition_uL: float
-    build_targets: Callable[[dict[str, Any]], Sequence[FormulationTarget]]
+    build_targets: "Callable[[dict[str, Any]], Sequence[FormulationTarget]] | None" = None
     budget_uL: float | None = None
     dried_frac: dict[str, float] | None = None  # per-stock dried-fraction override
+    #: The searched composition targets, when this context was built by declaring
+    #: them. This — not ``build_targets`` — is what a spec file carries.
+    axes: "tuple[CompositionAxis, ...]" = ()
+
+    def __post_init__(self) -> None:
+        from softae.core.composition_axes import build_targets_from_axes
+
+        self.axes = tuple(self.axes or ())
+        #: Whether :attr:`axes` is the *whole* truth about this context's targets
+        #: — set only when ``build_targets`` was derived from them here. A spec
+        #: file may carry the context only then: a caller-supplied callable can
+        #: compute something the axes do not describe, and no check can compare
+        #: two callables to find out, so "both were given" is treated as
+        #: unwritable rather than assumed to agree.
+        self.axes_define_targets = self.build_targets is None and bool(self.axes)
+        if self.build_targets is None:
+            if not self.axes:
+                raise ValueError(
+                    "GeneralFormulation needs either declared 'axes' or an "
+                    "explicit 'build_targets' — without one of them a suggestion "
+                    "maps to no composition targets at all")
+            self.build_targets = build_targets_from_axes(self.axes)
 
 
 class _SpecUnset:

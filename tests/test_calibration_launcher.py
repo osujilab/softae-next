@@ -37,7 +37,8 @@ def dlg(qapp, tmp_path):
         coro.close()                 # never actually disconnect in a test
         scheduled.append(done)
 
-    with patch.object(cl, "read_run_lock", return_value=None):
+    with patch.object(cl, "read_run_lock", return_value=None), \
+         patch.object(cl, "foreign_run_lock", return_value=None):
         d = cl.CalibrationLauncherDialog(
             manager, str(tmp_path), schedule=_schedule)
     d._scheduled = scheduled
@@ -51,6 +52,12 @@ def _foreign_lock() -> RunLock:
                    started_at="2026-08-07T14:02:00+00:00", host="")
 
 
+def _own_lock() -> RunLock:
+    """This process's own ``gui:desktop`` session claim."""
+    return RunLock(pid=os.getpid(), what="gui:desktop",
+                   started_at="2026-08-19T09:00:00+00:00", host="")
+
+
 # ── Scope: the defect that made the busy check invisible ─────────────────────
 
 
@@ -62,12 +69,14 @@ class TestLockScope:
         whole length of a running sequence, and let this dialog launch a second one
         onto the same ports. Passing *any* scope here is the bug.
         """
-        with patch.object(cl, "read_run_lock", return_value=None) as read:
+        with patch.object(cl, "foreign_run_lock", return_value=None) as foreign, \
+             patch.object(cl, "read_run_lock", return_value=None) as read:
             dlg._refresh_state()
+        foreign.assert_called_once_with()
         read.assert_called_once_with()
 
     def test_taking_over_breaks_the_lock_at_the_same_scope_it_was_read_from(self, dlg):
-        with patch.object(cl, "read_run_lock", return_value=_foreign_lock()), \
+        with patch.object(cl, "foreign_run_lock", return_value=_foreign_lock()), \
              patch.object(cl, "break_run_lock", return_value=_foreign_lock()) as brk, \
              patch.object(QMessageBox, "warning",
                           return_value=QMessageBox.StandardButton.Yes):
@@ -80,7 +89,7 @@ class TestLockScope:
 
 class TestRefusals:
     def test_a_live_lock_disables_launching_rather_than_only_warning_on_click(self, dlg):
-        with patch.object(cl, "read_run_lock", return_value=_foreign_lock()):
+        with patch.object(cl, "foreign_run_lock", return_value=_foreign_lock()):
             dlg._refresh_state()
         assert not dlg._btn_launch.isEnabled()
         assert dlg._btn_break.isEnabled()
@@ -90,12 +99,97 @@ class TestRefusals:
         """The button reflects a 2 s poll; the check at click time is the real one."""
         dlg._combo.setCurrentText("Commissioning — open blank")
         dlg._channels.setText("1-8")
-        with patch.object(cl, "read_run_lock", return_value=_foreign_lock()), \
+        with patch.object(cl, "foreign_run_lock", return_value=_foreign_lock()), \
              patch.object(QMessageBox, "warning") as warn, \
              patch.object(cl, "spawn_detached") as spawn:
             dlg._on_launch()
         assert spawn.call_count == 0
         assert warn.call_count == 1
+
+
+# ── This process's own claim is not a second owner (rig_session) ─────────────
+
+
+class TestOwnSessionClaim:
+    """``gui:desktop`` is held for the whole connected life of the window.
+
+    Read as "the rig is busy", it disabled this dialog's launch button
+    permanently — the defect this class pins. Left standing at spawn time, it
+    would have the child refused its own rig lock, so the *other* half is that
+    releasing it is mandatory before the spawn.
+    """
+
+    def test_refresh_leaves_the_launch_usable_while_this_process_holds_the_rig(
+        self, dlg
+    ):
+        with patch.object(cl, "foreign_run_lock", return_value=None), \
+             patch.object(cl, "read_run_lock", return_value=_own_lock()):
+            dlg._refresh_state()
+        assert dlg._btn_launch.isEnabled()
+        assert not dlg._btn_break.isEnabled()
+        assert "Busy" not in dlg._state_label.text()
+        assert "releases" in dlg._state_label.text()
+
+    def test_launch_proceeds_while_this_process_holds_its_own_claim(self, dlg):
+        dlg._combo.setCurrentText("Commissioning — open blank")
+        dlg._channels.setText("1-8")
+        released: list = []
+        with patch.object(cl, "foreign_run_lock", return_value=None), \
+             patch.object(cl, "read_run_lock", return_value=None), \
+             patch.object(cl, "release_rig_session",
+                          side_effect=lambda *a, **k: released.append(True)), \
+             patch.object(dlg._manager, "list_instruments", return_value=[]), \
+             patch.object(QMessageBox, "information"), \
+             patch.object(cl, "spawn_detached", return_value=99) as spawn:
+            dlg._on_launch()
+        assert released == [True], "the session claim must be handed back"
+        assert spawn.call_count == 1
+
+    def test_a_claim_still_standing_after_the_release_refuses_the_spawn(self, dlg):
+        """The child's own ``acquire_run_lock`` would refuse it and exit into a log."""
+        with patch.object(dlg._manager, "list_instruments", return_value=[]), \
+             patch.object(cl, "foreign_run_lock", return_value=None), \
+             patch.object(cl, "read_run_lock", return_value=_own_lock()), \
+             patch.object(QMessageBox, "critical") as crit, \
+             patch.object(cl, "spawn_detached") as spawn:
+            dlg._after_release(True, ["-m", "softae.tools.commission"])
+        assert spawn.call_count == 0
+        assert crit.call_count == 1
+
+    def test_the_release_coroutine_gives_back_the_claim_even_if_disconnect_raises(
+        self, dlg
+    ):
+        import asyncio
+
+        async def _boom():
+            raise RuntimeError("port stuck")
+
+        released: list = []
+        with patch.object(dlg._manager, "disconnect_all", side_effect=_boom), \
+             patch.object(cl, "release_rig_session",
+                          side_effect=lambda *a, **k: released.append(True)):
+            with pytest.raises(RuntimeError):
+                asyncio.run(dlg._release_rig_for_handover())
+        assert released == [True]
+
+    def test_launching_with_instruments_open_schedules_the_releasing_coroutine(
+        self, dlg
+    ):
+        """Not a bare ``disconnect_all()`` — the claim must go with the ports."""
+        dlg._combo.setCurrentText("Commissioning — open blank")
+        dlg._channels.setText("1-8")
+        coros: list = []
+        with patch.object(cl, "foreign_run_lock", return_value=None), \
+             patch.object(dlg._manager, "list_instruments",
+                          return_value=[{"name": "stage", "connected": True}]), \
+             patch.object(QMessageBox, "question",
+                          return_value=QMessageBox.StandardButton.Ok), \
+             patch.object(dlg, "_schedule",
+                          side_effect=lambda coro, done: coros.append(coro)):
+            dlg._on_launch()
+        assert len(coros) == 1
+        assert coros[0].__qualname__.endswith("_release_rig_for_handover")
+        coros[0].close()
 
     def test_a_sequence_needing_channels_refuses_an_empty_field(self, dlg):
         dlg._combo.setCurrentText("Commissioning — open blank")
@@ -120,7 +214,7 @@ class TestHandover:
     def test_instruments_are_released_before_the_child_is_spawned(self, dlg):
         dlg._combo.setCurrentText("Commissioning — open blank")
         dlg._channels.setText("1-8")
-        with patch.object(cl, "read_run_lock", return_value=None), \
+        with patch.object(cl, "foreign_run_lock", return_value=None), \
              patch.object(dlg._manager, "list_instruments",
                           return_value=[{"name": "stage", "connected": True}]), \
              patch.object(QMessageBox, "question",

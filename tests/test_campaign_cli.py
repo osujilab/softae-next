@@ -85,12 +85,24 @@ high = 1.0
         with pytest.raises(SpecLoadError, match="unknown field"):
             spec_from_dict({**MINIMAL, "budgett": 40})
 
-    @pytest.mark.parametrize(
-        "field", ["prior_mean", "formulation", "run_plan", "piezo",
-                  "general_formulation", "seed_observations"])
+    @pytest.mark.parametrize("field", ["formulation", "run_plan", "piezo"])
     def test_unrepresentable_fields_are_refused_with_a_reason(self, field):
         """Loading one partially would run a different experiment."""
         with pytest.raises(SpecLoadError, match="cannot be set from a file"):
+            spec_from_dict({**MINIMAL, field: "whatever"})
+
+    @pytest.mark.parametrize(
+        "field", ["prior_mean", "general_formulation", "seed_observations"])
+    def test_a_representable_field_given_nonsense_is_refused_not_defaulted(
+        self, field
+    ):
+        """These three load — but a value they cannot mean still raises.
+
+        The refusal is what stops the file quietly running a different
+        experiment; making the fields representable must not weaken it to a
+        shrug that takes the default.
+        """
+        with pytest.raises(SpecLoadError, match=field):
             spec_from_dict({**MINIMAL, field: "whatever"})
 
     def test_a_bad_parameter_is_caught_at_load_not_in_the_optimizer(self):
@@ -250,9 +262,14 @@ class TestTomlCompleteness:
     def test_an_untouched_spec_is_complete(self):
         assert spec_toml_completeness(spec_from_dict(MINIMAL)).complete
 
-    def test_a_composition_spec_is_not_toml_representable(self):
-        """The file would reload with no formulation *and* no vol_params, so
-        ``resolved_vol_params()`` would read its axes as raw µL volumes."""
+    def test_a_composition_spec_without_declared_axes_is_not_representable(self):
+        """A ``build_targets`` callable and no axes cannot be written.
+
+        The file would reload with no formulation *and* no vol_params, so
+        ``resolved_vol_params()`` would read its axes as raw µL volumes. Declaring
+        the axes is what makes the same campaign launchable — see
+        ``TestCompositionRoundTrip``.
+        """
         spec = spec_from_dict(MINIMAL)
         spec.general_formulation = object()
         result = spec_toml_completeness(spec)
@@ -267,27 +284,36 @@ class TestTomlCompleteness:
         setattr(spec, field, object())
         assert field in spec_toml_completeness(spec).missing
 
-    def test_seed_observations_are_reported_when_present(self):
+    def test_a_spec_with_seed_observations_is_complete(self):
         spec = spec_from_dict(MINIMAL)
         spec.seed_observations = (({"a": 0.5}, 0.7),)
-        assert "seed_observations" in spec_toml_completeness(spec).missing
+        assert spec_toml_completeness(spec).complete
 
     def test_an_explicitly_disabled_gate_is_not_silently_re_enabled(self):
-        """``rh_stability_pct = None`` switches the RH gate off; the writer drops
-        the ``None`` and the file would reload with the gate back ON."""
+        """``rh_stability_pct = None`` switches the RH gate off.
+
+        The writer used to drop the ``None`` — testing for it *before* comparing
+        against the default — so the file reloaded with the gate back ON. It is
+        written down now, and this asserts the round trip rather than a refusal.
+        """
         spec = spec_from_dict(MINIMAL)
         spec.rh_stability_pct = None
-        result = spec_toml_completeness(spec)
-        assert not result.complete
-        assert "rh_stability_pct" in result.missing
-        assert "None" in result.explain()
+        assert spec_toml_completeness(spec).complete
+        assert spec_from_dict(spec_to_dict(spec)).rh_stability_pct is None
 
-    def test_an_explicit_none_seed_is_reported_rather_than_reloading_as_42(self):
+    def test_an_explicit_none_seed_survives_rather_than_reloading_as_42(self):
         spec = spec_from_dict(MINIMAL)
         spec.seed = None
-        assert spec.seed is None
-        assert spec_from_dict(spec_to_dict(spec)).seed == 42     # the silent change
-        assert "seed" in spec_toml_completeness(spec).missing    # …now reported
+        assert spec_from_dict(spec_to_dict(spec)).seed is None
+        assert spec_toml_completeness(spec).complete
+
+    def test_a_none_that_is_the_shipped_default_is_not_written_at_all(self):
+        """Absence already says it; listing it would be noise in every file."""
+        spec = spec_from_dict(MINIMAL)
+        spec.pcb_name = None
+        written = spec_to_dict(spec)
+        assert "pcb_name" not in written
+        assert "explicit_none" not in written
 
     def test_a_default_valued_unrepresentable_field_is_not_reported(self):
         """A spec that never set one has lost nothing by not writing it."""
@@ -302,6 +328,17 @@ class TestTomlCompleteness:
         assert not result.complete
         assert any("TOML" in r for r in result.reasons)
 
+    def test_the_writers_ledger_of_explicit_nothings_is_not_read_as_a_field(self):
+        """``explicit_none`` is a directive about fields, not a field."""
+        with pytest.raises(SpecLoadError, match="unknown field"):
+            spec_from_dict({**MINIMAL, "explicit_nonee": ["seed"]})
+        with pytest.raises(SpecLoadError, match="unknown field"):
+            spec_from_dict({**MINIMAL, "explicit_none": ["sed"]})
+
+    def test_a_field_both_valued_and_nulled_is_refused_not_resolved(self):
+        with pytest.raises(SpecLoadError, match="two things about the same field"):
+            spec_from_dict({**MINIMAL, "seed": 7, "explicit_none": ["seed"]})
+
     def test_writing_and_reloading_a_complete_spec_gives_the_same_campaign(
         self, tmp_path
     ):
@@ -314,6 +351,203 @@ class TestTomlCompleteness:
         assert (reloaded.budget, reloaded.channels, reloaded.vol_params) == (
             17, (3, 4), ("a",))
         assert reloaded.time_scale == 0.0
+
+
+# ── The three fields the Live BO panel sets (S5.K) ───────────────────────────
+
+class TestPriorMeanRoundTrip:
+    """A callable cannot be written; the *name* of a built-in one can."""
+
+    def test_a_builtin_prior_mean_round_trips_by_name(self):
+        from softae.optimizers.prior_means import linear_demo
+
+        spec = spec_from_dict(MINIMAL)
+        spec.prior_mean = linear_demo
+
+        assert spec_to_dict(spec)["prior_mean"] == "linear_demo"
+        assert spec_from_dict(spec_to_dict(spec)).prior_mean is linear_demo
+        assert spec_toml_completeness(spec).complete
+
+    def test_an_unregistered_callable_is_reported_rather_than_named(self):
+        spec = spec_from_dict(MINIMAL)
+        spec.prior_mean = lambda params: 0.0
+        result = spec_toml_completeness(spec)
+        assert not result.complete
+        assert "prior_mean" in result.missing
+
+    def test_an_unknown_prior_mean_name_is_refused_with_the_known_ones(self):
+        with pytest.raises(SpecLoadError, match="unknown prior mean"):
+            spec_from_dict({**MINIMAL, "prior_mean": "quadratic"})
+
+    def test_every_offered_choice_is_a_name_a_file_can_carry(self):
+        """A picker label with no registry key behind it refuses its own launch."""
+        from softae.optimizers.prior_means import PRIOR_MEAN_CHOICES, PRIOR_MEANS
+
+        keys = [key for _, key in PRIOR_MEAN_CHOICES if key]
+        assert keys and all(key in PRIOR_MEANS for key in keys)
+
+
+class TestSeedObservationsRoundTrip:
+    def test_seed_observations_round_trip_as_params_and_value(self):
+        spec = spec_from_dict(MINIMAL)
+        spec.seed_observations = (({"a": 0.5}, 0.7), ({"a": 0.25}, -1.5))
+
+        reloaded = spec_from_dict(spec_to_dict(spec))
+
+        assert reloaded.seed_observations == (({"a": 0.5}, 0.7),
+                                              ({"a": 0.25}, -1.5))
+
+    def test_a_malformed_observation_is_refused_not_dropped(self):
+        with pytest.raises(SpecLoadError, match="needs a 'value'"):
+            spec_from_dict({**MINIMAL,
+                            "seed_observations": [{"params": {"a": 1.0}}]})
+
+
+class TestCompositionRoundTrip:
+    """The headline mode of the Live BO tab, and the point of the whole step.
+
+    A composition campaign is described by declared axes plus stock **names**;
+    the solver's callable is derived from the axes and the stocks are resolved
+    from the shared solution catalog. So the file carries the campaign, and
+    ``spec_toml_completeness`` says so — which is what lets the tab offer the
+    launch instead of refusing it.
+    """
+
+    @staticmethod
+    def _catalogs(monkeypatch):
+        """Two stocks, in a catalog that exists only for this test."""
+        import softae.core.campaign_spec_fields as fields
+        from softae.core.formulation import (
+            ChemicalCatalog,
+            Solution,
+            SolutionCatalog,
+        )
+
+        sol = SolutionCatalog()
+        sol.add(Solution(name="PEO stock"))
+        sol.add(Solution(name="LiCl stock"))
+        chem = ChemicalCatalog()
+        monkeypatch.setattr(fields, "catalogs", lambda: (chem, sol))
+        return chem, sol
+
+    @staticmethod
+    def _spec(chem, sol):
+        from softae.core.autonomous_wiring import CampaignSpec, GeneralFormulation
+        from softae.core.composition_axes import (
+            CompositionAxis,
+            axes_parameter_space,
+        )
+
+        axes = (CompositionAxis(kind="molar_ratio", a="EO", b="Li",
+                                low=5.0, high=40.0),
+                CompositionAxis(kind="dried_fraction", a="SiO2",
+                                low=0.1, high=0.1))
+        return CampaignSpec(
+            name="phase_map",
+            channels=(2, 4),
+            parameter_space=axes_parameter_space(axes),
+            general_formulation=GeneralFormulation(
+                stocks={"PEO stock": sol.get("PEO stock"),
+                        "LiCl stock": sol.get("LiCl stock")},
+                catalog=chem,
+                pump_assignment={"PEO stock": 0, "LiCl stock": 1},
+                target_deposition_uL=6.0,
+                axes=axes,
+            ),
+        )
+
+    def test_a_composition_spec_is_complete_and_can_therefore_be_launched(
+        self, monkeypatch
+    ):
+        chem, sol = self._catalogs(monkeypatch)
+        assert spec_toml_completeness(self._spec(chem, sol)).complete
+
+    def test_a_composition_spec_round_trips_with_its_axes_intact(self, monkeypatch):
+        chem, sol = self._catalogs(monkeypatch)
+        original = self._spec(chem, sol)
+
+        reloaded = spec_from_dict(spec_to_dict(original))
+        gf = reloaded.general_formulation
+
+        assert gf is not None
+        assert gf.axes == original.general_formulation.axes
+        assert sorted(gf.stocks) == ["LiCl stock", "PEO stock"]
+        assert gf.pump_assignment == {"PEO stock": 0, "LiCl stock": 1}
+        assert gf.target_deposition_uL == 6.0
+
+    def test_the_reloaded_targets_are_the_axes_not_raw_volumes(self, monkeypatch):
+        """The defect the refusal existed to prevent, asserted from the far side."""
+        from softae.core.formulation import DriedFractionTarget, MolarRatioTarget
+
+        chem, sol = self._catalogs(monkeypatch)
+        reloaded = spec_from_dict(spec_to_dict(self._spec(chem, sol)))
+
+        targets = reloaded.general_formulation.build_targets({"ratio_EO_Li": 22.0})
+
+        assert isinstance(targets[0], MolarRatioTarget)
+        assert targets[0].value == 22.0
+        assert isinstance(targets[1], DriedFractionTarget)
+        assert targets[1].value == 0.1        # the pinned axis, still pinned
+        assert reloaded.vol_params == ()      # never mistaken for µL params
+
+    def test_a_stock_the_catalog_does_not_know_is_refused_with_the_name(
+        self, monkeypatch
+    ):
+        """Resolving is what makes the names meaningful; an unresolvable one is
+        a campaign whose composition cannot be solved, so it must not load."""
+        self._catalogs(monkeypatch)
+        with pytest.raises(SpecLoadError, match="not in the solution catalog"):
+            spec_from_dict({**MINIMAL, "general_formulation": {
+                "stocks": ["Unobtainium"],
+                "pump_assignment": {"Unobtainium": 0},
+                "target_deposition_uL": 6.0,
+                "axes": [{"kind": "concentration", "a": "X", "b": "",
+                          "low": 0.1, "high": 0.9, "basis": "volume"}],
+            }})
+
+    def test_an_axis_missing_a_key_is_refused_rather_than_defaulted(
+        self, monkeypatch
+    ):
+        """An omitted ``basis`` or ``low`` would search a different composition."""
+        self._catalogs(monkeypatch)
+        with pytest.raises(SpecLoadError, match="missing"):
+            spec_from_dict({**MINIMAL, "general_formulation": {
+                "stocks": ["PEO stock"],
+                "pump_assignment": {"PEO stock": 0},
+                "target_deposition_uL": 6.0,
+                "axes": [{"kind": "concentration", "a": "X", "low": 0.1}],
+            }})
+
+    def test_a_context_with_no_axes_and_no_targets_cannot_be_built(self):
+        from softae.core.autonomous_wiring import GeneralFormulation
+
+        with pytest.raises(ValueError, match="axes"):
+            GeneralFormulation(stocks={}, catalog=None, pump_assignment={},
+                               target_deposition_uL=6.0)
+
+    def test_axes_plus_a_supplied_callable_is_not_written_as_if_they_agreed(
+        self, monkeypatch
+    ):
+        """Nothing can compare two callables, so "both" is unwritable.
+
+        Writing the axes would produce a file whose targets are whatever the axes
+        say — which is only the same campaign if the supplied callable happened to
+        compute that. Assuming it did is the silent difference this whole module
+        exists to refuse.
+        """
+        from softae.core.composition_axes import CompositionAxis
+
+        chem, sol = self._catalogs(monkeypatch)
+        spec = self._spec(chem, sol)
+        spec.general_formulation.build_targets = lambda params: []
+        spec.general_formulation.axes_define_targets = False
+        spec.general_formulation.axes = (
+            CompositionAxis(kind="concentration", a="X", low=0.1, high=0.9),)
+
+        result = spec_toml_completeness(spec)
+
+        assert not result.complete
+        assert "general_formulation" in result.missing
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
