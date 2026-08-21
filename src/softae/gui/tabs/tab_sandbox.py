@@ -58,8 +58,10 @@ from PySide6.QtWidgets import (
 )
 
 from softae.config import loader
+from softae.core.rig_activity import workflow_instruments
 from softae.core.task_catalog import Task, TaskCatalog
 from softae.gui.daemon_runner import DaemonRunnerMixin
+from softae.gui.rig_claim import rig_run
 from softae.gui.widgets import task_catalog_io as tio
 from softae.workflows import workflow_parser
 from softae.workflows.workflow_executor import WorkflowExecutor
@@ -1027,7 +1029,17 @@ class SandboxTab(DaemonRunnerMixin, QWidget):
         except Exception:
             logger.warning("sandbox_reset_locks_failed", exc_info=True)
         try:
-            asyncio.run(self._executor.run(wf))
+            # Claim the rig for the run so the background purge timer defers
+            # instead of travelling the stage to the flush basin mid-workflow.
+            # Scoped to what the workflow's steps name; an empty or unreadable
+            # union widens to the whole rig. Idle rest is deliberately left
+            # alone — a sandbox workflow is the operator's own composition and
+            # ends where they put it, and step B claims without moving anything
+            # that did not move before.
+            with rig_run(self, f"sandbox:{getattr(wf, 'name', 'workflow')}",
+                         instruments=workflow_instruments(wf),
+                         manage_rest=False):
+                asyncio.run(self._executor.run(wf))
             self._run_error = ""
             self._sig_done.emit(0)
         except Exception as exc:

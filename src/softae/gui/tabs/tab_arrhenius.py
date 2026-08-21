@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 
 from softae.core.channel_spec import parse_channel_spec
 from softae.gui.daemon_runner import DaemonRunnerMixin
+from softae.gui.rig_claim import rig_run
 
 if TYPE_CHECKING:
     from softae.core.data_store import DataStore
@@ -917,7 +918,24 @@ class ArrheniusTab(DaemonRunnerMixin, QWidget):
         except Exception:
             pass
         try:
-            results = loop.run_until_complete(sweep.run())
+            # Claim the rig for the sweep. **Whole-rig, and not the three
+            # instruments the sweep commands.** There is no ``Workflow`` object
+            # spanning a sweep to derive a scope from — ``ArrheniusSweep`` builds
+            # a fresh one per phase as it goes — so the alternative is the guess
+            # ``{temp, rh, eis}``, which excludes the syringe and the stage and
+            # would therefore leave the anti-clog purge free to travel the stage
+            # to the flush basin and dispense while a board sits at setpoint
+            # mid-dwell. Commanded is not the same as occupied; widening on
+            # doubt is the direction ``RigActivity.conflicts`` asks for.
+            #
+            # ``manage_rest=False``: the sweep drives no fluidics, so the tip is
+            # better left resting in flush for the hours it lasts than retracted
+            # into air, and travelling the stage home afterwards would be motion
+            # this run never asked for.
+            with rig_run(self,
+                         f"arrhenius:{getattr(sweep, 'run_id', None) or 'sweep'}",
+                         instruments=None, manage_rest=False):
+                results = loop.run_until_complete(sweep.run())
             n_ok = sum(1 for r in results if r.fit_success)
             # Model-aware per-channel summary in the log.
             for r in results:

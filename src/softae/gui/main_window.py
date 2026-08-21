@@ -942,7 +942,8 @@ class MainWindow(QMainWindow):
         return leave_idle_rest(self._manager, state=self._idle_rest)
 
     @contextmanager
-    def rig_run(self, owner: str, *, rest_after: bool = True):
+    def rig_run(self, owner: str, *, instruments=None,
+                rest_after: bool = True, manage_rest: bool = True):
         """Own the hardware for the duration of a run, then return it to rest.
 
         **This is the convention every run path should use.** It replaces the
@@ -955,14 +956,27 @@ class MainWindow(QMainWindow):
         path including abort and error: a rig left dry overnight clogs exactly as
         badly as one left stagnant. A parked rig refuses to rest, which is
         correct — a park should stay visible.
+
+        ``instruments`` scopes the claim to what the run will actually drive;
+        ``None`` — the default, and what a failed scope derivation returns —
+        claims the whole rig and conflicts with everything.
+
+        ``manage_rest=False`` claims **without touching the fluidics**, for a run
+        that drives none. An Arrhenius sweep commands the heater, the humidity
+        controller and the potentiostat and never the syringe or the stage: it
+        wants the claim (so the purge defers rather than travelling the stage out
+        from under a board at setpoint) and none of the motion, since the tip is
+        better left resting in flush for the hours the sweep lasts than retracted
+        into air.
         """
-        self._rig_activity.acquire(owner)
-        self.leave_idle_rest()
+        self._rig_activity.acquire(owner, instruments)
+        if manage_rest:
+            self.leave_idle_rest()
         try:
             yield
         finally:
             try:
-                if rest_after:
+                if manage_rest and rest_after:
                     self.enter_idle_rest()
             finally:
                 # Released last, and unconditionally: a leaked claim would

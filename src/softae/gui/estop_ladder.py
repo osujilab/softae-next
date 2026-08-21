@@ -62,6 +62,34 @@ as plausibility evidence and requires the operator to type the number.
 And rung 4 **acquires before it parks**: ``break_run_lock`` → terminate → claim →
 ``connect_all`` → ``safe_park``. A park issued before the connect would command
 nothing and report ``ok`` for it.
+
+Rung 4 is offered against a **campaign**, and against nothing else
+-------------------------------------------------------------------
+The kill has exactly two justifications and both are about campaigns:
+
+* a headless campaign may be wedged and unable to park *itself*, so something
+  outside it has to; and
+* the operator is asked to judge wedged-from-working, and a campaign's
+  ``events.jsonl`` is the evidence they judge from.
+
+Neither holds for a window. A ``gui:desktop`` holder **does** park on close
+(``closeEvent`` → ``_safe_park_on_exit``), so killing it is strictly worse than
+closing it — a terminated window runs no ``closeEvent`` and leaves the heater at
+its setpoint, the lamp on and the head wherever it was. And a window publishes
+no event stream, so the judgement the offer delegates to the operator has
+nothing to stand on. Neither holds for a bench workflow or a ``tool:`` claim
+either, for the second reason.
+
+So kill-eligibility is decided by the lock's ``what`` **kind**
+(:func:`holder_kind`, on the ``<kind>:<name>:<run_id>`` grammar
+``core.rig_session`` documents) and not by the absence of a run directory, which
+is what it used to be decided by. Only ``campaign`` is eligible; every other
+kind — ``gui``, ``tool``, the executor's kind-less ``workflow '<name>'``, an
+unreadable lock, and any kind not invented yet — reaches no rung and is told
+where the stop actually lives. **An unknown kind must not be killable**: the one
+thing known about a future holder is that this module has never been taught how
+it parks, and the direction that cannot cause an un-parked rig is the direction
+that does not kill.
 """
 
 from __future__ import annotations
@@ -152,22 +180,51 @@ STATE_NOTES: dict[str, str] = {
     STATE_TAKEN_OVER: "The rig was taken from the campaign and parked from here.",
 }
 
-#: Shown instead of :data:`STATE_NOTES`' idle line when something holds the rig
-#: but publishes no control channel — a bench sequence, an HT workflow. Rungs 1–3
-#: do not exist for it, so the ladder opens at its last rung rather than
-#: pretending to have asked.
+#: Shown instead of :data:`STATE_NOTES`' idle line when a **campaign** holds the
+#: rig but published no run directory. There is nowhere to write an abort and no
+#: stream to follow, so the ladder opens at its last rung rather than pretending
+#: to have asked. It is still a campaign, so the rung exists.
 NOTE_NO_CHANNEL = (
-    "Whatever holds the rig is not a campaign, so it reads no control file and "
-    "there is nothing to request: rungs 1-3 do not exist here. The only act left "
-    "is taking the rig, which is manual and confirmed — it is not something this "
-    "window will do on its own."
+    "The campaign that holds the rig published no run directory, so it reads no "
+    "control file and there is nothing to request: rungs 1-3 do not exist here. "
+    "The only act left is taking the rig, which is manual and confirmed — it is "
+    "not something this window will do on its own."
 )
 
-#: …and when that holder is also on another machine, there is no act left at all.
+#: …and when that campaign is also on another machine, there is no act left.
 NOTE_NOTHING_REACHABLE = (
-    "The rig is held by a non-campaign process on another machine. This window "
-    "can neither ask it to stop nor reach its instruments. Stop it at that "
-    "machine."
+    "The campaign that holds the rig is on another machine and published no run "
+    "directory. This window can neither ask it to stop nor reach its "
+    "instruments. Stop it at that machine."
+)
+
+#: A ``gui:`` holder. **Not** a refusal note — a routing note: it names the act
+#: that works. The stop this window cannot perform is one the *other* window
+#: performs perfectly, and closing that window parks the rig on the way out,
+#: which is the whole reason terminating it would be worse than useless.
+NOTE_HOLDER_IS_A_WINDOW = (
+    "ANOTHER SOFTAE WINDOW holds the rig — not a campaign. That window opened "
+    "the instrument sessions, so its own E-Stop is the one that can park them; "
+    "this window holds none and will not terminate it.\n\n"
+    "Closing that window parks the rig on its way out. Terminating it does NOT: "
+    "no closeEvent runs, so the heater stays at its setpoint, the lamp stays on "
+    "and the dispenser head stays where it is.\n\n"
+    "Go to that window and press its E-Stop, or close it. If it has stopped "
+    "responding, park the rig by hand at the instruments."
+)
+
+#: Any other non-campaign holder — an HT workflow, a ``tool:`` claim, a lock this
+#: window could not read, a kind that does not exist yet. It publishes no event
+#: stream, so the wedged-versus-working judgement rung 4 asks of the operator has
+#: no evidence behind it, and this window does not know how that process parks.
+NOTE_HOLDER_IS_NOT_A_CAMPAIGN = (
+    "The rig is held by something that is not a campaign. It publishes no event "
+    "stream and reads no control file, so there is nothing to ask it and nothing "
+    "to judge it by — and this window does not know whether it parks the rig "
+    "when it stops.\n\n"
+    "So no rung is offered here: terminating a process instead of stopping it "
+    "leaves the rig un-parked. Stop it where it runs, or park the rig by hand at "
+    "the instruments."
 )
 
 #: The states a timeout can put the ladder into. Nothing leaves one of these
@@ -179,13 +236,57 @@ TERMINAL_STATES = (
     STATE_PARKED, STATE_ACKED_ONLY, STATE_EXHAUSTED, STATE_TAKEN_OVER)
 
 
-def reachable_rungs(*, run_dir: str | None, cross_host: bool) -> tuple[int, ...]:
-    """Which rungs a press can ever enter, from the two facts that decide it.
+#: The one ``what`` kind rung 4 may be offered against. See the module docstring
+#: — a campaign is the only holder that both may be unable to park itself and
+#: publishes the evidence the operator is asked to judge it by.
+KIND_CAMPAIGN = "campaign"
+
+#: A desktop window's claim (``core.rig_session.DESKTOP_SESSION`` = ``gui:desktop``).
+#: Never killable: it parks on close, and it publishes nothing to judge.
+KIND_GUI = "gui"
+
+#: How a holder is named in a header when it is not a campaign with an identity.
+HOLDER_NOUNS = {KIND_CAMPAIGN: "The campaign", KIND_GUI: "Another softae window"}
+
+
+def holder_kind(lock: Any) -> str:
+    """The ``<kind>`` of a rig lock's ``what``. ``""`` when it has none.
+
+    The grammar is ``<kind>:<name>:<run_id>``, documented by
+    :mod:`softae.core.rig_session`; ``campaign:<name>:<run_id>`` and
+    ``gui:desktop`` are the shipped instances, with ``tool:eis-validate:<id>``
+    and ``tool:env-hold:<id>`` alongside them. The executor's
+    ``workflow '<name>'`` predates the grammar and carries no colon, so it has no
+    kind — and ``""`` is the right answer for it: *unknown*, which is what a
+    missing lock (``None``) also returns, and what a kind invented after this
+    module was written will return too.
+
+    All three of those resolve the same way at :func:`reachable_rungs`: not
+    ``campaign``, therefore not killable.
+    """
+    what = str(getattr(lock, "what", "") or "")
+    kind, separator, _ = what.partition(":")
+    return kind.strip().lower() if separator else ""
+
+
+def holder_noun(kind: str) -> str:
+    """How to name a holder that has no campaign identity of its own."""
+    return HOLDER_NOUNS.get(kind, "The process")
+
+
+def reachable_rungs(
+    *, run_dir: str | None, cross_host: bool, kind: str
+) -> tuple[int, ...]:
+    """Which rungs a press can ever enter, from the three facts that decide it.
 
     A module function rather than only a property, because the **button** must
     answer this before it is pressed and the **ladder** must answer it while it
     is climbing. Two copies of the rule is how a red button comes to promise a
     rung the machinery behind it cannot take.
+
+    *kind* is required rather than defaulted, and deliberately: a default in
+    either direction is a rule a caller can forget, and forgetting it one way
+    offers a kill against a holder nobody classified.
 
     ================================  ==============  ===========================
     Holder                            Rungs           Why
@@ -196,18 +297,44 @@ def reachable_rungs(*, run_dir: str | None, cross_host: bool) -> tuple[int, ...]
                                                       here to check or stop, and
                                                       the sessions are on a
                                                       machine we cannot reach
-    not a campaign, this host         ``(4,)``        it reads no control file,
-                                                      so there is nothing to ask
-                                                      — taking the rig is the
-                                                      only act left, and it is
-                                                      manual and confirmed
-    not a campaign, another host      ``()``          neither reachable
+    a campaign, no run directory      ``(4,)``        nothing to ask, but it is
+                                                      still a campaign: it may be
+                                                      unable to park itself, and
+                                                      nothing else can reach it
+    anything not a campaign           ``()``          a window parks on close and
+                                                      publishes nothing to judge;
+                                                      a workflow, a tool or an
+                                                      unknown kind publishes
+                                                      nothing to judge either.
+                                                      The kill's two
+                                                      justifications both fail,
+                                                      so it is not offered
     ================================  ==============  ===========================
     """
+    if kind != KIND_CAMPAIGN:
+        return ()
     requestable = run_dir is not None
     if cross_host:
         return (1, 2) if requestable else ()
     return (1, 2, 3, 4) if requestable else (4,)
+
+
+def session_report(result: Any) -> dict[str, bool] | None:
+    """``connect_all``'s ``{name: opened}``, or ``None`` when none was reported.
+
+    :meth:`softae.server.manager.InstrumentManager.connect_all` **never raises**
+    — it catches each instrument's failure and returns ``{name: success}``. So
+    "the coroutine returned" is not the question a takeover has to answer and
+    never was; "did any port open" is, and only the dict answers it.
+
+    ``None`` means *not reported*, which is distinct from "nothing opened": an
+    injected connector may legitimately return nothing at all, and a report that
+    guessed in either direction from that silence would be the same defect this
+    function exists to remove.
+    """
+    if isinstance(result, dict):
+        return {str(name): bool(opened) for name, opened in result.items()}
+    return None
 
 
 def terminate_pid(pid: int) -> bool:
@@ -276,7 +403,14 @@ class TakeoverResult:
     refused: str = ""
     broke_lock: bool = False
     terminated: bool = False
+    #: Whether **at least one instrument session is known to have opened**. Not
+    #: "the connect returned": ``connect_all`` always returns, so that would be
+    #: ``True`` on a rig where every port was still held by the process rung 4
+    #: had just terminated. Derived from :data:`sessions`.
     connected: bool = False
+    #: What ``connect_all`` reported, per instrument. ``None`` when it reported
+    #: nothing — see :func:`session_report`.
+    sessions: dict[str, bool] | None = None
     claimed: bool = False
     park: SafeParkResult | None = None
     #: Every step attempted, in order. The ordering property rung 4 depends on —
@@ -309,12 +443,31 @@ class TakeoverResult:
             f"rig lock broken: {'yes' if self.broke_lock else 'no'}",
             f"campaign process terminated: {'yes' if self.terminated else 'no'}",
             f"rig claimed by this window: {'yes' if self.claimed else 'no'}",
-            f"instrument sessions opened: {'yes' if self.connected else 'NO'}",
+            f"instrument sessions opened: {self.sessions_line()}",
         ]
         if self.park is not None:
             lines.append("")
             lines.append(self.park.describe())
         return "\n".join(lines)
+
+    def sessions_line(self) -> str:
+        """The connect's outcome as a **count**, because a yes/no was not evidence.
+
+        This line used to read ``yes`` whenever the coroutine returned, which on
+        the real rig it always does — so it read ``yes`` after a takeover that
+        opened nothing. Counting the dict makes the interesting case visible too:
+        a partial connect, where some ports came back after the kill and some did
+        not, is a park that reaches only half the rig.
+        """
+        if self.sessions is None:
+            return ("NOT REPORTED — the connect returned no per-instrument "
+                    "result; read the park below, not this line")
+        opened = sorted(name for name, ok in self.sessions.items() if ok)
+        failed = sorted(name for name, ok in self.sessions.items() if not ok)
+        if not opened:
+            return f"NONE — 0 of {len(self.sessions)} opened"
+        line = f"{len(opened)} of {len(self.sessions)}"
+        return f"{line} — FAILED: {', '.join(failed)}" if failed else line
 
 
 class EstopLadder:
@@ -328,11 +481,12 @@ class EstopLadder:
     ----------
     run_dir
         The campaign's run directory, from the rig lock's ``log_path``. ``None``
-        when something holds the rig but publishes no control channel: rungs 1–3
-        are then unreachable and :attr:`reachable_rungs` says so.
+        when the holder publishes no control channel: rungs 1–3 are then
+        unreachable and :attr:`reachable_rungs` says so.
     lock
         The :class:`~softae.core.run_lock.RunLock` behind the attach decision.
-        Rung 4's PID comes from here and from nowhere else.
+        Rung 4's PID comes from here and from nowhere else — and so does
+        :attr:`holder_kind`, which decides whether rung 4 exists at all.
     cross_host
         Whether the holder is on another machine. Forced by the caller from
         ``lock.host`` versus ``socket.gethostname()`` — the same comparison
@@ -367,6 +521,10 @@ class EstopLadder:
     ) -> None:
         self.run_dir = str(run_dir) if run_dir else None
         self.lock = lock
+        # Read once, from the lock, so this ladder and the button that opened it
+        # classify the holder by one rule and cannot disagree about whether the
+        # thing on the rig is killable.
+        self.holder_kind = holder_kind(lock)
         self.cross_host = bool(cross_host)
         self.campaign = campaign
         self._manager = manager
@@ -399,7 +557,8 @@ class EstopLadder:
         The rule is :func:`reachable_rungs`, shared with the button so the label
         the operator read and the ladder they are now watching cannot disagree.
         """
-        return reachable_rungs(run_dir=self.run_dir, cross_host=self.cross_host)
+        return reachable_rungs(run_dir=self.run_dir, cross_host=self.cross_host,
+                               kind=self.holder_kind)
 
     @property
     def state(self) -> str:
@@ -408,9 +567,21 @@ class EstopLadder:
     @property
     def note(self) -> str:
         """The operator-facing sentence for the current state."""
-        if self._state == STATE_IDLE and self.run_dir is None:
-            return NOTE_NO_CHANNEL if self.reachable_rungs else NOTE_NOTHING_REACHABLE
-        return STATE_NOTES.get(self._state, self._state)
+        if self._state != STATE_IDLE:
+            return STATE_NOTES.get(self._state, self._state)
+        if not self.reachable_rungs:
+            return self._nothing_to_offer_note()
+        if self.run_dir is None:
+            return NOTE_NO_CHANNEL
+        return STATE_NOTES[STATE_IDLE]
+
+    def _nothing_to_offer_note(self) -> str:
+        """Why no rung is on offer — and, for a window, where the stop *is*."""
+        if self.holder_kind == KIND_GUI:
+            return NOTE_HOLDER_IS_A_WINDOW
+        if self.holder_kind != KIND_CAMPAIGN:
+            return NOTE_HOLDER_IS_NOT_A_CAMPAIGN
+        return NOTE_NOTHING_REACHABLE
 
     @property
     def request(self) -> Any:
@@ -478,9 +649,14 @@ class EstopLadder:
     def may_take_over(self) -> bool:
         """Whether the operator may perform rung 4 from here.
 
-        ``True`` in exactly two places: after rung 3's budget expired, and from
-        the outset when there is no control channel at all (nothing to request,
-        so nothing to escalate *through*). Never as a consequence of a poll.
+        ``True`` in exactly two places, and **only against a campaign**: after
+        rung 3's budget expired, and from the outset when a campaign holds the
+        rig with no run directory (nothing to request, so nothing to escalate
+        *through*). Never as a consequence of a poll.
+
+        The kind gate is the first line, through :attr:`reachable_rungs`, and it
+        is the single choke point: a window, a workflow, a tool or an unknown
+        holder can reach this by no path, driven past both budgets or not.
         """
         if 4 not in self.reachable_rungs:
             return False
@@ -633,8 +809,7 @@ class EstopLadder:
         bookkeeping must never be what stops a stop.
         """
         if not self.may_take_over:
-            return TakeoverResult(
-                refused="the ladder is not offering it — nothing was touched.")
+            return TakeoverResult(refused=self._why_not_offered())
         if not confirmed:
             return TakeoverResult(refused="the operator did not confirm it.")
 
@@ -652,16 +827,18 @@ class EstopLadder:
             self._terminator, steps, "terminate", pid) if pid else False)
         claimed = self._call(self._claimer, steps, "claim", self._manager) is not None
 
-        connected = False
+        sessions: dict[str, bool] | None = None
         try:
             steps.append("connect")
-            await self._connect()
-            connected = True
+            sessions = session_report(await self._connect())
         except Exception:
             # Not fatal: some ports may have opened, and a park across a
             # partially connected rig is worth strictly more than no park.
             # `SafeParkResult` reports exactly how far it got.
-            logger.warning("estop_takeover_connect_failed", exc_info=True)
+            logger.warning("estop_takeover_connect_failed", exc_info=True,
+                           msg="the connect raised — no port is known to be open")
+        connected = bool(sessions) and any(sessions.values())
+        self._log_connect(sessions, connected)
 
         steps.append("park")
         park = await self._parker(
@@ -670,15 +847,62 @@ class EstopLadder:
         self._enter(STATE_TAKEN_OVER)
         return TakeoverResult(
             broke_lock=broke, terminated=terminated, connected=connected,
-            claimed=claimed, park=park, steps=tuple(steps))
+            sessions=sessions, claimed=claimed, park=park, steps=tuple(steps))
 
-    async def _connect(self) -> None:
+    @staticmethod
+    def _log_connect(sessions: dict[str, bool] | None, connected: bool) -> None:
+        """Say what the connect actually did, on the shape production produces.
+
+        The all-``False`` dict is the rung-4 failure the bench procedure exists
+        to hunt: Windows need not release a COM/HID handle the instant
+        ``TerminateProcess`` returns, so "killed the campaign, connected nothing,
+        parked nothing" is a real outcome — and until now it logged nothing at
+        all, because the only failure path was an exception the production
+        manager cannot raise.
+        """
+        if sessions is None:
+            return
+        if not connected:
+            logger.warning(
+                "estop_takeover_connect_failed", sessions=sessions,
+                msg="connect_all opened no port — the park that follows will "
+                    "command nothing")
+        elif not all(sessions.values()):
+            logger.warning(
+                "estop_takeover_connect_partial", sessions=sessions,
+                msg="some ports opened and some did not — the park reaches only "
+                    "what opened")
+
+    async def _connect(self) -> Any:
+        """Open this process's sessions, and **return what the connect said**."""
         if self._connector is not None:
             result = self._connector()
         else:
             result = self._manager.connect_all()
         if hasattr(result, "__await__"):
-            await result
+            result = await result
+        return result
+
+    def _why_not_offered(self) -> str:
+        """The refusal, and for a non-campaign holder *where the stop lives*.
+
+        A gate that declines by saying only "not offered" tells the operator
+        nothing they can act on — and this gate declines most often in the one
+        situation where there is a correct act available in the next window.
+        """
+        if self.holder_kind == KIND_GUI:
+            return (
+                "the rig is held by another softae window, not by a campaign. "
+                "That window parks the rig when it is closed, and terminating it "
+                "would skip the park — go to it and press its E-Stop, or close "
+                "it. Nothing was touched.")
+        if self.holder_kind != KIND_CAMPAIGN:
+            return (
+                "the rig is held by something that is not a campaign, so there "
+                "is no event stream to judge it by and no knowing whether it "
+                "parks when it stops. Stop it where it runs. Nothing was "
+                "touched.")
+        return "the ladder is not offering it — nothing was touched."
 
     def _call(self, fn: Any, steps: list[str], name: str, *args: Any) -> Any:
         """Run one best-effort takeover step, recording that it was attempted.

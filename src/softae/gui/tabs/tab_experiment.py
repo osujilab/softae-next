@@ -61,8 +61,10 @@ from softae.config.loader import (
 )
 from softae.analysis.eis_data import EISResult
 from softae.core.liquid_handling import DeadVolumeCorrection, LiquidHandlingCorrector
+from softae.core.rig_activity import workflow_instruments
 from softae.core.task_catalog import TaskCatalog
 from softae.gui.daemon_runner import DaemonRunnerMixin
+from softae.gui.rig_claim import rig_run
 from softae.gui.widgets.copyable_table import PasteableTableWidget
 from softae.workflows.experiment_logger import ExperimentLogger
 from softae.workflows.workflow_executor import (
@@ -1762,7 +1764,8 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
             # the resting convention is head DOWN in the flush basin, so without
             # this the tip sits in air between runs — the exact failure the
             # anti-clog work exists to prevent.
-            with self._rig_run(f"ht:{getattr(wf, 'name', 'workflow')}"):
+            with rig_run(self, f"ht:{getattr(wf, 'name', 'workflow')}",
+                         instruments=workflow_instruments(wf)):
                 loop.run_until_complete(self._executor.run(wf))
             self._sig_workflow_done.emit(0)
         except Exception as exc:
@@ -1772,17 +1775,6 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
             if self._exp_logger is not None:
                 self._exp_logger.close()
             loop.close()
-
-    def _rig_run(self, owner: str):
-        """The window's run wrapper — ownership + return-to-idle-rest.
-
-        No-op when the host window does not provide it, so the tab stays usable
-        outside the GUI shell and in tests.
-        """
-        from contextlib import nullcontext
-
-        factory = getattr(self.window(), "rig_run", None)
-        return factory(owner) if callable(factory) else nullcontext()
 
     # ── Executor callbacks (run on background thread) ────────────────────
 

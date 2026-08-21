@@ -33,6 +33,14 @@ launch location is worse than one that admits its limit, and the limit is real:
 :attr:`~softae.core.run_lock.RunLock.is_alive` reports a lock from another host
 as always alive by design, so against a cross-host campaign there is no process
 id here to check and none to stop.
+
+And what holds the rig decides it too. Rung 4 terminates a process, and it is
+offered against a **campaign** and nothing else
+(:func:`~softae.gui.estop_ladder.reachable_rungs`): a ``gui:`` holder is another
+softae window, which parks the rig when it is closed and publishes no event
+stream to judge it by, so terminating it is both unnecessary and unjudgeable.
+That case gets :data:`LABEL_OTHER_WINDOW` and a tooltip that names the act which
+works — the other window's own E-Stop — rather than a refusal.
 """
 
 from __future__ import annotations
@@ -44,7 +52,12 @@ import structlog
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import QPushButton, QMessageBox
 
-from softae.gui.estop_ladder import reachable_rungs
+from softae.gui.estop_ladder import (
+    KIND_CAMPAIGN,
+    KIND_GUI,
+    holder_kind,
+    reachable_rungs,
+)
 from softae.gui.launch_mode import OWNER_MODE, LaunchMode
 
 if TYPE_CHECKING:
@@ -62,15 +75,41 @@ LABEL_STOP = "⛔  EMERGENCY STOP"
 #: cannot verify a park, cannot check a PID and cannot open an instrument.
 LABEL_REQUEST_ONLY = "⛔  E-STOP — REQUEST ONLY"
 
-#: Something on another machine holds the rig and it is not a campaign: no
-#: control channel to write to, and no reachable process. Nothing this button
-#: presses changes anything, and it says so rather than looking armed.
+#: The holder is not a campaign — a bench workflow, a ``tool:`` claim, an
+#: unreadable lock, a kind that does not exist yet — or it is a campaign on
+#: another machine with no run directory. No control channel to write to, and no
+#: process this window may stop. Nothing this button presses changes anything,
+#: and it says so rather than looking armed.
 LABEL_UNREACHABLE = "⛔  E-STOP — UNAVAILABLE"
+
+#: A ``gui:`` holder — another softae window on this machine. **Routing, not
+#: refusal.** "UNAVAILABLE" would be true and useless: the stop this button
+#: cannot perform is one the other window performs perfectly, and its own E-Stop
+#: is two clicks away. The label names that act, because the failure mode here is
+#: not an operator who presses in vain — it is an operator who goes looking for a
+#: bigger hammer while the rig is running.
+LABEL_OTHER_WINDOW = "⛔  E-STOP — USE THE OTHER WINDOW"
 
 TOOLTIP_OWNER = (
     "Commands every instrument this window opened to a safe state: pumps "
     "halted, heater to its safe setpoint, lamp off. The dispenser head is not "
     "moved — you are asked about it afterwards."
+)
+
+#: The ``gui:`` holder's tooltip. Every sentence is an instruction or the reason
+#: for one; none of it is an apology. The middle paragraph is the load-bearing
+#: fact — a closed window parks, a killed window does not — because it is the
+#: reason "take the rig" is not merely unavailable here but *wrong*.
+TOOLTIP_GUI_HOLDER = (
+    "The rig is held by ANOTHER SOFTAE WINDOW on this machine, not by a "
+    "campaign. That window opened the instrument sessions, so its own E-Stop is "
+    "the one that can park them. This one holds none, and it will not terminate "
+    "that window.\n\n"
+    "A window closed normally parks the rig on its way out. A window that is "
+    "killed does not: the heater stays at its setpoint, the lamp stays on, and "
+    "the dispenser head stays exactly where it is.\n\n"
+    "Go to that window: press its E-Stop, or close it. If it has stopped "
+    "responding, park the rig by hand at the instruments."
 )
 
 
@@ -91,10 +130,12 @@ def _cross_host(holder: Any) -> bool:
     return bool(host and host != socket.gethostname())
 
 
-def _label_for(mode: LaunchMode, rungs: tuple[int, ...]) -> str:
+def _label_for(mode: LaunchMode, rungs: tuple[int, ...], kind: str) -> str:
     """The button's text. Decided once, from the mode, before any press."""
     if not mode.attached:
         return LABEL_STOP
+    if kind == KIND_GUI:
+        return LABEL_OTHER_WINDOW
     if not rungs:
         return LABEL_UNREACHABLE
     if 4 in rungs:
@@ -117,20 +158,38 @@ def attached_tooltip(
     *,
     cross_host: bool,
     rungs: tuple[int, ...],
+    kind: str,
 ) -> str:
     """What this press can reach, named before it happens.
 
     Every branch names the holder and then states the *limit*, in that order. The
-    cross-host sentence is the one that matters: it is the difference between a
-    button that stops a rig and a button that sends a message, and an operator
-    must not learn which they have by pressing it.
+    cross-host sentence is the one that matters for a campaign: it is the
+    difference between a button that stops a rig and a button that sends a
+    message, and an operator must not learn which they have by pressing it.
+
+    The two non-campaign branches say something stronger than "cannot": they name
+    the act that *does* stop the rig. A limit with no route out of it is what
+    sends an operator looking for a way to kill the holder.
     """
     who = _campaign_name(campaign)
+    if kind == KIND_GUI:
+        return TOOLTIP_GUI_HOLDER
+    if kind != KIND_CAMPAIGN:
+        where = " on another machine" if cross_host else ""
+        return (
+            f"The rig is held by a process{where} that is not a campaign: it "
+            "publishes no event stream and reads no control file, so there is "
+            "nothing to request and nothing to judge it by — and this window "
+            "does not know whether it parks the rig when it stops.\n\n"
+            "So this button offers nothing here. Terminating a process instead "
+            "of stopping it leaves the rig un-parked. Stop it where it runs, or "
+            "park the rig by hand at the instruments."
+        )
     if not rungs:
         return (
-            f"The rig is held by {who} on another machine, and it is not a "
-            "campaign — it reads no control file. This window can neither ask it "
-            "to stop nor reach its instruments. Stop it at that machine."
+            f"The rig is held by {who} on another machine, and it published no "
+            "run directory. This window can neither ask it to stop nor reach its "
+            "instruments. Stop it at that machine."
         )
     if cross_host:
         return (
@@ -143,11 +202,12 @@ def attached_tooltip(
         )
     if rungs == (4,):
         return (
-            f"The rig is held by {who}, which is not a campaign: it publishes no "
-            "event stream and reads no control file, so there is nothing to "
-            "request.\n\nThe only act left is taking the rig — breaking the lock, "
-            "stopping that one process id and parking from here. It is manual, it "
-            "is confirmed, and this window will never do it on its own."
+            "The rig is held by a CAMPAIGN that published no run directory, so "
+            "there is no event stream to follow and no control file to write: "
+            "there is nothing to request.\n\nThe only act left is taking the rig "
+            "— breaking the lock, stopping that one process id and parking from "
+            "here. It is manual, it is confirmed, and this window will never do "
+            "it on its own."
         )
     return (
         f"Asks {who} to abort, then follows what it does.\n\n"
@@ -230,20 +290,27 @@ class EmergencyStopButton(QPushButton):
         dialog_factory: Callable[..., Any] | None = None,
     ):
         mode = launch_mode if launch_mode is not None else OWNER_MODE
+        # From the lock, by the same function the ladder uses — so the label the
+        # operator reads and the ladder behind it cannot disagree about whether
+        # the holder is a campaign, which is what decides whether rung 4 exists.
+        kind = holder_kind(mode.holder) if mode.attached else ""
         rungs = (
-            reachable_rungs(run_dir=mode.run_dir, cross_host=_cross_host(mode.holder))
+            reachable_rungs(run_dir=mode.run_dir,
+                            cross_host=_cross_host(mode.holder), kind=kind)
             if mode.attached else ()
         )
-        super().__init__(_label_for(mode, rungs), parent)
+        super().__init__(_label_for(mode, rungs, kind), parent)
         self._manager = manager
         self._launch_mode = mode
         self._cross_host = _cross_host(mode.holder)
+        self._holder_kind = kind
         self._rungs = rungs
         self._ladder_factory = ladder_factory or self._build_ladder
         self._dialog_factory = dialog_factory or self._build_dialog
         self._dialog: Any = None
         self.setToolTip(
-            attached_tooltip(mode.campaign, cross_host=self._cross_host, rungs=rungs)
+            attached_tooltip(mode.campaign, cross_host=self._cross_host,
+                             rungs=rungs, kind=kind)
             if mode.attached else TOOLTIP_OWNER
         )
         self._worker: _EStopWorker | None = None
@@ -277,6 +344,16 @@ class EmergencyStopButton(QPushButton):
     def reachable_rungs(self) -> tuple[int, ...]:
         """The ladder rungs a press can enter. ``()`` in owner mode — no ladder."""
         return self._rungs
+
+    @property
+    def holder_kind(self) -> str:
+        """The holder's ``what`` kind. ``""`` in owner mode, or when unreadable.
+
+        Only ``campaign`` reaches rung 4, so this is the fact that decides
+        whether a press can ever terminate anything — answerable, like the label
+        and the tooltip, without pressing.
+        """
+        return self._holder_kind
 
     def _on_stop(self) -> None:
         if self.attached:

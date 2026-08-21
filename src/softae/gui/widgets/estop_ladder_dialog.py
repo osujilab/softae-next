@@ -51,6 +51,7 @@ from softae.gui.estop_ladder import (
     TERMINAL_STATES,
     EstopLadder,
     TakeoverResult,
+    holder_noun,
 )
 
 logger = structlog.get_logger(__name__)
@@ -209,7 +210,7 @@ class EstopLadderDialog(QDialog):
 
     def _header(self) -> str:
         ladder = self._ladder
-        name = (ladder.campaign or ("the holder", ""))[0] or "the holder"
+        name = (ladder.campaign or (None, ""))[0] or holder_noun(ladder.holder_kind)
         rungs = ladder.reachable_rungs
         reach = (
             " → ".join(str(rung) for rung in rungs) if rungs else "none")

@@ -768,6 +768,48 @@ class TestPurgeWiring:
         assert events == ["parked:operator emergency stop", "worker-started"]
         assert main_window._park_reason() == "operator emergency stop"
 
+    def test_rig_run_scoped_claim_conflicts_only_on_overlap(self, main_window):
+        """The claim a run makes is now what that run will actually drive.
+
+        Every claim in the tree was whole-rig until this; the scoping machinery
+        had no production user. ``tests/test_rig_claim.py`` covers the three run
+        kinds — this pins the method against the *real* window, so a rename of
+        ``_rig_activity`` or of the idle-rest pair cannot pass unnoticed.
+        """
+        with main_window.rig_run("ht:probe", instruments={"stage", "syringe"}):
+            assert main_window._rig_activity.conflicts({"stage"}) == "ht:probe"
+            assert main_window._rig_activity.conflicts({"temp_controller"}) is None
+        assert main_window._rig_activity.busy is False
+
+    def test_rig_run_default_claim_is_the_whole_rig(self, main_window):
+        with main_window.rig_run("ht:probe"):
+            assert main_window._rig_activity.conflicts({"temp_controller"}) == "ht:probe"
+
+    def test_rig_run_manage_rest_off_moves_no_fluidics(self, main_window):
+        """A run that drives no fluidics claims without disturbing the tip."""
+        calls: list[str] = []
+        main_window.leave_idle_rest = lambda: calls.append("leave")
+        main_window.enter_idle_rest = lambda: calls.append("enter")
+
+        with main_window.rig_run("arrhenius:sweep", manage_rest=False):
+            assert main_window._rig_activity.busy is True
+        assert calls == []
+
+    def test_rig_run_manage_rest_on_leaves_and_re_enters_rest(self, main_window):
+        calls: list[str] = []
+        main_window.leave_idle_rest = lambda: calls.append("leave")
+        main_window.enter_idle_rest = lambda: calls.append("enter")
+
+        with main_window.rig_run("ht:probe"):
+            pass
+        assert calls == ["leave", "enter"]
+
+    def test_rig_run_raising_body_releases_the_claim(self, main_window):
+        with pytest.raises(RuntimeError):
+            with main_window.rig_run("ht:probe", instruments={"stage"}):
+                raise RuntimeError("boom")
+        assert main_window._rig_activity.busy is False
+
     def test_closing_stops_the_purge_timer(self, qapp, qtbot, monkeypatch,
                                            mock_manager):
         monkeypatch.setattr(loader, "load", lambda: {"webcam": {"enabled": False}})
