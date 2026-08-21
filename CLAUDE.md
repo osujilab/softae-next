@@ -31,6 +31,8 @@ delegated to subagents.
 1. **Reviews** the spec (or asks the user to review)
 1. **Spawns an implementation subagent** → writes code + tests
 1. **Runs tiered tests** in the terminal → neighbourhood after each edit, package before accepting the task, full serial suite before a commit (see "Tiered Test Execution")
+1. **Checks ownership before staging** → `python tools/whose.py --staged --me <session>` must exit
+   zero before any `git add` is proposed to the operator (see "Shared-tree ownership")
 1. **Spawns update subagents** → updates PROGRESS.md, USER_GUIDE.md, ACTION_PLAN.md and other ".\docs" files as needed
 1. **Recurrent workflow reminders** → occasionally reminds the system to retain this workflow structure (roughly every three prompts).
 
@@ -39,6 +41,11 @@ required, not merely permitted, because the comparison in step 2 depends on the 
 formed its own independent view.
 
 #### Subagent capabilities
+
+**Every brief cites `SUBAGENT_RULES.md` as required reading rather than restating it.**
+That file carries the standing operational rules — process hygiene, test spend, ownership under a
+shared tree, and the two failure shapes that look like success — so they live in one maintained
+place instead of being copy-pasted, and drifting, across a dozen briefs.
 
 Every spawned subagent is granted **full command-line access** (Bash and PowerShell), not just
 file-read and edit tools. Subagents run tests, invoke git, execute scripts, and inspect the
@@ -206,5 +213,35 @@ dispenser head wherever it was. That is a hardware-safety event, not an inconven
 - **Assume the operator's GUI is live.** It usually is, it may be mid-experiment, and it owns the
   instruments. Editing source is safe — a running process already imported it. Killing processes and
   opening instrument sessions are not.
+
+### 6. Shared-tree Ownership
+
+Three sessions share one working tree and one git index, so `git add` on a file stages whatever
+else is in it — including another session's uncommitted work. Ownership is therefore **declared,
+not inferred**.
+
+`docs/SubAgent docs/OWNERSHIP.toml` is the declaration: path globs to sessions, appended to rather
+than edited, sitting beside `SESSION_MAIL.md` because it is coordination state that changes hourly.
+`tools/whose.py` is the lookup.
+
+| Rule | Practice |
+|---|---|
+| Declare before you edit | Append a claim naming the paths, before the first edit, not after the diff exists |
+| Look up before you stage | `python tools/whose.py --staged --me <session>`; a non-zero exit means a foreign file is staged |
+| Never `-A`, never `-a` | Stage by explicit file list, always |
+| Unclaimed is not free | It means nobody has said. Ask on the mail thread, or claim it and say so |
+| A double claim is a finding | Two sessions on one path is a coordination fact to surface, never something to resolve by picking one |
+
+- **The lookup runs before every commit, not when something feels risky.** Inference by diff-marker
+  worked every time it was tried and was a guess every time; the point of declaring is that the
+  answer stops depending on whether the orchestrator happened to be careful that hour.
+- **The map is only as good as its upkeep.** A claim made and never released is what turns the map
+  into folklore, so release when a task lands — releasing keeps the record, it does not erase it.
+- **`whose.py` fails loudly on a missing or malformed map.** A silent empty map would answer
+  "nothing is foreign" to every question, which is the failure shape `SUBAGENT_RULES.md` §3
+  describes: the wrong answer wearing the safe answer's clothes.
+- **Prefer a new file to a contested edit.** A new module importing an in-flight file costs that
+  file zero edits and is separately reviewable — the pattern that let `rig_session.py`,
+  `campaign_discovery.py` and `rig_claim.py` land while their neighbours were held by others.
 
 ---
