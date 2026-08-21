@@ -20,7 +20,8 @@ Configuration (``softae_config.toml``)::
     kp          = 0.008
     ki          = 0.0015
     kd          = 0.05
-    out_min     = 0.01
+    out_min     = 0.01      # also the duty :meth:`AsyncRHController.safe_dry`
+                            # parks at — see that method before lowering it
     out_max     = 1.0
     poll_period = 2.0       # PID loop period (seconds)
     max_rh      = 95.0      # safety cap (%)
@@ -124,6 +125,13 @@ class AsyncRHController(BaseInstrument):
         self._current_temp: float = float("nan")  # chamber T (RH sensor onboard)
         self._running: bool = False
         self._stop_event = threading.Event()
+        #: Duty the PID thread writes on its way out. ``0.0`` is the historical
+        #: (and still default) value; :meth:`safe_dry` raises it so the exiting
+        #: thread cannot slam a zero in ahead of the dry-purge duty. Set only via
+        #: :meth:`_stop_pid_loop`, and only *before* ``_stop_event`` is set — see
+        #: that method for why that ordering is the whole of the thread-safety
+        #: argument.
+        self._exit_duty: float = 0.0
         self._wait_abort = threading.Event()   # set by ArrheniusSweep.abort() to unblock wait()
         self._thread_lock = threading.Lock()  # guards _data / _current_rh / _setpoint
         self._data: deque[tuple[float, float, float]] = deque(maxlen=500)
@@ -341,13 +349,19 @@ class AsyncRHController(BaseInstrument):
 
             self._stop_event.wait(timeout=self._poll_period)
 
-        # Turn off humidifier when loop stops
+        # The exit write. Historically an unconditional zero; now whatever the
+        # stopper asked for, because "stop the loop" and "leave the device at
+        # duty 0" are two decisions and only the first belongs to every caller.
+        # A `safe_dry` that let this write 0.0 first would shut both PSVs for one
+        # frame before reopening them to dry air — a valve slam the firmware
+        # would see, since `ctrl == 0` is its own special case there.
+        exit_duty = self._exit_duty
         try:
-            self._send_duty(0.0)
+            self._send_duty(exit_duty)
         except Exception:
             pass
 
-        logger.info("rh_pid_loop_stopped")
+        logger.info("rh_pid_loop_stopped", exit_duty=exit_duty)
 
     def _start_pid_loop(self) -> None:
         if self._running:
@@ -357,9 +371,28 @@ class AsyncRHController(BaseInstrument):
         self._thread.start()
         self._running = True
 
-    def _stop_pid_loop(self) -> None:
+    def _stop_pid_loop(self, exit_duty: float = 0.0) -> None:
+        """Stop the PID thread, telling it what to leave on the wire.
+
+        *exit_duty* defaults to ``0.0``, so every existing caller — ``stop``,
+        ``disconnect``, ``safe_off`` — is unchanged.
+
+        **Why writing the attribute here is enough.** ``_exit_duty`` is stored
+        *before* ``_stop_event.set()``, and the loop reads it only after it has
+        observed the event. ``Event.set()`` releases the event's internal lock
+        and the loop's ``wait()``/``is_set()`` acquires it, so the store
+        happens-before the load by the same release/acquire pairing that makes
+        ``_stop_event`` itself work. No extra lock can strengthen that, and a
+        lock the loop would have to acquire on its exit path could deadlock
+        against a wedged tick.
+
+        Set on **every** stop rather than only on the dry path: a value left over
+        from a previous ``safe_dry`` must not become the exit duty of the next
+        plain ``stop()``.
+        """
         if not self._running:
             return
+        self._exit_duty = float(exit_duty)
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=5.0)
@@ -459,6 +492,116 @@ class AsyncRHController(BaseInstrument):
             return
 
         logger.info("rh_safe_off", instrument=self.name)
+
+    #: Why the last :meth:`safe_dry` could **not** command ``out_min`` — ``""``
+    #: when it did. Read by ``core.safe_park`` exactly as
+    #: :attr:`last_safe_off_error` is, and on the class for the same reason.
+    last_safe_dry_error: str = ""
+
+    #: The duty :meth:`safe_dry` actually put on the wire, published so a report
+    #: can *name* it. A park that says "dry purge" without the number is asking
+    #: the operator to trust a config file they cannot see from the dialog.
+    last_safe_dry_duty: float = 0.0
+
+    def safe_dry(self) -> None:
+        """Stop the loop and leave the chamber **purging dry air** at ``out_min``.
+
+        The sibling of :meth:`safe_off`, and named to sit beside it: both are
+        ``safe_<end state>``, both stop the loop, both zero the stored setpoint,
+        both never raise. The one word that differs names the one thing that
+        differs — whether gas keeps flowing. ``dry_purge()`` would have dropped
+        the ``safe_`` prefix that marks a park entry point; ``safe_dry_purge()``
+        adds length without adding information.
+
+        **Why this exists.** ``ctrl`` near 0 is *dry* air and ``ctrl = 1`` is
+        fully humid — bench-verified 2026-08-21. (``scripts/trinket_firmware/
+        README.md`` asserts the inverse; that sentence is wrong and is being
+        corrected separately. The firmware itself is unambiguous: ``V0_range``,
+        the humidity signal, rises with ``ctrl`` while ``V1_range``, the dry-air
+        signal, falls with it.) ``ctrl == 0`` *exactly* is a firmware special
+        case that shuts **both** Aalborg PSVs, so :meth:`safe_off` leaves no flow
+        at all and room air wins: after a long low-RH hold the chamber goes
+        10 %RH to ~50 %RH in tens of seconds, and every GUI restart or
+        GUI-to-headless switchover costs a full re-equilibration and re-drying.
+
+        Commanding ``out_min`` instead keeps dry air flowing while the host is
+        away, and the Trinket's own deadman — ``ctrl_timeout = 20`` iterations of
+        a ~1.25 s loop — forces ``ctrl = 0`` about 25 s after this last command,
+        shutting the valves without the host having to still be alive. It is
+        self-recovering: any new float resumes control instantly. So the plateau
+        the operator wants is already firmware behaviour, and all this method
+        does is stop pre-empting it.
+
+        **``self._out_min``, not a literal 0.01 and not the last PID output.**
+        The literal would silently disagree with a retuned config. The last PID
+        output would strand a *humidifying* duty on the wire whenever the exit
+        happens mid-approach to a wet setpoint — the exact failure the park
+        exists to prevent, arrived at by a different road.
+
+        The duplicate write is deliberate, for the reason :meth:`safe_off` gives:
+        ``_stop_pid_loop`` reports nothing about whether the thread reached its
+        own exit write, and a loop wedged past its ``join(timeout=5.0)`` never
+        will. Unlike ``safe_off`` the duplicate is not merely tolerated here — it
+        is what a never-started or wedged loop depends on entirely.
+        """
+        self.last_safe_dry_error = ""
+        self.last_safe_dry_duty = 0.0
+
+        # A degenerate `out_min` makes "dry purge" a lie: 0 is the firmware's
+        # valve-shutoff sentinel and a negative duty is not a duty at all. Three
+        # responses were possible and only one is defensible. Refusing outright
+        # would leave the humidifier under whatever duty it already had — worse
+        # than today on a park path. Clamping to an invented positive floor would
+        # push gas at a rate nobody configured. So it falls back to `safe_off`,
+        # which is a genuinely safe state, and reports that it did: the operator
+        # gets the safe direction *and* is told the dry purge they asked for did
+        # not happen, because a fallback nobody hears about is how a config typo
+        # becomes six months of unexplained RH collapses.
+        if not (self._out_min > 0.0):
+            logger.error("rh_safe_dry_degenerate_out_min",
+                         instrument=self.name, out_min=self._out_min)
+            self.safe_off()
+            outcome = (f" The fallback to safe_off also failed: "
+                       f"{self.last_safe_off_error}"
+                       if self.last_safe_off_error else
+                       " The humidifier was zeroed instead — safe, but the "
+                       "chamber will collapse to room RH.")
+            self.last_safe_dry_error = (
+                f"config [instruments.rh_controller] out_min = "
+                f"{self._out_min:g} is not positive, so there is no dry-purge "
+                f"duty to command: duty 0 shuts both valves.{outcome}")
+            return
+
+        duty = float(self._out_min)
+
+        # Stop first, then write — same race as `safe_off`: a still-running loop
+        # writes a fresh PID output every poll period and would overwrite this.
+        # The exit duty goes with the stop so the thread's own parting write is
+        # `duty` rather than the zero it used to send.
+        self._stop_pid_loop(exit_duty=duty)
+
+        with self._thread_lock:
+            self._setpoint = 0.0
+        if self._pid is not None:
+            self._pid.setpoint = 0.0
+
+        if self._serial is None:
+            self.last_safe_dry_error = (
+                "no serial transport — the dry purge could not be commanded "
+                "from this process")
+            logger.warning("rh_safe_dry_no_transport", instrument=self.name)
+            return
+
+        try:
+            self._send_duty(duty)
+        except Exception as exc:
+            self.last_safe_dry_error = str(exc)
+            logger.warning("rh_safe_dry_send_failed", instrument=self.name,
+                           error=str(exc))
+            return
+
+        self.last_safe_dry_duty = duty
+        logger.info("rh_safe_dry", instrument=self.name, duty=duty)
 
     def wait(
         self,

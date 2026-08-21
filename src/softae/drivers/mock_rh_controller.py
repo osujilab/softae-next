@@ -26,6 +26,10 @@ class MockRHController(BaseInstrument):
     def __init__(self, name: str = "rh_controller", config: dict[str, Any] | None = None):
         super().__init__(name, config)
         self._max_rh: float = float(self.config.get("max_rh", 95.0))
+        # Same key, same default, same spelling as the real driver — because
+        # :meth:`safe_dry` parks at it and a mock that read a different number
+        # would grade every ``--mock`` park against a duty the rig never uses.
+        self._out_min: float = float(self.config.get("out_min", 0.01))
         self._setpoint: float = 50.0
         self._rh: float = 45.0
         self._temp: float = 23.0  # simulated chamber temperature (°C)
@@ -94,6 +98,48 @@ class MockRHController(BaseInstrument):
         self._running = False
         self._duty = 0.0
         self._setpoint = 0.0
+
+    #: Parity with the real driver's pair of :meth:`safe_dry` report attributes,
+    #: present for the same reason :attr:`last_safe_off_error` is: ``safe_park``
+    #: reads the same names on either driver rather than branching on which it got.
+    last_safe_dry_error: str = ""
+    last_safe_dry_duty: float = 0.0
+
+    def safe_dry(self) -> None:
+        """Stop, and hold ``out_min`` — the mock's statement of the dry purge.
+
+        Implemented rather than inherited-as-a-no-op for exactly the reason
+        :meth:`safe_off` is: ``create_manager`` falls back to this class for
+        ``rh_controller`` and ``safe_park`` cannot tell a mock from a real
+        driver, so every mock-backed park, every ``--mock`` tool run and the
+        whole simulated campaign path goes through here. A ``safe_dry`` that
+        accepted the call and did nothing would make all of them pass while
+        proving nothing — and it would prove nothing about precisely the
+        distinction this method exists to make, since a no-op mock is
+        indistinguishable from ``safe_off``.
+
+        The degenerate-``out_min`` fallback mirrors the real driver's, message
+        and all. See :meth:`AsyncRHController.safe_dry` for why the fallback goes
+        to ``safe_off`` and why it is reported rather than silent.
+        """
+        self.last_safe_dry_error = ""
+        self.last_safe_dry_duty = 0.0
+
+        if not (self._out_min > 0.0):
+            logger.error("mock_rh_safe_dry_degenerate_out_min",
+                         instrument=self.name, out_min=self._out_min)
+            self.safe_off()
+            self.last_safe_dry_error = (
+                f"config [instruments.rh_controller] out_min = "
+                f"{self._out_min:g} is not positive, so there is no dry-purge "
+                f"duty to command: duty 0 shuts both valves. The humidifier was "
+                f"zeroed instead — safe, but the chamber will collapse to room RH.")
+            return
+
+        self._running = False
+        self._duty = float(self._out_min)
+        self._setpoint = 0.0
+        self.last_safe_dry_duty = float(self._out_min)
 
     def wait(
         self,

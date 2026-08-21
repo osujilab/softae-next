@@ -197,16 +197,20 @@ def test_temperature_refusal_releases_the_rh_loop_and_still_parks(
     The temperature arm refuses with the humidifier already driving. Before this
     change there was nothing to release; now the arm that started it early takes
     it down, and `cmd_run`'s `finally` parks on top of that as it always did.
+
+    The release is a DRY PURGE, so `safe_dry` is the spy: an assertion on
+    `safe_off` would still pass through the fallback chain while proving the
+    opposite of what this test names.
     """
     import softae.core.safe_park as SP
     import softae.workflows.equilibration as EQ
     from softae.workflows.equilibration import ApproachOutcome
 
-    parks, offs = [], []
+    parks, dried = [], []
     monkeypatch.setattr(SP, "safe_park",
                         lambda manager, **kw: parks.append(kw) or _ParkResult())
-    monkeypatch.setattr(M.FastMockRHController, "safe_off",
-                        lambda self: offs.append(self._setpoint))
+    monkeypatch.setattr(M.FastMockRHController, "safe_dry",
+                        lambda self: dried.append(self._setpoint))
     monkeypatch.setattr(
         EQ, "approach_setpoint",
         lambda read_pv, target, *, axis, **kw: ApproachOutcome(
@@ -219,23 +223,30 @@ def test_temperature_refusal_releases_the_rh_loop_and_still_parks(
                    "--min-treatment", "1"]) == V.EXIT_FAILED
     # Released by the approach itself -- at the run's own setpoint, so it is the
     # loop this run started that came down.
-    assert offs == [30.0]
+    assert dried == [30.0]
+    # The park behind it keeps its own default: opting one call site in must not
+    # convert the harness's own park into a dry purge.
     assert parks and parks[-1]["retract_head"] is None
+    assert parks[-1].get("rh_dry_purge", False) is False
     assert _rows(tmp_path, "rel") == []
 
 
 def test_temperature_refusal_releases_the_rh_loop_under_end_state_hold(
         tmp_path, monkeypatch):
-    """The path with no park behind it -- the reason the release exists at all."""
+    """The path with no park behind it -- the reason the release exists at all.
+
+    And the reason the release is a dry purge rather than a zero: nothing else
+    runs after this, so whatever it leaves on the wire is what the chamber gets.
+    """
     import softae.core.safe_park as SP
     import softae.workflows.equilibration as EQ
     from softae.workflows.equilibration import ApproachOutcome
 
-    parks, offs = [], []
+    parks, dried = [], []
     monkeypatch.setattr(SP, "safe_park",
                         lambda manager, **kw: parks.append(kw) or _ParkResult())
-    monkeypatch.setattr(M.FastMockRHController, "safe_off",
-                        lambda self: offs.append(self._setpoint))
+    monkeypatch.setattr(M.FastMockRHController, "safe_dry",
+                        lambda self: dried.append(self._setpoint))
     monkeypatch.setattr(
         EQ, "approach_setpoint",
         lambda read_pv, target, *, axis, **kw: ApproachOutcome(
@@ -246,8 +257,44 @@ def test_temperature_refusal_releases_the_rh_loop_under_end_state_hold(
                    "--temp-setpoint-c", "25", "--validation-name", "hld",
                    "--project", str(tmp_path), "--mock", "--min-treatment", "1",
                    "--end-state", "hold"]) == V.EXIT_FAILED
-    assert offs == [30.0]                 # the humidifier is down anyway
+    assert dried == [30.0]                # the humidifier is down anyway
     assert parks == []                    # and nothing else took it down
+
+
+def test_the_unmocked_release_really_reaches_the_mock_drivers_dry_purge(
+        tmp_path, monkeypatch):
+    """The same path with **nothing** patched over the driver.
+
+    The two tests above spy by replacing `safe_dry`, which proves the call is
+    made but not that the shipped implementation does anything. This one lets
+    `MockRHController.safe_dry` run and reads the duty it left behind -- the
+    assertion a no-op mock could not satisfy.
+    """
+    import softae.core.safe_park as SP
+    import softae.workflows.equilibration as EQ
+    from softae.workflows.equilibration import ApproachOutcome
+
+    seen: list = []
+    # The park is stubbed only so it cannot overwrite the duty afterwards; it is
+    # also how this test gets a handle on the run's own manager.
+    monkeypatch.setattr(SP, "safe_park",
+                        lambda manager, **kw: seen.append(manager) or _ParkResult())
+    monkeypatch.setattr(
+        EQ, "approach_setpoint",
+        lambda read_pv, target, *, axis, **kw: ApproachOutcome(
+            axis=axis, target=target, reached=False, elapsed_s=1.0,
+            pv_final=99.0, n_samples=1))
+
+    assert V.main(["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
+                   "--temp-setpoint-c", "25", "--validation-name", "dry",
+                   "--project", str(tmp_path), "--mock",
+                   "--min-treatment", "1"]) == V.EXIT_FAILED
+
+    assert seen, "the park never ran, so this test proved nothing"
+    rh = seen[-1].get("rh_controller")
+    assert rh._duty == pytest.approx(0.01)
+    assert rh._running is False
+    assert rh._setpoint == 0.0
 
 
 @pytest.mark.parametrize("verdict", ["ceiling", "not_evaluable"])
@@ -357,6 +404,12 @@ class TestApproachOverlap:
                 return temp_pv
 
         class _RH:
+            # The report attributes the real driver publishes. Present on the
+            # double because `_release_rh` reads them, and a double missing them
+            # would exercise a different branch than production does.
+            last_safe_dry_error = ""
+            last_safe_dry_duty = 0.01
+
             def set_setpoint(self, value):
                 log.append(("rh.set_setpoint", value))
 
@@ -368,6 +421,9 @@ class TestApproachOverlap:
 
             def safe_off(self):
                 log.append(("rh.safe_off",))
+
+            def safe_dry(self):
+                log.append(("rh.safe_dry",))
 
             def get_H(self):
                 log.append(("rh.get_H",))
@@ -500,20 +556,81 @@ class TestApproachOverlap:
             self, tmp_path, monkeypatch, capsys):
         """The arm that opened the loop early closes it when nothing will judge it.
 
-        `safe_off`, not `stop`: `stop` can return cleanly having sent nothing when
-        the PID thread is wedged, and under `--end-state hold` there is no park
-        behind it.
+        `safe_dry`, not `safe_off` and certainly not `stop`. `stop` can return
+        cleanly having sent nothing when the PID thread is wedged. `safe_off`
+        writes duty 0, which the Trinket treats as a shutoff of BOTH valves, so
+        the chamber this run just spent the whole heat drying goes straight back
+        to room RH — and under `--end-state hold` there is no park behind this to
+        do anything about it.
         """
         log, clock = [], H.VirtualClock()
         with pytest.raises(H.RefuseToStart) as excinfo:
             self._run(tmp_path, monkeypatch, log, clock, reached=("rh",))
         capsys.readouterr()
 
-        assert ("rh.safe_off",) in log
+        assert ("rh.safe_dry",) in log
+        assert ("rh.safe_off",) not in log
+        assert ("rh.stop",) not in log
         # Exactly one bounded retry, and the RH axis is never judged.
         assert [e[1] for e in log if e[0] == "judge"] == [
             "temperature", "temperature"]
         assert "temperature never reached" in str(excinfo.value)
+
+    def test_approach_condition_release_says_which_end_state_it_left(
+            self, tmp_path, monkeypatch, capsys):
+        """A dry purge deliberately leaves the device commanded, so the console
+        has to say so — and say it as a success, not as a humidifier nobody
+        managed to turn off. Under `--end-state hold` this line is the only
+        report there is."""
+        log, clock = [], H.VirtualClock()
+        with pytest.raises(H.RefuseToStart):
+            self._run(tmp_path, monkeypatch, log, clock, reached=("rh",))
+        out = capsys.readouterr().out
+
+        assert "DRY PURGE at duty 0.01" in out
+        assert "deadman shuts both valves" in out
+        assert "FAILED" not in out
+
+    def test_approach_condition_release_reports_a_dry_purge_that_failed(
+            self, tmp_path, monkeypatch, capsys):
+        """The genuine failure path still reads as a failure."""
+        log, clock = [], H.VirtualClock()
+        manager = self._rig(log)
+        rh = manager.get(H.RH_CONTROLLER)
+        monkeypatch.setattr(type(rh), "last_safe_dry_error",
+                            "port went away", raising=False)
+        import softae.workflows.equilibration as EQ
+
+        monkeypatch.setattr(EQ, "approach_setpoint",
+                            self._fake_approach(log, clock, reached=()))
+        with pytest.raises(H.RefuseToStart):
+            H.approach_condition(manager, _plan(tmp_path),
+                                 sleep=clock.sleep, now=clock)
+        out = capsys.readouterr().out
+
+        assert "DRY-PURGE PARK FAILED: port went away" in out
+
+    def test_approach_condition_release_falls_back_when_there_is_no_safe_dry(
+            self, tmp_path, monkeypatch, capsys):
+        """An older driver still gets taken down — just to the zeroed state.
+
+        Proves the fallback chain is reachable rather than decorative, and that
+        the dry-purge narration stays silent when no dry purge happened.
+        """
+        log, clock = [], H.VirtualClock()
+        manager = self._rig(log)
+        monkeypatch.delattr(type(manager.get(H.RH_CONTROLLER)), "safe_dry")
+        import softae.workflows.equilibration as EQ
+
+        monkeypatch.setattr(EQ, "approach_setpoint",
+                            self._fake_approach(log, clock, reached=()))
+        with pytest.raises(H.RefuseToStart):
+            H.approach_condition(manager, _plan(tmp_path),
+                                 sleep=clock.sleep, now=clock)
+        out = capsys.readouterr().out
+
+        assert ("rh.safe_off",) in log
+        assert "DRY PURGE" not in out
 
     def test_approach_condition_temperature_refusal_omits_a_lead_it_never_had(
             self, tmp_path, monkeypatch, capsys):
@@ -545,6 +662,7 @@ class TestApproachOverlap:
                       reached=("temperature",))
         capsys.readouterr()
 
+        assert ("rh.safe_dry",) not in log
         assert ("rh.safe_off",) not in log
         assert ("rh.stop",) not in log
         # The lead IS named, because it changes what the refusal means.
@@ -556,7 +674,7 @@ class TestApproachOverlap:
         log, clock = [], H.VirtualClock()
         manager = self._rig(log)
         rh = manager.get(H.RH_CONTROLLER)
-        monkeypatch.setattr(type(rh), "safe_off",
+        monkeypatch.setattr(type(rh), "safe_dry",
                             lambda self: (_ for _ in ()).throw(
                                 OSError("serial port vanished")), raising=False)
         import softae.workflows.equilibration as EQ

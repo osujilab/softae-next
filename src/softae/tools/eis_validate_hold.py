@@ -39,9 +39,9 @@ carries the evidence.** The RH loop is commanded at the *start* of
 works through the heat rather than waiting it out; RH *arrival* is still judged
 only after temperature is satisfied, because the attainable RH floor rises with
 temperature and a reading accepted against a floor about to move is not
-evidence. That docstring carries the whole argument -- including why an
-early-started loop cannot over-dry the chamber, and what takes the loop down
-when the temperature approach refuses.
+evidence. That docstring carries the whole argument -- including why drying
+through the heat is *permitted* rather than impossible, and what takes the loop
+down when the temperature approach refuses.
 
 **The settle rounds pay for themselves twice.** They are the stability gate
 *and* the arc-capture watch: running ``arc_closure`` over spectra that were
@@ -527,27 +527,44 @@ def approach_condition(
     control at *this run's own target* for the whole approach, and the RH
     approach that follows the heat is whatever is left of the descent.
 
-    **An early-started loop cannot dry the chamber further than leaving it alone
-    would, so no clamp is needed and none is added.** The PID's
-    ``output_limits`` are ``(out_min, out_max) = (0.01, 1.0)`` -- a *humidifier*
-    duty cycle. There is no drying actuator on this axis; a descent to a low
-    setpoint is passive, and the loop's only authority is to ADD moisture. The
-    state it displaces is not "no command" either:
-    ``AsyncRHController.safe_off`` records that a process which sets a setpoint
-    and never calls ``start`` "writes **nothing** -- leaving the Trinket at
-    whatever duty a previous session left it at". So through the heat the
-    sequential form left an *unsupervised* humidifier at a stale duty.
-    Commanding the loop early replaces that with closed-loop control whose worst
-    case is the ``out_min`` = 0.01 trickle -- the substitution is biased *wet*,
-    never dry, and the undershoot a clamp would have bounded is not reachable.
+    **Drying through the heat ramp is PERMITTED -- operator ruling, 2026-08-21 --
+    so no clamp is needed and none is added.** It is permitted, not impossible,
+    and the difference matters because this axis has two actuators, not one.
+    ``scripts/trinket_firmware/dac0_rh/code.py`` drives an Aalborg PSV pair from
+    a single ``ctrl``: humid air over ``V0_range`` scaled by ``ctrl``, and **dry
+    air over ``V1_range`` -- "dry air signal range" -- scaled by ``1 - ctrl``**.
+    So ``ctrl`` = 1 is fully humid, ``ctrl`` near 0 is dry air at nearly full
+    flow, and ``ctrl`` == 0 *exactly* is the firmware's auto-shutoff, which
+    closes both valves. The PID's ``output_limits`` of
+    ``(out_min, out_max) = (0.01, 1.0)`` therefore bound the loop at the
+    **driest flowing state**, not at a humidification trickle. An early-started
+    loop can and does dry the chamber during the heat.
 
-    **The same asymmetry is the honest limit on what the overlap buys.** If the
-    previous session left the Trinket near zero, the descent to a low setpoint
-    was already passive and already underway, and the overlap saves close to
-    nothing. If it left a real duty, the sequential form spent the whole heat
-    humidifying *against* the target and the descent only began afterwards --
-    and there the overlap is worth the entire approach. Which of the two it is
-    is a fact about the chamber's history, not about this harness, which is why
+    **The alternative to it is not "no drying" -- it is uncontrolled drift.**
+    RH moves while the block heats whether or not anything is commanding the
+    axis. The sequential form sent a temperature setpoint, waited on it, and did
+    not care where RH went in the meantime; the excursion it tolerated could be
+    more extreme than anything a loop aimed at the target would produce. The
+    early loop is closed-loop at *this run's own target*, so the heat is spent
+    moving toward the setpoint rather than away from it. **Active control is
+    bounded by the setpoint; absence of control is bounded by nothing.** And the
+    state it displaces is not even "no command": ``AsyncRHController.safe_off``
+    records that a process which sets a setpoint and never calls ``start``
+    "writes **nothing** -- leaving the Trinket at whatever duty a previous
+    session left it at". The sequential form did not merely decline to drive the
+    axis through the heat -- it left it *unsupervised* at a stale duty, pointed
+    wherever the last run pointed it.
+
+    **The variance in that stale duty is the honest limit on what the overlap
+    buys.** If the previous session left the Trinket near ``out_min``, dry air
+    was already flowing and the descent was already underway -- open-loop and
+    aimed at no particular target, but in the right direction -- so the overlap
+    saves close to nothing. If it left duty 0, both valves were shut and the
+    chamber was drifting back toward room air throughout. If it left a real
+    humidifying duty, the sequential form spent the whole heat driving *away*
+    from the target and the descent only began afterwards -- and there the
+    overlap is worth the entire approach. Which of the three it is is a fact
+    about the chamber's history, not about this harness, which is why
     :func:`render_projection` declares the overlap and projects no saving for it.
 
     **A temperature refusal takes the early loop down with it** -- see
@@ -621,25 +638,66 @@ def _release_rh(rh: Any) -> None:
     the arm that opened it closes it, and the change is a no-worse-than-today
     guarantee on every path rather than only on the parking ones.
 
-    ``safe_off``, not ``stop``. They are not aliases and the driver says why:
-    ``stop`` returns cleanly having sent nothing when the PID thread is wedged in
-    an I2C read, while ``safe_off`` writes the zero itself. This introduces no
-    control logic -- it is the shipped safe state, and the same call
-    :mod:`softae.core.safe_park` makes.
+    ``safe_dry``, not ``safe_off``, and neither of them ``stop``. All three stop
+    the loop; only the latter two write anything, because ``stop`` returns
+    cleanly having sent nothing when the PID thread is wedged in an I2C read.
+    Between the two that write, the choice is which end state the chamber is left
+    in, and this call site wants the dry one.
+
+    **Why the dry purge belongs here specifically.** This arm fires when the
+    temperature approach refused, i.e. after the RH loop has been drying the
+    chamber for as long as the heat took -- often the whole descent. ``safe_off``
+    writes duty 0, which the Trinket treats as a special case and shuts *both*
+    Aalborg PSVs, so there is no flow at all and room air wins: the chamber the
+    run just spent an hour drying goes back to ~50 %RH in tens of seconds, and
+    the operator's retry pays for the whole descent again. ``safe_dry`` leaves
+    ``out_min`` -- dry air -- on the wire and lets the firmware's own ~25 s
+    deadman close the valves, so nothing stays energised and the dry state
+    survives the refusal.
+
+    This matters most on the path that made the release necessary at all:
+    ``--end-state hold`` has no park behind it, so this call is the *only* thing
+    that decides what the chamber does next.
 
     Best-effort through :func:`_observe`, whose guarantee ("call it, never
     raise") is exactly the one wanted here even though the callee is a driver
     rather than an observer: the refusal is the news, and a humidifier that
-    cannot be zeroed must not become a *different* exception on the way out of
+    cannot be released must not become a *different* exception on the way out of
     one. ``cmd_run``'s park tries again and ``SafeParkResult`` is where that
-    failure is meant to be reported.
+    failure is meant to be reported -- except under ``--end-state hold``, which
+    is why the outcome is also printed here rather than only logged.
 
     **Only the temperature arm is wrapped.** An RH refusal leaves the loop
     running, which is byte-for-byte what the sequential form did; changing it
     here would be an unrelated behaviour change smuggled in beside this one.
     """
-    _observe(getattr(rh, "safe_off", None) or getattr(rh, "stop", None),
+    dry = getattr(rh, "safe_dry", None)
+    _observe(dry or getattr(rh, "safe_off", None) or getattr(rh, "stop", None),
              "eis_validate_rh_release_failed")
+    if dry is not None:
+        _observe(_report_dry_purge, "eis_validate_rh_release_report_failed", rh)
+
+
+def _report_dry_purge(rh: Any) -> None:
+    """Say on the console which end state the chamber was left in.
+
+    Routed through :func:`_observe` by its caller for the reason ``_observe``
+    exists: this is narration, and narration must never be why a refusal turns
+    into a different exception.
+    """
+    from softae.core.safe_park import RH_DEADMAN_S
+
+    err = getattr(rh, "last_safe_dry_error", "")
+    if isinstance(err, str) and err:
+        logger.warning("eis_validate_rh_dry_purge_failed", error=err)
+        print(f"[approach] rh DRY-PURGE PARK FAILED: {err}", flush=True)
+        return
+    duty = float(getattr(rh, "last_safe_dry_duty", 0.0))
+    logger.info("eis_validate_rh_dry_purge", duty=duty)
+    print(f"[approach] rh loop released to a DRY PURGE at duty {duty:g}: dry air "
+          f"keeps flowing, then the Trinket's deadman shuts both valves after "
+          f"~{RH_DEADMAN_S:g} s. The chamber holds its dry state -- a retry does "
+          f"not pay for the descent twice.", flush=True)
 
 
 def _approach_one(

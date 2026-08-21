@@ -300,6 +300,240 @@ class TestAsyncRHController:
         assert ctrl._running is False
         assert ctrl._setpoint == 0.0
 
+    # ── safe_dry: the dry-purge park ─────────────────────────────────────────
+    #
+    # `ctrl` near 0 is DRY air and `ctrl == 1` is fully humid (bench-verified
+    # 2026-08-21). `ctrl == 0` EXACTLY is a firmware special case that shuts both
+    # Aalborg PSVs, so `safe_off` leaves no flow at all and room air wins — which
+    # is why a clean shutdown after a long low-RH hold collapses the chamber from
+    # 10 %RH to ~50 %RH in tens of seconds. `safe_dry` commands `out_min` instead
+    # and lets the Trinket's own ~25 s deadman close the valves.
+
+    DRY = b"0.0100\n"
+
+    @pytest.fixture()
+    def rh_factory(self, mock_serial, mock_pid):
+        """Build a connected controller over an arbitrary config section."""
+        ser_mod, mock_ser = mock_serial
+        pid_mod, pid_inst = mock_pid
+
+        def _make(**config):
+            section = {"port": "COM42", "baud": 9600, "max_rh": 90.0}
+            section.update(config)
+            with patch.dict("sys.modules",
+                            {"serial": ser_mod, "simple_pid": pid_mod}):
+                from softae.drivers.async_rh_controller import AsyncRHController
+                ctrl = AsyncRHController(name="rh_test", config=section,
+                                         rh_reader=lambda: 55.0)
+                run(ctrl.connect())
+            return ctrl, mock_ser, pid_inst
+
+        return _make
+
+    def test_safe_dry_writes_out_min_and_never_zero(self, rh_ctrl):
+        """The whole point: duty 0 shuts both valves, `out_min` keeps dry air on."""
+        ctrl, mock_ser, _ = rh_ctrl
+        mock_ser.write.reset_mock()
+
+        ctrl.safe_dry()
+
+        assert mock_ser.write.call_count == 1
+        assert mock_ser.write.call_args[0][0] == self.DRY
+        assert self.ZERO not in [c[0][0] for c in mock_ser.write.call_args_list]
+        assert ctrl.last_safe_dry_error == ""
+        assert ctrl.last_safe_dry_duty == pytest.approx(0.01)
+
+    def test_safe_dry_uses_the_configured_out_min_not_the_code_default(
+            self, rh_factory):
+        """A hardcoded 0.01 would silently disagree with a retuned rig."""
+        ctrl, mock_ser, _ = rh_factory(out_min=0.05)
+        mock_ser.write.reset_mock()
+
+        ctrl.safe_dry()
+
+        assert mock_ser.write.call_args[0][0] == b"0.0500\n"
+        assert ctrl.last_safe_dry_duty == pytest.approx(0.05)
+
+    def test_safe_dry_suppresses_the_loops_exit_zero(self, rh_ctrl):
+        """No zero may precede the dry duty, or the valves slam shut and reopen.
+
+        The exiting PID thread used to write ``0.0`` unconditionally. The Trinket
+        treats ``ctrl == 0`` as its own shutoff case, so that frame is visible to
+        the firmware — not merely redundant.
+        """
+        ctrl, mock_ser, _ = rh_ctrl
+        ctrl.start()
+        time.sleep(0.05)                      # let the loop take a tick
+        mock_ser.write.reset_mock()
+
+        ctrl.safe_dry()
+
+        written = [c[0][0] for c in mock_ser.write.call_args_list]
+        assert self.ZERO not in written
+        assert written[-1] == self.DRY
+        assert ctrl._running is False
+        assert ctrl._thread is None
+
+    def test_safe_dry_writes_the_duty_itself_when_the_loop_never_ran(self, rh_ctrl):
+        """The belt-and-braces case ``safe_off`` documents, and the one where it
+        is not merely a duplicate but the *only* write.
+
+        ``_running`` True with no thread reproduces what a wedged loop leaves
+        behind: ``_stop_pid_loop`` returns cleanly having had nothing to join, so
+        no thread ever reaches an exit write and the method's own write is all
+        the Trinket will ever see.
+        """
+        ctrl, mock_ser, _ = rh_ctrl
+        ctrl._running = True
+        ctrl._thread = None
+        mock_ser.write.reset_mock()
+
+        ctrl.safe_dry()
+
+        assert mock_ser.write.call_count == 1
+        assert mock_ser.write.call_args[0][0] == self.DRY
+
+    def test_safe_dry_zeroes_the_stored_setpoint(self, rh_ctrl):
+        """Exactly as ``safe_off`` does — a later bare ``start()`` must not
+        resume the pre-park target, which ``_pid_loop`` re-reads every tick."""
+        ctrl, _, pid_inst = rh_ctrl
+        ctrl.set_setpoint(45.0)
+
+        ctrl.safe_dry()
+
+        assert ctrl._setpoint == 0.0
+        assert pid_inst.setpoint == 0.0
+
+    def test_safe_dry_never_strands_the_last_pid_output(self, rh_factory):
+        """An exit mid-approach to a WET setpoint must not leave that duty on.
+
+        The PID here returns 0.9 — a humidifying duty. Parking to "the last
+        output" would leave the chamber being actively wetted for the deadman's
+        whole window, which is the failure the park exists to prevent reached by
+        a different road.
+        """
+        ctrl, mock_ser, pid_inst = rh_factory()
+        pid_inst.return_value = 0.9
+        ctrl.set_setpoint(80.0)
+        ctrl.start()
+        time.sleep(0.05)
+        mock_ser.write.reset_mock()
+
+        ctrl.safe_dry()
+
+        written = [c[0][0] for c in mock_ser.write.call_args_list]
+        assert b"0.9000\n" not in written
+        assert written[-1] == self.DRY
+
+    def test_a_plain_stop_after_a_safe_dry_still_exits_on_zero(self, rh_ctrl):
+        """The exit duty is per-stop, not sticky: a dry purge must not silently
+        convert every later ``stop()`` into one."""
+        ctrl, mock_ser, _ = rh_ctrl
+        ctrl.start()
+        ctrl.safe_dry()
+
+        ctrl.start()
+        time.sleep(0.05)
+        mock_ser.write.reset_mock()
+        ctrl.stop()
+
+        assert mock_ser.write.call_args[0][0] == self.ZERO
+
+    def test_safe_off_after_a_safe_dry_still_ends_on_zero(self, rh_ctrl):
+        """The pinned safe state is untouched by the new sibling's existence."""
+        ctrl, mock_ser, _ = rh_ctrl
+        ctrl.start()
+        ctrl.safe_dry()
+
+        ctrl.start()
+        time.sleep(0.05)
+        mock_ser.write.reset_mock()
+        ctrl.safe_off()
+
+        assert mock_ser.write.call_args[0][0] == self.ZERO
+        assert ctrl.last_safe_off_error == ""
+
+    def test_safe_dry_falls_back_to_safe_off_when_out_min_is_zero(self, rh_factory):
+        """A "dry purge" at duty 0 is a valve shutoff wearing the wrong name.
+
+        The fallback is the safe direction, so it is taken — and it is *reported*,
+        because a config typo that silently disables the dry purge is met months
+        later as unexplained RH collapses with nothing naming the cause.
+        """
+        ctrl, mock_ser, _ = rh_factory(out_min=0.0)
+        ctrl.set_setpoint(45.0)
+        mock_ser.write.reset_mock()
+
+        ctrl.safe_dry()
+
+        assert mock_ser.write.call_args[0][0] == self.ZERO
+        assert ctrl._setpoint == 0.0
+        assert ctrl.last_safe_dry_duty == 0.0
+        assert "out_min" in ctrl.last_safe_dry_error
+        assert "zeroed instead" in ctrl.last_safe_dry_error
+
+    def test_safe_dry_falls_back_to_safe_off_when_out_min_is_negative(
+            self, rh_factory):
+        ctrl, mock_ser, _ = rh_factory(out_min=-0.5)
+        mock_ser.write.reset_mock()
+
+        ctrl.safe_dry()
+
+        assert mock_ser.write.call_args[0][0] == self.ZERO
+        assert "out_min" in ctrl.last_safe_dry_error
+
+    def test_safe_dry_reports_a_fallback_that_also_failed(self, rh_factory):
+        """Both halves of the bad news, not just the first."""
+        ctrl, _, _ = rh_factory(out_min=0.0)
+        ctrl._serial = None
+
+        ctrl.safe_dry()
+
+        assert "out_min" in ctrl.last_safe_dry_error
+        assert "fallback to safe_off also failed" in ctrl.last_safe_dry_error
+
+    def test_safe_dry_does_not_raise_when_the_write_fails(self, rh_ctrl):
+        """Never-raise is the park's contract; the failure travels in the attribute."""
+        ctrl, mock_ser, _ = rh_ctrl
+        mock_ser.write.side_effect = OSError("port went away")
+
+        ctrl.safe_dry()                        # must not raise
+
+        assert "port went away" in ctrl.last_safe_dry_error
+        assert ctrl.last_safe_dry_duty == 0.0
+
+    def test_safe_dry_does_not_raise_when_the_port_is_none(self, rh_ctrl):
+        ctrl, _, _ = rh_ctrl
+        ctrl.set_setpoint(45.0)
+        ctrl._serial = None
+
+        ctrl.safe_dry()                        # must not raise
+
+        assert ctrl._setpoint == 0.0
+        assert "no serial transport" in ctrl.last_safe_dry_error
+
+    def test_safe_dry_clears_a_previous_error_on_a_later_success(self, rh_ctrl):
+        ctrl, mock_ser, _ = rh_ctrl
+        mock_ser.write.side_effect = OSError("port went away")
+        ctrl.safe_dry()
+        assert ctrl.last_safe_dry_error != ""
+
+        mock_ser.write.side_effect = None
+        ctrl.safe_dry()
+
+        assert ctrl.last_safe_dry_error == ""
+        assert ctrl.last_safe_dry_duty == pytest.approx(0.01)
+
+    def test_safe_dry_leaves_the_port_open(self, rh_ctrl):
+        """A safe state, not a disconnect — and the port must stay open anyway,
+        or a later float could not reset the firmware's deadman."""
+        ctrl, _, _ = rh_ctrl
+
+        ctrl.safe_dry()
+
+        assert ctrl._serial is not None
+        assert ctrl._state is InstrumentState.CONNECTED
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AsyncRHController — config key spellings ([a69])
@@ -491,6 +725,82 @@ class TestMockRHControllerSafeOff:
                 == inspect.signature(MockRHController.safe_off))
         assert AsyncRHController.last_safe_off_error == ""
         assert MockRHController.last_safe_off_error == ""
+
+    def test_both_drivers_expose_safe_dry_with_the_same_signature(self):
+        from softae.drivers.async_rh_controller import AsyncRHController
+        from softae.drivers.mock_rh_controller import MockRHController
+
+        assert (inspect.signature(AsyncRHController.safe_dry)
+                == inspect.signature(MockRHController.safe_dry))
+        for cls in (AsyncRHController, MockRHController):
+            assert cls.last_safe_dry_error == ""
+            assert cls.last_safe_dry_duty == 0.0
+
+    def test_mock_safe_dry_holds_out_min_rather_than_zero(self, mock_rh):
+        """The mock is not a formality: ``safe_park`` cannot tell it from a real
+        driver, so a ``safe_dry`` that quietly behaved like ``safe_off`` would
+        make every ``--mock`` park pass while proving the opposite of the point."""
+        mock_rh.set_setpoint(45.0)
+        mock_rh.start()
+        mock_rh.status()                       # let the sim raise the duty
+
+        mock_rh.safe_dry()
+
+        assert mock_rh._running is False
+        assert mock_rh._duty == pytest.approx(0.01)
+        assert mock_rh._setpoint == 0.0
+        assert mock_rh.last_safe_dry_duty == pytest.approx(0.01)
+        assert mock_rh.last_safe_dry_error == ""
+
+    def test_mock_safe_dry_is_distinguishable_from_safe_off(self, mock_rh):
+        """The one assertion a no-op implementation could never satisfy."""
+        mock_rh.start()
+        mock_rh.safe_off()
+        zeroed = mock_rh._duty
+
+        mock_rh.start()
+        mock_rh.safe_dry()
+
+        assert zeroed == 0.0
+        assert mock_rh._duty > zeroed
+
+    def test_mock_stays_at_out_min_after_safe_dry(self, mock_rh):
+        """``_update_sim`` gates on ``_running``, so nothing overwrites the duty."""
+        mock_rh.set_setpoint(45.0)
+        mock_rh.start()
+
+        mock_rh.safe_dry()
+
+        assert mock_rh.status()["duty_cycle"] == pytest.approx(0.01)
+        assert mock_rh.status()["duty_cycle"] == pytest.approx(0.01)
+
+    def test_mock_safe_dry_reads_the_configured_out_min(self):
+        from softae.drivers.mock_rh_controller import MockRHController
+
+        ctrl = MockRHController(name="rh_mock", config={"out_min": 0.07})
+        run(ctrl.connect())
+
+        ctrl.safe_dry()
+
+        assert ctrl._duty == pytest.approx(0.07)
+
+    def test_mock_safe_dry_falls_back_to_safe_off_when_out_min_is_zero(self):
+        """Same decision, same words as the real driver — the mock has to grade
+        a misconfigured rig the way the rig would."""
+        from softae.drivers.mock_rh_controller import MockRHController
+
+        ctrl = MockRHController(name="rh_mock", config={"out_min": 0.0})
+        run(ctrl.connect())
+        ctrl.set_setpoint(45.0)
+        ctrl.start()
+
+        ctrl.safe_dry()
+
+        assert ctrl._duty == 0.0
+        assert ctrl._running is False
+        assert ctrl._setpoint == 0.0
+        assert "out_min" in ctrl.last_safe_dry_error
+        assert "zeroed instead" in ctrl.last_safe_dry_error
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

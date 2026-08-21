@@ -22,6 +22,7 @@ from softae.core.safe_park import (
     HEADLINE_COMMANDED,
     HEADLINE_NOTHING,
     HEADLINE_PARTIAL,
+    RH_DEADMAN_S,
     SafeParkResult,
     safe_park,
     safe_park_async,
@@ -350,6 +351,191 @@ class TestHumidifier:
         assert rh._duty == 0.0
         assert rh._running is False
         assert rh._setpoint == 0.0
+
+
+# ── The dry-purge park ───────────────────────────────────────────────────────
+
+class TestDryPurgePark:
+    """The other humidifier end state, and it is **opt-in**.
+
+    ``ctrl`` near 0 is dry air; ``ctrl == 0`` exactly is a firmware special case
+    that shuts both Aalborg PSVs, so a park to duty 0 leaves no flow and room air
+    wins — a chamber held at 10 %RH goes to ~50 %RH in tens of seconds and every
+    restart costs a re-drying. ``rh_dry_purge=True`` parks to ``out_min`` instead
+    and lets the Trinket's ~25 s deadman close the valves.
+
+    Every existing caller keeps duty 0. An E-stop that leaves gas flowing for
+    25 s is not an E-stop, and that is an operator ruling, not a default.
+    """
+
+    def _mock_rh(self, **config):
+        from softae.drivers.mock_rh_controller import MockRHController
+
+        rh = MockRHController(name="rh_controller", config=config or None)
+        rh._state = InstrumentState.CONNECTED
+        rh.set_setpoint(45.0)
+        rh.start()
+        return rh
+
+    # -- the default path is untouched ----------------------------------------
+
+    def test_the_park_defaults_to_zeroing_and_never_dry_purges(self):
+        """Additive means additive: the shipped call is byte-for-byte itself."""
+        mgr = _manager()
+
+        result = safe_park(mgr, reason="unit test")
+
+        mgr._insts["rh_controller"].safe_off.assert_called_once()
+        mgr._insts["rh_controller"].safe_dry.assert_not_called()
+        assert "humidifier off (PID stopped, duty 0)" in result.commanded
+
+    def test_the_default_park_leaves_a_real_driver_at_duty_zero(self):
+        rh = self._mock_rh()
+
+        result = safe_park(_manager(rh_controller=rh))
+
+        assert result.ok
+        assert rh._duty == 0.0
+        assert rh.last_safe_dry_duty == 0.0
+
+    # -- the opt-in path -------------------------------------------------------
+
+    def test_the_dry_purge_park_calls_safe_dry_and_not_safe_off(self):
+        mgr = _manager()
+
+        safe_park(mgr, rh_dry_purge=True)
+
+        mgr._insts["rh_controller"].safe_dry.assert_called_once()
+        mgr._insts["rh_controller"].safe_off.assert_not_called()
+
+    def test_the_dry_purge_park_leaves_a_real_driver_at_out_min(self):
+        rh = self._mock_rh()
+
+        result = safe_park(_manager(rh_controller=rh), rh_dry_purge=True)
+
+        assert result.ok
+        assert rh._duty == pytest.approx(0.01)
+        assert rh._running is False
+        assert rh._setpoint == 0.0
+
+    def test_the_dry_purge_report_names_the_duty_and_the_deadman(self):
+        rh = self._mock_rh(out_min=0.05)
+
+        result = safe_park(_manager(rh_controller=rh), rh_dry_purge=True)
+
+        (line,) = [c for c in result.commanded if "DRY-PURGED" in c]
+        assert "0.05" in line
+        assert f"{RH_DEADMAN_S:g} s" in line
+
+    def test_the_dry_purge_report_cannot_be_read_as_the_failure_message(self):
+        """It deliberately leaves the device commanded, so it must read as its
+        own success — never as a near-miss of ``HUMIDIFIER WAS NOT TURNED OFF``.
+
+        The two describe opposite situations: that one is a humidifier nobody
+        could turn off; this one is dry air left flowing on purpose.
+        """
+        rh = self._mock_rh()
+
+        result = safe_park(_manager(rh_controller=rh), rh_dry_purge=True)
+
+        assert result.ok
+        assert result.errors == []
+        assert result.headline() == (HEADLINE_COMMANDED, False)
+        (line,) = [c for c in result.commanded if "DRY-PURGED" in c]
+        assert "DELIBERATE" in line
+        assert "not a humidifier left on" in line
+        # None of the vocabulary the genuine failures use.
+        for forbidden in ("NOT TURNED OFF", "was not zeroed", "could not be"):
+            assert forbidden not in line
+        # And it is filed as a claim, not as a fault: the paragraph an operator
+        # reads has a Commanded block carrying this line and no Failed block at
+        # all. Asserted on the rendered text because that is the surface the
+        # confusion would actually happen on.
+        paragraph = result.describe()
+        assert "Failed:" not in paragraph
+        commanded_block = paragraph.split("Commanded (sent")[1]
+        assert line in commanded_block
+
+    def test_the_dry_purge_park_still_happens_before_the_lamp(self):
+        order: list[str] = []
+        mgr = _manager()
+        mgr._insts["temp_controller"].write_sp.side_effect = (
+            lambda *a, **k: order.append("temp"))
+        mgr._insts["rh_controller"].safe_dry.side_effect = lambda: order.append("rh")
+        mgr._insts["lamp"].off.side_effect = lambda: order.append("lamp")
+
+        safe_park(mgr, rh_dry_purge=True)
+
+        assert order == ["temp", "rh", "lamp"]
+
+    # -- the ways it can go wrong ---------------------------------------------
+
+    def test_a_degenerate_out_min_is_an_error_not_a_silent_dry_purge(self):
+        """The driver's fallback leaves the hardware safe; the *report* still
+        refuses to call it a dry purge, because a one-character config mistake
+        that silently disables the feature is met months later as unexplained
+        RH collapses with nothing naming the cause."""
+        rh = self._mock_rh(out_min=0.0)
+
+        result = safe_park(_manager(rh_controller=rh), rh_dry_purge=True)
+
+        assert not result.ok
+        assert any("out_min" in e for e in result.errors)
+        assert not any("DRY-PURGED" in c for c in result.commanded)
+        # ...and the hardware really did end up safe, which the message says.
+        assert rh._duty == 0.0
+        assert any("zeroed instead" in e for e in result.errors)
+
+    def test_a_driver_with_no_safe_dry_is_zeroed_and_the_gap_is_reported(self):
+        """Unlike the pump halt's refusal to fall back: there the fallback was a
+        dispense, here it is the strictly safer end state."""
+        rh = MagicMock(spec=["is_connected", "safe_off", "last_safe_off_error"])
+        rh.is_connected = True
+        rh.last_safe_off_error = ""
+
+        result = safe_park(_manager(rh_controller=rh), rh_dry_purge=True)
+
+        rh.safe_off.assert_called_once()
+        assert any("no safe_dry()" in e for e in result.errors)
+        assert "humidifier off (PID stopped, duty 0)" in result.commanded
+
+    def test_a_raising_safe_dry_does_not_block_the_lamp(self):
+        mgr = _manager()
+        mgr._insts["rh_controller"].safe_dry.side_effect = RuntimeError("wedged")
+
+        result = safe_park(mgr, rh_dry_purge=True)
+
+        assert any("humidity: wedged" in e for e in result.errors)
+        mgr._insts["lamp"].off.assert_called_once()
+
+    def test_a_failed_dry_write_is_reported_as_an_error_not_commanded(self):
+        """``safe_dry`` swallows a comms failure to keep the never-raise
+        contract, so a park that only watched for an exception would claim a
+        write that never landed."""
+        mgr = _manager()
+        mgr._insts["rh_controller"].last_safe_dry_error = "port went away"
+
+        result = safe_park(mgr, rh_dry_purge=True)
+
+        assert any("port went away" in e for e in result.errors)
+        assert not any("DRY-PURGED" in c for c in result.commanded)
+
+    def test_a_disconnected_rh_controller_is_skipped_on_the_dry_path_too(self):
+        mgr = _manager()
+        mgr._insts["rh_controller"].is_connected = False
+
+        result = safe_park(mgr, rh_dry_purge=True)
+
+        assert result.ok
+        mgr._insts["rh_controller"].safe_dry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_async_park_forwards_the_dry_purge_flag(self):
+        mgr = _manager()
+
+        await safe_park_async(mgr, rh_dry_purge=True)
+
+        mgr._insts["rh_controller"].safe_dry.assert_called_once()
 
 
 # ── The vocabulary of the result ─────────────────────────────────────────────
