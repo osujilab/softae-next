@@ -687,6 +687,22 @@ class SettleOutcome:
     apex_by_channel: dict[int, float] = field(default_factory=dict)
     projected: dict[str, int] = field(default_factory=dict)
     rh_median_pct: float = float("nan")
+    #: Could the configured tolerance be met **at all**, on this board's own
+    #: measured scatter? ``None`` when the question was never answerable. The
+    #: gate computed this every round through
+    #: :meth:`~softae.analysis.equilibration.SettleTracker.endorsement` and no
+    #: caller here ever asked for it, so a run could spend its whole ceiling
+    #: chasing a tolerance its own noise floor forbade -- and did, on
+    #: ``20260820T183625Z_eis_validate``. Trailing, with a default, because this
+    #: class is constructed positionally.
+    tolerance_achievable: bool | None = None
+    #: The sentence :func:`~softae.analysis.equilibration.endorse_tolerance`
+    #: produced. Carried verbatim rather than rebuilt, so the refusal an operator
+    #: reads is the one the rule wrote.
+    endorsement: str = ""
+    #: Median relative scatter across the participating channels of the last
+    #: judged window -- the number the endorsement was decided against.
+    noise_floor_rel: float | None = None
 
     @property
     def certified(self) -> bool:
@@ -750,6 +766,10 @@ def settle_phase(
     start = float(now())
     rounds = 0
     stopped_early = False
+    announced: dict[str, Any] = {}
+    endorsed: bool | None = None
+    endorsement = ""
+    floor_rel: float | None = None
 
     while True:
         fits: list[Any] = []
@@ -769,8 +789,13 @@ def settle_phase(
         rounds += 1
 
         rh_median = _read_rh(rh)
-        check = tracker.observe(fits, rh_median_pct=rh_median)
+        # Read before the round is recorded, because the round is what it stamps:
+        # `elapsed` is the trailing window's time axis, and it must be aligned
+        # with `tracker.rounds` the way `rh_medians` already is. A duration since
+        # the phase began -- never a target, and no setpoint enters here.
         elapsed = float(now()) - start
+        check = tracker.observe(fits, rh_median_pct=rh_median, t_s=elapsed)
+        endorsed, endorsement, floor_rel = tracker.endorsement()
         deviations = settle_deviations(
             tracker.rounds[-tracker.n_rounds:],
             check.participating if check is not None else [])
@@ -798,6 +823,7 @@ def settle_phase(
               f"-> {state}", flush=True)
         if check is not None and not check.evaluable:
             print(f"         not evaluable: {check.reason}", flush=True)
+        _announce_endorsement(tracker, endorsed, endorsement, announced)
         # Routed through `_observe` for the reason `_observe` exists: the table
         # is a monitoring convenience and must never be why a gate refuses.
         _observe(_print_trend, "eis_validate_trend_render_failed",
@@ -818,6 +844,13 @@ def settle_phase(
             "evaluable": None if check is None else bool(check.evaluable),
             "settled": bool(tracker.settled),
             "reason": "" if check is None else check.reason,
+            # Whether the tolerance was reachable AT ALL on this board's own
+            # scatter -- gate state, and the question a reader of a `ceiling`
+            # asks first. A median relative deviation, which is the same
+            # dimensionless, geometry-free ratio the deviations already are.
+            "tolerance_achievable": endorsed,
+            "endorsement": endorsement,
+            "noise_floor_rel": None if floor_rel is None else round(floor_rel, 5),
         })
 
         if tracker.settled and elapsed >= floor_s:
@@ -833,7 +866,46 @@ def settle_phase(
         verdict=verdict, n_rounds=rounds, elapsed_s=float(now()) - start,
         apex_by_channel=apexes, projected=projected,
         rh_median_pct=_read_rh(rh) if rh is not None else float("nan"),
+        tolerance_achievable=endorsed, endorsement=endorsement,
+        noise_floor_rel=floor_rel,
     )
+
+
+def _announce_endorsement(
+    tracker: Any, endorsed: bool | None, endorsement: str, announced: dict[str, Any],
+) -> None:
+    """Say, at the FIRST judged window, whether the tolerance is reachable at all.
+
+    ``SettleTracker.endorsement`` has existed since the criterion did, is called
+    by the campaign path and by the equilibration workflow, and was never called
+    here -- so the one consumer that refuses on a ceiling was also the one that
+    never asked whether any hold length could have cleared it. On
+    ``20260820T183625Z_eis_validate`` the answer at round 3 was no, twenty-eight
+    minutes before the ceiling it then ran to.
+
+    Two scopes, because they answer different questions and disagree by design.
+    The board's endorsement is taken over the **median** participant, so that one
+    noisy cell does not condemn the setpoint; the criterion aggregates with
+    **max**, so one noisy cell is exactly what holds the board. Only the
+    per-channel view can name it, and naming it is the whole point -- an operator
+    told "ch25 can never satisfy 10 %" fixes a cell, while one told "not yet"
+    waits another hour.
+
+    Announced on **change**, not every round: the first judged window carries the
+    news, and a later line means the answer actually moved.
+    """
+    if endorsed is not None and announced.get("board") is not endorsed:
+        announced["board"] = endorsed
+        mark = "ACHIEVABLE" if endorsed else "UNACHIEVABLE"
+        print(f"[settle] tolerance {mark}: {endorsement}", flush=True)
+    named: set[int] = announced.setdefault("channels", set())
+    for channel, (ok, _why, floor) in tracker.per_channel_endorsement().items():
+        if ok is False and floor is not None and channel not in named:
+            named.add(channel)
+            print(f"[settle] ch{channel} UNSETTLEABLE: its own scatter "
+                  f"{floor * 100:.1f}% exceeds the tolerance "
+                  f"{tracker.tol_rel * 100:.2f}% -- no hold length can satisfy "
+                  f"it, so waiting is not the fix", flush=True)
 
 
 def settle_deviations(window: Any, participating: Any) -> dict[int, float]:
@@ -975,6 +1047,30 @@ def render_arc_watch(outcome: SettleOutcome, plan: ValidationPlan, *,
     return "\n".join(lines)
 
 
+def _tolerance_clause(outcome: SettleOutcome) -> str:
+    """The sentence that decides what an operator does about a ceiling.
+
+    ``ceiling`` says the criterion was evaluable and said no. It does not say
+    whether **any** hold length could have said yes, and those two want opposite
+    responses: wait longer, or stop asking for a tolerance the board's own
+    scatter forbids. :func:`~softae.analysis.equilibration.endorse_tolerance`
+    already answers it from the run's own measurement; the refusal quotes that
+    answer rather than restating the rule.
+
+    Silent when the question was never answerable -- an absent endorsement is
+    not an endorsement, and appending "unknown" to a refusal adds nothing an
+    operator can act on.
+    """
+    if outcome.tolerance_achievable is None or not outcome.endorsement:
+        return ""
+    verdict = ("The tolerance WAS achievable on this run's own scatter, so more "
+               "rounds were the missing ingredient: "
+               if outcome.tolerance_achievable else
+               "The tolerance was NEVER achievable on this run's own scatter, "
+               "so no hold length would have cleared it: ")
+    return f" {verdict}{outcome.endorsement}"
+
+
 def assert_settle_licensed(outcome: SettleOutcome) -> None:
     """**The second policy inversion.** ``ceiling`` and ``not_evaluable`` refuse.
 
@@ -997,6 +1093,7 @@ def assert_settle_licensed(outcome: SettleOutcome) -> None:
             f"{outcome.n_rounds} rounds ({outcome.elapsed_s / 60:.1f} min). "
             "The material was never shown to have stopped moving, and "
             "'undeclared is unknown, never empty' -- refusing to start."
+            + _tolerance_clause(outcome)
         )
     if outcome.verdict == SETTLE_DISABLED:
         print("  ! --settle off: every row is stamped hold_certified=disabled "

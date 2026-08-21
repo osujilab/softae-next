@@ -823,6 +823,83 @@ def test_settle_deviations_agree_with_the_gates_own_maximum(tmp_path):
         absent).participating)
 
 
+def test_settle_phase_endorsement_is_announced_at_the_first_judged_window(
+        tmp_path, capsys):
+    """`SettleTracker.endorsement` has existed since the criterion did and this
+    module -- the ONE consumer that refuses on a ceiling -- never called it.
+
+    So the harness that stops a run for "the material never settled" was also
+    the one that never asked whether any hold length could have cleared the
+    tolerance it was holding to. Announced at the first judged window, and once:
+    a line every round is a line nobody reads.
+    """
+    payloads: list[dict] = []
+    _plan_used, outcome = _scripted_settle(
+        tmp_path, {18: [100.0], 19: [100.0], 20: [100.0]},
+        on_round=payloads.append)
+    announced = [ln for ln in capsys.readouterr().out.splitlines()
+                 if ln.startswith("[settle] tolerance")]
+
+    assert len(announced) == 1 and "ACHIEVABLE" in announced[0]
+    # Before a window exists the question has no answer, and that is recorded as
+    # an absence rather than as a pass.
+    assert payloads[0]["tolerance_achievable"] is None
+    judged = [p for p in payloads if p["evaluable"]]
+    assert judged and judged[0]["tolerance_achievable"] is True
+    assert "noise floor" in judged[0]["endorsement"]
+    assert judged[0]["noise_floor_rel"] == pytest.approx(0.0)
+    assert outcome.tolerance_achievable is True and outcome.endorsement
+
+
+def test_settle_phase_unachievable_tolerance_names_the_channel(tmp_path, capsys):
+    """Wiring the board-level endorsement in is necessary and NOT sufficient.
+
+    `window_noise_floor` takes the median across participants -- deliberately,
+    so one noisy cell does not condemn the setpoint -- while `settle_check`
+    takes the max, so one noisy cell is exactly what holds the board. The two
+    aggregate in opposite directions by design, and the gap between them is how
+    ch25 spent an hour at the ceiling without ever being named. Here ch20's own
+    scatter is 49 % against a 10 % tolerance while the board's median says the
+    tolerance is fine.
+    """
+    _plan_used, _outcome = _scripted_settle(
+        tmp_path, {18: [100.0], 19: [100.0], 20: [100.0, 300.0, 100.0, 300.0]})
+    lines = capsys.readouterr().out.splitlines()
+    named = [ln for ln in lines if "UNSETTLEABLE" in ln]
+
+    assert len(named) == 1, "announced once per cell, not once per round"
+    assert named[0].startswith("[settle] ch20 UNSETTLEABLE")
+    assert "49.5%" in named[0] and "10.00%" in named[0]
+    assert "no hold length can satisfy it" in named[0]
+    # ...and the board-level line disagrees, which is the whole point.
+    assert any("tolerance ACHIEVABLE" in ln for ln in lines)
+
+
+def test_settle_refusal_quotes_whether_the_tolerance_was_ever_achievable():
+    """`ceiling` says the criterion said no. It does not say whether any hold
+    length could have said yes, and those two want opposite responses -- wait
+    longer, or stop asking for a tolerance the board's own scatter forbids."""
+    hopeless = H.SettleOutcome(
+        "ceiling", 9, 5400.0, tolerance_achievable=False,
+        endorsement="tol_rel 10.00% is BELOW the measured noise floor 15.00%")
+    with pytest.raises(H.RefuseToStart) as excinfo:
+        H.assert_settle_licensed(hopeless)
+    assert "NEVER achievable" in str(excinfo.value)
+    assert "BELOW the measured noise floor" in str(excinfo.value)
+
+    reachable = H.SettleOutcome("ceiling", 9, 5400.0, tolerance_achievable=True,
+                                endorsement="tol_rel 10.00% is above ...")
+    with pytest.raises(H.RefuseToStart) as excinfo:
+        H.assert_settle_licensed(reachable)
+    assert "WAS achievable" in str(excinfo.value)
+
+    # An unanswered question adds nothing an operator can act on, so it is not
+    # appended as "unknown".
+    with pytest.raises(H.RefuseToStart) as excinfo:
+        H.assert_settle_licensed(H.SettleOutcome("not_evaluable", 9, 5400.0))
+    assert "achievable" not in str(excinfo.value)
+
+
 def test_arc_watch_lists_each_cell_and_bounds_the_listing(tmp_path):
     """Counts alone do not say WHICH cells to move the setpoint for."""
     plan = _plan(tmp_path, channels=V.EXAMPLE_CHANNELS)
@@ -2654,7 +2731,10 @@ class TestRunNarration:
             "ts", "seq", "type", "round", "elapsed_s", "rh_median_pct",
             "rh_spread_pct", "tol_rel", "worst_deviation_rel", "worst_channel",
             "deviation_rel_by_channel", "participating", "n_channels",
-            "evaluable", "settled", "reason"}
+            "evaluable", "settled", "reason",
+            # Was the tolerance reachable at all on this board's own scatter?
+            # The gate computed it every round and nothing here asked for it.
+            "tolerance_achievable", "endorsement", "noise_floor_rel"}
 
         judged = rounds[-1]                        # the round the gate acted on
         assert judged["settled"] is True

@@ -1040,6 +1040,60 @@ EXCLUDED_ZERO_MEAN = "zero_mean"
 RH_MOVED = "rh_moved"
 EXCLUDED_RH_UNREADABLE = "rh_unreadable"
 
+# ── The rate criterion's vocabulary ──────────────────────────────────────────
+#
+# The deviation criterion above measures `max|σ − mean| / |mean|` over a window,
+# and for a 3-round window that statistic **is** the window's noise floor to
+# within a factor in [0.866, 1.000] — a scatter estimate being asked a question
+# about motion. Run `20260820T183625Z_eis_validate` is the proof: one channel
+# scattering ~90 % about a *stable* mean held a fifteen-channel board at the
+# ceiling for an hour, and the verdict it produced was the same word a channel
+# genuinely still drying produced. Those two want opposite actions from an
+# operator — stop waiting versus wait longer — so they need different names.
+#
+# The separation is a two-parameter OLS of `ln σ` on `t`: a **slope** (motion)
+# and a **residual** (scatter), gated on a confidence bound of the slope. It is
+# not a relaxation fit — no σ_∞, no τ, no monotonicity requirement, no model —
+# and it therefore survives τ's retirement. See :func:`log_rate`.
+
+#: `U > tol` and the bound is driven by |ĝ|: the slope is itself significant, so
+#: the cell is **still moving**. The one refusal here that is evidence about the
+#: sample, and so the one that blocks.
+RATE_MOVING = "rate_moving"
+#: `U > tol` and the bound is driven by SE(ĝ): the cell is too noisy to be judged
+#: at this tolerance. Spelled apart from :data:`RATE_MOVING` for the reason
+#: :data:`SETTLE_NOT_EVALUABLE` is spelled apart from :data:`SETTLE_CEILING` —
+#: "σ is moving" and "nothing here can tell us whether σ is moving" are different
+#: findings and only one of them is about the sample.
+RATE_UNDETECTABLE = "rate_undetectable"
+#: Fewer than ``min_fit_points`` usable rounds in the window.
+RATE_TOO_FEW_POINTS = "rate_too_few_points"
+#: Even a **perfectly flat** channel could not have certified over this span at
+#: this noise: `t(0.975, k−2)·SE(ĝ)` alone already exceeds the tolerance. This is
+#: where :data:`MIN_WINDOWS_PER_TAU`'s discipline survives without its constant —
+#: "a window shorter than the dynamics is an extrapolation, not a fit" becomes
+#: span-vs-noise rather than span-vs-τ. A statement about the *observation* and
+#: not about the sample, so it is not evaluable.
+RATE_SPAN_TOO_SHORT = "rate_span_too_short"
+#: This channel's **own** noise floor exceeds the relative tolerance, so no hold
+#: length can ever certify it. :func:`window_noise_floor` takes the MEDIAN across
+#: participants — deliberately — while the criterion aggregates with MAX, so the
+#: two point in opposite directions by design and a single unsettleable cell can
+#: hold a board whose tolerance was endorsed as achievable.
+EXCLUDED_UNSETTLEABLE = "unsettleable"
+
+#: df = 2, `t(0.975, 2) = 4.303` — the fewest points at which a confidence
+#: interval exists at all, and the hard floor :func:`rate_check` never fits
+#: below whatever it is asked for. k = 3 gives df = 1 and t = **12.706**, 6.5×
+#: the z ≈ 1.96 a reader assumes, which would make :data:`RATE_UNDETECTABLE` the
+#: universal verdict rather than a diagnosis.
+SETTLE_MIN_FIT_POINTS = 4
+#: df = 4, t = 2.776 — the fewest at which an interval is worth *quoting*, and
+#: the default. `SE(ĝ) = s_resid/√Σ(tᵢ−t̄)² ≈ s_resid·√12/(T·√k)`: span enters
+#: linearly and count only as √k, so more points is the weaker of the two levers
+#: and this is a floor rather than a target.
+DEFAULT_SETTLE_MIN_FIT_POINTS = 6
+
 
 @dataclass(frozen=True)
 class RoundFit:
@@ -1069,6 +1123,85 @@ class SettleCheck:
     participating: list[int] = field(default_factory=list)
     excluded: dict[int, str] = field(default_factory=dict)
     max_deviation_rel: float | None = None
+    n_rounds: int = 0
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ChannelRate:
+    """One cell's rate verdict — motion and scatter, reported separately.
+
+    The whole point of the pair ``rate_per_hour`` / ``resid_rel`` is that the
+    deviation criterion collapses them into one number and then cannot say which
+    one it saw. Three shapes, and the third is the one that has no name today:
+
+    ==========  =========  ===========================  ==================
+    ĝ           s_resid    U = |ĝ| + t·SE               verdict
+    ==========  =========  ===========================  ==================
+    ≈ 0         small      small                        settled
+    large       any        large, driven by ĝ           ``rate_moving``
+    ≈ 0         **large**  large, driven by SE          ``rate_undetectable``
+    ==========  =========  ===========================  ==================
+
+    Rates are in **ln-units per hour** — a fractional rate, so a constant
+    multiplicative factor on σ (the cell constant) cancels exactly.
+    """
+
+    channel: int
+    evaluable: bool = False
+    settled: bool = False
+    #: ĝ, the OLS slope of ``ln σ`` on ``t``. Negative for a drying film, whose
+    #: σ falls; the sign is load-bearing and is asserted, never assumed.
+    rate_per_hour: float | None = None
+    stderr_per_hour: float | None = None
+    #: `U = |ĝ| + t(0.975, k−2)·SE(ĝ)` — a one-sided 95 % upper bound on |rate|.
+    #: The channel is certified quiet only if even the top of its interval
+    #: cannot be moving faster than the tolerance.
+    upper_bound_per_hour: float | None = None
+    #: Residual RMS in ln units — the per-channel noise floor, measured on the
+    #: same window rather than assumed.
+    resid_rel: float | None = None
+    #: The channel's relative scatter about its own window mean, from
+    #: :func:`channel_noise_floors`. What :func:`endorse_tolerance` judges.
+    noise_floor_rel: float | None = None
+    n_points: int = 0
+    span_s: float = 0.0
+    #: `t(0.975, k−2)`, carried so a reader can see it is not 1.96.
+    t_multiplier: float | None = None
+    refusal: str = ""
+    reason: str = ""
+
+
+@dataclass
+class RateCheck:
+    """The rate verdict on one window — per cell, and then aggregated.
+
+    ``evaluable`` / ``settled`` carry the same meaning they carry on
+    :class:`SettleCheck`, and the per-cell lists below are why the pair is worth
+    having: a board that will not clear is now attributable. ``moving`` is the
+    only list that blocks. ``undetectable`` and ``unsettleable`` are cells the
+    observation cannot speak for, recorded so they can be dropped under an
+    explicit budget rather than silently.
+    """
+
+    evaluable: bool
+    settled: bool
+    participating: list[int] = field(default_factory=list)
+    excluded: dict[int, str] = field(default_factory=dict)
+    by_channel: dict[int, ChannelRate] = field(default_factory=dict)
+    quiet: list[int] = field(default_factory=list)
+    moving: list[int] = field(default_factory=list)
+    undetectable: list[int] = field(default_factory=list)
+    unsettleable: list[int] = field(default_factory=list)
+    #: The population rate — mean ĝ over the cells that produced a fit. Reported,
+    #: **never routed on**: pooling divides SE by √N (3.87× at N = 15) but it
+    #: certifies the population rather than the cell, and probe-3ch-v3 is direct
+    #: evidence that a population certificate does not carry to a per-cell
+    #: endpoint. The ``_status``-vs-``_ok`` discipline, one level down.
+    pooled_rate_per_hour: float | None = None
+    #: The worst per-cell upper bound — the quantity the gate compares to `tol`.
+    max_upper_bound_per_hour: float | None = None
+    span_s: float = 0.0
     n_rounds: int = 0
     reason: str = ""
 
@@ -1202,6 +1335,32 @@ def settle_check(
                 f"deviation {worst * 100:.2f}% is {verb} {float(tol_rel) * 100:.2f}%"))
 
 
+def channel_noise_floors(
+    window: Sequence[Sequence[RoundFit]], participating: Sequence[int],
+) -> dict[int, float | None]:
+    """Per-channel relative scatter over *window* — one entry per participant.
+
+    Exactly what :func:`window_noise_floor` takes the median of, exposed because
+    the median answers a different question from the one an operator asks when a
+    gate will not clear. *"Is this setpoint's tolerance achievable?"* is a
+    property of the board and wants the median; *"which cell can never satisfy
+    it?"* is a property of one cell and the median actively hides it — a single
+    channel at 90 % scatter moves a fifteen-channel median by nothing at all,
+    while :func:`settle_check` aggregates with ``max`` and lets that one channel
+    hold the whole board to its ceiling.
+
+    ``None`` for a channel whose window carries fewer than two usable σ: an
+    unmeasured floor is not a floor of zero.
+    """
+    by_channel = _window_series([list(r) for r in window])
+    floors: dict[int, float | None] = {}
+    for channel in participating:
+        fits = by_channel.get(int(channel)) or []
+        sigmas = [fit.sigma for fit in fits if fit.sigma is not None]
+        floors[int(channel)] = noise_floor(sigmas, n_settle=len(sigmas))
+    return floors
+
+
 def window_noise_floor(
     window: Sequence[Sequence[RoundFit]], participating: Sequence[int],
 ) -> float | None:
@@ -1211,16 +1370,324 @@ def window_noise_floor(
     criterion is actually judging rather than over a settled tail chosen later.
     Median across channels so one noisy channel does not decide whether the whole
     setpoint's tolerance was achievable.
+
+    One line over :func:`channel_noise_floors`, so the per-channel and pooled
+    views can never disagree about what a floor is.
     """
-    by_channel = _window_series([list(r) for r in window])
-    floors = []
-    for channel in participating:
-        fits = by_channel.get(int(channel)) or []
-        sigmas = [fit.sigma for fit in fits if fit.sigma is not None]
-        floor = noise_floor(sigmas, n_settle=len(sigmas))
-        if floor is not None:
-            floors.append(floor)
+    floors = [floor for floor in channel_noise_floors(window, participating).values()
+              if floor is not None]
     return float(np.median(floors)) if floors else None
+
+
+def log_rate(
+    times_s: Sequence[float], sigmas: Sequence[float]
+) -> tuple[float, float, float] | None:
+    """OLS of ``ln σ`` on ``t`` → ``(ĝ, SE(ĝ), s_resid)``, all per **second**.
+
+    A two-parameter slope estimate, closed-form, and deliberately **not** a
+    relaxation fit: it assumes no mechanism, has no σ_∞ and no τ, requires no
+    monotonicity, and carries none of ``curve_fit``'s scaling hazards — which is
+    why it survives τ's retirement while :class:`ExponentialRelaxationFitter`
+    does not. A later reader must not take "no τ" to mean "back to thresholds":
+    a threshold on a magnitude is precisely what failed.
+
+    ``ln σ`` rather than σ so that ĝ is a *fractional* rate. With ``σ = K/R₁``
+    and K constant across the window, ``d ln σ/dt = −d ln R₁/dt``: the cell
+    constant becomes an additive offset on ``ln σ``, absorbed by the intercept,
+    and cancels from the slope exactly. Non-uniform round spacing is handled by
+    construction, because ``t`` is a regressor and not an index.
+
+    ``None`` when the estimate is underdetermined — fewer than three finite,
+    strictly positive pairs (df ≥ 1 is needed for a residual at all) or a window
+    with no time span. Refused rather than returned with an infinite standard
+    error, on this module's standing posture: an absent number beats a plausible
+    wrong one.
+    """
+    t = np.asarray(times_s, dtype=float)
+    s = np.asarray(sigmas, dtype=float)
+    if t.size != s.size or t.size < 3:
+        return None
+    usable = np.isfinite(t) & np.isfinite(s) & (s > 0.0)
+    t, y = t[usable], np.log(s[usable])
+    if t.size < 3:
+        return None
+    centred = t - t.mean()
+    sxx = float(np.sum(centred ** 2))
+    if not np.isfinite(sxx) or sxx <= 0.0:
+        return None
+    slope = float(np.sum(centred * (y - y.mean())) / sxx)
+    residual = y - (y.mean() + slope * centred)
+    s_resid = float(np.sqrt(float(np.sum(residual ** 2)) / (t.size - 2)))
+    return slope, s_resid / float(np.sqrt(sxx)), s_resid
+
+
+def _t_multiplier(df: int) -> float:
+    """``t(0.975, df)`` — computed, never recalled as z ≈ 1.96.
+
+    At the window lengths a settle gate can afford the two are not
+    interchangeable: df = 2 (k = 4) wants 4.303, which is 2.20× the normal
+    multiplier, and df = 1 (k = 3) wants 12.706, which is 6.48×. An interval
+    quoted at z would be a third of its true width exactly where the decision is
+    hardest, so the multiplier is taken from the distribution the residual
+    actually has.
+    """
+    from scipy import stats
+
+    return float(stats.t.ppf(0.975, max(1, int(df))))
+
+
+def _reference_half_width(
+    times_s: Sequence[float],
+    fits: Sequence[tuple[float, float, float] | None] | Any,
+) -> float | None:
+    """`t(0.975, k−2)·SE` at the window's **median** residual, in ln/h.
+
+    What a *typical* cell on this board could have certified over this
+    observation, and therefore the quantity that separates "the window was too
+    short" from "this one cell is too noisy". Median across channels for exactly
+    the reason :func:`window_noise_floor` takes one — a single scattering cell
+    must not be allowed to declare the whole observation inadequate, which is
+    the mirror image of the failure that motivated this criterion.
+
+    ``None`` when no channel produced a fit: without a reference the two
+    diagnoses cannot be told apart, and the caller says so rather than guessing.
+    """
+    residuals = [fit[2] for fit in fits if fit is not None]
+    t = np.asarray(list(times_s), dtype=float)
+    sxx = float(np.sum((t - t.mean()) ** 2)) if t.size else 0.0
+    if not residuals or sxx <= 0.0:
+        return None
+    return float(_t_multiplier(t.size - 2) * np.median(residuals)
+                 / np.sqrt(sxx) * 3600.0)
+
+
+def _channel_rate(
+    channel: int,
+    times_s: Sequence[float],
+    sigmas: Sequence[float],
+    fit: tuple[float, float, float] | None,
+    *,
+    tol_per_hour: float,
+    tol_rel: float | None,
+    min_fit_points: int,
+    reference_half_width: float | None,
+) -> ChannelRate:
+    """One cell's verdict. The numbers are filled in even under a refusal, so a
+    dropped cell can be audited rather than merely named.
+
+    **The order the tests run in is load-bearing, and it is not the order a
+    naive reading gives.** Two of them are worth stating outright, because both
+    were got wrong first and both fail toward "do not block":
+
+    1. *Moving is decided before the span guard.* A noisy cell that is
+       nonetheless **provably** moving — ĝ significant against its own SE — is
+       moving, whatever the span. Checking span first excuses it as
+       non-evaluable, which turns a channel that must block into one that may be
+       dropped. A drying film has both a large residual and a large slope, so
+       this is the common case and not a corner.
+    2. *Unsettleable is decided on the* **residual**, *not on the raw scatter.*
+       ``noise_floor`` measures `std/|mean|`, which during a transient is
+       dominated by the drift rather than by the noise — the exact conflation
+       this criterion exists to remove. A drying cell's raw floor is five times
+       its residual, so endorsing against the raw floor would condemn every
+       moving cell as unachievable. ``s_resid`` is the scatter *with the trend
+       taken out*, which is what "this cell's own noise floor" has to mean once
+       a slope estimate exists.
+    """
+    span_s = float(max(times_s) - min(times_s)) if len(times_s) else 0.0
+    fields: dict[str, Any] = {
+        "channel": int(channel), "n_points": len(sigmas), "span_s": span_s,
+        "noise_floor_rel": noise_floor(sigmas, n_settle=len(sigmas)),
+    }
+    needed = max(SETTLE_MIN_FIT_POINTS, int(min_fit_points))
+    if fit is None or len(sigmas) < needed:
+        return ChannelRate(
+            evaluable=False, settled=False, refusal=RATE_TOO_FEW_POINTS,
+            reason=(f"{len(sigmas)} point(s) over {span_s:.0f} s; {needed} are "
+                    f"needed for an interval worth quoting"),
+            **fields)
+
+    slope, stderr, s_resid = fit
+    multiplier = _t_multiplier(len(sigmas) - 2)
+    half_width = multiplier * stderr * 3600.0
+    rate = slope * 3600.0
+    bound = abs(rate) + half_width
+    fields.update(rate_per_hour=rate, stderr_per_hour=stderr * 3600.0,
+                  resid_rel=s_resid, t_multiplier=multiplier,
+                  upper_bound_per_hour=bound)
+
+    tol = float(tol_per_hour)
+    if tol_rel is not None:
+        achievable, why = endorse_tolerance(float(tol_rel), s_resid)
+        if not achievable:
+            return ChannelRate(evaluable=False, settled=False,
+                               refusal=EXCLUDED_UNSETTLEABLE, reason=why, **fields)
+    if bound <= tol:
+        return ChannelRate(
+            evaluable=True, settled=True,
+            reason=(f"|rate| is at most {bound:.4f} ln/h at 95 % over "
+                    f"{span_s:.0f} s, within {tol:.4f} ln/h"),
+            **fields)
+    if abs(rate) >= half_width:
+        return ChannelRate(
+            evaluable=True, settled=False, refusal=RATE_MOVING,
+            reason=(f"rate {rate:+.4f} ln/h is significant against its own "
+                    f"t*SE {half_width:.4f}, and the 95 % bound {bound:.4f} "
+                    f"exceeds {tol:.4f} ln/h"),
+            **fields)
+    if reference_half_width is not None and reference_half_width > tol:
+        return ChannelRate(
+            evaluable=False, settled=False, refusal=RATE_SPAN_TOO_SHORT,
+            reason=(f"a cell at this window's median residual could itself have "
+                    f"certified no better than {reference_half_width:.4f} ln/h "
+                    f"over {span_s:.0f} s, above the {tol:.4f} tolerance — the "
+                    f"observation was too short, which is not a finding about "
+                    f"this cell"),
+            **fields)
+    return ChannelRate(
+        evaluable=False, settled=False, refusal=RATE_UNDETECTABLE,
+        reason=(f"the 95 % bound {bound:.4f} ln/h exceeds {tol:.4f}, but it is "
+                f"driven by scatter (t*SE {half_width:.4f}) rather than by the "
+                f"rate ({rate:+.4f}) — this cell is too noisy to be judged here, "
+                f"which is not the same as moving"),
+        **fields)
+
+
+def rate_check(
+    window: Sequence[Sequence[RoundFit]],
+    times_s: Sequence[float | None],
+    *,
+    tol_per_hour: float,
+    tol_rel: float | None = None,
+    min_fit_points: int = DEFAULT_SETTLE_MIN_FIT_POINTS,
+    min_channels: int = DEFAULT_SETTLE_MIN_CHANNELS,
+    r1_bound_ohms: float | None = None,
+) -> RateCheck:
+    """Is σ still *moving*, as distinct from merely noisy? Pure, and per cell.
+
+    Sibling of :func:`settle_check`, never a mode of it. Both read the same
+    window and the same participation rule; they differ in what they estimate.
+    :func:`settle_check` measures a magnitude and compares it to a drift
+    tolerance, which conflates the two components it is made of. This one
+    regresses ``ln σ`` on ``t`` for every participating channel and gates on a
+    one-sided 95 % **upper bound** of the slope, so a cell is certified quiet
+    only if even the top of its interval cannot be moving faster than
+    *tol_per_hour*.
+
+    Aggregation is **per cell**, matching the validator's endpoints, which are
+    per cell too. A channel proven moving blocks the window; a channel that is
+    merely too noisy to judge is identified and recorded rather than allowed to
+    block, which is the whole difference between this and today's ``max``.
+
+    *times_s* is elapsed seconds, one per round, index-aligned with *window*. A
+    window with any round time missing is refused rather than assumed evenly
+    spaced — the spacing is the regressor, and inventing it would invent the
+    answer. **No setpoint is read here**, and none may ever be passed: like
+    :func:`rh_window_spread` this compares a series to itself, and *tol_per_hour*
+    is a tolerance rather than a target.
+
+    *tol_rel* is optional and buys the second finding: given the *relative*
+    tolerance the deviation criterion is configured with, a cell whose residual
+    exceeds it is named :data:`EXCLUDED_UNSETTLEABLE` — no hold length can
+    certify it, so waiting is the wrong instruction. Omit it and the window is
+    judged on rate alone.
+
+    **Nothing calls this yet, by design.** It ships as a pure unit so that the
+    criterion can be measured against real windows before it is given any
+    routing power; the selector that would call it is a later stage.
+    """
+    rounds = [list(r) for r in window]
+    if not rounds:
+        return RateCheck(evaluable=False, settled=False, reason="no rounds yet")
+
+    times = list(times_s)
+    known = [t for t in times if t is not None and np.isfinite(float(t))]
+    if len(times) != len(rounds) or len(known) != len(rounds):
+        return RateCheck(
+            evaluable=False, settled=False, n_rounds=len(rounds),
+            reason=(f"{len(known)} of {len(rounds)} round times are known; the "
+                    "rate criterion needs a time axis and will not assume even "
+                    "spacing"))
+    axis = [float(t) for t in known]
+
+    by_channel = _window_series(rounds)
+    excluded = {ch: why for ch, fits in by_channel.items()
+                if (why := _exclusion(fits, r1_bound_ohms))}
+    # A conductance that is not strictly positive has no logarithm, and it is not
+    # a measurement of a conducting cell either. Spelled with the existing name
+    # because the cause is the existing one: the fit produced no usable σ.
+    for channel, fits in by_channel.items():
+        if channel not in excluded and any(
+                fit.sigma is None or float(fit.sigma) <= 0.0 for fit in fits):
+            excluded[channel] = EXCLUDED_SIGMA_NULL
+    participating = sorted(ch for ch in by_channel if ch not in excluded)
+    span_s = max(axis) - min(axis)
+    needed = max(1, int(min_channels))
+    if len(participating) < needed:
+        return RateCheck(
+            evaluable=False, settled=False, participating=participating,
+            excluded=excluded, n_rounds=len(rounds), span_s=span_s,
+            reason=(f"{len(participating)} participating channel(s) < {needed} "
+                    f"required; the criterion cannot be evaluated"))
+
+    series = {channel: [float(fit.sigma) for fit in by_channel[channel]]  # type: ignore[arg-type]
+              for channel in participating}
+    fitted = {channel: log_rate(axis, sigmas)
+              for channel, sigmas in series.items()}
+    reference = _reference_half_width(axis, fitted.values())
+    by_rate = {
+        channel: _channel_rate(
+            channel, axis, sigmas, fitted[channel],
+            tol_per_hour=tol_per_hour, tol_rel=tol_rel,
+            min_fit_points=min_fit_points, reference_half_width=reference)
+        for channel, sigmas in series.items()
+    }
+    grouped = {name: sorted(ch for ch, rate in by_rate.items()
+                            if rate.refusal == name)
+               for name in (RATE_MOVING, RATE_UNDETECTABLE,
+                            EXCLUDED_UNSETTLEABLE, RATE_SPAN_TOO_SHORT,
+                            RATE_TOO_FEW_POINTS)}
+    quiet = sorted(ch for ch, rate in by_rate.items() if rate.settled)
+    bounds = [rate.upper_bound_per_hour for rate in by_rate.values()
+              if rate.upper_bound_per_hour is not None]
+    rates = [rate.rate_per_hour for rate in by_rate.values()
+             if rate.rate_per_hour is not None]
+    common = {
+        "participating": participating, "excluded": excluded,
+        "by_channel": by_rate, "quiet": quiet,
+        "moving": grouped[RATE_MOVING],
+        "undetectable": grouped[RATE_UNDETECTABLE],
+        "unsettleable": grouped[EXCLUDED_UNSETTLEABLE],
+        "pooled_rate_per_hour": float(np.mean(rates)) if rates else None,
+        "max_upper_bound_per_hour": max(bounds) if bounds else None,
+        "span_s": span_s, "n_rounds": len(rounds),
+    }
+    tol = float(tol_per_hour)
+    if grouped[RATE_MOVING]:
+        return RateCheck(
+            evaluable=True, settled=False,
+            reason=(f"{len(grouped[RATE_MOVING])} channel(s) still moving above "
+                    f"{tol:.4f} ln/h: "
+                    + " ".join(f"ch{ch}" for ch in grouped[RATE_MOVING])),
+            **common)
+    if len(quiet) >= needed:
+        return RateCheck(
+            evaluable=True, settled=True,
+            reason=(f"{len(rounds)} rounds over {span_s:.0f} s, {len(quiet)} "
+                    f"quiet channel(s): worst 95 % bound "
+                    f"{max(bounds) if bounds else float('nan'):.4f} ln/h is "
+                    f"within {tol:.4f} ln/h"),
+            **common)
+    tally = ", ".join(
+        f"{len(grouped[name])} {name}" for name in
+        (RATE_UNDETECTABLE, EXCLUDED_UNSETTLEABLE, RATE_SPAN_TOO_SHORT,
+         RATE_TOO_FEW_POINTS) if grouped[name])
+    return RateCheck(
+        evaluable=False, settled=False,
+        reason=(f"{len(quiet)} channel(s) certified quiet < {needed} required "
+                f"({tally or 'no channel could be judged'}); an absence of "
+                f"evidence, not a verdict"),
+        **common)
 
 
 def round_rh_median(samples: Sequence[Any] | None) -> float | None:
@@ -1303,6 +1770,12 @@ class SettleTracker:
         #: One per round, aligned with :attr:`rounds`. ``None`` = this round's RH
         #: was never observed, which is not the same as "was steady".
         self.rh_medians: list[float | None] = []
+        #: Elapsed seconds at each round, aligned with :attr:`rounds` on exactly
+        #: the :attr:`rh_medians` precedent. ``None`` = this round carried no
+        #: clock, and a rate estimate over a window containing one refuses
+        #: rather than assuming even spacing. A **duration**, never a target:
+        #: the setpoint prohibition above applies to this axis unchanged.
+        self.times_s: list[float | None] = []
         self.last: SettleCheck | None = None
         #: Achieved spread of the **last** judged window, for the record. It is
         #: deliberately not the discriminator below: the binding window may have
@@ -1326,7 +1799,8 @@ class SettleTracker:
         self.rh_unreadable = False
 
     def observe(
-        self, fits: Sequence[RoundFit], *, rh_median_pct: float | None = None
+        self, fits: Sequence[RoundFit], *, rh_median_pct: float | None = None,
+        t_s: float | None = None,
     ) -> SettleCheck | None:
         """Record one round; return the verdict on the trailing window, if any.
 
@@ -1336,10 +1810,17 @@ class SettleTracker:
         :func:`~softae.core.autonomous_wiring.drive_settle_phase` refuses at entry
         to run a configured tolerance with no supplier wired: a missing wire and a
         dead sensor are otherwise indistinguishable at the point of harm.
+
+        *t_s* is elapsed seconds since the phase began — a duration and not a
+        target — and follows the same convention: ``None`` records the absence,
+        and :func:`rate_check` refuses a window containing one rather than
+        guessing at the spacing. Nothing reads it under the deviation criterion,
+        so every existing verdict is unchanged.
         """
         self.rounds.append(list(fits))
         self.rh_medians.append(
             None if rh_median_pct is None else float(rh_median_pct))
+        self.times_s.append(None if t_s is None else float(t_s))
         self.last = None
         if not self.enabled or len(self.rounds) < self.n_rounds:
             return None
@@ -1427,6 +1908,32 @@ class SettleTracker:
                                    self.last.participating)
         ok, why = endorse_tolerance(self.tol_rel, floor)
         return ok, why, floor
+
+    def per_channel_endorsement(
+        self,
+    ) -> dict[int, tuple[bool | None, str, float | None]]:
+        """The same question, asked of each cell instead of of the board.
+
+        :meth:`endorsement` aggregates with the **median** and the criterion
+        aggregates with the **max**; they point in opposite directions by design,
+        so a board can be told its tolerance is achievable while one cell it can
+        never satisfy holds it at the ceiling. That is not hypothetical — it is
+        run ``20260820T183625Z_eis_validate``, where a channel at ~90 % scatter
+        about a stable mean cost an hour and was never named.
+
+        Returned per channel as :meth:`endorsement` returns it for the board,
+        with the same discipline: ``None`` — never ``True`` — where the floor
+        could not be measured, because "not checked" is not "checked and fine".
+        """
+        if not self.enabled or self.last is None or not self.last.participating:
+            return {}
+        floors = channel_noise_floors(self.rounds[-self.n_rounds:],
+                                      self.last.participating)
+        judged: dict[int, tuple[bool | None, str, float | None]] = {}
+        for channel, floor in floors.items():
+            ok, why = endorse_tolerance(self.tol_rel, floor)
+            judged[channel] = (None if floor is None else ok, why, floor)
+        return judged
 
 
 #: This round's fits, keyed the way :func:`load_sigma_series` keys the whole run —
