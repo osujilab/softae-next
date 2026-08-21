@@ -410,7 +410,11 @@ def persist(ctx: RunContext, eis: Any, arm: str) -> int:
     measurement_id = ctx.data_store.record_measurement(
         ctx.run_id, eis, role="sample")
     try:
-        report = analyze_spectrum(eis, model_name="simpleSalt")
+        # The plan's model, not a literal: the settle gate excludes a channel
+        # whose R1 rests on *this* model's lower bound, so the gate and the
+        # reported fit have to be the same model or the bound describes a number
+        # nobody reads. Same value as the literal it replaces.
+        report = analyze_spectrum(eis, model_name=ctx.plan.circuit_model)
         ctx.data_store.record_fit(measurement_id, report.fit, report=report)
     except Exception as exc:
         logger.warning("eis_validate_fit_failed", channel=channel, arm=arm,

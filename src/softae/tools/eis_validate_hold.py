@@ -105,6 +105,17 @@ SOAK_PRINT_EVERY_N_POLLS = 10
 TEMP_CONTROLLER = "temp_controller"
 RH_CONTROLLER = "rh_controller"
 
+#: The circuit model both the settle gate and the measurement block fit with.
+#: **One name, because two would be a silent disagreement**: the gate excludes a
+#: channel whose R₁ rests on *the model's* lower bound
+#: (:func:`~softae.analysis.equilibration.r1_lower_bound_ohms`), so a gate fitting
+#: one model while the run reports another would rail against a bound that does
+#: not describe the number anybody reads. Carried on the plan so a future
+#: ``--circuit-model`` moves both together; the campaign path names its own copy
+#: at :data:`softae.core.autonomous_wiring.SETTLE_CIRCUIT_MODEL` for the same
+#: reason.
+SETTLE_CIRCUIT_MODEL = "simpleSalt"
+
 
 class VirtualClock:
     """A clock that advances only when the code under it waits.
@@ -198,6 +209,14 @@ class ValidationPlan:
     baseline_ok_hz: float = 0.0
     #: ``[eis.scout] band_below_apex_min_decades`` as it stood for this run.
     band_min_decades: float = 1.0
+    #: Which equivalent circuit the settle gate fits to get its R₁, and which the
+    #: measurement block reports through. Trailing, with a default, so every
+    #: existing positional construction is unchanged. **Deliberately not in
+    #: :meth:`fingerprint`** -- it changes how a spectrum is *read*, not which
+    #: specimen was measured, and the hash's stated line is ceiling-versus-floor
+    #: on the sample's state. Recorded in :meth:`as_dict` instead, which is where
+    #: an analysis choice belongs.
+    circuit_model: str = SETTLE_CIRCUIT_MODEL
 
     def cell_key(self, channel: int) -> str:
         return (f"{int(channel)}:{self.rh_setpoint_pct:g}:"
@@ -746,6 +765,7 @@ def settle_phase(
         DEFAULT_RH_STABILITY_PCT,
         SETTLE_DISABLED,
         SettleTracker,
+        r1_lower_bound_ohms,
     )
     from softae.workflows.equilibration import default_round_period_s
 
@@ -759,8 +779,17 @@ def settle_phase(
     period_s = (default_round_period_s(plan.baseline_preset, len(plan.channels))
                 if round_period_s is None else float(round_period_s))
 
+    # The bound the gate had no way to use until `_round_fit` started reporting
+    # the quantity it describes. `is_railed` returned False unconditionally while
+    # `r1_ohms` held a raw low-frequency real part -- correctly, since the model's
+    # R1 floor says nothing about that number -- so `EXCLUDED_RAILED` was
+    # structurally unreachable here and a channel whose fit came to rest on the
+    # floor reported the SAME number every round, which is what a stability
+    # criterion is least able to refuse. 325 of 1440 fits in the reference run
+    # sat on it while reporting success.
     tracker = SettleTracker(
-        enabled=True, rh_stability_pct=DEFAULT_RH_STABILITY_PCT)
+        enabled=True, rh_stability_pct=DEFAULT_RH_STABILITY_PCT,
+        r1_bound_ohms=r1_lower_bound_ohms(plan.circuit_model))
     rh = manager.get(RH_CONTROLLER)
     apexes: dict[int, float] = {}
     start = float(now())
@@ -780,7 +809,7 @@ def settle_phase(
                 logger.warning("eis_validate_settle_sweep_failed",
                                channel=channel, error=str(exc))
                 continue
-            fits.append(_round_fit(channel, eis))
+            fits.append(_round_fit(channel, eis, plan.circuit_model))
             closure = arc_closure(eis.frequency, eis.z_imag_neg,
                                   getattr(eis, "phase", None))
             apex = float(closure.f_apex_interior_hz)
@@ -824,6 +853,8 @@ def settle_phase(
         if check is not None and not check.evaluable:
             print(f"         not evaluable: {check.reason}", flush=True)
         _announce_endorsement(tracker, endorsed, endorsement, announced)
+        _announce_basis(fits, check, tracker.min_channels, plan.circuit_model,
+                        announced)
         # Routed through `_observe` for the reason `_observe` exists: the table
         # is a monitoring convenience and must never be why a gate refuses.
         _observe(_print_trend, "eis_validate_trend_render_failed",
@@ -851,6 +882,15 @@ def settle_phase(
             "tolerance_achievable": endorsed,
             "endorsement": endorsement,
             "noise_floor_rel": None if floor_rel is None else round(floor_rel, 5),
+            # How many channels this round produced a number the circuit model
+            # stands behind, and why the others left the window. Both are gate
+            # state and neither is an observable -- a count and a reason word,
+            # not a resistance -- which is the same line `deviation_rel_by_
+            # channel` sits on. Without them a run that stalls because its
+            # spectra stopped fitting is indistinguishable, in the only record
+            # that survives, from a run that stalled because the film moved.
+            "n_modelled": _n_modelled(fits),
+            "excluded_by_channel": _narrated_exclusions(check),
         })
 
         if tracker.settled and elapsed >= floor_s:
@@ -906,6 +946,99 @@ def _announce_endorsement(
                   f"{floor * 100:.1f}% exceeds the tolerance "
                   f"{tracker.tol_rel * 100:.2f}% -- no hold length can satisfy "
                   f"it, so waiting is not the fix", flush=True)
+
+
+def _announce_basis(
+    fits: Any, check: Any, min_channels: int, circuit_model: str,
+    announced: dict[str, Any],
+) -> None:
+    """Say, on the round it happens, when the gate's number was not the fit's.
+
+    The gate now reads a fitted R1 (see :func:`_round_fit`), and a fit can fail.
+    The failure is **a property of the cell, not of the round**, so it will not
+    arrive as scattered singletons -- it arrives as a population. Measured on
+    ``20260820T164634Z_eis_validate``: ch22 carried non-finite points in all
+    three of its sweeps and refused all three, while ch25 and ch32 carried none
+    and refused none. A cell that drops points drops them every round.
+
+    That population leaving the window silently is the failure this exists to
+    prevent: below ``min_channels`` participants the criterion is *not
+    evaluable*, which runs to the ceiling and then refuses, and an operator
+    reading "not yet" every round for ninety minutes has no way to tell that
+    from a film that is genuinely still moving. The two want opposite responses,
+    exactly as :func:`_announce_endorsement`'s two do.
+
+    Announced once per channel and once per stall, not once per round: a line
+    every round is a line nobody reads.
+    """
+    from softae.analysis.equilibration import (
+        BASIS_FITTED,
+        EXCLUDED_RAILED,
+        EXCLUDED_SIGMA_NULL,
+    )
+
+    named: set[int] = announced.setdefault("basis", set())
+    for fit in fits:
+        if fit.basis in ("", BASIS_FITTED) or int(fit.channel) in named:
+            continue
+        named.add(int(fit.channel))
+        raw = ("and the sweep carried no readable Z' either"
+               if fit.r_raw_ohms is None else
+               f"its raw low-frequency Z' was {fit.r_raw_ohms:.4g} ohm, recorded "
+               "as a diagnostic but NOT substituted -- that number is noisiest "
+               "on exactly the cells whose fit fails")
+        # "no USABLE R1", because a fit that railed on the model's bound also
+        # lands here now: the route demotes it to `success=False` with a NaN R1
+        # rather than reporting the bound as a measurement. See `_fitted_r1`.
+        print(f"[settle] ch{int(fit.channel)} NO FIT: {circuit_model} produced no "
+              f"usable R1, so this round carries no sigma and the channel drops "
+              f"out of the window ({raw})", flush=True)
+
+    if check is None or check.evaluable or announced.get("starved"):
+        return
+    blamed = sorted(int(ch) for ch, why in check.excluded.items()
+                    if why in (EXCLUDED_SIGMA_NULL, EXCLUDED_RAILED))
+    if not blamed or len(check.participating) >= int(min_channels):
+        return
+    announced["starved"] = True
+    print(f"[settle] NOT EVALUABLE because of the FITS, not the sample: "
+          f"{len(check.participating)} channel(s) participate against a minimum "
+          f"of {int(min_channels)}; "
+          f"{', '.join(f'ch{ch}' for ch in blamed)} carry no usable fitted R1. "
+          f"Holding longer cannot fix this -- the gate will run to its ceiling "
+          f"and refuse.", flush=True)
+
+
+def _n_modelled(fits: Any) -> int:
+    from softae.analysis.equilibration import BASIS_FITTED
+
+    return sum(1 for fit in fits if fit.basis == BASIS_FITTED)
+
+
+def _narrated_exclusions(check: Any) -> dict[str, str]:
+    """``{channel: why}`` in words the **event stream** is allowed to carry.
+
+    ``events.jsonl`` is narration and a test asserts over its raw bytes that no
+    observable's vocabulary appears in it -- ``sigma``, ``r1``, ``fit`` and
+    ``ohms`` are all forbidden substrings. The ``EXCLUDED_*`` constants spell two
+    of those (``sigma_null``, ``railed_R1``), so the reason is narrated in words
+    that say the same thing without naming the quantity. Nothing is lost: the
+    console line beside it carries the number, and the constants stay unchanged
+    for every caller that is not a stream.
+    """
+    from softae.analysis.equilibration import (
+        EXCLUDED_ABSENT,
+        EXCLUDED_RAILED,
+        EXCLUDED_SIGMA_NULL,
+        EXCLUDED_ZERO_MEAN,
+    )
+
+    words = {EXCLUDED_ABSENT: "absent", EXCLUDED_SIGMA_NULL: "no_value",
+             EXCLUDED_RAILED: "railed", EXCLUDED_ZERO_MEAN: "zero_mean"}
+    if check is None:
+        return {}
+    return {str(ch): words.get(why, "excluded")
+            for ch, why in sorted(check.excluded.items())}
 
 
 def settle_deviations(window: Any, participating: Any) -> dict[int, float]:
@@ -1361,7 +1494,9 @@ def _read_rh(rh: Any) -> float | None:
     return value if math.isfinite(value) else None
 
 
-def _round_fit(channel: int, eis: Any) -> Any:
+def _round_fit(
+    channel: int, eis: Any, circuit_model: str = SETTLE_CIRCUIT_MODEL
+) -> Any:
     """One channel's contribution to a settle round, **with a sigma**.
 
     ``settle_check`` excludes any channel carrying a NULL sigma from a round --
@@ -1369,34 +1504,206 @@ def _round_fit(channel: int, eis: Any) -> Any:
     test perfectly -- so a caller that supplies only ``r1_ohms`` makes every
     window ``not_evaluable`` and runs to its ceiling for nothing.
 
-    The sigma supplied here is ``1/R``, i.e. sigma with the cell constant set to
+    The sigma supplied here is ``1/R1``, i.e. sigma with the cell constant set to
     1. That is exact rather than approximate for this gate's purpose: the check
     is a **per-channel relative deviation from that channel's own mean**, so the
     channel's real ``K`` cancels out of it entirely -- the same reason the
     harness's whole comparison is geometry-free. No geometry is resolved, and
     none is needed.
 
-    ``R`` is the low-frequency real part, not a circuit fit. The gate compares a
-    quantity against itself across rounds, so what it needs is something monotone
-    in the arc size and available on every round -- and a fit on every channel of
-    every round is where a settle phase's cost would otherwise go, at 2.6 s per
-    open-arc fit.
+    **``R1`` is the circuit fit's, and this reverses an earlier decision made on
+    cost.** What stood here said the gate wanted "something monotone in the arc
+    size and available on every round", took the low-frequency real part, and
+    priced a fit at "2.6 s per open-arc fit". The cost was the whole argument and
+    it was wrong twice over:
+
+    - *Measured* (2026-08-21) through the sanctioned route,
+      :func:`~softae.analysis.eis.engine.analyze_spectrum` with ``engine`` unset
+      and ``[eis] engine = "legacy"``, on the ten real sweeps of run
+      ``20260820T164634Z_eis_validate``: **16.5 - 120.3 ms** where the fit
+      converges and **0.7 - 1.2 ms** where it refuses -- against the 2.6 s
+      quoted, i.e. **20x to 150x** cheaper. Fifteen channels is ~1 s of a 562 s
+      round even at the slow end. The pacing budget does not notice this. See
+      :func:`_fitted_r1` for the direct-fitter comparison and for the one config
+      under which this stops being true.
+    - The number it bought was defective. ``z_real[-1]`` is the real part **at the
+      lowest swept frequency**, which on a cell whose arc has not closed there is
+      `R + arc contribution` and moves with anything that moves the arc. On run
+      ``20260820T183625Z_eis_validate`` ch25 sat at 87/88/92/87 % relative
+      deviation across four consecutive windows -- flat scatter about a stable
+      mean, not drift -- while thirteen of fifteen channels converged to 6-22 %,
+      and it held the whole board at the ceiling for an hour. The gate takes the
+      MAX across channels, so one such cell is enough.
+
+    A future reader must not re-derive the raw point as an optimisation: it is
+    not that it costs nothing, it is that what it saves is measured in
+    milliseconds and what it costs is measured in hours at temperature.
+
+    **No fallback to the raw point when the fit fails, and the reason is not the
+    one first written here.** That reason was "the fit refuses when the data put
+    its R1 guess outside the model's bounds, which is what an unclosed arc does".
+    That mechanism is real -- it is what a synthetic open arc produces -- but it
+    is **not** what the real refusals are. On run
+    ``20260820T164634Z_eis_validate``, measured 2026-08-21, all three of ch22's
+    sweeps refuse with ``array must not contain infs or NaNs`` and none of them
+    ever reaches a bounds check:
+
+    ==============================  ========  =============  ==================
+    sweep                           points    non-finite     ``z_real[-1]``
+    ==============================  ========  =============  ==================
+    ``ch22_001_reference``          53        **64** / 265   1.664e+08 (finite)
+    ``ch22_002_adaptive_scout``     27        **16** / 135   3.361e+07 (finite)
+    ``ch22_003_reference_end``      53        **4** / 265    1.682e+08 (finite)
+    every ``ch25`` and ``ch32``     27-53     **0**          finite
+    ==============================  ========  =============  ==================
+
+    (Cells are points x five stored arrays -- ``frequency``, ``z_magnitude``,
+    ``phase``, ``z_real``, ``z_imag_neg``; the frequency axis is always clean, so
+    the non-finite count is four per dropped point.)
+
+    **A single-point read cannot notice that a quarter of the spectrum is NaN.**
+    ``z_real[-1]`` is one array cell, and on all three ch22 sweeps it is finite
+    and perfectly plausible -- so the old path counted a corrupt spectrum as
+    evidence and let ch22 sit at 47-55 % deviation for an hour without ever
+    saying anything was wrong with the data. The fit reads all 53 points and
+    refuses; the raw point reads one and cannot. Falling back would therefore
+    restore, under the fitted path's name, exactly the read that could not see
+    the defect that caused the refusal -- and it would do so on the cells where
+    the defect is densest. ``sigma=None`` excludes the channel and
+    :func:`_announce_basis` says so on the round it happens. The raw value is
+    still carried, in ``r_raw_ohms``, so a shadow run can measure what the fit
+    actually bought without a second bench run.
+
+    ``r1_ohms`` is NaN rather than ``None`` on a failed fit: an all-``None``
+    ``RoundFit`` reads to ``_exclusion`` as *absent* -- a sweep that never
+    happened -- and that is a different finding from a sweep that happened and
+    could not be fitted.
     """
-    from softae.analysis.equilibration import RoundFit
+    from softae.analysis.equilibration import (
+        BASIS_ABSENT,
+        BASIS_FIT_FAILED,
+        BASIS_FITTED,
+        RoundFit,
+    )
+
+    raw = _low_frequency_real(eis)
+    r1 = _fitted_r1(eis, circuit_model)
+    if r1 is None:
+        return RoundFit(
+            channel=int(channel), sigma=None,
+            r1_ohms=None if raw is None else float("nan"),
+            basis=BASIS_ABSENT if raw is None else BASIS_FIT_FAILED,
+            r_raw_ohms=raw)
+    return RoundFit(channel=int(channel), sigma=1.0 / r1, r1_ohms=r1,
+                    basis=BASIS_FITTED, r_raw_ohms=raw)
+
+
+def _low_frequency_real(eis: Any) -> float | None:
+    """``Z'`` at the lowest swept frequency -- a diagnostic now, not the gate."""
+    try:
+        value = float(eis.z_real[-1])
+    except Exception:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _fitted_r1(eis: Any, circuit_model: str) -> float | None:
+    """The route's R1 in ohms, or ``None`` if it produced no usable number.
+
+    **Through** :func:`~softae.analysis.eis.engine.analyze_spectrum`, **with
+    ``engine`` left unset.** An earlier version of this function called
+    ``fit_circuit`` directly and argued the gate "wants a resistance and nothing
+    else" -- true, and not a licence to open a second route. User ruling ``[a23]``
+    is that one resolver decides which physics runs, "as nothing changes about
+    the casting nor measurement between them", and a settle round is the same
+    casting and the same measurement as the reference sweep taken forty minutes
+    later. ``SpectrumReport.fit`` is the fitter's own ``FitResult``, so R1 is
+    reachable through the sanctioned route without asking the route for anything
+    it does not already return.
+
+    **The cost argument that justified the shortcut does not survive
+    measurement.** Re-measured warm on the ten stored sweeps of run
+    ``20260820T164634Z_eis_validate`` (2026-08-21), median of five, config
+    ``[eis] engine = "legacy"``:
+
+    ===================  ==================  ====================
+    per spectrum         ``fit_circuit``     ``analyze_spectrum``
+    ===================  ==================  ====================
+    successful fit       15.5 - 123.5 ms     16.5 - 120.3 ms
+    refused fit          0.9 - 1.2 ms        0.7 - 1.2 ms
+    ===================  ==================  ====================
+
+    The wrapper's arc annotation, quality grading and (withheld) sigma are
+    sub-millisecond against a fit that is tens of milliseconds; the difference is
+    inside the run-to-run noise. Fifteen channels is ~1 s of a ~562 s round.
+
+    **``cell=None``, deliberately, and no sigma is taken from the report.** The
+    gate compares a channel against *itself*, so the cell constant cancels out of
+    every statistic here -- see :func:`_round_fit`. There is no thickness and no
+    area to supply, and supplying a nominal one to make the report carry a sigma
+    would put a fabricated geometry into the one phase that is geometry-free by
+    construction. ``report.sigma`` is therefore ``mode="unavailable"`` on every
+    round, and nothing reads it: ``1/R1`` is built here instead.
+
+    **``blocking=True``, stated rather than inherited.** It is the default, and
+    on the legacy engine it is inert -- ``_legacy_report`` never builds a gate
+    context -- so leaving it off would look identical today and would be a
+    silent bet that the flag stays inert. It does not: under
+    ``[eis] engine = "gated"`` ``blocking`` reaches ``build_context`` and decides
+    whether ``gate_hf_inductance`` treats a high-frequency ``Im Z > 0`` run as
+    artefact and truncates it, and whether the Lin-KK ladder is fitted with a
+    series capacitance. These are ionically **blocking** coplanar cells --
+    polymer electrolyte on inert stripes, no faradaic couple, which is why the
+    low-frequency tail is capacitive and why the arcs do not close -- and a
+    settle round measures the same cells the rest of the harness does. The value
+    is a fact about the hardware, not about this phase, so it is written down
+    where a reader can check it against the board.
+
+    **A railed fit now arrives here as no fit, and that is a behaviour change.**
+    ``analyze_spectrum`` runs ``_demote_if_railed``, which clears ``success`` and
+    NaNs ``R1`` on a fit resting on the model's R1 bound -- naming the settle
+    criterion, by name, as one of the consumers that were taking a property of
+    ``CIRCUIT_MODELS`` for an observation. So the exclusion this phase used to
+    make itself, via the ``r1_bound_ohms`` it hands ``SettleTracker``, is now
+    made one level upstream and arrives as ``BASIS_FIT_FAILED`` /
+    ``EXCLUDED_SIGMA_NULL`` rather than ``EXCLUDED_RAILED``. The channel leaves
+    the window on the same round either way and the verdict is unchanged; what
+    moves is the word in ``excluded_by_channel`` -- and the console gains a line,
+    because a railed fit used to count as ``BASIS_FITTED`` and so was never named
+    by :func:`_announce_basis`. The bound stays wired: it is a second line of
+    defence for a caller that reaches ``SettleTracker`` with a railed R1 in hand,
+    which is still every path that reads a stored fit.
+    """
+    from softae.analysis.eis.engine import analyze_spectrum
 
     try:
-        r = float(eis.z_real[-1])
-    except Exception:
-        return RoundFit(channel=int(channel), sigma=None, r1_ohms=None)
-    sigma = (1.0 / r) if (math.isfinite(r) and r > 0) else None
-    return RoundFit(channel=int(channel), sigma=sigma, r1_ohms=r)
+        report = analyze_spectrum(eis, cell=None, model_name=str(circuit_model),
+                                  blocking=True)
+    except Exception as exc:
+        logger.warning("eis_validate_settle_fit_raised",
+                       model=str(circuit_model), error=str(exc))
+        return None
+    fit = report.fit
+    if fit is None:
+        # The gated engine withholds the fit entirely on a spectrum its
+        # admission gates reject. Never reached while `[eis] engine` is legacy.
+        logger.warning("eis_validate_settle_fit_withheld",
+                       model=str(circuit_model), engine=str(report.engine))
+        return None
+    if not fit.success:
+        logger.warning("eis_validate_settle_fit_failed",
+                       model=str(circuit_model), error=str(fit.error_msg))
+        return None
+    r1 = float(fit.R1) if fit.R1 is not None else float("nan")
+    return r1 if math.isfinite(r1) and r1 > 0 else None
 
 
 __all__ = [
     "DEFAULT_DRIFT_CHECK", "DEFAULT_MIN_TREATMENT",
     "DEFAULT_RH_APPROACH_TIMEOUT_S", "DEFAULT_SETTLE_MAX_HOLD_S",
     "DEFAULT_SOAK_S", "DEFAULT_TEMP_APPROACH_TIMEOUT_S",
-    "DEFAULT_TEMP_DESCENT_TIMEOUT_S", "SOAK_CEILING_FACTOR",
+    "DEFAULT_TEMP_DESCENT_TIMEOUT_S", "SETTLE_CIRCUIT_MODEL",
+    "SOAK_CEILING_FACTOR",
     "SOAK_POLL_INTERVAL_S", "SOAK_PRINT_EVERY_N_POLLS",
     "ApproachReport", "HoldWatch", "Projection", "RefuseToStart",
     "SettleOutcome", "SoakOutcome", "ValidationPlan", "VirtualClock",

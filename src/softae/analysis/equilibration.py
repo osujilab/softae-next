@@ -1095,6 +1095,21 @@ SETTLE_MIN_FIT_POINTS = 4
 DEFAULT_SETTLE_MIN_FIT_POINTS = 6
 
 
+#: How a :class:`RoundFit`'s σ was arrived at. Recorded rather than inferred,
+#: because every candidate is `1/R` for *some* R and the numbers are therefore
+#: indistinguishable once they are in the window — which is precisely how a gate
+#: comes to be decided by a quantity nobody chose. A window that mixes bases
+#: mixes two different observables and must be refused, never averaged.
+BASIS_FITTED = "fitted"
+BASIS_RAW = "raw"
+#: The fit ran and produced nothing usable. Spelled apart from
+#: :data:`BASIS_ABSENT` for the reason :data:`EXCLUDED_SIGMA_NULL` is spelled
+#: apart from :data:`EXCLUDED_ABSENT`: a fit that failed and a sweep that never
+#: happened send an operator to different places.
+BASIS_FIT_FAILED = "fit_failed"
+BASIS_ABSENT = "absent"
+
+
 @dataclass(frozen=True)
 class RoundFit:
     """One channel's fit from one round — the two numbers the criterion reads.
@@ -1107,6 +1122,16 @@ class RoundFit:
     channel: int
     sigma: float | None = None
     r1_ohms: float | None = None
+    #: Which of the ``BASIS_*`` words above produced ``sigma``. Empty on the
+    #: feeders that predate the question — :func:`load_round_fits` and the
+    #: campaign path both read a σ the measurement block already fitted and
+    #: recorded — which is an absence of the *question*, not of the answer.
+    basis: str = ""
+    #: The low-frequency real part of Z this round, in ohms, carried **beside**
+    #: the fitted R₁ and never in place of it. It is the quantity this gate used
+    #: to read, so keeping it is what makes "did fitting actually buy anything?"
+    #: answerable from a run's own record instead of from a second bench run.
+    r_raw_ohms: float | None = None
 
 
 @dataclass

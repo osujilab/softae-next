@@ -158,9 +158,11 @@ def render_trend_legend(
                   "DIRECTION that the",
         _INDENT + "[settle] line's magnitude cannot show. Console only; not "
                   "persisted.",
-        _INDENT + "sigma = 1/Re(Z) at the LOWEST measured frequency with the "
-                  "cell constant set",
-        _INDENT + "to 1. A relative tracking number, NOT a calibrated "
+        _INDENT + "sigma = 1/R1 from the CIRCUIT FIT, with the cell constant "
+                  "set to 1 -- not",
+        _INDENT + "Re(Z) at the sweep floor, which moves with an arc that has "
+                  "not closed",
+        _INDENT + "there. A relative tracking number, NOT a calibrated "
                   "conductivity, and NOT",
         _INDENT + "comparable between channels -- only against its own past.",
         _INDENT + "EMA folds the PREVIOUS rounds ONLY; the current reading is "

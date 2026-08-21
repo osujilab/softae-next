@@ -735,18 +735,34 @@ def test_apex_histogram_comes_from_the_settle_rounds(tmp_path):
 # criterion itself is unchanged and `test_settle_deviations_agree_with_the_gates
 # _own_maximum` is what says so.
 
-def _sweep_at(r_ohms: float):
-    """A Debye semicircle whose low-frequency real part is *r_ohms*.
+#: Stray capacitance of the synthetic arc, in farads. Inside `simpleSalt`'s own
+#: `C0` bounds (1e-11 .. 5e-9) so the model can represent the spectrum exactly,
+#: which is what makes the fitted `R1` reproducible to ~1 % of the value asked
+#: for. See `_sweep_at`.
+_SWEEP_C0_F = 1e-9
 
-    `_round_fit` reads `z_real[-1]` and nothing else, so this is the smallest
-    object that makes one channel's sigma controllable to the digit -- which is
-    what a test about *which channel is worst* needs and a mock rig, drifting
-    every channel identically, cannot give.
+
+def _sweep_at(r_ohms: float):
+    """A Debye semicircle whose **fitted** `R1` is *r_ohms* to within ~2 %.
+
+    `_round_fit` fits the circuit model now rather than reading `z_real[-1]`, so
+    the smallest object that makes one channel's sigma controllable is a spectrum
+    `simpleSalt` can actually represent -- `R0 - CPE0 - p(R1, C0)` with `R0 = 0`
+    -- on the shipped `Quick` grid. The arc closes well inside that grid, which
+    is what keeps the fit reproducible; an arc that does NOT close is the case
+    `test_round_fit_an_unfittable_spectrum_*` exercises deliberately.
+
+    **Values are ohms and are ~10 kOhm rather than ~100.** `simpleSalt`'s R1
+    lower bound *is* 100 Ohm, so a series written there either rails on it or is
+    refused by the fitter outright -- which is real behaviour, pinned by
+    `test_settle_phase_a_railed_fit_is_excluded_*`, and not what a test about
+    which channel is worst wants to be measuring.
     """
     from types import SimpleNamespace
 
-    freq = np.logspace(5.0, 0.81, 24)
-    z = float(r_ohms) / (1.0 + 1j * 2.0 * np.pi * freq * 1e-6)
+    freq = np.geomspace(200_000.0, 6.475, 27)
+    tau = float(r_ohms) * _SWEEP_C0_F
+    z = float(r_ohms) / (1.0 + 1j * 2.0 * np.pi * freq * tau)
     return SimpleNamespace(frequency=freq, z_real=z.real, z_imag_neg=-z.imag,
                            phase=np.degrees(np.angle(z)))
 
@@ -779,7 +795,7 @@ def test_settle_line_names_the_quantity_the_threshold_and_the_worst_channel(
     fifteen and used to do it anonymously.
     """
     _plan_used, outcome = _scripted_settle(tmp_path, {
-        18: [100.0], 19: [100.0], 20: [100.0, 100.0, 130.0]})
+        18: [10_000.0], 19: [10_000.0], 20: [10_000.0, 10_000.0, 13_000.0]})
     line = [ln for ln in capsys.readouterr().out.splitlines()
             if ln.startswith("[settle] round 3")][0]
 
@@ -787,7 +803,13 @@ def test_settle_line_names_the_quantity_the_threshold_and_the_worst_channel(
     assert "sigma drift" in line and "%RH" in line
     assert "(tol 10.00%)" in line
     assert "worst ch20" in line
-    assert " 16.67%" in line                       # the same units as the tolerance
+    # The same units as the tolerance. 16.92 % and not the 16.67 % the raw ratio
+    # 10 k -> 13 k gives: the gate reads the FITTED R1 now, and `simpleSalt`
+    # recovers 9893 / 12916 from this arc rather than 10000 / 13000. The two
+    # differ by the fit's own bias, which is the point -- a bias that is stable
+    # across rounds cancels from a relative deviation, and the raw point's
+    # ROUND-TO-ROUND scatter does not.
+    assert " 16.92%" in line
     assert "spread 0.130" not in line              # the old, unitless, anonymous form
 
 
@@ -835,7 +857,7 @@ def test_settle_phase_endorsement_is_announced_at_the_first_judged_window(
     """
     payloads: list[dict] = []
     _plan_used, outcome = _scripted_settle(
-        tmp_path, {18: [100.0], 19: [100.0], 20: [100.0]},
+        tmp_path, {18: [10_000.0], 19: [10_000.0], 20: [10_000.0]},
         on_round=payloads.append)
     announced = [ln for ln in capsys.readouterr().out.splitlines()
                  if ln.startswith("[settle] tolerance")]
@@ -863,16 +885,272 @@ def test_settle_phase_unachievable_tolerance_names_the_channel(tmp_path, capsys)
     tolerance is fine.
     """
     _plan_used, _outcome = _scripted_settle(
-        tmp_path, {18: [100.0], 19: [100.0], 20: [100.0, 300.0, 100.0, 300.0]})
+        tmp_path,
+        {18: [10_000.0], 19: [10_000.0],
+         20: [10_000.0, 30_000.0, 10_000.0, 30_000.0]})
     lines = capsys.readouterr().out.splitlines()
     named = [ln for ln in lines if "UNSETTLEABLE" in ln]
 
     assert len(named) == 1, "announced once per cell, not once per round"
     assert named[0].startswith("[settle] ch20 UNSETTLEABLE")
-    assert "49.5%" in named[0] and "10.00%" in named[0]
+    # 49.4 % rather than 49.5 %: the floor is now measured on the fitted R1, so
+    # it carries the fit's bias on each of the three rounds instead of the raw
+    # low-frequency point's. The conclusion is untouched -- five times the
+    # tolerance either way.
+    assert "49.4%" in named[0] and "10.00%" in named[0]
     assert "no hold length can satisfy it" in named[0]
     # ...and the board-level line disagrees, which is the whole point.
     assert any("tolerance ACHIEVABLE" in ln for ln in lines)
+
+
+# ── S5-series: the gate reads a FITTED R1, not the raw low-frequency point ───
+#
+# `20260820T183625Z_eis_validate`, ch25: 87/88/92/87 % relative deviation across
+# four consecutive windows -- flat scatter about a STABLE mean -- while 13 of 15
+# channels converged to 6-22 %. The gate takes the MAX, so that one cell held a
+# fifteen-channel board at the ceiling for an hour. The quantity it scattered on
+# was `Re(Z)` at the LOWEST swept frequency, measured on a cell whose arc had not
+# closed there, which is exactly where that point is least stable.
+
+def _open_arc_sweep():
+    """A spectrum `simpleSalt` cannot fit: the apex sits far below the floor.
+
+    Not an invented failure: the fitter derives its `R1` initial guess from the
+    data and refuses when that guess falls outside the model's bounds, which is
+    what an arc still rising at the sweep floor produces.
+
+    **It is not, however, the failure the real spectra show, and it is no longer
+    the stated reason for excluding rather than falling back.** On run
+    `20260820T164634Z_eis_validate` all three ch22 sweeps refuse with `array must
+    not contain infs or NaNs` (64/265, 16/135 and 4/265 non-finite array cells)
+    while every ch25 and ch32 sweep has zero -- and ch22's `z_real[-1]` is finite
+    in all three. The argument in `_round_fit` is now that one: a single-point
+    read cannot notice that a quarter of the spectrum is NaN, so falling back to
+    it would reinstate exactly the read that could not see the defect. This
+    fixture stays because the bounds refusal is the OTHER way a fit can produce
+    nothing, and the gate must handle both identically.
+    """
+    return _sweep_at(1e8)
+
+
+def _scattering_low_frequency_point(scale: float):
+    """One arc, whose two lowest-frequency points are off by *scale*.
+
+    ch25 in miniature: everything about the cell is unchanged round to round
+    except the tail of the sweep, which is the only part `z_real[-1]` can see
+    and a small part of what a 27-point fit sees.
+    """
+    eis = _sweep_at(10_000.0)
+    eis.z_real = eis.z_real.copy()
+    eis.z_real[-1] *= float(scale)
+    eis.z_real[-2] *= 1.0 + (float(scale) - 1.0) * 0.5
+    return eis
+
+
+def test_round_fit_uses_the_fitted_r1_not_the_raw_low_frequency_point():
+    """`sigma = 1/R1_fitted`, and the raw point rides along as a diagnostic.
+
+    `fit_circuit` is the INDEPENDENT oracle here, not the implementation:
+    `_round_fit` goes through `analyze_spectrum` with `engine` unset (P.20), and
+    on the legacy engine that must return the same `R1` byte for byte. Rewriting
+    the expectation in terms of `analyze_spectrum` would turn this into `x == x`.
+    """
+    from softae.analysis.circuit_fitting import fit_circuit
+
+    eis = _sweep_at(10_000.0)
+    fit = H._round_fit(20, eis)
+    expected = fit_circuit(eis, model_name="simpleSalt")
+
+    assert fit.basis == "fitted"
+    assert fit.r1_ohms == pytest.approx(expected.R1)
+    assert fit.sigma == pytest.approx(1.0 / expected.R1)
+    # Carried, never used: this is what makes "did the fit buy anything?"
+    # answerable from a run's own record instead of from a second bench run.
+    assert fit.r_raw_ohms == pytest.approx(float(eis.z_real[-1]))
+    assert fit.r_raw_ohms != pytest.approx(fit.r1_ohms)
+
+
+def test_round_fit_an_unfittable_spectrum_yields_no_sigma_and_keeps_the_raw_point():
+    """The documented fallback is EXCLUSION, and it is wired rather than described.
+
+    Falling back to `z_real[-1]` would restore ch25 on exactly the cells the fit
+    could not reach -- unclosed arcs -- while wearing the fitted path's name. So
+    the channel drops out, `basis` records why, and the raw value survives beside
+    it for diagnosis without ever being substituted for the missing one.
+    """
+    from softae.analysis.equilibration import EXCLUDED_SIGMA_NULL, settle_check
+
+    eis = _open_arc_sweep()
+    fit = H._round_fit(20, eis)
+
+    assert fit.sigma is None
+    assert fit.basis == "fit_failed"
+    assert fit.r_raw_ohms == pytest.approx(float(eis.z_real[-1]))
+    # A fit that RAN and failed is not a sweep that never happened, and the two
+    # send an operator to different places -- so `r1_ohms` is NaN rather than
+    # None, which is what keeps `_exclusion` off the `absent` branch.
+    assert math.isnan(fit.r1_ohms)
+    window = [[fit, H._round_fit(21, _sweep_at(10_000.0))]] * 3
+    assert settle_check(window).excluded[20] == EXCLUDED_SIGMA_NULL
+
+
+def test_round_fit_a_missing_spectrum_is_absent_rather_than_a_failed_fit():
+    """Nothing readable at all is the OTHER absence, and keeps its own name."""
+    from types import SimpleNamespace
+
+    from softae.analysis.equilibration import EXCLUDED_ABSENT, settle_check
+
+    fit = H._round_fit(20, SimpleNamespace())
+
+    assert (fit.sigma, fit.r1_ohms, fit.r_raw_ohms) == (None, None, None)
+    assert fit.basis == "absent"
+    window = [[fit, H._round_fit(21, _sweep_at(10_000.0))]] * 3
+    assert settle_check(window).excluded[20] == EXCLUDED_ABSENT
+
+
+def test_round_fit_a_railed_fit_is_demoted_by_the_route_before_the_bound_sees_it():
+    """MOVED because `_round_fit` now fits through `analyze_spectrum` (P.20/[a23]).
+
+    Previously `_fitted_r1` called `fit_circuit` directly, which reports a fit
+    resting on the model's R1 floor as `success = True` with `R1 = 100` -- so the
+    railed value reached `RoundFit` as a `fitted` basis and the phase's own
+    `r1_bound_ohms` wiring was what excluded it, as `EXCLUDED_RAILED`.
+
+    On the route, `analyze_spectrum` runs `_demote_if_railed` first, and that
+    helper names the settle criterion by name as one of the consumers it exists
+    to protect: it clears `success` and NaNs `R1`, because "the optimiser
+    reported where the wall was" is not a measurement. So the demotion now
+    happens one level upstream and the channel arrives as `fit_failed`.
+
+    The consequence for the gate is unchanged -- excluded on the same round,
+    same verdict -- and the console is strictly better, because a `fitted` basis
+    was never announced by `_announce_basis` and a `fit_failed` one is. What
+    moves is the exclusion WORD, and that is asserted in both places below so a
+    future reader can see it was decided rather than drifted.
+    """
+    from softae.analysis.circuit_fitting import fit_circuit
+    from softae.analysis.eis.engine import analyze_spectrum
+    from softae.analysis.equilibration import (
+        EXCLUDED_RAILED,
+        EXCLUDED_SIGMA_NULL,
+        RoundFit,
+        r1_lower_bound_ohms,
+        settle_check,
+    )
+
+    eis = _sweep_at(150.0)
+    bound = r1_lower_bound_ohms("simpleSalt")
+
+    # The two routes genuinely disagree, and this is the disagreement.
+    direct = fit_circuit(eis, model_name="simpleSalt")
+    assert direct.success and direct.R1 == pytest.approx(bound)
+    routed = analyze_spectrum(eis, cell=None, model_name="simpleSalt").fit
+    assert not routed.success and "railed fit" in str(routed.error_msg)
+
+    railed = H._round_fit(20, eis)
+    quiet = [H._round_fit(ch, _sweep_at(10_000.0)) for ch in (18, 19)]
+    window = [[railed, *quiet]] * 3
+
+    assert railed.basis == "fit_failed" and railed.sigma is None
+    assert math.isnan(railed.r1_ohms)          # ran and failed, not never ran
+    assert settle_check(window, r1_bound_ohms=bound).excluded[20] \
+        == EXCLUDED_SIGMA_NULL
+    # ...and the bound is NOT dead wiring: it is the second line of defence for
+    # every caller that reaches `settle_check` holding a railed R1 already -- the
+    # campaign path and `load_round_fits`, which read a stored fit rather than
+    # producing one, and so never pass through `_demote_if_railed`.
+    stored = [[RoundFit(20, 1.0 / bound, bound, basis="fitted"), *quiet]] * 3
+    assert settle_check(stored, r1_bound_ohms=bound).excluded[20] == EXCLUDED_RAILED
+    assert settle_check(stored).participating == [18, 19, 20]   # no bound, no refusal
+
+
+def test_settle_phase_a_railed_channel_leaves_the_window_as_an_unusable_fit(tmp_path):
+    """MOVED with the test above: the narrated word is `no_value`, not `railed`.
+
+    End to end inside the phase. The verdict, the participant list and the
+    refusal are all byte-identical to what they were; the one byte that changed
+    is the reason `excluded_by_channel` carries, because the route withholds the
+    bound value instead of handing it over to be recognised downstream.
+    """
+    payloads: list[dict] = []
+    _plan_used, outcome = _scripted_settle(
+        tmp_path, {18: [10_000.0], 19: [10_000.0], 20: [150.0]},
+        on_round=payloads.append)
+    judged = [p for p in payloads if p["evaluable"] is not None][0]
+
+    assert judged["excluded_by_channel"] == {"20": "no_value"}
+    assert judged["participating"] == [18, 19]
+    # Two participants against a minimum of three: an absence of evidence, run
+    # to the ceiling and refused, never a quiet pass on the survivors.
+    assert outcome.verdict == "not_evaluable"
+
+
+def test_settle_phase_an_unfittable_channel_is_named_on_the_round_it_drops_out(
+        tmp_path, capsys):
+    """Announced once per cell, and carried into the one record that survives.
+
+    A fit failure is not random: it tracks unclosed arcs, so it arrives as a
+    population rather than as singletons. A population leaving the window in
+    silence is a gate that says "not yet" for ninety minutes about a film that
+    may not be moving at all.
+    """
+    payloads: list[dict] = []
+    _plan_used, _outcome = _scripted_settle(
+        tmp_path, {18: [10_000.0], 19: [10_000.0], 20: [1e8]},
+        on_round=payloads.append)
+    named = [ln for ln in capsys.readouterr().out.splitlines() if "NO FIT" in ln]
+
+    assert len(named) == 1, "once per cell, not once per round"
+    assert named[0].startswith("[settle] ch20 NO FIT")
+    assert "NOT substituted" in named[0]
+    judged = [p for p in payloads if p["evaluable"] is not None][0]
+    assert judged["n_modelled"] == 2 and judged["n_channels"] == 3
+    assert judged["excluded_by_channel"] == {"20": "no_value"}
+
+
+def test_settle_phase_fit_starvation_below_min_channels_says_the_fits_are_why(
+        tmp_path, capsys):
+    """The failure this stage could have traded one stall for -- named, not silent.
+
+    Below `min_channels` participants the criterion is NOT EVALUABLE, which runs
+    to the ceiling and then refuses. "The film is still moving" and "we cannot
+    fit these spectra" both print as `not yet`, and they want opposite responses:
+    wait longer, versus stop waiting because holding cannot fix a fit.
+    """
+    _plan_used, outcome = _scripted_settle(
+        tmp_path, {18: [1e8], 19: [1e8], 20: [10_000.0]})
+    lines = capsys.readouterr().out.splitlines()
+    starved = [ln for ln in lines if "NOT EVALUABLE because of the FITS" in ln]
+
+    assert outcome.verdict == "not_evaluable"
+    assert len(starved) == 1, "once per stall, not once per round"
+    assert "ch18" in starved[0] and "ch19" in starved[0]
+    assert "1 channel(s) participate against a minimum of 3" in starved[0]
+    assert "Holding longer cannot fix this" in starved[0]
+
+
+def test_round_fit_a_scattering_raw_point_settles_on_the_fitted_basis():
+    """ch25, reproduced -- and the two bases disagree about it, which is the point.
+
+    One cell, unchanged round to round except in the tail of its sweep. The raw
+    low-frequency real part IS that tail, so it scatters ~50 % and the gate reads
+    a film doubling its conductivity between rounds. A 27-point fit sees the
+    whole arc, so the same three rounds are flat to ~3 % and the gate reads what
+    is actually there. No hold length fixes the first; nothing needs to fix the
+    second.
+    """
+    from softae.analysis.equilibration import RoundFit, settle_check
+
+    sweeps = [_scattering_low_frequency_point(s) for s in (0.6, 1.0, 1.5)]
+    fitted = [[H._round_fit(20, eis)] for eis in sweeps]
+    raw = [[RoundFit(20, 1.0 / float(eis.z_real[-1]), float(eis.z_real[-1]))]
+           for eis in sweeps]
+
+    assert H.settle_deviations(raw, [20])[20] == pytest.approx(0.5, abs=0.02)
+    assert H.settle_deviations(fitted, [20])[20] < 0.05
+    # Same three rounds, same cell, opposite verdicts.
+    assert settle_check(raw, min_channels=1).settled is False
+    assert settle_check(fitted, min_channels=1).settled is True
 
 
 def test_settle_refusal_quotes_whether_the_tolerance_was_ever_achievable():
@@ -947,7 +1225,8 @@ def test_a_failing_round_observer_never_fails_the_settle_phase(tmp_path):
         raise OSError("no space left on device")
 
     _plan_used, outcome = _scripted_settle(
-        tmp_path, {18: [100.0], 19: [100.0], 20: [100.0]}, on_round=_boom)
+        tmp_path, {18: [10_000.0], 19: [10_000.0], 20: [10_000.0]},
+        on_round=_boom)
     assert outcome.certified
 
 
@@ -1073,7 +1352,8 @@ def test_trend_table_leaves_every_settle_verdict_bit_identical(
 
     Also pins the cadence: the legend once, the column header under every round.
     """
-    series = {18: [100.0], 19: [100.0], 20: [100.0, 100.0, 130.0]}
+    series = {18: [10_000.0], 19: [10_000.0],
+              20: [10_000.0, 10_000.0, 13_000.0]}
     _plan_shown, shown = _scripted_settle(tmp_path, series)
     with_table = capsys.readouterr().out
 
@@ -1105,7 +1385,7 @@ def test_a_failing_trend_render_never_fails_the_settle_phase(tmp_path, monkeypat
 
     monkeypatch.setattr(H, "_print_trend", _boom)
     _plan_used, outcome = _scripted_settle(
-        tmp_path, {18: [100.0], 19: [100.0], 20: [100.0]})
+        tmp_path, {18: [10_000.0], 19: [10_000.0], 20: [10_000.0]})
     assert outcome.certified
 
 
@@ -2734,13 +3014,20 @@ class TestRunNarration:
             "evaluable", "settled", "reason",
             # Was the tolerance reachable at all on this board's own scatter?
             # The gate computed it every round and nothing here asked for it.
-            "tolerance_achievable", "endorsement", "noise_floor_rel"}
+            "tolerance_achievable", "endorsement", "noise_floor_rel",
+            # How many channels the circuit model stood behind this round, and
+            # why the others left the window. The gate reads a FITTED R1, so a
+            # run can now stall because its spectra stopped fitting -- which,
+            # without these two, is indistinguishable in the only surviving
+            # record from a run that stalled because the film kept moving.
+            "n_modelled", "excluded_by_channel"}
 
         judged = rounds[-1]                        # the round the gate acted on
         assert judged["settled"] is True
         assert judged["tol_rel"] == pytest.approx(0.10)
         assert judged["participating"] == [18, 19, 20]
         assert judged["n_channels"] == 3
+        assert judged["n_modelled"] == 3 and judged["excluded_by_channel"] == {}
         assert set(judged["deviation_rel_by_channel"]) == {"18", "19", "20"}
         assert judged["worst_channel"] in (18, 19, 20)
         assert judged["worst_deviation_rel"] == pytest.approx(

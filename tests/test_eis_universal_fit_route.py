@@ -85,14 +85,24 @@ STAGE_B_HELD: dict[str, str] = {}
 ENGINE_DECISION_EXEMPT: dict[str, str] = {}
 
 #: Every migrated fit site — Stage A's six, plus Stage B's ``router.py`` (site 9, the
-#: workflow auto-fit, the origin of nearly every stored ``fit_results`` row). All must
-#: name ``analyze_spectrum``.
+#: workflow auto-fit, the origin of nearly every stored ``fit_results`` row), plus
+#: ``tools/eis_validate_hold.py`` (site 11, the validation harness's settle gate). All
+#: must name ``analyze_spectrum``.
+#:
+#: Site 11 arrived *after* the guard, not before it: the settle gate began reading a
+#: fitted R₁ instead of ``z_real[-1]`` and reached for ``fit_circuit`` to get one,
+#: which is how ``test_no_module_outside_the_sanctioned_set_...`` first caught a
+#: regression rather than a legacy. It is the first **per-round, all-channel** consumer
+#: of this route, so it is also the first place ``[eis] engine``'s cost is load-bearing
+#: — see ``_fitted_r1``'s docstring, which measures it. That is a reason to price the
+#: engine, never a reason to let a surface name its own.
 MIGRATED_FIT_SITES = (
     "analysis/eis/router.py",
     "gui/tabs/tab_analysis.py",
     "gui/tabs/tab_experiment.py",
     "gui/tabs/tab_manual.py",
     "gui/widgets/eis_visualizer_widget.py",
+    "tools/eis_validate_hold.py",
     "web/data_adapter.py",
     "workflows/temp_eis_sweep.py",
 )

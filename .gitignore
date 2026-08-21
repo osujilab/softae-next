@@ -40,6 +40,9 @@ logs/
 output/
 # data exports; no CSV outside data/ exists today
 *.csv
+# repo-root only: a test artifact from a DataStore built on a relative path
+# instead of tmp_path. Ignored so it cannot be committed by accident.
+/softae_data/
 
 # ─── Documentation: private by default ────────────────────────────────
 # Everything under docs/ is ignored, then the public surface is
