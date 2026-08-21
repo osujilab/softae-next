@@ -71,6 +71,88 @@ def test_paste_writes_editable_cells(qtbot):
     assert [t.item(r, c).text() for r in range(2) for c in range(2)] == ["1", "2", "3", "4"]
 
 
+def _ro(text: str) -> QTableWidgetItem:
+    it = QTableWidgetItem(text)
+    it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+    return it
+
+
+def _mixed_grid(rows, qtbot):
+    """3 columns: read-only, editable, read-only — the results-table shape."""
+    t = _grid(PasteableTableWidget, rows, 3, qtbot)
+    for r in range(rows):
+        t.setItem(r, 0, _ro("ro"))
+        t.setItem(r, 1, QTableWidgetItem("0"))
+        t.setItem(r, 2, _ro("ro"))
+    return t
+
+
+def _paste_at(t, text, row, col):
+    QApplication.clipboard().setText(text)
+    t.setCurrentCell(row, col)
+    emitted = []
+    t.pasteCompleted.connect(emitted.append)
+    t._paste_selection()
+    return emitted
+
+
+def test_paste_completed_emits_once_with_rows_written(qtbot):
+    t = _mixed_grid(4, qtbot)
+    emitted = _paste_at(t, "1\n2\n3", 0, 1)
+    assert emitted == [[0, 1, 2]]  # one batched emission, not one per cell
+    assert [t.item(r, 1).text() for r in range(4)] == ["1", "2", "3", "0"]
+
+
+def test_paste_completed_emits_empty_list_when_nothing_writable(qtbot):
+    """TRAP 2: a cursor outside the editable column writes nothing at all."""
+    t = _mixed_grid(4, qtbot)
+    emitted = _paste_at(t, "1\n2\n3", 0, 0)  # cursor on the read-only column
+    assert emitted == [[]]                   # reported, not silent
+    assert [t.item(r, 1).text() for r in range(4)] == ["0"] * 4
+
+
+def test_paste_completed_not_emitted_for_empty_clipboard(qtbot):
+    t = _mixed_grid(2, qtbot)
+    emitted = _paste_at(t, "", 0, 1)
+    assert emitted == []  # nothing was attempted, so there is nothing to report
+
+
+def test_paste_completed_fires_after_signals_unblocked(qtbot):
+    """TRAP 1: an emit inside blockSignals would be swallowed silently."""
+    t = _mixed_grid(2, qtbot)
+    seen = []
+    t.pasteCompleted.connect(lambda rows: seen.append(
+        (t.signalsBlocked(), [t.item(r, 1).text() for r in rows])))
+    QApplication.clipboard().setText("7\n8")
+    t.setCurrentCell(0, 1)
+    t._paste_selection()
+    assert seen == [(False, ["7", "8"])]  # receiver sees the written text
+
+
+def test_paste_steps_over_readonly_cells_preserving_column_alignment(qtbot):
+    t = _mixed_grid(2, qtbot)
+    QApplication.clipboard().setText("a\tb\tc")  # 3 wide, starting at col 0
+    t.setCurrentCell(0, 0)
+    t._paste_selection()
+    # Only the editable middle column takes a value, and it takes the *middle* one.
+    assert [t.item(0, c).text() for c in range(3)] == ["ro", "b", "ro"]
+
+
+def test_paste_clamps_at_row_count_and_never_grows_table(qtbot):
+    t = _mixed_grid(2, qtbot)
+    emitted = _paste_at(t, "1\n2\n3\n4\n5", 0, 1)
+    assert t.rowCount() == 2
+    assert emitted == [[0, 1]]
+    assert [t.item(r, 1).text() for r in range(2)] == ["1", "2"]
+
+
+def test_paste_drops_trailing_excel_newline(qtbot):
+    t = _mixed_grid(3, qtbot)
+    emitted = _paste_at(t, "1\r\n2\r\n", 0, 1)  # Excel's CRLF + trailing newline
+    assert emitted == [[0, 1]]                  # not a third, empty row
+    assert t.item(2, 1).text() == "0"
+
+
 # ── Shift-click range toggling ───────────────────────────────────────────────
 
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
-from PySide6.QtCore import QThread
+from PySide6.QtCore import Qt, QThread
 from PySide6.QtWidgets import QApplication
 
 from softae.drivers.mock_factory import create_mock_manager
@@ -320,6 +320,258 @@ class TestPerRowThickness:
         _add_fit_row(tab, 1)
         flags = tab._results_table.item(0, _RCOL_T).flags()
         assert flags & Qt.ItemFlag.ItemIsEditable
+
+
+# ── Clipboard paste of a thickness column (F1) ───────────────────────────────
+
+
+def _add_result_row(tab, *, channel: int = 1, r1: float = 1000.0, t: float = 0.175):
+    """A full-width results row, as `_populate_results` builds one.
+
+    Wider than `_add_fit_row` on purpose: the paste tests need the read-only R0/R1
+    and σ cells present to prove a paste steps over them.
+    """
+    from softae.gui.tabs.tab_analysis import (
+        _RCOL_ERROR, _RCOL_FILE, _RCOL_GATE, _RCOL_MODEL, _RCOL_R0, _RCOL_R1,
+        _RCOL_SIGMA, _RCOL_STATUS, _ro_item,
+    )
+
+    _add_fit_row(tab, channel, t=t)
+    row = tab._results_table.rowCount() - 1
+    tab._results_table.blockSignals(True)
+    for col, text in ((_RCOL_FILE, "f.txt"), (_RCOL_MODEL, "randles"),
+                      (_RCOL_R0, "10.00"), (_RCOL_R1, f"{r1:.2f}"),
+                      (_RCOL_SIGMA, "—"), (_RCOL_STATUS, "✓"),
+                      (_RCOL_GATE, "pass"), (_RCOL_ERROR, "")):
+        tab._results_table.setItem(row, col, _ro_item(text))
+    tab._results_table.blockSignals(False)
+    tab._recompute_row_sigma(row)
+    return row
+
+
+def _paste_into_results(tab, text: str, *, row: int = 0, col: int | None = None):
+    from softae.gui.tabs.tab_analysis import _RCOL_T
+
+    QApplication.clipboard().setText(text)
+    tab._results_table.setCurrentCell(row, _RCOL_T if col is None else col)
+    tab._results_table._paste_selection()
+
+
+def _sigmas(tab):
+    from softae.gui.tabs.tab_analysis import _RCOL_SIGMA
+
+    return [tab._results_table.item(r, _RCOL_SIGMA).text()
+            for r in range(tab._results_table.rowCount())]
+
+
+class TestResultsTablePaste:
+    def test_paste_writes_thickness_column_for_every_clipboard_row(self, tab):
+        from softae.gui.tabs.tab_analysis import _RCOL_T
+
+        for _ in range(3):
+            _add_result_row(tab)
+
+        _paste_into_results(tab, "0.01\r\n0.02\r\n0.03\r\n")  # Excel's CRLF shape
+
+        assert [tab._results_table.item(r, _RCOL_T).text() for r in range(3)] == [
+            "0.01", "0.02", "0.03"]
+
+    def test_paste_recomputes_sigma_for_every_pasted_row(self, tab):
+        """TRAP 1 — the defect that would ship new t beside stale σ.
+
+        Mutation-checked: with the `pasteCompleted` connection removed, this test
+        fails (σ stays at the pre-paste value for all three rows).
+        """
+        tab._fits = []  # force `_row_r1` onto the R1 cell, not a live fit
+        for _ in range(3):
+            _add_result_row(tab, r1=1000.0, t=0.175)
+        before = _sigmas(tab)
+        assert all(s not in ("", "—") for s in before)
+
+        _paste_into_results(tab, "0.35\n0.35\n0.35")  # doubled thickness
+
+        after = _sigmas(tab)
+        assert all(a != b for a, b in zip(after, before)), (
+            "every pasted row's σ must be recomputed, not just the first")
+        for a, b in zip(after, before):
+            # rel 1e-4: the cells carry the displayed '%.4e', not full precision.
+            assert float(a) == pytest.approx(float(b) / 2, rel=1e-4)  # σ ∝ 1/t
+
+    def test_paste_refreshes_the_sigma_plot_once(self, tab):
+        calls = []
+        tab._update_sigma_plot = lambda: calls.append(True)
+        for _ in range(4):
+            _add_result_row(tab)
+
+        _paste_into_results(tab, "0.01\n0.02\n0.03\n0.04")
+
+        assert len(calls) == 1  # one batched refresh, not one per row
+
+    def test_paste_steps_over_readonly_cells_preserving_column_alignment(self, tab):
+        from softae.gui.tabs.tab_analysis import _RCOL_R0, _RCOL_R1, _RCOL_T
+
+        _add_result_row(tab)
+        # Three columns wide starting at R0: R0 and R1 are read-only, t is not.
+        _paste_into_results(tab, "999\t888\t0.02", col=_RCOL_R0)
+
+        assert tab._results_table.item(0, _RCOL_R0).text() == "10.00"   # untouched
+        assert tab._results_table.item(0, _RCOL_R1).text() == "1000.00"  # untouched
+        assert tab._results_table.item(0, _RCOL_T).text() == "0.02"      # aligned
+
+    def test_paste_cannot_write_the_checkbox_column(self, tab):
+        from softae.gui.tabs.tab_analysis import _RCOL_CHECK
+
+        _add_result_row(tab)
+        tab._results_table.item(0, _RCOL_CHECK).setCheckState(Qt.CheckState.Checked)
+
+        _paste_into_results(tab, "x", col=_RCOL_CHECK)
+
+        item = tab._results_table.item(0, _RCOL_CHECK)
+        assert item.text() == ""
+        assert item.checkState() == Qt.CheckState.Checked
+
+    def test_paste_longer_than_the_table_clamps_without_adding_rows(self, tab):
+        from softae.gui.tabs.tab_analysis import _RCOL_T
+
+        for _ in range(2):
+            _add_result_row(tab)
+
+        _paste_into_results(tab, "\n".join(f"0.0{i}" for i in range(1, 8)))
+
+        assert tab._results_table.rowCount() == 2
+        assert [tab._results_table.item(r, _RCOL_T).text() for r in range(2)] == [
+            "0.01", "0.02"]
+
+    def test_paste_that_writes_nothing_is_reported_and_names_the_column(self, tab):
+        """TRAP 2 — the everyday case: the cursor is not in the t column."""
+        from softae.gui.tabs.tab_analysis import _RCOL_CHANNEL, _RCOL_T
+
+        _add_result_row(tab)
+        _paste_into_results(tab, "0.01", col=_RCOL_CHANNEL)
+
+        assert tab._results_table.item(0, _RCOL_T).text() == "0.175"  # unchanged
+        status = tab._lbl_db_status.text()
+        assert "nothing" in status.lower()
+        assert "t (cm)" in status
+
+    def test_paste_does_not_relocate_itself_to_the_thickness_column(self, tab):
+        """Refusing is the contract; silently moving the operator's paste is not."""
+        from softae.gui.tabs.tab_analysis import _RCOL_FILE, _RCOL_T
+
+        for _ in range(2):
+            _add_result_row(tab)
+
+        _paste_into_results(tab, "0.01\n0.02", col=_RCOL_FILE)
+
+        assert [tab._results_table.item(r, _RCOL_T).text() for r in range(2)] == [
+            "0.175", "0.175"]
+
+    def test_paste_with_non_numeric_values_counts_them_and_leaves_them_visible(
+            self, tab):
+        from softae.gui.tabs.tab_analysis import _RCOL_SIGMA, _RCOL_T
+
+        tab._fits = []
+        for _ in range(3):
+            _add_result_row(tab)
+
+        _paste_into_results(tab, "t (cm)\n0.02\n")  # a spreadsheet header row
+
+        status = tab._lbl_db_status.text()
+        assert "2" in status                          # two rows written
+        assert "1 not numeric" in status              # one of them unusable
+        assert tab._results_table.item(0, _RCOL_T).text() == "t (cm)"  # left visible
+        assert tab._results_table.item(0, _RCOL_SIGMA).text() == "—"
+        assert tab._results_table.item(1, _RCOL_SIGMA).text() not in ("", "—")
+
+    def test_clean_paste_reports_without_a_dialog(self, tab, monkeypatch):
+        import softae.gui.tabs.tab_analysis as mod
+
+        popped = []
+        monkeypatch.setattr(mod.QMessageBox, "information",
+                            lambda *a, **k: popped.append(a))
+        _add_result_row(tab)
+
+        _paste_into_results(tab, "0.02")
+
+        assert popped == []
+        assert "Pasted 1" in tab._lbl_db_status.text()
+
+
+# ── DataStore selection dialog: Shift-click range (F2) ───────────────────────
+
+
+class _FakeStore:
+    """Minimal store surface `_DataStoreSelectionDialog` actually calls."""
+
+    def __init__(self, n: int = 6):
+        self._n = n
+
+    def query_runs(self):
+        return [{"run_id": "run1"}]
+
+    def query_measurements(self, run_id=None, channel=None, limit=None,
+                           descending=True):
+        return [{"measurement_id": i, "timestamp": f"2026-08-21T00:0{i}",
+                 "run_id": "run1", "channel": i + 1, "workflow_name": "wf",
+                 "eis_file_path": f"eis_ch{i + 1}.txt"} for i in range(self._n)]
+
+    def query_conditions(self, measurement_id=None, stage=None):
+        return []
+
+
+class TestDataStoreSelectionDialogRange:
+    def _dialog(self, qapp, n=6):
+        from softae.gui.tabs.tab_analysis import _DataStoreSelectionDialog
+
+        return _DataStoreSelectionDialog(_FakeStore(n))
+
+    def test_shift_click_range_fills_checkboxes_between_anchor_and_row(self, qapp):
+        dlg = self._dialog(qapp)
+        try:
+            dlg._table.item(1, 0).setCheckState(Qt.CheckState.Checked)
+            dlg._table._check_anchor_row = 1
+
+            dlg._table._apply_check_range(1, 4)
+
+            checked = [dlg._table.item(r, 0).checkState() == Qt.CheckState.Checked
+                       for r in range(6)]
+            assert checked == [False, True, True, True, True, False]
+        finally:
+            dlg.close()
+
+    def test_selected_rows_returns_exactly_the_shift_filled_range(self, qapp):
+        """`selected_rows()` reads checkbox state, so the range must reach it."""
+        dlg = self._dialog(qapp)
+        try:
+            dlg._table.item(1, 0).setCheckState(Qt.CheckState.Checked)
+            dlg._table._check_anchor_row = 1
+            dlg._table._apply_check_range(1, 4)
+
+            assert [r["channel"] for r in dlg.selected_rows()] == [2, 3, 4, 5]
+        finally:
+            dlg.close()
+
+    def test_reload_rows_resets_the_range_anchor(self, qapp):
+        """A filter change must not let a range be filled from stale rows.
+
+        `_reset_check_anchor` hangs off the *model's* row signals, so the widget's
+        own `blockSignals` cannot suppress it — this asserts that rather than
+        arguing it.
+        """
+        dlg = self._dialog(qapp)
+        try:
+            dlg._table._check_anchor_row = 3
+            dlg._reload_rows()
+            assert dlg._table._check_anchor_row is None
+        finally:
+            dlg.close()
+
+    def test_checkable_column_is_the_checkbox_column(self, qapp):
+        dlg = self._dialog(qapp)
+        try:
+            assert dlg._table.checkable_column == 0
+        finally:
+            dlg.close()
 
 
 # ── Excel-style sample IDs ───────────────────────────────────────────────────

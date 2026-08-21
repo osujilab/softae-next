@@ -110,7 +110,21 @@ class PasteableTableWidget(CopyableTableWidget):
     are written; read-only cells and widget (checkbox) cells are stepped over so
     column alignment is preserved, and the paste is clamped to the existing rows
     and columns (it never grows the table).
+
+    The write loop runs with the widget's signals blocked, so ``itemChanged`` does
+    *not* fire per cell.  :attr:`pasteCompleted` is the replacement: it fires once
+    per paste, after the block is lifted, carrying the rows actually written — so a
+    host that derives values from pasted cells can refresh them in a single pass
+    instead of receiving nothing at all.
     """
+
+    #: Emitted once after a paste, with the list of rows written (batched refresh).
+    #:
+    #: The list is **empty when nothing was written** — the paste started outside
+    #: any editable column — because a paste that does nothing is an event the host
+    #: needs to report, not an absence of one.  Not emitted for an empty clipboard:
+    #: nothing was attempted there.
+    pasteCompleted = Signal(list)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 — Qt override name
         if event.matches(QKeySequence.StandardKey.Paste):
@@ -128,6 +142,7 @@ class PasteableTableWidget(CopyableTableWidget):
             rows.pop()                      # ignore Excel's trailing newline
         start_row = max(0, self.currentRow())
         start_col = max(0, self.currentColumn())
+        written: list[int] = []
         self.blockSignals(True)
         try:
             for dr, line in enumerate(rows):
@@ -142,5 +157,10 @@ class PasteableTableWidget(CopyableTableWidget):
                     if item is None or not (item.flags() & Qt.ItemFlag.ItemIsEditable):
                         continue            # read-only / widget cell → step over
                     item.setText(value.strip())
+                    if not written or written[-1] != row:
+                        written.append(row)
         finally:
             self.blockSignals(False)
+        # After the unblock, never inside it: an emit under blockSignals is exactly
+        # the silent no-op this signal exists to prevent.
+        self.pasteCompleted.emit(written)

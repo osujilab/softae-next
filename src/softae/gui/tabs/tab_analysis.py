@@ -50,7 +50,10 @@ from softae.analysis.circuit_fitting import CIRCUIT_MODELS, FitResult
 from softae.analysis.eis.engine import analyze_spectrum
 from softae.analysis.eis_data import EISResult
 from softae.gui.eis_sigma import cell_sigma, gui_cell, report_sigma
-from softae.gui.widgets.copyable_table import CopyableTableWidget
+from softae.gui.widgets.copyable_table import (
+    CopyableTableWidget,
+    PasteableTableWidget,
+)
 
 if TYPE_CHECKING:
     from softae.server.manager import InstrumentManager
@@ -376,7 +379,10 @@ class _DataStoreSelectionDialog(QDialog):
         filters.addStretch()
         root.addLayout(filters)
 
-        self._table = QTableWidget()
+        # Copyable rather than plain: Shift-click fills the checkbox range from the
+        # last plainly-clicked row, which is what turns "channels 12–34 of 300" from
+        # 23 clicks into two, and Ctrl+C copies the visible rows to a notebook.
+        self._table = CopyableTableWidget()
         # ☑, Timestamp, Run, Channel, Workflow, then the five environmental
         # SP/PVs captured at measurement time plus the resolved temperature and
         # the thermometer it came from, then the EIS file path. The resolved
@@ -394,6 +400,15 @@ class _DataStoreSelectionDialog(QDialog):
         )
         self._table.setColumnCount(len(headers))
         self._table.setHorizontalHeaderLabels(headers)
+        # `selected_rows()` reads checkbox state, so a Shift-filled range is picked
+        # up with no further wiring. `checkRangeToggled` is deliberately connected to
+        # nothing: this dialog's per-checkbox click path refreshes nothing either —
+        # the status label carries a candidate count set by `_reload_rows`, and both
+        # action buttons validate on click rather than on selection change.
+        self._table.checkable_column = 0
+        self._table.setToolTip(
+            "Click a checkbox, then Shift-click another to select the whole range.\n"
+            "Ctrl+C copies the selected cells as spreadsheet-ready TSV.")
         hdr = self._table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self._table.setColumnWidth(0, 32)
@@ -944,7 +959,10 @@ class AnalysisTab(QWidget):
         tbl_actions.addWidget(self._btn_clear_all_loaded)
         table_lay.addLayout(tbl_actions)
 
-        self._results_table = CopyableTableWidget()
+        # Pasteable, not merely copyable: thicknesses are measured off-rig and
+        # arrive as a spreadsheet column. Only `t (cm)` is editable, so a paste
+        # physically cannot land in a fitted or derived column.
+        self._results_table = PasteableTableWidget()
         self._results_table.setColumnCount(_RCOL_COUNT)
         self._results_table.setHorizontalHeaderLabels([
             "☑", "Sample", "Channel", "File", "Model", "R0 (Ω)", "R1 (Ω)",
@@ -955,6 +973,8 @@ class AnalysisTab(QWidget):
         self._results_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
         self._results_table.setToolTip(
             "Select cells and press Ctrl+C to copy to a spreadsheet.\n"
+            "Click a t (cm) cell and press Ctrl+V to paste a column of thicknesses\n"
+            "down from that row — σ is recomputed for every row written.\n"
             "Edit a row's t (cm) to recompute its conductivity with that sample's thickness.")
         # Scroll rather than grow: a small height floor lets the user recoup vertical
         # span for the σ plot below and page through rows with the table's scrollbar.
@@ -970,6 +990,10 @@ class AnalysisTab(QWidget):
         # Shift-click a checkbox to fill the range from the anchor row (one refresh).
         self._results_table.checkable_column = _RCOL_CHECK
         self._results_table.checkRangeToggled.connect(self._update_plots)
+        # A paste writes with the table's signals blocked, so `itemChanged` — the
+        # only thing that recomputes σ from a thickness — never fires. Without this
+        # connection a paste leaves new t beside stale σ, and nothing looks wrong.
+        self._results_table.pasteCompleted.connect(self._on_results_pasted)
         table_lay.addWidget(self._results_table)
         right_split.addWidget(table_widget)
 
@@ -1344,6 +1368,39 @@ class AnalysisTab(QWidget):
             self._recompute_row_sigma(row)
         self._results_table.blockSignals(False)
         self._update_sigma_plot()
+
+    def _on_results_pasted(self, rows: list) -> None:
+        """Recompute σ for every row a clipboard paste wrote, then refresh once.
+
+        The paste itself runs with the table's signals blocked, so this is the only
+        thing that keeps σ in step with a pasted thickness.
+
+        Two outcomes are reported rather than left silent:
+
+        * **Nothing written.** A single-column clipboard pastes into whatever column
+          the cursor is in, and only ``t (cm)`` is editable — so a cursor anywhere
+          else writes nothing at all. The paste is *not* redirected to the thickness
+          column: silently relocating an operator's paste is worse than refusing it.
+        * **Unparseable values.** A spreadsheet column often carries a header row or
+          blanks. Those land as text, σ renders as '—' for them, and the count is
+          named here. The text stays in the cell so the operator can see what landed.
+        """
+        if not rows:
+            self._lbl_db_status.setText(
+                "Paste wrote nothing — click a cell in the t (cm) column first.")
+            return
+        self._results_table.blockSignals(True)
+        unparseable = 0
+        for row in rows:
+            if _cell_float(self._results_table.item(row, _RCOL_T)) is None:
+                unparseable += 1
+            self._recompute_row_sigma(row)
+        self._results_table.blockSignals(False)
+        self._update_sigma_plot()
+        message = f"Pasted {len(rows)} thickness value(s)"
+        if unparseable:
+            message += f" — {unparseable} not numeric (σ shown as '—')"
+        self._lbl_db_status.setText(message)
 
     def _on_select_all(self) -> None:
         self._results_table.blockSignals(True)
