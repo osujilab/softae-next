@@ -888,7 +888,8 @@ def gate_kk_truncation(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> Gat
     ok = _all_pass(n)
     limit = float(_ctx_get(ctx, "gates", "kk_resid_pct", 1.0))
 
-    result = lin_kk(f, Z, blocking=bool(ctx.get("blocking", True)),
+    result = lin_kk(f, Z,
+                    blocking=bool(_ctx_get(ctx, "cell", "blocking", True)),
                     c=float(_ctx_get(ctx, "gates", "kk_c", 0.85)),
                     max_M=int(_ctx_get(ctx, "gates", "kk_max_M", 50)))
     if not result.ok:

@@ -30,6 +30,7 @@ from softae.analysis.eis.gates import (
     gate_cap_flatness,
     gate_finiteness,
     gate_hf_inductive,
+    gate_kk_truncation,
     gate_magnitude,
     gate_min_points,
     gate_quadrant,
@@ -143,6 +144,32 @@ class TestPointGates:
         ctx = build_context(blocking=False)
         r = gate_hf_inductive(f, Z, ctx)
         assert r.passed and r.n_dropped == 0
+
+    @pytest.mark.parametrize("blocking", [True, False])
+    def test_cell_blocking_reaches_the_kk_ladder_from_a_real_built_context(
+        self, monkeypatch, blocking
+    ):
+        # `blocking` decides `add_cap` on the K–K ladder (kk.py), so a non-blocking
+        # cell fitted with the blocking basis is a wrong answer that reports as a
+        # clean one. The context must be built by `build_context`, not by hand: it
+        # files the flag under `cell`, and a hand-built `{"blocking": ...}` would
+        # satisfy a top-level `ctx.get("blocking")` that production never sees.
+        import softae.analysis.eis.kk as kk_module
+
+        assert "blocking" not in build_context(blocking=blocking), \
+            "build_context files the flag under 'cell'; a top-level read cannot work"
+
+        seen: dict[str, object] = {}
+
+        def _capture(f, Z, *, blocking=True, **kw):
+            seen["blocking"] = blocking
+            return kk_module.LinKKResult(error="stubbed — kwarg capture only")
+
+        monkeypatch.setattr(kk_module, "lin_kk", _capture)
+
+        f, Z = reference_spectrum()
+        gate_kk_truncation(f, Z, build_context(blocking=blocking))
+        assert seen["blocking"] is blocking
 
     def test_points_outside_the_magnitude_window_are_dropped_pointwise_not_by_median(self):
         f, Z = reference_spectrum()

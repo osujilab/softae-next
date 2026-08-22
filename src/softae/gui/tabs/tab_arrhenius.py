@@ -39,6 +39,8 @@ from softae.gui.daemon_runner import DaemonRunnerMixin
 from softae.gui.rig_claim import rig_run
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from softae.core.data_store import DataStore
     from softae.server.manager import InstrumentManager
 
@@ -725,6 +727,49 @@ class ArrheniusTab(DaemonRunnerMixin, QWidget):
         self._ax.autoscale_view()
         self._canvas.draw_idle()
 
+    def _store_root(self) -> "Path":
+        """The DataStore's root directory, as an absolute path.
+
+        The thing this exists to *not* be is ``Path("softae_data")``, which is
+        relative and therefore resolves against the process working directory
+        rather than against the store. Launched from anywhere but the repo root,
+        an export with no run id landed wherever the GUI happened to be started;
+        a stray ``softae_data/`` tree in the repo root is how that was found.
+
+        ``DataStore.project_dir`` is already ``expanduser().resolve()``-ed and is
+        the authority when a store exists. With no store, the configured
+        ``[data] project_dir`` is expanded **the same way the store expands it**,
+        so the fallback lands where the store would have put it rather than
+        somewhere merely absolute.
+        """
+        from pathlib import Path
+
+        project_dir = getattr(self._data_store, "project_dir", None)
+        if project_dir is not None:
+            return Path(project_dir)
+        try:
+            from softae.config.loader import data_project_dir
+
+            raw = data_project_dir()
+        except Exception:              # no config file reachable at all
+            raw = "~/softae_data"
+        return Path(raw).expanduser().resolve()
+
+    def _images_dir(self, run_id: str | None) -> "Path":
+        """Where this run's exported figures belong. Never CWD-relative.
+
+        ``DataStore.run_dir`` owns the ``runs/<run_id>/`` layout, so it is asked
+        whenever there is a store and a run id to ask it about. The no-run-id
+        case cannot ask, so it reproduces the same shape under the same root —
+        one ``unknown/`` folder inside the store, not one per launch directory.
+        """
+        from pathlib import Path
+
+        store = self._data_store
+        if store is not None and run_id and hasattr(store, "run_dir"):
+            return Path(store.run_dir(run_id)) / "images"
+        return self._store_root() / "runs" / (run_id or "unknown") / "images"
+
     def _on_export_plot(self) -> None:
         """Save the current Arrhenius figure to the run's images/ folder.
 
@@ -733,16 +778,9 @@ class ArrheniusTab(DaemonRunnerMixin, QWidget):
         to a daemon thread to avoid blocking the event loop.
         """
         import io
-        from pathlib import Path
+
         run_id = getattr(self, "_run_id", None)
-        if (
-            self._data_store is not None
-            and run_id
-            and hasattr(self._data_store, "project_dir")
-        ):
-            images_dir = Path(self._data_store.project_dir) / "runs" / run_id / "images"
-        else:
-            images_dir = Path("softae_data") / "runs" / (run_id or "unknown") / "images"
+        images_dir = self._images_dir(run_id)
         try:
             images_dir.mkdir(parents=True, exist_ok=True)
             out_path = images_dir / f"arrhenius_{run_id or 'plot'}.png"
@@ -891,11 +929,43 @@ class ArrheniusTab(DaemonRunnerMixin, QWidget):
         )
         self._sweep_thread.start()
 
+    def _sweep_run_lock(self, sweep: Any):
+        """Hold the cross-process rig lock for the **whole** sweep.
+
+        ``WorkflowExecutor.run`` already takes the lock, so a sweep is not
+        unlocked outright — but ``ArrheniusSweep`` runs *one executor per phase*
+        and an RH sweep runs several, each acquiring and releasing in turn. The
+        gaps between them are not idle: ``_run_rh_sweep`` starts the RH
+        controller, writes its setpoint and polls it to stabilise **outside any
+        executor**, and its ``finally`` writes the temperature back to ambient
+        the same way. A headless tool starting in one of those windows would find
+        the lock file free and take the rig out from under a board sitting at
+        setpoint. Held here, those windows close.
+
+        Nesting is safe by construction: ``acquire_run_lock`` is re-entrant per
+        process, and the executor's ``mine_already`` discipline means it will not
+        release a lock it did not create — so the release stays with this block.
+
+        Simulated rigs are exempt, using the executor's own predicate rather than
+        a second notion of "real": a mock run holding the lock would turn a dry
+        run into an outage for a real one.
+        """
+        from contextlib import nullcontext
+
+        from softae.core.run_lock import held_run_lock, rig_is_simulated
+
+        if rig_is_simulated(self._manager):
+            return nullcontext()
+        run_id = getattr(sweep, "run_id", None)
+        return held_run_lock(what=f"Arrhenius sweep ({run_id or 'no run id'})")
+
     def _run_sweep_thread(
         self,
         sweep: Any,
     ) -> None:
         """Run the sweep in a fresh event loop (daemon thread)."""
+        from softae.core.run_lock import RunLockHeld, busy_rig_message
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         # Re-create per-instrument asyncio.Lock objects so they bind to THIS
@@ -932,9 +1002,16 @@ class ArrheniusTab(DaemonRunnerMixin, QWidget):
             # better left resting in flush for the hours it lasts than retracted
             # into air, and travelling the stage home afterwards would be motion
             # this run never asked for.
-            with rig_run(self,
-                         f"arrhenius:{getattr(sweep, 'run_id', None) or 'sweep'}",
-                         instruments=None, manage_rest=False):
+            #
+            # The rig lock is the *other* axis, and it goes outermost: it says
+            # no second **process** may drive this rig, where the claim says no
+            # second activity in *this* process may. Outermost so a refusal
+            # happens before any claim is taken and before the event loop is
+            # handed a sweep it cannot run.
+            with self._sweep_run_lock(sweep), \
+                    rig_run(self,
+                            f"arrhenius:{getattr(sweep, 'run_id', None) or 'sweep'}",
+                            instruments=None, manage_rest=False):
                 results = loop.run_until_complete(sweep.run())
             n_ok = sum(1 for r in results if r.fit_success)
             # Model-aware per-channel summary in the log.
@@ -957,6 +1034,20 @@ class ArrheniusTab(DaemonRunnerMixin, QWidget):
                 f"(run_id={self._run_id or '—'})"
             )
             self._sig_sweep_done.emit(True, msg)
+        except RunLockHeld as exc:
+            # Never a bare "busy": the operator's only recourse against an
+            # anonymous refusal is to start deleting lock files, so the holder is
+            # named and every exit is spelled out. The full message goes to the
+            # log, where multiple lines render; the status label gets one line.
+            logger.warning("arrhenius_sweep_rig_held", holder=exc.lock.describe())
+            self._sig_log_line.emit(
+                "  ⚠ " + busy_rig_message(exc.lock, action="This Arrhenius sweep")
+            )
+            self._sig_sweep_done.emit(
+                False,
+                f"Rig busy — PID {exc.lock.pid} is running "
+                f"{exc.lock.what or 'an unnamed run'}",
+            )
         except Exception as exc:
             logger.exception("arrhenius_sweep_thread_error", error=str(exc))
             self._sig_sweep_done.emit(False, str(exc))
@@ -1087,17 +1178,9 @@ class ArrheniusTab(DaemonRunnerMixin, QWidget):
             import numpy as np
             from matplotlib.figure import Figure
             from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-            from pathlib import Path as _Path
 
             run_id = getattr(self, "_run_id", None)
-            if (
-                self._data_store is not None
-                and run_id
-                and hasattr(self._data_store, "project_dir")
-            ):
-                images_dir = _Path(self._data_store.project_dir) / "runs" / run_id / "images"
-            else:
-                images_dir = _Path("softae_data") / "runs" / (run_id or "unknown") / "images"
+            images_dir = self._images_dir(run_id)
             images_dir.mkdir(parents=True, exist_ok=True)
 
             rh_vals = sorted(rh_results.keys())

@@ -484,16 +484,23 @@ def _cmd_hold(args) -> int:
     try:
         # `--mock` claims nothing, and the gate is **this tool's own flag** rather
         # than `held_rig_session`'s `session_is_simulated` exemption, which would
-        # otherwise reach the same answer here today. Per SESSION_MAIL [e6] §1,
-        # measured rather than argued: that exemption recognises a mock by the
-        # `Mock` prefix on its class *name*, so a legitimately-named mock
-        # **subclass** reads as real — `eis-validate --mock` installs exactly that
-        # shape, and an unconditional claim there took the machine-scope
-        # `~/.softae/rig.lock` for a run that touches no hardware, refusing the
-        # operator's GUI on the way. This tool's `--mock` happens to install
-        # prefix-named mocks, which makes the unconditional form correct by
-        # coincidence and not by construction; one mock subclass introduced here
-        # later would silently turn a dry run into an outage for a real one.
+        # otherwise reach the same answer here today.
+        #
+        # The original reason is **retracted**: SESSION_MAIL [e6] §1 measured that
+        # exemption recognising a mock by the `Mock` prefix on its class *name*,
+        # so a legitimately-named mock **subclass** read as real. [p39] §3
+        # repaired the predicate to an `isinstance` test against the shipped mock
+        # bases, which survives subclassing. Two reasons outlive the repair:
+        #
+        #   * the `foreign_run_lock` peek above consults **no predicate at all**,
+        #     so only this flag stops a hold that claims nothing from being
+        #     *refused* over a lock it never wanted; and
+        #   * `_mock_driver_classes` is a hand-maintained registry whose own
+        #     docstring names its failure direction — a mock added to
+        #     `softae.drivers` and forgotten there reads as real. The exemption
+        #     can still return a wrong verdict; the mistake is now about
+        #     *membership* rather than spelling.
+        #
         # The flag is the invariant's own evidence, so it is what the invariant
         # is gated on. Same shape as `tools/eis_validate.py`'s `_rig_claim`.
         claim = (contextlib.nullcontext() if args.mock

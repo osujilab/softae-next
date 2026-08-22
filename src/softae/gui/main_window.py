@@ -1145,8 +1145,24 @@ class MainWindow(QMainWindow):
             from softae.core.safe_park import safe_park
 
             retract = not getattr(self, "_skip_exit_retract", False)
+            # ``rh_dry_purge=True``: an orderly exit leaves *dry gas flowing*
+            # rather than zeroing the humidifier. Duty 0 trips the Trinket's
+            # explicit auto-shutoff (`dac0_rh/code.py`, `if ctrl == 0`), which
+            # closes both Aalborg PSVs and lets room air back into the chamber —
+            # so a clean close was collapsing a dry chamber toward room RH and
+            # charging every GUI restart a full re-dry. The host commands
+            # ``out_min`` and goes away; the *device* decides when to stop, via
+            # its own ``ctrl_timeout`` deadman. Nothing here times that window:
+            # raising ``ctrl_timeout`` on the Trinket lengthens the purge with no
+            # change on this side, which a host-side timer would silently
+            # truncate.
+            #
+            # Deliberately not extended to the E-Stop, fault-class parks or
+            # crash/unclean-shutdown recovery — operator ruling: an emergency
+            # stop that leaves gas flowing is not an emergency stop. That
+            # boundary is asserted in ``tests/test_safe_exit.py``.
             result = safe_park(self._manager, reason="application closing",
-                               retract_head=retract)
+                               retract_head=retract, rh_dry_purge=True)
             # ``severe``, not ``not ok``. This close is unattended by definition,
             # so the log line is the only account of it — and ``ok`` is true of a
             # park that raised nothing *because it reached nothing*, which on the

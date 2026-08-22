@@ -42,6 +42,7 @@ what gets armed.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -83,7 +84,55 @@ DESKTOP_SESSION = f"{SESSION_PREFIX}desktop"
 #: is a coordinator over the stage and syringe, which are checked directly — the
 #: same exclusion, for the same reason, as
 #: :func:`~softae.core.hardware_safety.probe_motion`.
+#:
+#: **Still required after the move to** :func:`isinstance` **, and not an
+#: instance of the same mistake.** The prefix rule needed this constant because
+#: ``AsyncLiquidHandler`` is simulated-but-not-``Mock``-named, which made the
+#: exception look like a patch over a naming heuristic. It is not:
+#: ``AsyncLiquidHandler`` is the *real* coordinator too — the mock factory and
+#: the real factory register the identical class — so no mock-detection rule of
+#: any kind can classify it. It is excluded because its ports belong to the
+#: stage and the syringe and are counted there, which is a fact about the
+#: rig's topology rather than about anybody's class names.
 PORTLESS_INSTRUMENTS = ("liquid_handler",)
+
+
+@lru_cache(maxsize=1)
+def _mock_driver_classes() -> tuple[type, ...]:
+    """The shipped mock drivers, as **classes** — the thing a subclass keeps.
+
+    Imported lazily so that reasoning about the rig lock does not drag the whole
+    driver stack into a headless process that only wanted to read a lock file.
+
+    A mock added to :mod:`softae.drivers` and forgotten here reads as *real*, so
+    a fully simulated session claims the rig: one refused dry run. That is the
+    direction this list is allowed to fail in, and it is the opposite of the
+    prefix rule's, which failed by *widening* the set of things called mock
+    the moment somebody named a subclass ``FastMockRHController``.
+    """
+    from softae.drivers.mock_camera import MockCamera, MockDACSwitch
+    from softae.drivers.mock_espico import MockESPico
+    from softae.drivers.mock_ht_sensor import MockHTSensor
+    from softae.drivers.mock_keithley import MockKeithley
+    from softae.drivers.mock_piezo import MockPiezoController
+    from softae.drivers.mock_rh_controller import MockRHController
+    from softae.drivers.mock_stage import MockStage
+    from softae.drivers.mock_syringe import MockSyringe
+    from softae.drivers.mock_temp_controller import MockTempController
+
+    # ``MockLamp`` is an alias of ``MockDACSwitch``; listing it would add nothing.
+    return (
+        MockCamera,
+        MockDACSwitch,
+        MockESPico,
+        MockHTSensor,
+        MockKeithley,
+        MockPiezoController,
+        MockRHController,
+        MockStage,
+        MockSyringe,
+        MockTempController,
+    )
 
 
 def session_is_simulated(manager: Any) -> bool:
@@ -93,11 +142,25 @@ def session_is_simulated(manager: Any) -> bool:
     over nothing, and a mock run holding the rig turns a dry run into an outage
     for a real one.
 
-    **Every failure answers "real".** An unreadable enumeration and an unreadable
-    driver both mean "I could not look", which must not be spelled the same way as
-    "I looked and found only mocks" — skipping the claim is the unsafe direction,
-    and claiming a rig that turns out to be simulated costs at worst one refused
-    dry run.
+    **Simulated means "is one of the shipped mock drivers", by type.** It used to
+    mean "has a class name starting with ``Mock``", which is a statement about
+    spelling: ``GridAwareMockPico(MockESPico)`` and ``FastMockRHController(
+    MockRHController)`` — the fast-clock subclasses ``eis-validate --mock``
+    installs — are wholly simulated and read as *real* under a prefix test. The
+    cost was paid twice over: a ``--mock`` run at an operator's terminal took the
+    machine-scope ``~/.softae/rig.lock`` and refused the live GUI, and
+    :func:`softae.gui.campaign_launch.campaign_runs_on_mocks`, which asks this
+    same question to decide whether the campaign child gets ``--mock``, would
+    have launched that child *without* it — sending a simulated session's child
+    at the real ports. :func:`isinstance` survives subclassing, which is the
+    whole property the predicate needed and the one a name cannot have.
+
+    **Every failure answers "real", and so does every driver this cannot place.**
+    An unreadable enumeration, an unreadable driver, and a driver that is neither
+    a known mock nor anything else recognisable all mean "I could not confirm
+    this is simulated". Claiming a rig that turns out to be simulated costs at
+    worst one refused dry run; skipping the claim on a rig that turns out to be
+    real costs a port collision with whoever already had it open.
     """
     try:
         names = list(manager.names)
@@ -108,18 +171,28 @@ def session_is_simulated(manager: Any) -> bool:
                 "and claiming the rig")
         return False
 
+    try:
+        mock_classes = _mock_driver_classes()
+    except Exception:
+        logger.warning(
+            "rig_session_mock_registry_unavailable", exc_info=True,
+            msg="cannot import the mock drivers — nothing can be recognised as "
+                "simulated, so this session claims the rig")
+        return False
+
     for name in names:
         if name in PORTLESS_INSTRUMENTS:
             continue
         try:
-            driver = type(manager.get(name)).__name__
+            driver = manager.get(name)
         except Exception:
             logger.warning(
                 "rig_session_probe_failed", instrument=name, exc_info=True,
                 msg="cannot read this driver — assuming it is real")
             return False
-        if not driver.startswith("Mock"):
-            logger.debug("rig_session_real_instrument", instrument=name, driver=driver)
+        if not isinstance(driver, mock_classes):
+            logger.debug("rig_session_real_instrument", instrument=name,
+                         driver=type(driver).__name__)
             return False
     return True
 

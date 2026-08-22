@@ -305,20 +305,34 @@ class TestRigClaim:
         """The gate itself, pinned — so nobody "simplifies" it away as redundant.
 
         `held_rig_session` has its own exemption for a fully simulated manager,
-        and on today's drivers it would reach the same answer, which is exactly
-        why the gate looks removable and is not. Per SESSION_MAIL [e6] §1,
-        measured rather than argued: `session_is_simulated` recognises a mock by
-        the `Mock` prefix on its class **name**, so a legitimately-named mock
-        *subclass* reads as REAL. `eis-validate --mock` installs that shape and
-        an unconditional claim there took the machine-scope `~/.softae/rig.lock`
-        for a run touching no hardware, refusing the operator's GUI. This tool's
-        mocks happen to be prefix-named, which makes the delegated form correct
-        by coincidence; one mock subclass added later would silently make a
-        `--mock` hold contend with a real one.
+        and on today's drivers it reaches the same answer, which is exactly why
+        the gate looks removable and is not. The **first** assertion is the gate:
+        `held_rig_session` must not even be *reached* under `--mock`.
 
-        So: `held_rig_session` must not even be *reached* under `--mock`. The
-        second assertion is the counterfactual it is protected from — the
-        exemption's own verdict on a subclass, which is the wrong one.
+        **History — the `is True` below was inverted, not written that way.**
+        SESSION_MAIL [e6] §1 measured `session_is_simulated` recognising a mock
+        by the `Mock` prefix on its class *name*, so a legitimately-named mock
+        **subclass** read as REAL; `eis-validate --mock` installs exactly that
+        shape, and an unconditional claim there took the machine-scope
+        `~/.softae/rig.lock` for a run touching no hardware, refusing the
+        operator's GUI. That assertion recorded the defect as a deliberate
+        counterfactual. [p39] §3 accepted it and the predicate was repaired to an
+        :func:`isinstance` test against the shipped mock bases, which survives
+        subclassing — so the counterfactual became false and is now inverted to
+        record the repair instead.
+
+        **The repair retired that argument for the gate, not the gate.** Two
+        reasons outlive it, and the `is False` assertion is the live one:
+
+        * the `foreign_run_lock` peek consults no predicate at all, so only
+          `args.mock` can stop a hold that claims nothing from being *refused*
+          over a lock it never wanted; and
+        * `_mock_driver_classes` is a hand-maintained registry whose own
+          documented failure direction is "a mock added to `softae.drivers` and
+          forgotten here reads as real". So the exemption still has a wrong
+          verdict available to it — about membership now rather than spelling —
+          and the flag is what this tool is immune by. Note the mock is
+          `Mock`-prefixed: naming is no longer what decides, in either direction.
         """
         from softae.core.rig_session import session_is_simulated
         from softae.drivers.mock_rh_controller import MockRHController
@@ -332,14 +346,22 @@ class TestRigClaim:
         assert main(["hold", "--rh", "45", "--duration-s", "0",
                      "--execute", "--yes", "--mock"]) == EXIT_OK
 
+        def _manager_of(driver):
+            manager = MagicMock()
+            manager.names = ["rh_controller"]
+            manager.get.return_value = driver
+            return manager
+
         class FastMockRHController(MockRHController):
             """[e6]'s shape: fully simulated, no `Mock` prefix on the name."""
 
-        subclassed = MagicMock()
-        subclassed.names = ["rh_controller"]
-        subclassed.get.return_value = FastMockRHController.__new__(
-            FastMockRHController)
-        assert session_is_simulated(subclassed) is False
+        class MockUnregisteredController:
+            """A mock the registry has not been told about — the live gap."""
+
+        assert session_is_simulated(_manager_of(
+            FastMockRHController.__new__(FastMockRHController))) is True
+        assert session_is_simulated(
+            _manager_of(MockUnregisteredController())) is False
 
     def test_a_foreign_holder_refuses_with_exit_busy(self, project, monkeypatch,
                                                     capsys):

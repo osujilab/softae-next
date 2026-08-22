@@ -538,6 +538,38 @@ class TestSafeParkOnExit:
         assert [e for e, _ in warnings] == ["safe_park_on_exit_incomplete"]
         assert warnings[0][1]["headline"] == sp.HEADLINE_NOTHING
 
+    def test_close_asks_for_the_rh_dry_purge(self, main_window, monkeypatch):
+        """An orderly close leaves dry gas *flowing*, and nothing else changes.
+
+        Zeroing the humidifier is not the dry end of the range: the Trinket
+        firmware's ``if ctrl == 0`` branch is an explicit auto-shutoff, so duty 0
+        closes both Aalborg PSVs and lets room air back into the chamber. A clean
+        close was therefore charging every restart a full re-dry. The purge's
+        length belongs to the device (``ctrl_timeout``), not to this process —
+        which is why nothing here passes a duration.
+
+        ``retract_head`` is asserted alongside it on purpose: this test would
+        otherwise pass just as happily if the new argument had displaced the old
+        one.
+        """
+        import softae.core.safe_park as sp
+
+        seen: list[dict] = []
+        monkeypatch.setattr(
+            sp, "safe_park",
+            lambda mgr, **kw: seen.append(kw) or sp.SafeParkResult(
+                commanded=["stub"]),
+        )
+        main_window.close()
+
+        assert seen, "closeEvent must drive the rig safe"
+        assert seen[0]["rh_dry_purge"] is True
+        assert seen[0]["retract_head"] is True
+        # Constraint (2), asserted where it would first be broken: the host says
+        # *what* to command and never *for how long*.
+        assert not [k for k in seen[0]
+                    if any(t in k for t in ("duration", "timeout", "seconds"))]
+
 
 # ── Attach mode: the park path is absent, not conditional ────────────────────
 

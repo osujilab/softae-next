@@ -35,9 +35,12 @@ from softae.core.rig_session import (
     session_is_simulated,
 )
 from softae.core.run_lock import RunLockHeld
+from softae.drivers.mock_espico import MockESPico
 from softae.drivers.mock_factory import create_mock_manager
 from softae.drivers.mock_keithley import MockKeithley
+from softae.drivers.mock_rh_controller import MockRHController
 from softae.drivers.mock_temp_controller import MockTempController
+from softae.server.base_instrument import BaseInstrument
 
 
 # ── Fixtures and stand-ins ───────────────────────────────────────────────────
@@ -52,18 +55,57 @@ def rig_scope(tmp_path: Path, monkeypatch) -> Path:
     return scope
 
 
-class StandInTempController(MockTempController):
+class _RealLookingDriver(BaseInstrument):
     """A driver that is *not* a mock as far as either predicate can tell.
 
-    Subclassed rather than stubbed so it behaves like an instrument in a running
-    widget; only the class name matters to the detection, which keys on the
-    ``Mock`` prefix exactly as :func:`softae.core.hardware_safety.probe_motion`
-    does.
+    **Composed, not subclassed** — and that is the whole point. These two stood
+    in for real hardware by deriving from the mocks, which worked only while the
+    detection keyed on the class *name*. ``session_is_simulated`` now keys on
+    :func:`isinstance`, which is precisely a test a subclass cannot fool, so a
+    subclassed stand-in would read as *simulated* and quietly un-test every claim
+    assertion in this file: eighteen tests that assert a lock **is** taken would
+    all pass against a predicate that had stopped taking it.
+
+    Delegating keeps the mock's behaviour for a widget that actually drives it,
+    while the type says "real". ``probe_motion`` still reads the class name, and
+    still gets ``StandIn…`` — so the motion-scoped contrast in
+    :meth:`TestSessionIsSimulated.test_session_is_simulated_real_heater_and_mock_stage_returns_false`
+    is unchanged.
     """
 
+    _MOCK: type
 
-class StandInKeithley(MockKeithley):
+    def __init__(self, name: str, config: dict | None = None):
+        super().__init__(name, config)
+        self._inner = self._MOCK(name, config or {})
+
+    def __getattr__(self, item):
+        if item == "_inner":            # before ``__init__`` set it — else recursion
+            raise AttributeError(item)
+        return getattr(self._inner, item)
+
+    async def connect(self) -> None:
+        await self._inner.connect()
+        self._state = self._inner._state
+
+    async def disconnect(self) -> None:
+        await self._inner.disconnect()
+        self._state = self._inner._state
+
+    def status(self) -> dict:
+        return dict(self._inner.status(), name=self.name)
+
+
+class StandInTempController(_RealLookingDriver):
+    """A real heater, for a rig whose stage is still a mock."""
+
+    _MOCK = MockTempController
+
+
+class StandInKeithley(_RealLookingDriver):
     """As above, for a real potentiostat."""
+
+    _MOCK = MockKeithley
 
 
 class UnlistableManager:
@@ -141,6 +183,62 @@ class TestSessionIsSimulated:
         assert "liquid_handler" in mgr.names
         assert type(mgr.get("liquid_handler")).__name__ == "AsyncLiquidHandler"
         assert session_is_simulated(mgr) is True
+
+    def test_session_is_simulated_mock_subclass_suite_returns_true(self):
+        """A mock stays a mock when you subclass it. The prefix test disagreed.
+
+        This is ``eis-validate --mock``'s actual suite, reproduced rather than
+        described: it swaps in fast-clock subclasses so a treatment loop does not
+        take real minutes, and none of the three names begins with ``Mock``.
+        Under the old ``driver.startswith("Mock")`` this manager read as **real**,
+        with two consequences that were both live in the tree:
+
+        * ``claim_rig_session`` took the machine-scope ``~/.softae/rig.lock`` for
+          a run that opens no port, refusing the operator's GUI; and
+        * ``campaign_launch.campaign_runs_on_mocks`` — the same predicate, asked
+          to decide whether the spawned campaign child gets ``--mock`` — would
+          have withheld the flag, aiming a simulated session's child at the real
+          ports.
+
+        The subclasses are registered over the names the mock factory already
+        used, so this asserts on a *replacement*, not on an extra instrument the
+        real suite would never have.
+        """
+        class GridAwareMockPico(MockESPico):
+            """eis-validate's grid-aware pico. No ``Mock`` prefix."""
+
+        class FastMockTempController(MockTempController):
+            """Fast-clock heater. No ``Mock`` prefix."""
+
+        class FastMockRHController(MockRHController):
+            """Fast-clock humidifier. No ``Mock`` prefix."""
+
+        mgr = create_mock_manager(config={})
+        mgr.register(GridAwareMockPico("pico1", {}))
+        mgr.register(GridAwareMockPico("pico2", {}))
+        mgr.register(FastMockTempController("temp_controller", {}))
+        mgr.register(FastMockRHController("rh_controller", {}))
+
+        assert not any(type(mgr.get(n)).__name__.startswith("Mock")
+                       for n in ("pico1", "pico2", "temp_controller",
+                                 "rh_controller")), "the defect's premise"
+        assert session_is_simulated(mgr) is True
+
+    def test_session_is_simulated_unrecognised_driver_returns_false(self):
+        """"Not a mock I ship" and "a real instrument" get the same answer.
+
+        Deliberately: the predicate cannot enumerate every real driver, so the
+        only honest reading of an unplaceable object is "I could not confirm this
+        is simulated", and the conservative resolution of that is to claim. One
+        refused dry run against a port collision.
+        """
+        class SomethingElseEntirely:
+            pass
+
+        mgr = MagicMock()
+        mgr.names = ["pico1"]
+        mgr.get.return_value = SomethingElseEntirely()
+        assert session_is_simulated(mgr) is False
 
 
 # ── The ``what`` string ──────────────────────────────────────────────────────
