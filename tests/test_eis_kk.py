@@ -169,6 +169,35 @@ class TestKKTruncationGate:
     def test_the_bound_default_is_half_the_band(self):
         assert DEFAULT_KK_MAX_TRUNCATE_FRAC == 0.5
 
+    @pytest.mark.parametrize("blocking", [False, True])
+    def test_kk_truncation_cell_blocking_reaches_the_ladder(self, monkeypatch,
+                                                            blocking):
+        """``build_context`` stores the flag at ``ctx["cell"]["blocking"]``.
+
+        A gate reading a *top-level* ``ctx["blocking"]`` finds nothing and silently
+        takes its default — so a non-blocking cell would be K–K tested as blocking
+        with no error anywhere. The ``ctx()`` helper above never passes ``blocking``,
+        which is why that read went unnoticed. Delegating to the real ladder rather
+        than stubbing it keeps the gate's behaviour intact, so the only thing this
+        test can be measuring is the kwarg.
+        """
+        import softae.analysis.eis.kk as kk_module
+
+        seen: list[bool] = []
+        real = kk_module.lin_kk
+
+        def spy(f, Z, **kw):
+            seen.append(kw["blocking"])
+            return real(f, Z, **kw)
+
+        monkeypatch.setattr(kk_module, "lin_kk", spy)
+
+        f, Z = reference_spectrum()
+        gate_kk_truncation(f, Z, build_context(envelope=instrument_envelope(),
+                                               gates=GateSettings(), cell=None,
+                                               blocking=blocking))
+        assert seen == [blocking]
+
 
 class TestKKIsModelFree:
     """K–K must pass anything causal, and leave topology to the topology gates.

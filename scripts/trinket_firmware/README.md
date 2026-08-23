@@ -53,12 +53,25 @@ CircuitPython builds and carry different UIDs:
 
 **Protocol — bare duty floats, one per line, host → device only.** The host writes
 `f"{duty:.4f}\n"` and nothing else; there is no command grammar, no acknowledgement, and no
-capability handshake. `duty` is the control value `ctrl` in `[0, 1]`: **0 is humid air, 1 is dry
-air.** The device maps it linearly onto two PWM outputs — `board.A3` over `V0_range = [1.4, 2.5] V`
-rising with `ctrl`, and `board.A4` over `V1_range = [1.15, 2.7] V` falling with `ctrl` — at 10 kHz
-against a 3.33 V full scale. Each loop pass holds the computed duty for 0.4 s, then drops to a
-reduced duty (÷1.5 on the humid channel, ÷2 on the dry channel) for 0.1 s; the humid-side brake
-exists to stop the bubbler over-bubbling.
+capability handshake. `duty` is the control value `ctrl` in `[0, 1]`: **`ctrl = 1` is fully humid
+air, and `ctrl` just above 0 is the driest *flowing* state.** `ctrl == 0` exactly is not the dry
+end of that range — it is the firmware's auto-shutoff, which closes **both** valves and therefore
+stops supplying gas at all, leaving the chamber to drift towards room humidity. The device maps
+`ctrl` linearly onto two PWM outputs — `board.A3` (the humid channel) over
+`V0_range = [1.4, 2.5] V` rising with `ctrl`, and `board.A4` (the dry channel) over
+`V1_range = [1.15, 2.7] V` falling with `ctrl` — at 10 kHz against a 3.33 V full scale. Each loop
+pass holds the computed duty for 0.4 s, then drops to a reduced duty (÷1.5 on the humid channel,
+÷2 on the dry channel) for 0.1 s; the humid-side brake exists to stop the bubbler over-bubbling.
+
+> **`code.py`'s `# 0 is humid air, 1 is dry air` is a pin index, not a `ctrl` range.**
+>
+> That comment heads two lines beginning `0:` and `1:` that list voltage bounds, so its `0` and `1`
+> are `pwmpin0` (`board.A3`, humid) and `pwmpin1` (`board.A4`, dry) — the same labelling
+> `V0_range`'s own *"humidity signal range"* and `V1_range`'s *"dry air signal range"* carry. Read
+> instead as the endpoints of `ctrl`, it asserts the exact opposite of what the arithmetic does,
+> and that misreading has already inverted the direction for two careful readers and for an earlier
+> revision of this README (SESSION_MAIL `[e10]` §1; bench-confirmed by the operator 2026-08-21).
+> **The arithmetic is the authority:** `V0targ` scales with `ctrl`, `V1targ` with `1 - ctrl`.
 
 The device prints status back on the same endpoint (`setting to <ctrl>` / `no value received,
 remaining at <ctrl>`). The host does not parse it.
