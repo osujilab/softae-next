@@ -1765,8 +1765,23 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
             # this the tip sits in air between runs — the exact failure the
             # anti-clog work exists to prevent.
             with rig_run(self, f"ht:{getattr(wf, 'name', 'workflow')}",
-                         instruments=workflow_instruments(wf)):
-                loop.run_until_complete(self._executor.run(wf))
+                         instruments=workflow_instruments(wf)) as claim:
+                # Pausing re-enables Manual Control (operator ruling), and the
+                # claim is what refuses it — so a held run suspends its own
+                # claim. Keyed on the executor's *hold*, never on `pause()`:
+                # the request only sets a flag and the run keeps driving to the
+                # top of the next step, so suspending at the request would hand
+                # the syringe back mid-dispense. The executor's self-pause at
+                # the consecutive-failure ceiling fires the same callback, which
+                # is exactly right — that is also a moment the operator should
+                # have the rig.
+                self._executor.on_pause_hold = claim.set_held
+                try:
+                    loop.run_until_complete(self._executor.run(wf))
+                finally:
+                    # Dropped with the claim it points at, so a reused executor
+                    # never carries a handle to a released claim.
+                    self._executor.on_pause_hold = None
             self._sig_workflow_done.emit(0)
         except Exception as exc:
             logger.error("experiment_tab_workflow_error", error=str(exc))

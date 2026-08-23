@@ -17,6 +17,9 @@ dependency.  Pass callables via:
 * ``on_step_complete(step, index, total, result)``
 * ``on_step_error(step, index, total, error)``
 * ``on_state_change(old_state, new_state)``
+* ``on_pause_hold(held)`` — the run has actually come to rest in a pause wait
+  (``True``), or is leaving one (``False``).  Not the same event as
+  ``on_state_change(_, PAUSED)``: see :meth:`WorkflowExecutor._pause_hold`.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from contextlib import asynccontextmanager
 from enum import Enum, auto
 from typing import Any, Callable
 
@@ -248,6 +252,30 @@ class WorkflowExecutor:
         # synchronously is answering a hold that exists.
         self.on_channel_failure_hold: Callable[..., Any] | None = None
 
+        # --- Pause holds ---
+        # ``on_pause_hold(held: bool)`` fires ``True`` when the run actually
+        # comes to rest in a pause wait and ``False`` when it leaves one. It is
+        # deliberately **not** ``on_state_change(_, PAUSED)``, which is the
+        # obvious hook and is wrong for a reason invisible from the signature:
+        # ``pause()`` only sets the flag, and the executor keeps driving until
+        # the top of the next tier or step. Between the button press and the
+        # wait lies the remainder of the current step — a dispense, a stage
+        # move, an EIS sweep — so a host that hands the instruments back on the
+        # state change hands the syringe back mid-dispense.
+        #
+        # ``None`` by default; with it unset nothing about the executor changes.
+        self.on_pause_hold: Callable[..., Any] | None = None
+        # Nested pause holds collapse to the outermost. ``RigActivity.unsuspend``
+        # is membership, not a counter — its own docstring says an unsuspend from
+        # an inner hold clears an outer pause's suspension — and a *suspended*
+        # owner is the one that PERMITS manual control. So an inner hold firing
+        # ``False`` would take manual control away in the middle of the
+        # operator's own pause, with nothing reporting it. Counting here means
+        # the host sees one True and one False per hold and needs no nesting
+        # logic of its own. Touched only from the executor's event loop, so a
+        # plain int is enough.
+        self._pause_hold_depth = 0
+
         # --- Concurrent purge windows (P8) ---
         # ``on_purge_window(step) -> None`` is run as a task *alongside* a step
         # that declares itself co-runnable, and joined before the run moves on.
@@ -436,6 +464,55 @@ class WorkflowExecutor:
             self._set_state(ExecutorState.RUNNING)
             logger.info("workflow_resumed")
 
+    @asynccontextmanager
+    async def _pause_hold(self):
+        """Announce, for the duration of the block, that the run is *held*.
+
+        One definition, three call sites — the three ``while self._state is
+        ExecutorState.PAUSED`` waits. It cannot be collapsed to one invocation:
+        the consecutive-failure hold carries a deadline that parks and aborts,
+        and is not structurally the same wait.
+
+        **Entered only when the run is already paused.** Wrapping the waits
+        unconditionally would announce a hold at every tier and step boundary of
+        every run, handing the instruments back for the instant between entering
+        and leaving — a real window, since the host that consumes this callback
+        is read from the GUI thread. Guarding at the call site rather than in
+        here is what makes the announcement cover the *whole* wait: either the
+        guard passes and the block covers it, or there is no wait at all.
+
+        Nested holds collapse to the outermost, for the reason
+        :attr:`_pause_hold_depth` records. No such nesting is reachable today
+        (``_hold_for_operator`` runs from the body of the linear loop, after that
+        loop's own wait has exited, and the tier and linear strategies are
+        alternatives chosen once per run) — the counter is what keeps it
+        unreachable *by construction* rather than by that argument staying true.
+        """
+        self._pause_hold_depth += 1
+        if self._pause_hold_depth == 1:
+            self._fire_pause_hold(True)
+        try:
+            yield
+        finally:
+            self._pause_hold_depth -= 1
+            if self._pause_hold_depth == 0:
+                self._fire_pause_hold(False)
+
+    def _fire_pause_hold(self, held: bool) -> None:
+        """Tell the host the run is (no longer) held. Never raises.
+
+        The hold is the safety property; telling the host about it is a
+        courtesy, and a courtesy that fails must not break a run that has
+        already stopped — the same reasoning ``_hold_for_operator`` applies to
+        a prompt that fails to draw.
+        """
+        if self.on_pause_hold is None:
+            return
+        try:
+            self.on_pause_hold(held)
+        except Exception:
+            logger.warning("on_pause_hold_failed", held=held, exc_info=True)
+
     def abort(self) -> None:
         """Request workflow abort.  Takes effect before the next step."""
         old = self._state
@@ -561,9 +638,12 @@ class WorkflowExecutor:
             # released by the very state change that must stop it. Checking abort
             # before the pause loop let the released iteration fall straight into
             # `_run_step` — one more dispense or stage move after the operator
-            # aborted a rig they believed quiescent.
-            while self._state is ExecutorState.PAUSED:
-                await asyncio.sleep(0.05)
+            # aborted a rig they believed quiescent. That order is unchanged: the
+            # hold wraps the wait only, and the abort check still follows it.
+            if self._state is ExecutorState.PAUSED:
+                async with self._pause_hold():
+                    while self._state is ExecutorState.PAUSED:
+                        await asyncio.sleep(0.05)
 
             if self._state is ExecutorState.ABORTED:
                 raise AbortedError(
@@ -621,8 +701,11 @@ class WorkflowExecutor:
         while i < len(steps):
             # Pause first, abort second — see `_run_tiers` for why the order is
             # the fix: an abort issued while paused must not release one step.
-            while self._state is ExecutorState.PAUSED:
-                await asyncio.sleep(0.05)
+            # The hold wraps the wait only; the order it protects is untouched.
+            if self._state is ExecutorState.PAUSED:
+                async with self._pause_hold():
+                    while self._state is ExecutorState.PAUSED:
+                        await asyncio.sleep(0.05)
 
             if self._state is ExecutorState.ABORTED:
                 raise AbortedError(
@@ -837,12 +920,28 @@ class WorkflowExecutor:
                 logger.warning("on_channel_failure_hold_failed", exc_info=True)
 
         deadline = time.monotonic() + self.channel_hold_timeout_s
-        while self._state is ExecutorState.PAUSED:
-            if time.monotonic() >= deadline:
-                await self._park_unattended(channel, consecutive)
-                self.abort()
-                return
-            await asyncio.sleep(CHANNEL_HOLD_POLL_S)
+        unanswered = False
+        # The guard is not redundant with the loop: `pause()` above is a no-op
+        # unless the state was RUNNING, so an abort that landed a moment earlier
+        # leaves nothing to hold and nothing to announce.
+        if self._state is ExecutorState.PAUSED:
+            async with self._pause_hold():
+                while self._state is ExecutorState.PAUSED:
+                    if time.monotonic() >= deadline:
+                        unanswered = True
+                        break
+                    await asyncio.sleep(CHANNEL_HOLD_POLL_S)
+
+        # The park is deliberately OUTSIDE the hold, which is why the timeout
+        # breaks the loop rather than acting inside it. A hold hands the
+        # instruments back — that is the whole point of `on_pause_hold` — and
+        # `_park_unattended` drives them: parking while the hold was still
+        # announced would move the head and halt the pumps at the one moment a
+        # manual jog was permitted. Leaving the hold re-guards the rig first.
+        if unanswered:
+            await self._park_unattended(channel, consecutive)
+            self.abort()
+            return
 
         # Answered (resumed, or aborted). A clean slate rather than a hair
         # trigger: an operator who has just looked at the rig and said "carry on"

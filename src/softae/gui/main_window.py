@@ -968,12 +968,20 @@ class MainWindow(QMainWindow):
         from under a board at setpoint) and none of the motion, since the tip is
         better left resting in flush for the hours the sweep lasts than retracted
         into air.
+
+        Yields a :class:`~softae.gui.rig_claim.RigRunClaim` — the run's handle on
+        its *own* claim, used to suspend it while the run is held at a pause. The
+        owner string therefore never leaves this method: a run that had to repeat
+        it to suspend itself could get it wrong, and a wrong owner does not raise,
+        it silently registers a second entry that never drains.
         """
+        from softae.gui.rig_claim import RigRunClaim
+
         self._rig_activity.acquire(owner, instruments)
         if manage_rest:
             self.leave_idle_rest()
         try:
-            yield
+            yield RigRunClaim(self._rig_activity, owner)
         finally:
             try:
                 if manage_rest and rest_after:

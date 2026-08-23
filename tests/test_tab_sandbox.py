@@ -163,6 +163,68 @@ def test_add_step_reused_index_stays_unique(tab):
     assert len(names) == len(set(names))
 
 
+def test_sandbox_run_suspends_its_own_claim_while_the_executor_is_held(tab):
+    """A held Sandbox run hands the rig back, exactly as an HT run does.
+
+    Sandbox drives the same ``WorkflowExecutor`` through the same hold loops, so
+    the operator's pause ruling has to reach it too — and it is the run kind most
+    likely to be forgotten, since it claimed nothing at all until recently.
+
+    The assertion is on the *registry*, not on the wiring: a spy that only
+    recorded "something was assigned to on_pause_hold" would pass against a
+    handle pointing at the wrong owner, which does not raise — it registers a
+    second entry that never drains.
+    """
+    from softae.core.rig_activity import PURGE_INSTRUMENTS, RigActivity
+    from softae.gui.rig_claim import RigRunClaim
+    from softae.workflows.workflow_model import Workflow
+
+    activity = RigActivity()
+    owner = "sandbox:bench"
+    activity.acquire(owner, None)
+    observed: dict[str, object] = {}
+
+    class _HeldExecutor:
+        on_pause_hold = None
+
+        async def run(self, wf):
+            observed["driving"] = activity.conflicts(PURGE_INSTRUMENTS)
+            self.on_pause_hold(True)
+            observed["held"] = activity.conflicts(PURGE_INSTRUMENTS)
+            observed["held_owner"] = activity.suspended_conflict(PURGE_INSTRUMENTS)
+            self.on_pause_hold(False)
+            observed["resumed"] = activity.conflicts(PURGE_INSTRUMENTS)
+
+    # The tab is windowless, so `rig_run` yields the null handle; point it at a
+    # real registry the way a hosted tab's `MainWindow.rig_run` would.
+    monkey = RigRunClaim(activity, owner)
+    import softae.gui.tabs.tab_sandbox as mod
+
+    real_rig_run = mod.rig_run
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _hosted(host, owner_str, **kw):
+        with real_rig_run(host, owner_str, **kw):
+            yield monkey
+
+    mod.rig_run = _hosted
+    try:
+        tab._executor = _HeldExecutor()
+        t = threading.Thread(target=tab._run_thread_fn,
+                             args=(Workflow(name="bench"),), daemon=True)
+        t.start()
+        t.join(timeout=20.0)
+        assert not t.is_alive()
+    finally:
+        mod.rig_run = real_rig_run
+
+    assert observed["driving"] == owner        # driving: manual refused
+    assert observed["held"] is None            # held: manual permitted
+    assert observed["held_owner"] == owner     # …and still not an idle rig
+    assert observed["resumed"] == owner        # driving again
+
+
 def test_user_param_edit_persists_after_switch(tab):
     """A user's param edit on one step survives selecting another and returning."""
     import json

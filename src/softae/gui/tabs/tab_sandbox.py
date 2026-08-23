@@ -1038,8 +1038,17 @@ class SandboxTab(DaemonRunnerMixin, QWidget):
             # that did not move before.
             with rig_run(self, f"sandbox:{getattr(wf, 'name', 'workflow')}",
                          instruments=workflow_instruments(wf),
-                         manage_rest=False):
-                asyncio.run(self._executor.run(wf))
+                         manage_rest=False) as claim:
+                # Identical to the HT tab, and deliberately so: a Sandbox run
+                # drives the same executor through the same hold loops, and a
+                # held run hands the instruments back whichever tab launched it.
+                # See `tab_experiment._run_workflow_thread` for why this keys on
+                # the hold rather than on `pause()`.
+                self._executor.on_pause_hold = claim.set_held
+                try:
+                    asyncio.run(self._executor.run(wf))
+                finally:
+                    self._executor.on_pause_hold = None
             self._run_error = ""
             self._sig_done.emit(0)
         except Exception as exc:
