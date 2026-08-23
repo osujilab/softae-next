@@ -115,8 +115,10 @@ from softae.tools.eis_validate_hold import (
     DEFAULT_MIN_TREATMENT,
     DEFAULT_RH_APPROACH_TIMEOUT_S,
     DEFAULT_SETTLE_MAX_HOLD_S,
+    DEFAULT_SETTLE_TOL_REL,
     DEFAULT_SOAK_S,
     DEFAULT_TEMP_APPROACH_TIMEOUT_S,
+    SETTLE_TOL_REL_MAX,
     SOAK_CEILING_FACTOR,
     SOAK_PRINT_EVERY_N_POLLS,
     HoldWatch,
@@ -177,6 +179,55 @@ EXAMPLE_CHANNELS = "18-32"
 #: real run id, and a bare ``tool:eis-validate:`` in a lock file would assert
 #: "there is a run id and it is blank".
 CLAIM_KIND = "tool:eis-validate"
+
+#: Exit statuses whose park is an **orderly** one, and which therefore opt the
+#: humidifier into ``safe_park``'s dry purge rather than its duty-0 default.
+#:
+#: Every exit path in :func:`cmd_run` -- success, refusal, ``KeyboardInterrupt``
+#: and any unnamed exception -- lands in the *same* ``finally`` and the *same*
+#: ``safe_park`` call, so "opt the end-of-run park in" is not a choice about one
+#: branch: it decides the humidifier's end state on all of them at once. And
+#: ``core/safe_park.py`` records an operator ruling that **fault-class parks keep
+#: zeroing immediately** -- the 25 s flowing window is for orderly exits only.
+#:
+#: So the two are separated by the only thing that distinguishes them here, which
+#: this file already computes for the stream: ``outcome["status"]``.
+#:
+#: * ``done`` -- the run finished, or found nothing to measure.
+#: * ``aborted`` -- a *decision*. A gate refused, or the rig was claimed. Nothing
+#:   faulted; the chamber is exactly the one ``_release_rh`` already dry-purges.
+#: * ``interrupted`` -- the operator pressed Ctrl-C and will very likely restart,
+#:   which is the case the dry purge was built for.
+#:
+#: ``error`` is deliberately absent: an unnamed exception is this harness's fault
+#: class, and it keeps duty 0. Widening this set is a one-word change and an
+#: operator ruling, not a refactor.
+ORDERLY_EXIT_STATUSES = frozenset({"done", "aborted", "interrupted"})
+
+#: What ``--end-state hold`` leaves behind, said accurately.
+#:
+#: It replaces *"the heater and humidifier are STILL DRIVEN"*, which was half
+#: true and so worse than wholly wrong: temperature really does hold, and the
+#: humidifier really was being shut off by ``disconnect_all`` one line later.
+#: The three facts an operator needs are which axis holds, which does not and for
+#: how long, and the one command that takes the axis over -- because **no exiting
+#: process can hold RH**: the Trinket wants a continuous heartbeat and its
+#: deadman is ~25 s. ``softae-env hold`` is a live process and is the only thing
+#: on this rig that can. It is printed, never spawned: an automatic hand-off is a
+#: separate item the operator has deferred.
+HOLD_NOTICE = """\
+         --end-state hold: TEMPERATURE HOLDS. The heater keeps its setpoint;
+         nothing on this path writes to it, and no park was performed.
+         HUMIDITY DOES NOT HOLD, and no exiting process can make it: the Trinket
+         needs a continuous heartbeat and its deadman is ~{deadman:g} s. The PID
+         loop is stopped and the humidifier is left commanded DRY, so both valves
+         shut ~{deadman:g} s from now and the chamber then drifts toward room RH
+         unless something takes the axis over inside that window.
+         To actually keep this condition, start the holder NOW:
+             python -m softae.tools.env_hold hold --rh {rh:g} --execute --yes
+         (add --duration-h H to bound it; -y skips the typed confirmation the
+         {deadman:g} s window has no room for. This run gives the rig claim back a
+         moment after this line -- if the holder refuses as busy, retry it once.)"""
 
 
 def _no_run_to_finalize(status: str) -> None:
@@ -251,6 +302,11 @@ def build_plan(args: argparse.Namespace) -> ValidationPlan:
         temp_approach_timeout_s=float(args.temp_approach_timeout_s),
         settle=(args.settle == "on"),
         settle_max_hold_s=float(args.settle_max_hold_s),
+        # `getattr`, on `softae.tools.equilibration`'s precedent: a namespace
+        # built by a caller older than the flag keeps the shipped band rather
+        # than raising.
+        settle_tol_rel=float(getattr(args, "settle_tol_rel",
+                                     DEFAULT_SETTLE_TOL_REL)),
         # Hours in, seconds on the plan: the flag is in the operator's unit and
         # every field beside it is in the arithmetic's.
         soak_s=float(args.soak_h) * 3600.0,
@@ -670,6 +726,25 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--settle", choices=("on", "off"), default="on")
     run.add_argument("--settle-max-hold-s", type=float,
                      default=DEFAULT_SETTLE_MAX_HOLD_S)
+    # Spelled exactly as `softae.tools.equilibration` spells it, because it is
+    # the same quantity feeding the same `SettleTracker`; two tools spelling one
+    # concept differently is how an operator learns that a flag means whatever
+    # the tool feels like. The help carries the UNIT, loudly: a comment in
+    # `settle_phase` records an operator reading `spread 0.130` as %RH and
+    # nearly typing 1.0 here.
+    run.add_argument("--settle-tol-rel", dest="settle_tol_rel", type=float,
+                     default=DEFAULT_SETTLE_TOL_REL,
+                     help=f"the settle band, as a RELATIVE DEVIATION OF SIGMA "
+                          f"from its own window mean -- dimensionless, and NOT "
+                          f"%%RH. 0.20 means 20%%: a cell whose conductivity "
+                          f"swings +/-20%% across the judged window still "
+                          f"certifies as settled, and 1.0 would accept a film "
+                          f"whose conductivity doubled between rounds. Default "
+                          f"{DEFAULT_SETTLE_TOL_REL:g}; the run REFUSES above "
+                          f"{SETTLE_TOL_REL_MAX:g}. It must also exceed this "
+                          f"board's own noise floor or no hold length can "
+                          f"satisfy it -- the run says so, and names a workable "
+                          f"value, at its first judged window")
     # `--soak-h`, not `--settle-min-hold-s`. Three reasons, in the order they
     # decided it. (1) The name is already taken: `settle_phase` has a
     # `min_hold_first_s` parameter, sourced from the shipped
@@ -773,7 +848,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     from softae.core.eis_scout_scripts import ScoutPlanner
     from softae.core.hardware_safety import assert_hardware_armed
     from softae.core.run_lock import RunLockHeld, busy_rig_message, foreign_run_lock
-    from softae.core.safe_park import safe_park
+    from softae.core.safe_park import (
+        RH_DEADMAN_S,
+        dry_purge_humidifier,
+        safe_park,
+    )
     from softae.drivers.factory import create_manager
 
     plan = build_plan(args)
@@ -965,9 +1044,23 @@ def cmd_run(args: argparse.Namespace) -> int:
         # an operator the correct response to an unknown is to add no motion to
         # it -- `safe_park`'s default is reversed for exactly this caller class.
         narration.state(PHASE_PARK, end_state=plan.end_state)
+        # ORDERLY, not "successful": see `ORDERLY_EXIT_STATUSES` for why the
+        # humidifier's end state is decided by how the run ended rather than by
+        # which branch below runs. Read here, once, because both branches want it
+        # and the `finally` is the only place `outcome` is settled.
+        orderly = outcome.get("status") in ORDERLY_EXIT_STATUSES
         if plan.end_state == "park":
+            # `rh_dry_purge=orderly` -- an end-of-run park is an orderly exit, and
+            # duty 0 is the firmware's auto-shutoff rather than its dry end: it
+            # closes both Aalborg valves, so a chamber the run spent an hour
+            # drying goes back to room RH in tens of seconds and the operator's
+            # next attempt pays for the whole descent again. The dry purge leaves
+            # `out_min` flowing and lets the ~25 s deadman close the valves.
+            # It does NOT preserve the condition -- the heater still goes to 10 C
+            # and `--resume` still re-equilibrates from scratch, which is what the
+            # line below has always said and still says.
             result = safe_park(manager, reason="eis validation complete",
-                               retract_head=None)
+                               retract_head=None, rh_dry_purge=orderly)
             print(f"\n[park  ] {result.summary()}")
             print("         A PARK ENDS THE CONDITION: the heater is driven to "
                   "10 C and anti-clog purging is suspended. --resume "
@@ -977,12 +1070,35 @@ def cmd_run(args: argparse.Namespace) -> int:
             # sees it knows the measurement block is over and the rig is on its
             # way to safe, rather than inferring it from a silence.
             narration.record("park", reason="eis validation complete",
-                             ok=bool(getattr(result, "ok", True)))
+                             ok=bool(getattr(result, "ok", True)),
+                             rh_dry_purge=orderly)
         else:
-            print("\n[hold  ] --end-state hold: the heater and humidifier are "
-                  "STILL DRIVEN. You are expected to be standing there.")
+            # The heater is deliberately untouched -- that is what the flag buys,
+            # and temperature genuinely holds because the controller keeps its own
+            # setpoint. The humidifier is NOT left alone, because it cannot be:
+            # `disconnect_all()` below reaches `AsyncRHController.disconnect` ->
+            # `_stop_pid_loop()`, whose thread-exit write commands the exit duty,
+            # and that default is 0.0 -- the firmware's auto-shutoff, closing both
+            # valves. "Still driven" was therefore never an available end state on
+            # this path; the only choice was valves shut now versus dry air
+            # flowing for the deadman window, and `dry_purge_humidifier` takes the
+            # second. It stops the loop itself, so the `_stop_pid_loop()` inside
+            # `disconnect()` finds `_running` False and writes nothing over it.
+            result = dry_purge_humidifier(
+                manager, reason="eis validation --end-state hold")
+            print(f"\n[hold  ] {result.summary()}")
+            # The graded lines themselves, not a paraphrase: `DRY_PURGE_COMMANDED`
+            # already names the duty and what closes the valves, and a degenerate
+            # `out_min` -- the one case where "commanded dry" would be a lie --
+            # arrives here as an error rather than being silently absent.
+            for line in (*result.commanded, *result.errors, *result.skipped):
+                print(f"         {line}")
+            print(HOLD_NOTICE.format(rh=plan.rh_setpoint_pct,
+                                     deadman=RH_DEADMAN_S))
             narration.record("park", reason="--end-state hold: not parked",
-                             ok=False, held=True)
+                             ok=False, held=True,
+                             rh_dry_purge=bool(result.commanded
+                                               and not result.errors))
         try:
             import asyncio
 

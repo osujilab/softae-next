@@ -306,6 +306,29 @@ def endorse_tolerance(
                   f"noise floor and is achievable")
 
 
+def settle_tol_rel_refusal(tol_rel: float) -> str | None:
+    """Why *tol_rel* is not a usable settle band at all, or ``None`` if it is.
+
+    The rule :class:`softae.core.run_plan.SettlePlan` has enforced since it was
+    written, lifted out so its later callers do not restate it — a settle band
+    that means one thing to the campaign path and another to a tool is exactly
+    the divergence a shared criterion module exists to prevent.
+
+    It **returns** the reason instead of raising, because the callers differ in
+    what they raise and only the criterion is worth sharing: a frozen dataclass
+    refusing its own construction wants ``ValueError``, while a tool refusing
+    before it heats anything wants its own ``RefuseToStart``.
+
+    Only the non-positive case lives here, because only it is universal — a zero
+    or negative band can never be satisfied by any series whatsoever. How
+    *loose* a band a caller will accept is that caller's policy: it depends on
+    what a false ``settled`` costs there, and this module has no view on it.
+    """
+    if float(tol_rel) <= 0:
+        return "settle_tol_rel must be positive; a zero band can never be satisfied"
+    return None
+
+
 def _sign_changes(diffs: np.ndarray, *, threshold: float) -> int:
     """Sign changes in a smoothed first difference, ignoring sub-noise steps."""
     if diffs.size < 2:

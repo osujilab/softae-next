@@ -453,6 +453,34 @@ class TestAsyncRHController:
         assert mock_ser.write.call_args[0][0] == self.ZERO
         assert ctrl.last_safe_off_error == ""
 
+    def test_disconnect_after_a_safe_dry_writes_nothing_over_the_dry_duty(
+            self, rh_ctrl):
+        """The mechanism ``eis-validate --end-state hold`` rests on entirely.
+
+        ``disconnect()`` calls ``_stop_pid_loop()`` with the default exit duty
+        ``0.0`` — the firmware's valve shutoff — so any exit that merely printed
+        a different message would still hand the chamber a shutoff a line later.
+        ``safe_dry`` stops the loop *itself*, so by the time ``disconnect`` runs,
+        ``_stop_pid_loop`` finds ``_running`` already ``False`` and returns having
+        written nothing. ``out_min`` is the last thing the Trinket saw, and the
+        ~25 s deadman — not the host — is what closes the valves.
+
+        Unlike the two tests above, nothing restarts the loop in between: that is
+        the difference between "the exit duty is not sticky" and "the dry duty
+        survives the port closing".
+        """
+        ctrl, mock_ser, _ = rh_ctrl
+        ctrl.start()
+        time.sleep(0.05)
+        ctrl.safe_dry()
+        assert mock_ser.write.call_args[0][0] == self.DRY
+        mock_ser.write.reset_mock()
+
+        run(ctrl.disconnect())
+
+        assert mock_ser.write.call_count == 0
+        assert ctrl._running is False
+
     def test_safe_dry_falls_back_to_safe_off_when_out_min_is_zero(self, rh_factory):
         """A "dry purge" at duty 0 is a valve shutoff wearing the wrong name.
 

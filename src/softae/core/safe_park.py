@@ -571,3 +571,62 @@ async def safe_park_async(
         reason=reason, pump_ids=tuple(pump_ids), safe_temp_C=safe_temp_C,
         retract_head=retract_head, rh_dry_purge=rh_dry_purge,
     )
+
+
+def dry_purge_humidifier(
+    manager: "InstrumentManager",
+    *,
+    reason: str = "",
+) -> SafeParkResult:
+    """Leave the humidifier dry-commanded, and touch **nothing else**.
+
+    Step 5 of :func:`safe_park` on its own, in the ``rh_dry_purge=True`` end
+    state. Same helpers, same grading, same never-raises contract — so this is
+    not a second path to the humidifier, it is the same one with the other four
+    steps not taken.
+
+    **Why it exists at all.** There is one caller class that must leave the
+    *heater* exactly where it is and still cannot leave the *humidifier* alone:
+    an exit that means "the condition stands, a human is here"
+    (``eis-validate --end-state hold``). ``safe_park(rh_dry_purge=True)`` is
+    wrong for it — that drives the heater to
+    :data:`DEFAULT_SAFE_TEMP_C` and suspends purging, which is precisely what
+    such an exit is declining to do. Calling ``rh.safe_dry()`` inline in the
+    tool would be the second path this module exists to prevent, and would
+    re-implement :func:`_dry_purge`'s grading — including the degenerate
+    ``out_min`` case, whose whole point is that it is *reported*.
+
+    **Why the humidifier cannot simply be left alone on such an exit.**
+    ``AsyncRHController.disconnect`` calls ``_stop_pid_loop()``, whose PID
+    thread writes an exit duty on its way out, and that default is ``0.0`` —
+    the firmware's auto-shutoff, which closes *both* Aalborg PSVs. So "leave it
+    driven" is not an available end state for any process that is exiting:
+    the choice is only between valves shut immediately and dry air flowing for
+    the Trinket's ~:data:`RH_DEADMAN_S` s deadman.
+
+    **Why this survives a later ``disconnect_all``.** ``safe_dry`` stops the
+    loop itself, so by the time ``disconnect()`` runs, ``_stop_pid_loop`` finds
+    ``_running`` already ``False`` and returns having written nothing. The
+    ``out_min`` duty is what stays on the wire. Call this *before* the
+    disconnect; calling it after would find no transport and be reported as a
+    failure, which is the honest outcome but not a useful one.
+
+    **This does not hold RH, and nothing that is exiting can.** The Trinket
+    needs a continuous heartbeat. All this buys is a gentle decay over the
+    deadman window instead of a collapse to room air at once.
+    """
+    result = SafeParkResult()
+    rh = _instrument(manager, "rh_controller", result)
+    if rh is not None:
+        _park_humidifier(rh, True, result)
+
+    log = logger.error if result.errors else logger.warning
+    log(
+        "rh_dry_purge_done",
+        reason=reason or "unspecified",
+        ok=result.ok,
+        commanded=result.commanded,
+        errors=result.errors,
+        skipped=result.skipped,
+    )
+    return result

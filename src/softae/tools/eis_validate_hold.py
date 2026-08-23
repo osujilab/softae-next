@@ -81,6 +81,44 @@ DEFAULT_SETTLE_MAX_HOLD_S = 5400.0
 DEFAULT_MIN_TREATMENT = 6
 DEFAULT_DRIFT_CHECK = 3
 
+#: The settle band this harness starts from, and the value ``--settle-tol-rel``
+#: falls back to. A **relative deviation of sigma from its own window mean** --
+#: dimensionless, and in particular not %RH.
+#:
+#: **Restated rather than imported, and pinned by a test.** This module holds no
+#: module-level ``softae`` imports at all: ``softae-eis-validate --help`` costs
+#: 0.3 s and loads neither numpy nor scipy, and importing
+#: ``analysis.equilibration`` for one float would put both on every invocation
+#: including ``--help``. So the number is written here and
+#: ``test_settle_tol_rel_default_is_the_shipped_criterions_own`` fails the moment
+#: it diverges from :data:`softae.analysis.equilibration.DEFAULT_SETTLE_TOL_REL`,
+#: which remains the criterion's home.
+DEFAULT_SETTLE_TOL_REL = 0.10
+
+#: At or above this band, the run says out loud what the operator just bought.
+#: Twice the shipped default: on the board that motivated the flag the median
+#: scatter was 12.5-14 %, so the honest fix there (~0.16-0.18) sits below this
+#: line, and everything above it is a deliberate widening that deserves to be
+#: audible rather than silent.
+SETTLE_TOL_REL_LOOSE = 0.20
+
+#: Above this band the run refuses to start. At 0.5 a channel's sigma may span
+#: ``[0.5, 1.5] x`` its own window mean -- a threefold spread between the
+#: extremes -- and still certify as *settled*; there is no film state that
+#: reading describes, so this is not a loosened gate but the absence of one. The
+#: ceiling exists because the two directions are not symmetric: a band set too
+#: LOW is self-correcting -- :func:`~softae.analysis.equilibration.endorse_tolerance`
+#: announces it as unachievable and the run refuses at its ceiling -- while a
+#: band set too HIGH silently certifies a film that moved, and the run that
+#: follows looks exactly like a correct one. A comment in :func:`settle_phase`
+#: records an operator who read ``spread 0.130`` as %RH and nearly typed ``1.0``
+#: here, which is 100 % relative deviation: a film whose conductivity doubled
+#: between rounds, accepted. Exposing the number on the CLI reopens that trap, so
+#: the trap is closed at the far end. Deliberately **not** overridable: a
+#: ``--yes-i-really-mean-it`` escape would restore exactly the value it exists to
+#: refuse.
+SETTLE_TOL_REL_MAX = 0.50
+
 #: No soak unless one is asked for. Every invocation and every test written
 #: before the soak existed must behave exactly as it did, and 0 is the only
 #: default that guarantees it.
@@ -217,6 +255,16 @@ class ValidationPlan:
     #: on the sample's state. Recorded in :meth:`as_dict` instead, which is where
     #: an analysis choice belongs.
     circuit_model: str = SETTLE_CIRCUIT_MODEL
+    #: The settle gate's band, from ``--settle-tol-rel``. Trailing, with a
+    #: default, so every existing positional construction is unchanged. Until
+    #: this field existed :func:`settle_phase` built its ``SettleTracker``
+    #: without a ``tol_rel`` and so silently took the shipped 0.10 -- which
+    #: 20260821T173111Z_eis_validate could not satisfy at all, its own median
+    #: scatter being 12.5-14 %, with no way for the operator to say so.
+    #:
+    #: **In** :meth:`fingerprint`, unlike ``circuit_model`` and unlike every
+    #: other duration on this plan -- see that method for why.
+    settle_tol_rel: float = DEFAULT_SETTLE_TOL_REL
 
     def cell_key(self, channel: int) -> str:
         return (f"{int(channel)}:{self.rh_setpoint_pct:g}:"
@@ -243,15 +291,44 @@ class ValidationPlan:
         than hidden: ``--resume`` must repeat the soak it started with, and a
         resume that simply forgets the flag is refused instead of quietly
         measuring an unsoaked sample into a soaked dataset.
+
+        **``settle_tol_rel`` is in, and ``circuit_model`` stays out.** They look
+        alike -- both trailing, both added late, both about how the run treats a
+        spectrum -- and they are not. ``circuit_model`` changes how a spectrum is
+        *read*; the settle band decides **which sample states are admitted into
+        the dataset at all**, which puts it on ``soak_s``'s side of the line, not
+        on the ceilings' side. ``settle_max_hold_s`` is a ceiling on *waiting for
+        a criterion*; this is the criterion. And it is a **pre-registered gate
+        parameter** in the sense :mod:`softae.tools.eis_validate_rule` opens
+        with -- *"a validation whose success criterion is chosen after the data
+        arrives proves nothing"* -- so a ``--resume`` that continues under a
+        widened band is precisely the thing pre-registration forbids, and it is
+        the resume that would be *tempting*: the operator who hits a ceiling has
+        a widened tolerance in hand and a half-finished run on disk.
+
+        **It enters the hash only when it is not the default, and that is not a
+        hack.** The guarantee wanted is *"a resume cannot change the criterion"*,
+        and conditional inclusion delivers it in full: default -> the ten-part
+        string exactly as before; anything else -> an eleventh, labelled part. A
+        run started at 0.15 and resumed without the flag mismatches, a run
+        started at the default and resumed at 0.15 mismatches, and two different
+        non-default bands mismatch. What it buys is that every checkpoint written
+        before this field existed keeps its fingerprint, so introducing an
+        operator knob does not invalidate an in-flight run's ``--resume`` --
+        including the run whose unsatisfiable band is why the knob exists.
         """
         import hashlib
 
-        parts = "|".join(str(p) for p in (
+        parts = [str(p) for p in (
             self.validation_name, self.channels, self.rh_setpoint_pct,
             self.temp_setpoint_c, self.baseline_preset, self.reference_preset,
             self.order, self.max_follow_ups, self.visit, self.soak_s,
-        ))
-        return hashlib.sha256(parts.encode("utf-8")).hexdigest()[:16]
+        )]
+        if float(self.settle_tol_rel) != float(DEFAULT_SETTLE_TOL_REL):
+            # Labelled, not bare: a self-describing token cannot be confused
+            # with a future appended field, and reads in a debugger.
+            parts.append(f"settle_tol_rel={float(self.settle_tol_rel)!r}")
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
     def as_dict(self) -> dict[str, Any]:
         payload = {
@@ -265,14 +342,26 @@ class ValidationPlan:
 def validate_plan(plan: ValidationPlan) -> None:
     """Refuse impossible plans **before** anything is heated.
 
-    Two checks today, and neither is hypothetical: ``settle_check`` requires at
+    Three checks today, and none is hypothetical: ``settle_check`` requires at
     least ``DEFAULT_SETTLE_MIN_CHANNELS`` participating channels, so a run on
     fewer than that can never return ``settled`` -- it runs every round to the
     ceiling and then refuses. Caught late that costs the full
     ``--settle-max-hold-s`` (90 minutes by default) at temperature, and the
     operator's first evidence is a refusal that names the wrong cause.
+
+    The third is ``--settle-tol-rel``, and it is refused in **one** direction
+    only. Too tight is left alone on purpose: it is self-correcting, because
+    :func:`~softae.analysis.equilibration.endorse_tolerance` announces it as
+    unachievable at the first judged window and the phase then refuses at its
+    ceiling rather than certifying anything. Too loose has no such backstop --
+    it *certifies*, and the run it produces is indistinguishable from a correct
+    one -- so :data:`SETTLE_TOL_REL_MAX` is where it stops, before anything is
+    heated.
     """
-    from softae.analysis.equilibration import DEFAULT_SETTLE_MIN_CHANNELS
+    from softae.analysis.equilibration import (
+        DEFAULT_SETTLE_MIN_CHANNELS,
+        settle_tol_rel_refusal,
+    )
 
     # A negative soak would sail through `soak_phase` as "already satisfied" and
     # read on the projection as a *shortened* run, so it is refused rather than
@@ -291,6 +380,70 @@ def validate_plan(plan: ValidationPlan) -> None:
             "refuse anyway. Add channels, or state --settle off and accept a "
             "withheld outcome."
         )
+    if not plan.settle:
+        # Gated on the same condition the channel-count check is: with no gate
+        # there is nothing to certify, so the band is never read and a refusal
+        # here would be about an unused number.
+        return
+    # One rule, shared with `run_plan.SettlePlan` rather than restated here, so
+    # a band the campaign path would refuse cannot be accepted by this tool.
+    if (refusal := settle_tol_rel_refusal(plan.settle_tol_rel)) is not None:
+        raise RefuseToStart(f"--settle-tol-rel {plan.settle_tol_rel:g}: {refusal}")
+    if not math.isfinite(plan.settle_tol_rel):
+        # `nan > MAX` is False, so the ceiling below would pass it through, and a
+        # NaN band makes every comparison in `settle_check` False -- a gate that
+        # can never certify, arriving as "the film never settled".
+        raise RefuseToStart(
+            f"--settle-tol-rel {plan.settle_tol_rel} is not a real number. The "
+            "settle band is a relative deviation of sigma from its own window "
+            "mean; a non-finite one makes every round's comparison false, so "
+            "the run would hold to its ceiling and blame the film."
+        )
+    if plan.settle_tol_rel > SETTLE_TOL_REL_MAX:
+        raise RefuseToStart(
+            f"--settle-tol-rel {plan.settle_tol_rel:g} is above the maximum "
+            f"{SETTLE_TOL_REL_MAX:g}. This number is a RELATIVE DEVIATION OF "
+            f"SIGMA from its own window mean, not %RH: "
+            f"{plan.settle_tol_rel:g} certifies a cell whose conductivity "
+            f"varies by {plan.settle_tol_rel * 100:.0f}% across the judged "
+            f"window as having stopped moving, and 1.0 would accept a film "
+            f"whose conductivity doubled between rounds. If the gate cannot be "
+            f"cleared at a defensible band, the cells are the problem and a "
+            f"wider band only hides it."
+        )
+
+
+def loose_band_notice(tol_rel: float) -> str:
+    """The line printed when an admissible band is still a generous one.
+
+    Between :data:`SETTLE_TOL_REL_LOOSE` and :data:`SETTLE_TOL_REL_MAX` the run
+    proceeds -- a board scattering at 12-14 % has no honest alternative -- but it
+    says what was bought, in the unit the number is actually in. ``""`` below the
+    line, so the common case prints nothing.
+    """
+    if not (math.isfinite(tol_rel) and tol_rel >= SETTLE_TOL_REL_LOOSE):
+        return ""
+    return (f"[settle] WIDE BAND: --settle-tol-rel {tol_rel:g} certifies a cell "
+            f"whose sigma varies by {tol_rel * 100:.0f}% about its own window "
+            f"mean as settled. That is a RELATIVE DEVIATION, not %RH. Default "
+            f"is {DEFAULT_SETTLE_TOL_REL:g}; the run refuses above "
+            f"{SETTLE_TOL_REL_MAX:g}.")
+
+
+def suggested_settle_tol_rel(floor_rel: float) -> float | None:
+    """The narrowest admissible band this board's own scatter could clear.
+
+    ``floor_rel * 1.2``, rounded up to a whole percent: the floor itself is the
+    boundary case and a band exactly on it certifies nothing, so the suggestion
+    carries margin. ``None`` when the answer would be above
+    :data:`SETTLE_TOL_REL_MAX` -- a value the run would then refuse is not a
+    suggestion, it is a second trap, and at that scatter the cells are the
+    finding rather than the flag.
+    """
+    if not (math.isfinite(floor_rel) and floor_rel > 0):
+        return None
+    suggestion = math.ceil(float(floor_rel) * 1.2 * 100.0) / 100.0
+    return None if suggestion > SETTLE_TOL_REL_MAX else suggestion
 
 
 def population_thresholds(
@@ -845,9 +998,17 @@ def settle_phase(
     # floor reported the SAME number every round, which is what a stability
     # criterion is least able to refuse. 325 of 1440 fits in the reference run
     # sat on it while reporting success.
+    #
+    # `tol_rel` comes from the plan. It used to be omitted, which took the
+    # shipped 0.10 silently -- correct for the board it was measured on and
+    # arithmetically unsatisfiable on 20260821T173111Z_eis_validate, whose own
+    # median scatter was 12.5-14 %.
     tracker = SettleTracker(
-        enabled=True, rh_stability_pct=DEFAULT_RH_STABILITY_PCT,
+        enabled=True, tol_rel=plan.settle_tol_rel,
+        rh_stability_pct=DEFAULT_RH_STABILITY_PCT,
         r1_bound_ohms=r1_lower_bound_ohms(plan.circuit_model))
+    if (wide := loose_band_notice(plan.settle_tol_rel)):
+        print(wide, flush=True)
     rh = manager.get(RH_CONTROLLER)
     apexes: dict[int, float] = {}
     start = float(now())
@@ -910,7 +1071,8 @@ def settle_phase(
               f"-> {state}", flush=True)
         if check is not None and not check.evaluable:
             print(f"         not evaluable: {check.reason}", flush=True)
-        _announce_endorsement(tracker, endorsed, endorsement, announced)
+        _announce_endorsement(tracker, endorsed, endorsement, announced,
+                              floor_rel=floor_rel)
         _announce_basis(fits, check, tracker.min_channels, plan.circuit_model,
                         announced)
         # Routed through `_observe` for the reason `_observe` exists: the table
@@ -971,6 +1133,7 @@ def settle_phase(
 
 def _announce_endorsement(
     tracker: Any, endorsed: bool | None, endorsement: str, announced: dict[str, Any],
+    *, floor_rel: float | None = None,
 ) -> None:
     """Say, at the FIRST judged window, whether the tolerance is reachable at all.
 
@@ -991,11 +1154,35 @@ def _announce_endorsement(
 
     Announced on **change**, not every round: the first judged window carries the
     news, and a later line means the answer actually moved.
+
+    An UNACHIEVABLE board also gets **the flag and a number**. "No hold length
+    can satisfy it" is a complete diagnosis and an incomplete instruction: it
+    tells an operator that waiting is not the fix without saying what is, and
+    until this run there was nothing they could have changed anyway. The value
+    is derived from the floor this board just measured (see
+    :func:`suggested_settle_tol_rel`), never hardcoded, and it is deliberately
+    *not* attached to the per-channel UNSETTLEABLE lines below: when one cell in
+    fifteen is unsettleable the fix is that cell, and offering a wider band there
+    would be advice to hide it.
     """
     if endorsed is not None and announced.get("board") is not endorsed:
         announced["board"] = endorsed
         mark = "ACHIEVABLE" if endorsed else "UNACHIEVABLE"
         print(f"[settle] tolerance {mark}: {endorsement}", flush=True)
+        if endorsed is False and floor_rel is not None:
+            suggestion = suggested_settle_tol_rel(floor_rel)
+            if suggestion is None:
+                print(f"         no admissible band clears a "
+                      f"{floor_rel * 100:.2f}% floor (--settle-tol-rel stops at "
+                      f"{SETTLE_TOL_REL_MAX:g}), so the cells are the finding "
+                      f"here, not the flag", flush=True)
+            else:
+                print(f"         to hold this board to a band it can meet, "
+                      f"restart with --settle-tol-rel {suggestion:g} (a RELATIVE "
+                      f"sigma deviation, not %RH -- {suggestion * 100:.0f}%). "
+                      f"--resume will refuse a changed band, by design: it is "
+                      f"the criterion this run was registered under",
+                      flush=True)
     named: set[int] = announced.setdefault("channels", set())
     for channel, (ok, _why, floor) in tracker.per_channel_endorsement().items():
         if ok is False and floor is not None and channel not in named:

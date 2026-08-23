@@ -24,6 +24,7 @@ from softae.core.safe_park import (
     HEADLINE_PARTIAL,
     RH_DEADMAN_S,
     SafeParkResult,
+    dry_purge_humidifier,
     safe_park,
     safe_park_async,
 )
@@ -715,3 +716,79 @@ class TestAsync:
         result = await safe_park_async(mgr, reason="async test")
         mgr._insts["rh_controller"].safe_off.assert_called_once()
         assert any("humidifier off" in c for c in result.commanded)
+
+
+class TestDryPurgeHumidifier:
+    """Step 5 on its own, for the one exit that must leave the heater alone.
+
+    ``--end-state hold`` means "the condition stands, a human is here". It
+    cannot call :func:`safe_park` — that drives the heater to 10 °C, which is
+    the opposite of holding — and it cannot leave the humidifier untouched
+    either, because ``AsyncRHController.disconnect`` commands duty 0 on its way
+    out and duty 0 is the firmware's valve shutoff.
+    """
+
+    def _rh(self, **config):
+        from softae.drivers.mock_rh_controller import MockRHController
+
+        rh = MockRHController(config=config or None)
+        rh._state = InstrumentState.CONNECTED
+        return rh
+
+    def test_dry_purge_touches_only_the_humidifier(self):
+        """The heater, the pumps, the head and the lamp are all left alone."""
+        mgr = _manager()
+        result = dry_purge_humidifier(mgr, reason="unit test")
+
+        mgr._insts["rh_controller"].safe_dry.assert_called_once()
+        mgr._insts["rh_controller"].safe_off.assert_not_called()
+        mgr._insts["temp_controller"].write_sp.assert_not_called()
+        mgr._insts["syringe"].halt_pump.assert_not_called()
+        mgr._insts["syringe"].head_retract.assert_not_called()
+        mgr._insts["lamp"].off.assert_not_called()
+        # And it says nothing about anti-clog purging, because it suspended
+        # nothing: no park latch is set by this call.
+        assert result.notes == []
+
+    def test_dry_purge_leaves_out_min_on_the_wire_not_zero(self):
+        """The duty itself, off a driver with nothing patched over it.
+
+        A spy on ``safe_dry`` would pass against a no-op; the number is what
+        the Trinket would be sitting at, and ``0.0`` is the one value that
+        means *both valves shut*.
+        """
+        rh = self._rh()
+        result = dry_purge_humidifier(_manager(rh_controller=rh))
+
+        assert rh._duty == pytest.approx(rh._out_min)
+        assert rh._duty > 0.0
+        assert rh._running is False
+        assert rh._setpoint == 0.0
+        assert result.ok and result.commanded
+
+    def test_dry_purge_names_the_duty_and_what_closes_the_valves(self):
+        """A standing command reported as a success has to say why it stands."""
+        result = dry_purge_humidifier(_manager(rh_controller=self._rh()))
+        text = " ".join(result.commanded)
+        assert "DRY-PURGED" in text
+        assert f"~{RH_DEADMAN_S:g} s" in text
+        assert not any("DRY-PURGED" in e for e in result.errors)
+
+    def test_dry_purge_reports_a_degenerate_out_min_as_an_error(self):
+        """A config typo must not disable the purge silently — and the hardware
+        still ends up safe, zeroed by the driver's own fallback."""
+        rh = self._rh(out_min=0.0)
+        result = dry_purge_humidifier(_manager(rh_controller=rh))
+
+        assert not result.ok
+        assert any("out_min" in e for e in result.errors)
+        assert rh._duty == 0.0
+
+    def test_dry_purge_skips_a_humidifier_this_process_never_opened(self):
+        """Called after the port closed, or on a refusal that never connected."""
+        rh = self._rh()
+        rh._state = InstrumentState.DISCONNECTED
+        result = dry_purge_humidifier(_manager(rh_controller=rh))
+
+        assert result.skipped and not result.errors
+        assert not result.commanded_anything

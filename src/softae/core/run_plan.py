@@ -44,6 +44,7 @@ from softae.analysis.equilibration import (
     DEFAULT_SETTLE_MIN_CHANNELS,
     DEFAULT_SETTLE_N_ROUNDS,
     DEFAULT_SETTLE_TOL_REL,
+    settle_tol_rel_refusal,
 )
 
 __all__ = [
@@ -159,9 +160,11 @@ class SettlePlan:
                 f"max_hold_s ({self.max_hold_s:g}s) is below min_hold_s "
                 f"({self.min_hold_s:g}s); the ceiling would fire before the floor"
             )
-        if self.settle_tol_rel <= 0:
-            raise ValueError("settle_tol_rel must be positive; a zero band can "
-                             "never be satisfied")
+        # The same rule, and now literally the same code, as the one
+        # `eis_validate_hold.validate_plan` applies to its own `--settle-tol-rel`.
+        # Behaviour and message are unchanged; only the restatement is gone.
+        if (refusal := settle_tol_rel_refusal(self.settle_tol_rel)) is not None:
+            raise ValueError(refusal)
         if self.rh_stability_pct is not None and self.rh_stability_pct <= 0:
             raise ValueError("rh_stability_pct must be positive; a zero band can "
                              "never be satisfied — use None to switch the RH "

@@ -224,10 +224,13 @@ def test_temperature_refusal_releases_the_rh_loop_and_still_parks(
     # Released by the approach itself -- at the run's own setpoint, so it is the
     # loop this run started that came down.
     assert dried == [30.0]
-    # The park behind it keeps its own default: opting one call site in must not
-    # convert the harness's own park into a dry purge.
+    # The park behind it now asks for the dry purge too. This assertion was the
+    # reverse when `_release_rh` was the only opt-in; a refusal is an `aborted`
+    # exit, which is ORDERLY, so the park no longer re-zeroes the axis the
+    # release just dried. `_release_rh` remains necessary regardless -- under
+    # `--end-state hold` there is no park behind it at all.
     assert parks and parks[-1]["retract_head"] is None
-    assert parks[-1].get("rh_dry_purge", False) is False
+    assert parks[-1]["rh_dry_purge"] is True
     assert _rows(tmp_path, "rel") == []
 
 
@@ -257,8 +260,12 @@ def test_temperature_refusal_releases_the_rh_loop_under_end_state_hold(
                    "--temp-setpoint-c", "25", "--validation-name", "hld",
                    "--project", str(tmp_path), "--mock", "--min-treatment", "1",
                    "--end-state", "hold"]) == V.EXIT_FAILED
-    assert dried == [30.0]                # the humidifier is down anyway
-    assert parks == []                    # and nothing else took it down
+    # Twice, and both at the run's own setpoint: the release, then the `hold`
+    # branch's own dry purge. Idempotent to the same end state, and the second
+    # is not redundant -- it is the one that runs on the exits where no approach
+    # ever refused, and it is what stops `disconnect_all` writing a zero.
+    assert dried == [30.0, 30.0]
+    assert parks == []                    # and no park was performed
 
 
 def test_the_unmocked_release_really_reaches_the_mock_drivers_dry_purge(
@@ -368,6 +375,136 @@ def test_end_state_parks_by_default_and_hold_does_not(tmp_path, monkeypatch):
     assert len(parks) == 1
     assert V.main(base + ["--validation-name", "h", "--end-state", "hold"]) == V.EXIT_OK
     assert len(parks) == 1                                  # unchanged
+
+
+# ── End-of-run humidifier end state ──────────────────────────────────────────
+
+def _capture_manager(monkeypatch) -> list:
+    """Keep the manager `cmd_run` actually built, so a test can read the rig.
+
+    Nothing is replaced -- `create_manager` still returns exactly what it
+    returns. It is the only handle on the run's own instruments that does not
+    require stubbing the park under test.
+    """
+    import softae.drivers.factory as FA
+
+    real, seen = FA.create_manager, []
+
+    def _create(*args, **kwargs):
+        manager = real(*args, **kwargs)
+        seen.append(manager)
+        return manager
+
+    monkeypatch.setattr(FA, "create_manager", _create)
+    return seen
+
+
+def _park_spy(monkeypatch) -> list:
+    parks: list = []
+    import softae.core.safe_park as SP
+
+    monkeypatch.setattr(SP, "safe_park",
+                        lambda manager, **kw: parks.append(kw) or _ParkResult())
+    return parks
+
+
+def test_end_state_park_requests_the_dry_purge_on_an_orderly_exit(
+        tmp_path, monkeypatch):
+    """An end-of-run park is orderly, so the humidifier is dried, not zeroed.
+
+    Duty 0 is the firmware's auto-shutoff -- both Aalborg valves closed -- so
+    the default park threw away the descent the run had just paid hours for.
+    """
+    parks = _park_spy(monkeypatch)
+    assert V.main(["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
+                   "--temp-setpoint-c", "25", "--validation-name", "ord",
+                   "--project", str(tmp_path), "--mock", "--min-treatment", "1",
+                   "--drift-check", "0"]) == V.EXIT_OK
+    assert parks and parks[-1]["rh_dry_purge"] is True
+
+
+def test_end_state_park_keeps_duty_zero_on_a_fault_exit(tmp_path, monkeypatch):
+    """The other half of the same rule, and the reason it is a rule.
+
+    Every exit in `cmd_run` lands in one `finally` and one `safe_park` call, so
+    opting the park in is not a decision about the success path -- it decides
+    the humidifier's end state on the fault paths too. `core/safe_park.py`
+    records an operator ruling that fault-class parks keep zeroing immediately,
+    and `outcome["status"]` is what keeps the two apart.
+    """
+    parks = _park_spy(monkeypatch)
+    monkeypatch.setattr(H.HoldWatch, "poll", lambda self:
+                        (_ for _ in ()).throw(RuntimeError("bus died")))
+    assert V.main(["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
+                   "--temp-setpoint-c", "25", "--validation-name", "flt",
+                   "--project", str(tmp_path), "--mock", "--min-treatment", "1",
+                   "--drift-check", "0"]) == V.EXIT_FAILED
+    assert parks and parks[-1]["rh_dry_purge"] is False
+
+
+def test_end_state_hold_leaves_the_humidifier_dry_commanded_not_zeroed(
+        tmp_path, monkeypatch):
+    """The duty on the wire after the process is done with the port.
+
+    **Read after `main` returns, which is after `disconnect_all`** -- that is
+    the whole assertion. `AsyncRHController.disconnect` calls `_stop_pid_loop()`,
+    whose thread-exit write commands duty 0, so a `hold` branch that merely
+    printed something different would still hand the chamber a valve shutoff.
+    `safe_dry` stops the loop itself, so `disconnect` finds it stopped and
+    writes nothing over the dry duty.
+
+    Nothing is patched over the driver and nothing is patched over the park: a
+    spy on a call name would pass against a no-op, and this is the number the
+    Trinket would actually be sitting at.
+    """
+    seen = _capture_manager(monkeypatch)
+    assert V.main(["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
+                   "--temp-setpoint-c", "25", "--validation-name", "hdt",
+                   "--project", str(tmp_path), "--mock", "--min-treatment", "1",
+                   "--drift-check", "0", "--end-state", "hold"]) == V.EXIT_OK
+    assert seen, "the run built no manager, so this test proved nothing"
+    rh = seen[-1].get("rh_controller")
+    assert rh._duty == pytest.approx(0.01)     # out_min -- dry air, still flowing
+    assert rh._duty != 0.0                     # NOT the firmware's valve shutoff
+    assert rh._running is False
+    assert rh._setpoint == 0.0
+
+
+def test_end_state_hold_message_states_nothing_false(tmp_path, monkeypatch,
+                                                     capsys):
+    """The sentence it replaces was half true, which is worse than wholly wrong.
+
+    *"the heater and humidifier are STILL DRIVEN"* -- temperature really does
+    hold, so the operator had no reason to disbelieve the other half, and the
+    humidifier was being shut off by `disconnect_all` one line later.
+
+    The cited hand-off is **parsed by `env_hold`'s own parser**, not merely
+    matched as a substring: a message that told the operator to run an invented
+    flag inside a ~25 s window is the same class of defect as the sentence
+    being replaced.
+    """
+    from softae.tools import env_hold as EH
+
+    _capture_manager(monkeypatch)
+    assert V.main(["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
+                   "--temp-setpoint-c", "25", "--validation-name", "hmsg",
+                   "--project", str(tmp_path), "--mock", "--min-treatment", "1",
+                   "--drift-check", "0", "--end-state", "hold"]) == V.EXIT_OK
+    out = capsys.readouterr().out
+
+    assert "STILL DRIVEN" not in out
+    assert "TEMPERATURE HOLDS" in out
+    assert "HUMIDITY DOES NOT HOLD" in out
+    # No exiting process can hold RH, and the message says so rather than
+    # implying this one does.
+    assert "no exiting process can make it" in out
+
+    cited = next(line.strip() for line in out.splitlines()
+                 if "env_hold hold" in line)
+    assert cited.startswith(f"python -m {EH.MODULE} hold ")
+    argv = cited.split()[3:]
+    parsed = EH.build_parser().parse_args(argv)
+    assert parsed.rh == 30.0 and parsed.execute is True and parsed.yes is True
 
 
 def test_rh_approach_timeout_default_is_not_the_shipped_1800(tmp_path):
@@ -885,9 +1022,15 @@ def _sweep_at(r_ohms: float):
                            phase=np.degrees(np.angle(z)))
 
 
-def _scripted_settle(tmp_path, series, **overrides):
-    """Run `settle_phase` over a scripted per-channel R series. No rig, no sleep."""
-    plan = _plan(tmp_path, channels=",".join(str(c) for c in series))
+def _scripted_settle(tmp_path, series, *, tol_rel=None, **overrides):
+    """Run `settle_phase` over a scripted per-channel R series. No rig, no sleep.
+
+    *tol_rel* goes in through the real `--settle-tol-rel` flag rather than onto
+    the plan object, so a test that asserts on the band is asserting on the whole
+    path an operator actually uses.
+    """
+    flags = {} if tol_rel is None else {"settle_tol_rel": tol_rel}
+    plan = _plan(tmp_path, channels=",".join(str(c) for c in series), **flags)
     plan.settle_max_hold_s = 270.0                 # four rounds at 90 s
     rounds = {"n": -1}
 
@@ -1019,6 +1162,268 @@ def test_settle_phase_unachievable_tolerance_names_the_channel(tmp_path, capsys)
     assert "no hold length can satisfy it" in named[0]
     # ...and the board-level line disagrees, which is the whole point.
     assert any("tolerance ACHIEVABLE" in ln for ln in lines)
+
+
+# ── S4b-series: the settle band is the operator's, and it has one spelling ────
+#
+# `20260821T173111Z_eis_validate` (40 C / 10 %RH, 15 channels) reported
+# `achievable=False floor=0.12516` at round 3 and `0.14035` at round 4: the
+# typical cell on that board scatters at 12-14 % against a band hardwired to
+# 10 %. The gate was arithmetically incapable of passing and the operator had no
+# way to say so, because `settle_phase` built its `SettleTracker` with no
+# `tol_rel` at all.
+
+def test_settle_tol_rel_default_is_the_shipped_criterions_own(tmp_path):
+    """The restated constant is pinned to the criterion's home, not merely equal.
+
+    `eis_validate_hold` holds no module-level `softae` imports -- `--help` costs
+    0.3 s and loads no numpy -- so the default is written there rather than
+    imported for one float. This is the test that makes the restatement safe:
+    retuning the criterion in `analysis/equilibration.py` and forgetting this
+    file fails here instead of at the bench.
+    """
+    from softae.analysis.equilibration import DEFAULT_SETTLE_TOL_REL
+
+    assert H.DEFAULT_SETTLE_TOL_REL == DEFAULT_SETTLE_TOL_REL
+    assert _plan(tmp_path).settle_tol_rel == pytest.approx(DEFAULT_SETTLE_TOL_REL)
+
+
+def test_settle_phase_without_the_flag_judges_at_the_shipped_band(tmp_path, capsys):
+    """No flag, no change: the band is 10 % and the tracker judges with it."""
+    payloads: list[dict] = []
+    _plan_used, _outcome = _scripted_settle(
+        tmp_path, {18: [10_000.0], 19: [10_000.0], 20: [10_000.0]},
+        on_round=payloads.append)
+
+    assert payloads and all(p["tol_rel"] == pytest.approx(0.10) for p in payloads)
+    assert "(tol 10.00%)" in capsys.readouterr().out
+
+
+def test_settle_phase_the_flag_changes_the_band_the_tracker_judges_with(tmp_path):
+    """The flag reaches the gate's arithmetic, not just the gate's printout.
+
+    ch20 scatters ~12.0 % about its window mean -- above the shipped 10 % and
+    below 15 %. The band is the ONLY thing that differs between these two runs,
+    so a verdict that flips is the tracker actually judging with the new number.
+    A payload assertion alone would pass just as well against a plan field
+    nothing reads, which is the shape this whole change exists to fix.
+    """
+    series = {18: [10_000.0], 19: [10_000.0], 20: [10_000.0, 10_000.0, 12_000.0]}
+    _p1, shipped = _scripted_settle(tmp_path, series)
+    payloads: list[dict] = []
+    _p2, widened = _scripted_settle(tmp_path, series, tol_rel=0.15,
+                                    on_round=payloads.append)
+
+    assert not shipped.certified                   # 12.0 % against a 10 % band
+    assert widened.certified                       # ...and inside a 15 % one
+    assert payloads and all(p["tol_rel"] == pytest.approx(0.15) for p in payloads)
+
+
+def test_validate_plan_a_non_positive_settle_tol_rel_is_refused(tmp_path):
+    """One rule, not a second one: the reason is `run_plan`'s own, verbatim.
+
+    A band of zero or less can never be satisfied by any series at all, which is
+    universal rather than this tool's policy -- so the predicate lives beside the
+    criterion and both callers ask it the same question.
+    """
+    from softae.analysis.equilibration import settle_tol_rel_refusal
+
+    for band in (0.0, -0.05):
+        plan = _plan(tmp_path)
+        plan.settle_tol_rel = band
+        with pytest.raises(H.RefuseToStart) as excinfo:
+            H.validate_plan(plan)
+        assert settle_tol_rel_refusal(band) in str(excinfo.value)
+        assert "--settle-tol-rel" in str(excinfo.value)
+
+
+def test_settle_tol_rel_refusal_is_the_rule_the_run_plan_enforces():
+    """`SettlePlan` and this tool now share the code, not just the intent."""
+    from softae.analysis.equilibration import settle_tol_rel_refusal
+    from softae.core.run_plan import SettlePlan
+
+    with pytest.raises(ValueError) as excinfo:
+        SettlePlan(round_period_s=60.0, min_hold_s=60.0, max_hold_s=600.0,
+                   settle_tol_rel=0.0)
+    assert str(excinfo.value) == settle_tol_rel_refusal(0.0)
+    assert settle_tol_rel_refusal(H.DEFAULT_SETTLE_TOL_REL) is None
+
+
+def test_validate_plan_a_settle_tol_rel_above_the_maximum_is_refused(tmp_path):
+    """The direction that has no backstop is the direction that is refused.
+
+    Too TIGHT is self-correcting: `endorse_tolerance` announces it unachievable
+    and the phase refuses at its ceiling, so nothing is certified. Too LOOSE
+    certifies, and the resulting run is indistinguishable from a correct one --
+    1.0, the value an operator who read `spread 0.130` as %RH nearly typed, is
+    100 % relative deviation, i.e. a film whose conductivity doubled between
+    rounds, accepted. So the trap is closed at the far end.
+    """
+    for band in (0.51, 1.0):
+        plan = _plan(tmp_path)
+        plan.settle_tol_rel = band
+        with pytest.raises(H.RefuseToStart) as excinfo:
+            H.validate_plan(plan)
+        message = str(excinfo.value)
+        assert "--settle-tol-rel" in message
+        assert "RELATIVE DEVIATION OF SIGMA" in message   # the unit, unmistakably
+        assert f"{H.SETTLE_TOL_REL_MAX:g}" in message
+    # The maximum itself is admissible: a ceiling that refuses its own value
+    # would be a different number.
+    plan = _plan(tmp_path)
+    plan.settle_tol_rel = H.SETTLE_TOL_REL_MAX
+    H.validate_plan(plan)
+
+
+def test_validate_plan_a_non_finite_settle_tol_rel_is_refused(tmp_path):
+    """`nan > MAX` is False, so the ceiling alone would let it through.
+
+    A NaN band makes every comparison in `settle_check` false, so the phase runs
+    to its ceiling and reports it as the film never settling -- a typo arriving
+    as a material finding.
+    """
+    plan = _plan(tmp_path)
+    plan.settle_tol_rel = float("nan")
+    with pytest.raises(H.RefuseToStart, match="not a real number"):
+        H.validate_plan(plan)
+
+
+def test_settle_phase_a_loose_but_admissible_band_is_announced_not_refused(
+        tmp_path, capsys):
+    """Between generous and inadmissible the run proceeds -- and says so.
+
+    A board scattering at 12-14 % has no honest alternative to a wide band, so
+    this cannot be a refusal; but a band that accepts +/-25 % swings as *settled*
+    is a decision the operator should hear made, in the unit it is made in.
+    """
+    series = {18: [10_000.0], 19: [10_000.0], 20: [10_000.0]}
+    _p, _outcome = _scripted_settle(tmp_path, series, tol_rel=0.25)
+    wide = [ln for ln in capsys.readouterr().out.splitlines()
+            if "WIDE BAND" in ln]
+
+    assert len(wide) == 1 and "not %RH" in wide[0]
+    assert "25%" in wide[0]
+    # ...and the shipped band says nothing, or the warning is noise.
+    _scripted_settle(tmp_path, series)
+    assert "WIDE BAND" not in capsys.readouterr().out
+
+
+def test_settle_phase_unachievable_tolerance_names_the_flag_and_a_workable_value(
+        tmp_path, capsys):
+    """"No hold length can satisfy it" is a diagnosis missing its instruction.
+
+    The run already knew the board's measured floor and already knew the band was
+    below it; what it never said was which flag to move or to what. The value is
+    derived from that floor -- never hardcoded -- and must clear it.
+    """
+    scatter = [10_000.0, 10_000.0, 13_000.0]
+    payloads: list[dict] = []
+    _p, outcome = _scripted_settle(
+        tmp_path, {18: scatter, 19: scatter, 20: scatter},
+        on_round=payloads.append)
+    lines = capsys.readouterr().out.splitlines()
+    board = [ln for ln in lines if ln.startswith("[settle] tolerance")]
+    advice = [ln for ln in lines if "restart with --settle-tol-rel" in ln]
+
+    assert len(board) == 1 and "UNACHIEVABLE" in board[0]
+    # The existing wording is untouched; the instruction is added beside it.
+    assert "no hold length can satisfy it" in board[0]
+    assert len(advice) == 1, "announced with the endorsement, not every round"
+    suggested = float(advice[0].split("--settle-tol-rel ")[1].split()[0])
+    # The floor AT THE MOMENT OF THE ANNOUNCEMENT, not `outcome.noise_floor_rel`:
+    # the endorsement fires once, at the first judged window, and later windows
+    # move the floor. The two differ here (14.4 % then 15.7 %), and the advice
+    # has to be the number the operator was actually shown.
+    judged = next(p for p in payloads if p["tolerance_achievable"] is False)
+    assert suggested == pytest.approx(
+        H.suggested_settle_tol_rel(judged["noise_floor_rel"]))
+    assert suggested > judged["noise_floor_rel"]
+    assert outcome.noise_floor_rel is not None
+    assert suggested > outcome.noise_floor_rel     # and it still clears the last
+    assert suggested <= H.SETTLE_TOL_REL_MAX
+    assert "not %RH" in advice[0]
+
+
+def test_suggested_settle_tol_rel_above_the_maximum_is_no_suggestion():
+    """A value the run would then refuse is a second trap, not advice."""
+    assert H.suggested_settle_tol_rel(0.12516) == pytest.approx(0.16)
+    assert H.suggested_settle_tol_rel(0.14035) == pytest.approx(0.17)
+    assert H.suggested_settle_tol_rel(0.49) is None
+    assert H.suggested_settle_tol_rel(0.0) is None
+
+
+def test_settle_phase_an_unclearable_floor_says_the_cells_are_the_finding(
+        tmp_path, capsys):
+    """At 49 % board-wide scatter no admissible band exists, and it says so."""
+    scatter = [10_000.0, 30_000.0, 10_000.0, 30_000.0]
+    _p, _outcome = _scripted_settle(
+        tmp_path, {18: scatter, 19: scatter, 20: scatter})
+    lines = capsys.readouterr().out.splitlines()
+
+    assert any("no admissible band clears" in ln for ln in lines)
+    assert not any("restart with --settle-tol-rel" in ln for ln in lines)
+
+
+def test_validation_plan_fingerprint_covers_the_settle_tol_rel(tmp_path):
+    """A pre-registered gate parameter, so a resume cannot quietly widen it.
+
+    Unlike `circuit_model`, which changes how a spectrum is READ, the band
+    decides which sample states enter the dataset -- `soak_s`'s side of the line,
+    not the ceilings'. And it is the resume that would be tempting: an operator
+    who hit a ceiling has a wider band in hand and a half-finished run on disk.
+    """
+    shipped = _plan(tmp_path)
+    widened = _plan(tmp_path, settle_tol_rel=0.16)
+    wider = _plan(tmp_path, settle_tol_rel=0.2)
+
+    assert shipped.fingerprint() != widened.fingerprint() != wider.fingerprint()
+    assert shipped.fingerprint() != wider.fingerprint()
+    # Stated explicitly rather than restated: an EXPLICIT default is the same
+    # criterion as an absent flag, and must not be a different run.
+    assert _plan(tmp_path, settle_tol_rel=H.DEFAULT_SETTLE_TOL_REL
+                 ).fingerprint() == shipped.fingerprint()
+
+
+def test_validation_plan_fingerprint_at_the_default_band_is_the_old_hash(tmp_path):
+    """Introducing the knob invalidates no checkpoint that predates it.
+
+    The band enters the hash only when it is NOT the default, which is what lets
+    the run whose unsatisfiable band motivated the flag still `--resume`. The
+    ten-part string is recomputed here rather than trusted, so a future field
+    appended unconditionally fails this test instead of the operator's resume.
+    """
+    import hashlib
+
+    plan = _plan(tmp_path)
+    parts = "|".join(str(p) for p in (
+        plan.validation_name, plan.channels, plan.rh_setpoint_pct,
+        plan.temp_setpoint_c, plan.baseline_preset, plan.reference_preset,
+        plan.order, plan.max_follow_ups, plan.visit, plan.soak_s,
+    ))
+    assert plan.fingerprint() == hashlib.sha256(
+        parts.encode("utf-8")).hexdigest()[:16]
+
+
+def test_settle_tol_rel_is_spelled_as_the_equilibration_tool_spells_it():
+    """One concept, one flag name. Two spellings is how a flag stops meaning
+    anything: `softae-equilibration` feeds the SAME `SettleTracker` parameter."""
+    import argparse
+
+    from softae.tools.equilibration import build_parser as equilibration_parser
+
+    def _spellings(parser):
+        """Every option string carrying `settle_tol_rel`, subcommands included."""
+        found = {opt for action in parser._actions
+                 if action.dest == "settle_tol_rel"
+                 for opt in action.option_strings}
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                for child in action.choices.values():
+                    found |= _spellings(child)
+        return found
+
+    assert _spellings(V.build_parser()) == {"--settle-tol-rel"}
+    assert _spellings(equilibration_parser()) == {"--settle-tol-rel"}
 
 
 # ── S5-series: the gate reads a FITTED R1, not the raw low-frequency point ───
