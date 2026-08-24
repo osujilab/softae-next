@@ -358,6 +358,17 @@ def busy_rig_message(lock: RunLock, *, action: str) -> str:
     refusal is to start deleting files, so the holder is named — PID, what it is
     running, since when — via :meth:`RunLock.describe`, and every exit from the
     situation is spelled out.
+
+    The closing sentence draws the line between *this* refusal and manual
+    control, and it has to stay drawn accurately for every caller. It used to
+    read "manual control at the rig is never refused", which was true when the
+    lock was the only thing that could refuse anything. It is not any more: a
+    run started **from the same window** takes a scoped rig claim
+    (:class:`~softae.core.rig_activity.RigActivity`) and the Manual tab refuses
+    the controls whose instruments that claim covers, until the run is paused.
+    That is a different owner reached by a different mechanism, and an operator
+    reading this message while being refused a jog needs the difference stated
+    rather than contradicted.
     """
     return (
         f"{action} would drive the same rig, and {lock.describe()}\n"
@@ -367,7 +378,10 @@ def busy_rig_message(lock: RunLock, *, action: str) -> str:
         "checkpoint, so `softae-campaign resume` continues it);\n"
         f"  - {WEDGED_HOLDER_ADVICE}\n"
         "\nThis refusal is scoped to starting a second automated run. Manual "
-        "control at the rig is never refused."
+        "control at the rig is not refused by this lock — an operator at the "
+        "bench keeps it while another process runs. (A run started from the "
+        "GUI is the one case that does hold back the manual controls it is "
+        "driving, and pausing that run hands them straight back.)"
     )
 
 

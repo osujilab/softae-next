@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import os
 import tempfile
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 from .tab_manual_workers import _CommandWorker
 
@@ -60,15 +60,25 @@ if TYPE_CHECKING:
     from softae.server.manager import InstrumentManager
 
 
-class _AttachRefusal:
-    """The answer :meth:`ManualControlTab._note_manual_actuation` gives instead of
-    a lock when this window is attached to a campaign it does not own.
+class _ManualRefusal:
+    """Base for the answers :meth:`ManualControlTab._note_manual_actuation` gives
+    that mean *stop*, as opposed to the two that mean *proceed*.
 
-    A sentinel rather than a bool because the method's two existing answers are
-    already ``None`` (the rig is free) and the lock itself (someone else holds it,
-    and we actuate anyway) — both of which mean *proceed*. Identity-compared at
-    the call sites, so no truthiness accident can turn a refusal into a go-ahead.
+    Sentinel objects rather than a bool because the method's original answers are
+    already ``None`` (the rig is free) and the lock itself (someone else's
+    **process** holds it, and we actuate anyway) — both of which mean proceed, and
+    one of which is truthy. A class hierarchy rather than a growing tuple of
+    singletons because the second refusal carries the owner it is refusing for,
+    so it cannot be a singleton; :func:`refused` is the one predicate every call
+    site asks, so a third refusal added later needs no sweep of the sixteen slots.
     """
+
+    __slots__ = ()
+
+
+class _AttachRefusal(_ManualRefusal):
+    """This window is attached to a campaign it does not own, so it opened no
+    session for the command to travel down."""
 
     __slots__ = ()
 
@@ -76,8 +86,67 @@ class _AttachRefusal:
         return "<manual actuation refused: this window is attached>"
 
 
+class _RunRefusal(_ManualRefusal):
+    """A run **in this window** is driving the instruments the action needs.
+
+    Carries ``owner`` — the string :meth:`softae.core.rig_activity.RigActivity.conflicts`
+    returned — because a refusal an operator cannot act on is the one this
+    codebase spent :func:`softae.core.run_lock.busy_rig_message` avoiding. Not a
+    singleton for that reason.
+    """
+
+    __slots__ = ("owner",)
+
+    def __init__(self, owner: str) -> None:
+        self.owner = owner
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<manual actuation refused: {self.owner} is driving the rig>"
+
+
 #: Singleton of :class:`_AttachRefusal`; see :meth:`ManualControlTab._note_manual_actuation`.
 REFUSED_WHILE_ATTACHED = _AttachRefusal()
+
+
+def refused(answer: object) -> bool:
+    """Whether :meth:`ManualControlTab._note_manual_actuation` said *stop*.
+
+    The single predicate the actuating slots branch on. ``isinstance`` rather
+    than identity because a run refusal names its owner and so is built per
+    call; the attach refusal stays a shared singleton and is still identity-
+    comparable for anyone who wants that specific answer.
+    """
+    return isinstance(answer, _ManualRefusal)
+
+
+#: The manager key of the composite driver that moves the stage **and** fires the
+#: syringe from inside a single workflow step — ``deposition_steps`` builds its
+#: cast tasks with ``instrument="liquid_handler"``. A run scoped to it is
+#: driving both, so a manual jog or dispense must collide with that name as well
+#: as with the two it hides. Widening on doubt is the direction
+#: :meth:`softae.core.rig_activity.RigActivity.conflicts` asks for.
+_LIQUID_HANDLER = "liquid_handler"
+
+#: What each family of manual control actually drives, in the manager-key
+#: vocabulary ``RigActivity`` claims are expressed in (``workflow_instruments``
+#: unions ``step.instrument``, which are manager keys).
+STAGE_INSTRUMENTS = frozenset({"stage", _LIQUID_HANDLER})
+SYRINGE_INSTRUMENTS = frozenset({"syringe", _LIQUID_HANDLER})
+TEMP_INSTRUMENTS = frozenset({"temp_controller"})
+RH_INSTRUMENTS = frozenset({"rh_controller"})
+PIEZO_INSTRUMENTS = frozenset({"piezo"})
+LAMP_INSTRUMENTS = frozenset({"lamp"})
+
+#: Everything this tab can reach — the scope an actuation gets when it declares
+#: none. Deliberately the widest manual scope rather than the empty set: an
+#: empty ``want`` collides only with a whole-rig claim, so a slot added later
+#: that forgets to declare would be *permitted* through a scoped run. The
+#: potentiostats are named here because the EIS control routes per channel and
+#: has no fixed one.
+MANUAL_INSTRUMENTS = (
+    STAGE_INSTRUMENTS | SYRINGE_INSTRUMENTS | TEMP_INSTRUMENTS | RH_INSTRUMENTS
+    | PIEZO_INSTRUMENTS | LAMP_INSTRUMENTS | frozenset({"pico1", "pico2"})
+)
 
 
 def _manual_scout_default() -> bool:
@@ -299,27 +368,57 @@ class _ManualPollingWorker(StoppableWorker):
 
     _default_stop_timeout_ms = 5000
 
+    #: The two values :attr:`interval_end` may hold when :meth:`run` returns if
+    #: the stop was prompt: the wait was woken, or the stop was already set when
+    #: the loop reached it and no wait was entered at all. Exiting on
+    #: ``"elapsed"`` means the loop sat out the whole interval with a stop
+    #: pending — the ``msleep`` behaviour this class replaced.
+    #:
+    #: This is what the promptness test asserts on. A wall-clock bound cannot
+    #: tell a missed wake-up from scheduling latency on a machine running the
+    #: suite, so it measures the machine; this measures the mechanism.
+    PROMPT_STOPS = frozenset({"woken", "stop-before-wait"})
+
     def __init__(self, manager, parent=None):
         super().__init__(parent)
         self._manager = manager
         self._stop = False
         self._mutex = QMutex()
         self._condition = QWaitCondition()
+        #: How the current (or last) poll interval ended — see
+        #: :data:`PROMPT_STOPS`. ``"waiting"`` while one is in flight, ``None``
+        #: until the loop reaches its first wait.
+        self.interval_end: str | None = None
 
     def run(self) -> None:
         self._stop = False
-        while not self._stop:
+        while True:
             self.poll_done.emit(self.poll_once())
             # A *wakeable* wait rather than ``msleep``: an msleep cannot be
             # interrupted, so a stop arriving just after a poll blocked the
             # **caller** — the main thread, inside ``cleanup()`` — for the rest of
             # the interval. Closing the tab or the window froze the GUI for up to
-            # 2 s for no reason. The flag is re-checked under the mutex so a stop
-            # landing between the poll and the wait cannot lose its wake-up.
+            # 2 s for no reason.
+            #
+            # Both the flag checks are under the mutex, and that is what makes
+            # ``interval_end`` mean something. ``QWaitCondition.wait`` re-acquires
+            # the mutex before returning, so a stop cannot slip in between a
+            # timed-out wait and the check below and leave a *prompt* stop
+            # recorded as ``"elapsed"``. Without that, the record would race and
+            # the test reading it would be flaky in a new way.
             self._mutex.lock()
-            if not self._stop:
-                self._condition.wait(self._mutex, 2000)
-            self._mutex.unlock()
+            try:
+                if self._stop:
+                    self.interval_end = "stop-before-wait"
+                    return
+                self.interval_end = "waiting"
+                self.interval_end = (
+                    "woken" if self._condition.wait(self._mutex, 2000) else "elapsed"
+                )
+                if self._stop:
+                    return
+            finally:
+                self._mutex.unlock()
 
     def poll_once(self) -> dict:
         """One sweep of the instruments, as the payload ``poll_done`` carries.
@@ -371,12 +470,21 @@ class _ManualPollingWorker(StoppableWorker):
 class ManualControlTab(QWidget):
     """Hands-on instrument control panel.
 
-    Owner mode is the whole of its history and is untouched by attach mode: the
-    rig may be occupied by another process and every control here still acts, by
-    ruling (see :mod:`softae.gui.widgets.rig_owner`). What changes is a window
-    launched *attached* — one that opened no instrument session at all. Its
-    controls actuate nothing whatever they do, so they say so instead; see
-    :meth:`_note_manual_actuation`.
+    A foreign **process** holding the rig never refuses anything here, and that
+    is the standing ruling (see :mod:`softae.gui.widgets.rig_owner`): the
+    operator at the bench cannot pause a run they are not looking at, so a
+    lockout would leave them with nothing but the E-Stop.
+
+    Two owners *can* refuse, and both are ones the operator can address:
+
+    * a window launched **attached** opened no instrument session at all, so its
+      controls would command nothing — they say which run has the sessions
+      instead;
+    * a run **in this window** holding a conflicting rig claim is refused with
+      its name, because Pause is right there and pausing hands the instruments
+      back (:meth:`softae.core.rig_activity.RigActivity.suspend`).
+
+    Both go through :meth:`_note_manual_actuation`.
     """
 
     def __init__(
@@ -1049,11 +1157,14 @@ class ManualControlTab(QWidget):
     def refresh_rig_owner(self) -> "RunLock | None":
         """Show who owns the rig, if it is not this process. Returns that lock.
 
-        The banner is the *whole* of this tab's response to a foreign owner. It
-        does not disable a control, refuse a command, or offer to take the rig
-        over, and that is a decision rather than an omission: the operator at the
-        bench reaches for manual control precisely when something has gone wrong,
-        and a lockout at that moment is the failure, not the protection.
+        The banner is the *whole* of this tab's response to a foreign owner —
+        one in another **process**. It does not disable a control, refuse a
+        command, or offer to take the rig over, and that is a decision rather
+        than an omission: the operator at the bench reaches for manual control
+        precisely when something has gone wrong, and a lockout at that moment is
+        the failure, not the protection. (A run in *this* window is the case
+        they can address, and it does refuse — see
+        :meth:`_refuse_while_running`. Different owner, different recourse.)
 
         Stopping a run is a designated control with a scope of its own — rig-scale
         (the E-Stop already on the main toolbar), campaign-scale and terminal
@@ -1124,31 +1235,68 @@ class ManualControlTab(QWidget):
         self._lbl_rig_owner.setToolTip(mode.reason)
         self._lbl_rig_owner.setVisible(True)
 
-    def _note_manual_actuation(self, action: str) -> "RunLock | None | _AttachRefusal":
-        """Record a manual *action*, and refuse it only if nothing could receive it.
+    def _rig_run_owner(self, instruments: Iterable[str]) -> str | None:
+        """The run **in this window** driving *instruments*, or ``None``.
 
-        Three answers, and the caller acts on exactly one of them:
+        Asks :meth:`softae.core.rig_activity.RigActivity.conflicts` and nothing
+        else. That method already skips a *suspended* owner — a run held at a
+        pause has handed the instruments back — so the permit-while-paused case
+        needs no branch here, and there is no second predicate to keep in sync
+        with it. A ``if suspended`` written at this level would be that second
+        predicate.
 
-        ==========================  ================================================
-        ``None``                    the rig is free — proceed, nothing to say
-        the foreign :class:`RunLock`  someone else is running — **proceed anyway**,
-                                    with the collision logged and named, because
-                                    the operator at the bench is the authority
+        Windowless is not a refusal: most of the suite builds this tab with no
+        parent, ``window()`` then returns the tab itself, and nothing there
+        carries a registry. Same shape and same reason as
+        :func:`softae.gui.rig_claim.rig_run`'s null context — a tab used outside
+        the GUI shell stays fully usable.
+        """
+        activity = getattr(self.window(), "_rig_activity", None)
+        return None if activity is None else activity.conflicts(instruments)
+
+    def _note_manual_actuation(
+        self, action: str, instruments: Iterable[str] = MANUAL_INSTRUMENTS,
+    ) -> "RunLock | None | _ManualRefusal":
+        """Record a manual *action*, and refuse it when it would collide.
+
+        *instruments* is what this action drives, in the manager-key vocabulary
+        rig claims use. It defaults to the whole of :data:`MANUAL_INSTRUMENTS`
+        so a slot that declares nothing is refused conservatively.
+
+        Four answers; :func:`refused` separates the two that mean *stop* from
+        the two that mean *proceed*:
+
+        ==============================  ============================================
+        ``None``                        the rig is free — proceed, nothing to say
+        the foreign :class:`RunLock`    another **process** is running — proceed
+                                        anyway, with the collision logged and
+                                        named, because the operator at the bench
+                                        is the authority
         :data:`REFUSED_WHILE_ATTACHED`  this window opened no sessions — stop, and
-                                    say which run has them
-        ==========================  ================================================
+                                        say which run has them
+        :class:`_RunRefusal`            a run **in this window** holds these
+                                        instruments — stop, and name it
+        ==============================  ============================================
 
-        The middle answer is the ruled one and it is unchanged: a lock is never a
-        reason to refuse. The third is not derived from a lock at all (see
-        :attr:`_attached`); it is the launch decision, and what it reports is not
-        "you may not" but "there is nothing here to command".
+        The second answer is the ruled one and it is unchanged: a foreign *lock*
+        is never a reason to refuse, because the operator standing at the bench
+        can neither pause nor abort a run in a process they are not looking at.
+        The fourth is the case where they can: an HT or AE run started from this
+        very window has a Pause beside it, and pausing suspends its claim, which
+        is exactly what re-enables these controls. Refusing and saying who —
+        rather than interleaving a jog into a live cast — is the pragmatic
+        ruling for the one owner this window can actually address.
 
         This is the seam because every actuating slot already routes through it —
         pinned by ``test_every_actuating_slot_reports_before_it_acts`` — so a
         control added later cannot be added *past* the refusal.
+
+        The refusal half is :meth:`_refuse_manual_actuation`, which a slot with
+        work to do before it commands may ask **earlier**; see the note there.
         """
-        if self._attached:
-            return self._refuse_while_attached(action)
+        refusal = self._refuse_manual_actuation(action, instruments)
+        if refusal is not None:
+            return refusal
         lock = self.refresh_rig_owner()
         if lock is None:
             return None
@@ -1166,6 +1314,33 @@ class ManualControlTab(QWidget):
             f"(PID {lock.pid}) holds the rig"
         )
         return lock
+
+    def _refuse_manual_actuation(
+        self, action: str, instruments: Iterable[str] = MANUAL_INSTRUMENTS,
+    ) -> "_ManualRefusal | None":
+        """Whether *action* is refused — the **decision**, without the record.
+
+        The two refusing answers of :meth:`_note_manual_actuation`, split from
+        the two permitting ones, so a slot that has work to do *before* it
+        commands can ask the question first. ``None`` means nothing refuses it;
+        that is not yet a permission to log, because "the rig is free" and "a
+        foreign process holds it" are records the other method still owes.
+
+        Safe to call early precisely because it *is* a decision. Both branches
+        announce a refusal on the status line, and a refusal is an outcome — it
+        is true the moment it is asked. What must not move early is the
+        permitting half: ``"Last command: …"`` has to keep meaning *the command
+        was sent*, not *a button was pressed*, so slots that call this early
+        still call :meth:`_note_manual_actuation` at the point of actuation.
+        Asking twice costs two dictionary lookups and re-decides immediately
+        before the bus is touched, which is the answer that matters.
+        """
+        if self._attached:
+            return self._refuse_while_attached(action)
+        owner = self._rig_run_owner(instruments)
+        if owner is not None:
+            return self._refuse_while_running(action, owner, instruments)
+        return None
 
     def _refuse_while_attached(self, action: str) -> "_AttachRefusal":
         """Say — on screen and in the log — why *action* was not sent.
@@ -1195,6 +1370,37 @@ class ManualControlTab(QWidget):
         )
         return REFUSED_WHILE_ATTACHED
 
+    def _refuse_while_running(
+        self, action: str, owner: str, instruments: Iterable[str],
+    ) -> "_RunRefusal":
+        """Say — on screen and in the log — that *owner* is driving these instruments.
+
+        Names the run and names the way out, in the same place and by the same
+        means as its attached twin: the status line every other outcome of a
+        manual command already reports to, and no modal (a slot reachable from a
+        worker's queued signal must not block the event loop).
+
+        The way out is **Pause**, and it is a real control on the tab that
+        started the run rather than advice: pausing suspends the claim, and a
+        suspended owner is skipped by ``conflicts``, so these controls come back
+        with no further wiring. That is why this refusal is worth having — it is
+        addressed to an operator who can lift it.
+        """
+        import structlog
+
+        structlog.get_logger(__name__).warning(
+            "manual_actuation_refused_while_running",
+            action=action, owner=owner, instruments=sorted(instruments),
+            msg="manual control was not sent: a run in this window is driving "
+                "the instruments it needs — pausing that run releases them",
+        )
+        self._lbl_last_command.setText(
+            f"Refused: {action} — {owner} is driving this rig "
+            f"({', '.join(sorted(instruments))}). Pause that run to take manual "
+            f"control; it hands the instruments back while it is held."
+        )
+        return _RunRefusal(owner)
+
     # --- Slots ----------------------------------------------------------------
 
     def _safe_run(self, fn, error_title: str = "Error") -> None:
@@ -1205,7 +1411,7 @@ class ManualControlTab(QWidget):
             QMessageBox.warning(self, error_title, str(exc))
 
     def _on_goto(self) -> None:
-        if self._note_manual_actuation("stage go-to") is REFUSED_WHILE_ATTACHED:
+        if refused(self._note_manual_actuation("stage go-to", STAGE_INSTRUMENTS)):
             return
         x, y = self._spin_x.value(), self._spin_y.value()
         self._btn_goto.setEnabled(False)
@@ -1224,7 +1430,7 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_jog(self, dx: float, dy: float) -> None:
-        if self._note_manual_actuation("stage jog") is REFUSED_WHILE_ATTACHED:
+        if refused(self._note_manual_actuation("stage jog", STAGE_INSTRUMENTS)):
             return
         step = self._spin_jog_step.value()
         for b in self._jog_buttons:
@@ -1248,7 +1454,7 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_set_temp(self) -> None:
-        if self._note_manual_actuation("temperature setpoint") is REFUSED_WHILE_ATTACHED:
+        if refused(self._note_manual_actuation("temperature setpoint", TEMP_INSTRUMENTS)):
             return
         sp = self._spin_temp.value()
         self._btn_set_temp.setEnabled(False)
@@ -1266,7 +1472,7 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_ramp(self) -> None:
-        if self._note_manual_actuation("temperature ramp") is REFUSED_WHILE_ATTACHED:
+        if refused(self._note_manual_actuation("temperature ramp", TEMP_INSTRUMENTS)):
             return
         end = self._spin_ramp_end.value()
         rate = self._spin_ramp_rate.value()
@@ -1290,7 +1496,7 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_set_rh(self) -> None:
-        if self._note_manual_actuation("humidity setpoint") is REFUSED_WHILE_ATTACHED:
+        if refused(self._note_manual_actuation("humidity setpoint", RH_INSTRUMENTS)):
             return
         sp = self._spin_rh.value()
         self._btn_set_rh.setEnabled(False)
@@ -1307,7 +1513,7 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_rh_start(self) -> None:
-        if self._note_manual_actuation("humidity control start") is REFUSED_WHILE_ATTACHED:
+        if refused(self._note_manual_actuation("humidity control start", RH_INSTRUMENTS)):
             return
         sp = self._spin_rh.value()
         self._btn_rh_start.setEnabled(False)
@@ -1325,7 +1531,7 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_rh_stop(self) -> None:
-        if self._note_manual_actuation("humidity control stop") is REFUSED_WHILE_ATTACHED:
+        if refused(self._note_manual_actuation("humidity control stop", RH_INSTRUMENTS)):
             return
         self._btn_rh_stop.setEnabled(False)
 
@@ -1341,7 +1547,8 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_head_retract(self) -> None:
-        if self._note_manual_actuation("dispenser head retract") is REFUSED_WHILE_ATTACHED:
+        if refused(self._note_manual_actuation(
+                "dispenser head retract", SYRINGE_INSTRUMENTS)):
             return
         self._btn_head_retract.setEnabled(False)
 
@@ -1359,7 +1566,8 @@ class ManualControlTab(QWidget):
         w.start()
 
     def _on_head_descend(self) -> None:
-        if self._note_manual_actuation("dispenser head descend") is REFUSED_WHILE_ATTACHED:
+        if refused(self._note_manual_actuation(
+                "dispenser head descend", SYRINGE_INSTRUMENTS)):
             return
         self._btn_head_descend.setEnabled(False)
 
@@ -1502,6 +1710,22 @@ class ManualControlTab(QWidget):
                 label.setStyleSheet("")
 
     def _on_infuse(self, pump_id: int) -> None:
+        action = f"pump {pump_id} dispense"
+        # Decided first, recorded later — the two halves of the ownership seam
+        # go in different places in this one slot, and for opposite reasons.
+        #
+        # The *decision* has to precede the occupancy prompt below, because that
+        # prompt asks the operator whether the board was replaced and writes a
+        # "fresh board" answer through to the store immediately. Refusing after
+        # it would leave the store asserting a board that was never cast on —
+        # and occupancy is what gates re-casting — having first asked a question
+        # about a dispense that was never going to happen.
+        #
+        # It also keeps a refused dispense off the bus entirely:
+        # `_pending_cast_target` reads the head and the stage, which are the very
+        # instruments a cast claim holds.
+        if refused(self._refuse_manual_actuation(action, SYRINGE_INSTRUMENTS)):
+            return
         pw = self._pump_widgets[pump_id]
         rate = pw["rate"].value()
         target_vol = pw["vol"].value()
@@ -1544,10 +1768,13 @@ class ManualControlTab(QWidget):
                         )
                 # CAST_ANYWAY: keep (board_id, electrode) — deliberate re-cast.
 
-        # Noted here rather than at the top of the slot: everything above can
-        # still decline, and the log line should mean "fluid was commanded", not
-        # "a button was pressed".
-        if self._note_manual_actuation(f"pump {pump_id} dispense") is REFUSED_WHILE_ATTACHED:
+        # The *record* stays here rather than at the top of the slot: everything
+        # above can still decline (CANCEL), and the log line should mean "fluid
+        # was commanded", not "a button was pressed". It re-asks the refusal on
+        # the way through, which is what makes this the authoritative check —
+        # the early one exists only to keep the prompt and the store out of a
+        # command that was already refusable.
+        if refused(self._note_manual_actuation(action, SYRINGE_INSTRUMENTS)):
             return
         btn.setEnabled(False)
 
@@ -1586,7 +1813,7 @@ class ManualControlTab(QWidget):
     def _on_piezo_a_on(self) -> None:
         if not self._piezo_enabled_cfg:
             return
-        if self._note_manual_actuation("piezo channel A on") is REFUSED_WHILE_ATTACHED:
+        if refused(self._note_manual_actuation("piezo channel A on", PIEZO_INSTRUMENTS)):
             return
         self._ensure_piezo_capability_status()
         self._btn_piezo_a_on.setEnabled(False)
@@ -1611,7 +1838,7 @@ class ManualControlTab(QWidget):
     def _on_piezo_a_off(self) -> None:
         if not self._piezo_enabled_cfg:
             return
-        if self._note_manual_actuation("piezo channel A off") is REFUSED_WHILE_ATTACHED:
+        if refused(self._note_manual_actuation("piezo channel A off", PIEZO_INSTRUMENTS)):
             return
         self._ensure_piezo_capability_status()
         self._btn_piezo_a_on.setEnabled(False)
@@ -1636,7 +1863,7 @@ class ManualControlTab(QWidget):
     def _on_piezo_apply_settings(self) -> None:
         if not self._piezo_enabled_cfg:
             return
-        if self._note_manual_actuation("piezo profile") is REFUSED_WHILE_ATTACHED:
+        if refused(self._note_manual_actuation("piezo profile", PIEZO_INSTRUMENTS)):
             return
         self._ensure_piezo_capability_status()
         if not self._piezo_config_supported:
@@ -1719,7 +1946,13 @@ class ManualControlTab(QWidget):
         except ValueError as exc:
             self._lbl_eis_status.setText(f"Routing error: {exc}")
             return
-        if self._note_manual_actuation("manual EIS") is REFUSED_WHILE_ATTACHED:
+        # Scoped to the potentiostats these channels actually route to, which is
+        # why the routing validation above runs first: `pico_for_channel` is the
+        # same map the claim's `instrument=` came from (`deposition_steps` builds
+        # its EIS task with it), so a run measuring on pico1 does not refuse a
+        # manual sweep on pico2.
+        if refused(self._note_manual_actuation(
+                "manual EIS", {pico_for_channel(ch) for ch in channels})):
             return
         preset = self._combo_eis_preset.currentText()
         auto_fit = self._chk_autofit.isChecked()
@@ -1928,7 +2161,7 @@ class ManualControlTab(QWidget):
             self._lbl_cam_image.setPixmap(pixmap)
 
     def _on_lamp_on(self) -> None:
-        if self._note_manual_actuation("lamp on") is REFUSED_WHILE_ATTACHED:
+        if refused(self._note_manual_actuation("lamp on", LAMP_INSTRUMENTS)):
             return
 
         def go():
@@ -1937,7 +2170,7 @@ class ManualControlTab(QWidget):
         self._safe_run(go, "Lamp Error")
 
     def _on_lamp_off(self) -> None:
-        if self._note_manual_actuation("lamp off") is REFUSED_WHILE_ATTACHED:
+        if refused(self._note_manual_actuation("lamp off", LAMP_INSTRUMENTS)):
             return
 
         def go():
