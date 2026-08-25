@@ -167,7 +167,7 @@ def _legacy_report(
 ) -> SpectrumReport:
     """Exactly the pre-existing behaviour, wrapped in the new return shape."""
     from softae.analysis.circuit_fitting import fit_circuit
-    from softae.analysis.quality import grade_fit
+    from softae.analysis.quality import grade_fit, quality_config
 
     fit = fit_circuit(eis_result, model_name)
     # The one behaviour change on this path, and it only ever fires on a fit that
@@ -175,8 +175,17 @@ def _legacy_report(
     # fit takes the identical route it always has.
     railed = _demote_if_railed(fit)
     arc = annotate_arc_closure(fit, eis_result)
+    # The two fit thresholds are read from ``[quality]``. They were not: this call
+    # passed neither, so it graded against ``grade_fit``'s defaults — which equal the
+    # shipped values exactly, so an operator editing the file saw no effect and no
+    # error either, on the engine that is still the default. Resolved per call, like
+    # ``eis_settings()`` above and ``quality_config()`` in ``gate_measurement``;
+    # ``loader.load`` caches, so the cost is dict lookups.
+    thresholds = quality_config()
     quality = grade_fit(getattr(fit, "quality", {}) or {},
-                        success=bool(fit.success))
+                        success=bool(fit.success),
+                        min_r_squared=thresholds["min_r_squared"],
+                        max_residual_pct=thresholds["max_residual_pct"])
     if railed:
         quality.issues.append(railed)
     if not arc.closed:
@@ -406,7 +415,7 @@ def analyze_spectrum(
         blocked_by,
         run_gates,
     )
-    from softae.analysis.quality import Verdict, grade_fit
+    from softae.analysis.quality import Verdict, grade_fit, quality_config
 
     gate_cfg = gates if gates is not None else cfg.gates
     env = envelope if envelope is not None else instrument_envelope()
@@ -575,8 +584,15 @@ def analyze_spectrum(
     results = list(results) + list(front2)
     log = list(log) + list(log2)
 
+    # Same two thresholds, same source, same per-call resolution as ``_legacy_report``
+    # — one grading standard across both engines, which is the whole premise of
+    # comparing them. Note this settles only what ``fit_report`` *says*; who acts on it
+    # is decided below and is deliberately untouched.
+    thresholds = quality_config()
     fit_report = grade_fit(getattr(fit, "quality", {}) or {},
-                           success=bool(fit.success))
+                           success=bool(fit.success),
+                           min_r_squared=thresholds["min_r_squared"],
+                           max_residual_pct=thresholds["max_residual_pct"])
     quality = reduce_gates(
         results, n_surviving=n_surviving, min_fit_pts=gate_cfg.min_fit_pts,
         report_mode=mode, enabled=gate_cfg.enabled,

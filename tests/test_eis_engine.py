@@ -187,6 +187,186 @@ class TestRailedDetectionReadsTheModelsBounds:
             SimpleNamespace(model_name="flexSalt", R1=100.0, covariance=None))
 
 
+#: Fit metrics comfortably inside the shipped limits and outside the ones the tests
+#: below set. Pinning them is what makes a threshold test turn on the threshold rather
+#: than on the optimiser's last digits.
+PINNED_METRICS = {"r_squared": 0.97, "residual_rms_pct": 5.0}
+
+
+@pytest.fixture()
+def pinned_fit_quality(monkeypatch):
+    """A real fit, with a known ``quality`` dict.
+
+    Both fitters are wrapped because the two engines use different ones — legacy fits
+    through ``circuit_fitting.fit_circuit``, gated through ``fitter.fit_spectrum`` with
+    ``fit_circuit`` as its fallback — and a pin that covered only one would silently
+    stop pinning the moment the other ran.
+    """
+    from softae.analysis import circuit_fitting
+    from softae.analysis.eis import fitter
+
+    def wrap(real):
+        def fit_with_pinned_quality(eis_result, model_name="simpleSalt", **kw):
+            fit = real(eis_result, model_name, **kw)
+            fit.quality = dict(PINNED_METRICS)
+            return fit
+
+        return fit_with_pinned_quality
+
+    monkeypatch.setattr(circuit_fitting, "fit_circuit", wrap(circuit_fitting.fit_circuit))
+    monkeypatch.setattr(fitter, "fit_spectrum", wrap(fitter.fit_spectrum))
+
+
+def _quality_overlay(monkeypatch, **keys):
+    """Replace ``[quality]`` at the loader, leaving every other section alone.
+
+    The loader is the one parse point ``quality_config`` reads, so patching here
+    exercises the real resolution; patching ``grade_fit``'s caller would test the test.
+    Every *other* section is carried through from the real file because the gated
+    engine also reads ``[eis.instrument]``, ``[eis.pregate]`` and ``[eis.fixture]`` —
+    handing it a bare dict would move the gates as well as the thresholds, and the
+    comparison would no longer isolate what it claims to.
+    """
+    from softae.config import loader
+
+    overlaid = dict(loader.load())
+    overlaid["quality"] = keys
+    monkeypatch.setattr(loader, "load", lambda *a, **k: overlaid)
+
+
+def _shipped_equals_defaults():
+    """The premise the whole no-op property rests on, checked rather than assumed."""
+    from softae.analysis.quality import (
+        DEFAULT_MAX_RESIDUAL_PCT,
+        DEFAULT_MIN_R_SQUARED,
+        quality_config,
+    )
+
+    cfg = quality_config()
+    return (cfg["min_r_squared"] == DEFAULT_MIN_R_SQUARED
+            and cfg["max_residual_pct"] == DEFAULT_MAX_RESIDUAL_PCT)
+
+
+class TestLegacyEngineHonoursTheQualityConfig:
+    """``[quality] min_r_squared`` and ``max_residual_pct`` must reach this path.
+
+    They did not. ``_legacy_report`` called ``grade_fit`` with neither threshold, so
+    it graded against the module defaults — and the shipped config repeats those
+    defaults exactly (0.95 / 15.0), so nothing ever looked wrong. An operator editing
+    the file simply saw no effect, on the engine that is still the rig's default.
+    """
+
+    @staticmethod
+    def _verdict():
+        return analyze_spectrum(as_eis_result(*reference_spectrum()),
+                                cell=CELL, engine="legacy").quality.verdict
+
+    def test_legacy_engine_configured_min_r_squared_flips_accept_to_reject(
+            self, monkeypatch, pinned_fit_quality):
+        assert self._verdict() is Verdict.ACCEPT
+        _quality_overlay(monkeypatch, min_r_squared=0.99)
+        assert self._verdict() is Verdict.REJECT
+
+    def test_legacy_engine_configured_max_residual_pct_flips_accept_to_reject(
+            self, monkeypatch, pinned_fit_quality):
+        assert self._verdict() is Verdict.ACCEPT
+        _quality_overlay(monkeypatch, max_residual_pct=2.0)
+        assert self._verdict() is Verdict.REJECT
+
+    def test_legacy_engine_a_loosened_threshold_admits_what_the_default_refuses(
+            self, monkeypatch, pinned_fit_quality):
+        # The other direction, because a threshold that could only ever tighten would
+        # be indistinguishable from a hard-coded floor plus an extra rejection rule.
+        _quality_overlay(monkeypatch, min_r_squared=0.99)
+        assert self._verdict() is Verdict.REJECT
+        _quality_overlay(monkeypatch, min_r_squared=0.5, max_residual_pct=99.0)
+        assert self._verdict() is Verdict.ACCEPT
+
+    def test_legacy_engine_shipped_config_leaves_every_verdict_where_it_was(
+            self, pinned_fit_quality):
+        # The no-op property. Routing the thresholds through config is only safe
+        # because the file and the defaults agree today; if someone edits
+        # softae_config.toml this fails here rather than at the bench.
+        from softae.analysis.quality import grade_fit
+
+        assert _shipped_equals_defaults()
+        assert self._verdict() is grade_fit(PINNED_METRICS, success=True).verdict
+
+    def test_legacy_engine_unreadable_config_falls_back_to_the_defaults(
+            self, monkeypatch, pinned_fit_quality):
+        # `quality_config` already swallows a broken load; the point here is that
+        # `_legacy_report` did not acquire a second config read that does not.
+        from softae.config import loader
+
+        def boom(*a, **k):
+            raise OSError("config unreadable")
+
+        monkeypatch.setattr(loader, "load", boom)
+        assert self._verdict() is Verdict.ACCEPT
+
+
+class TestGatedEngineHonoursTheQualityConfig:
+    """The same defect, and the same fix, on the other engine.
+
+    ``analyze_spectrum``'s gated branch graded its fit against ``grade_fit``'s defaults
+    too, so the two engines could not have disagreed about a configured threshold —
+    they were both ignoring it. One grading standard across both is the premise of
+    comparing them at all.
+
+    Scope: these tests pin what ``fit_report`` *says*. Who acts on it — the
+    ``and gate_cfg.enabled`` conjunction below the call, a third authority flag
+    distinct from ``[quality] enabled`` — is an open design question and is not
+    asserted here beyond leaving it visible: the gates are enabled in these runs, which
+    is the configuration under which a fit-quality rejection reaches the verdict.
+    """
+
+    @staticmethod
+    def _verdict():
+        return analyze_spectrum(as_eis_result(*reference_spectrum()),
+                                cell=CELL, settings=_gated()).quality.verdict
+
+    def test_gated_engine_configured_min_r_squared_flips_an_admitted_spectrum_to_reject(
+            self, monkeypatch, pinned_fit_quality):
+        # Both runs go through the overlay, so the *only* difference between them is
+        # the threshold — the gates, envelope and fixture are identical either side.
+        _quality_overlay(monkeypatch, min_r_squared=0.95, max_residual_pct=15.0)
+        assert self._verdict() is not Verdict.REJECT
+        _quality_overlay(monkeypatch, min_r_squared=0.99, max_residual_pct=15.0)
+        assert self._verdict() is Verdict.REJECT
+
+    def test_gated_engine_configured_max_residual_pct_flips_an_admitted_spectrum_to_reject(
+            self, monkeypatch, pinned_fit_quality):
+        _quality_overlay(monkeypatch, min_r_squared=0.95, max_residual_pct=15.0)
+        assert self._verdict() is not Verdict.REJECT
+        _quality_overlay(monkeypatch, min_r_squared=0.95, max_residual_pct=2.0)
+        assert self._verdict() is Verdict.REJECT
+
+    def test_gated_engine_shipped_config_leaves_the_verdict_where_it_was(
+            self, monkeypatch, pinned_fit_quality):
+        # The no-op property on this engine. The shipped file and the defaults agree,
+        # so overlaying the defaults explicitly must reproduce the file's own verdict
+        # exactly — which is what the unfixed code did on every spectrum.
+        assert _shipped_equals_defaults()
+        shipped = self._verdict()
+        _quality_overlay(monkeypatch, min_r_squared=0.95, max_residual_pct=15.0)
+        assert self._verdict() is shipped
+        assert shipped is not Verdict.REJECT
+
+    def test_gated_engine_the_fit_grade_is_not_the_only_authority_over_the_verdict(
+            self, monkeypatch, pinned_fit_quality):
+        # The boundary of this change, made mechanical. A configured threshold that
+        # rejects the fit does NOT reach the verdict while [eis.gates] enabled is
+        # false, because a separate flag governs that write. If someone later unifies
+        # the three authority flags, this test is where they will notice.
+        _quality_overlay(monkeypatch, min_r_squared=0.99)
+        observing = analyze_spectrum(as_eis_result(*reference_spectrum()),
+                                     cell=CELL, settings=_gated(enabled=False))
+        assert observing.quality.verdict is not Verdict.REJECT
+        # …and it is not silent about it: the configured limit is named on the report,
+        # which is the whole point of observing-only mode.
+        assert any("0.990" in issue for issue in observing.quality.issues)
+
+
 class TestGatedEngine:
     def test_a_clean_spectrum_is_admitted_and_keeps_every_point(self):
         report = analyze_spectrum(as_eis_result(*reference_spectrum()),

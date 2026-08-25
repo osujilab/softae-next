@@ -11,7 +11,13 @@ The fix is an **ordering**: ask the rig lock (liveness) before asking the run ro
 ``read_run_lock`` unlinks a stale lock so it can never be a recovery marker, and a
 run row never self-clears so it can never be a liveness check. These tests pin the
 ordering, both surfaces, and the two things that must NOT change: a genuinely
-crashed run is still recovered, and nothing here refuses manual control.
+crashed run is still recovered, and this lock never becomes a lockout of the bench
+— an operator keeps manual control while another *process* holds the rig.
+
+That second guarantee is about **this lock**, not about every refusal. A run
+started from the same GUI takes a scoped rig claim (``ff27bc1``) and does hold
+back the controls it is driving, until it is paused; ``busy_rig_message`` states
+the difference and ``TestBusyMessage`` pins that wording.
 """
 
 from __future__ import annotations
@@ -191,12 +197,22 @@ class TestBusyMessage:
         assert "wedged" in text
         assert "Calibration Launcher" in text
 
-    def test_it_says_the_refusal_does_not_extend_to_manual_control(
+    def test_it_still_names_manual_control_when_it_scopes_the_refusal(
             self, _isolated_scope):
-        """The standing no-lockout ruling is about manual control at the rig.
+        """The message must keep *addressing* manual control, whatever it says.
 
-        Refusing a second *automated* run is a different act, and the message has
-        to draw that line or it reads as the lockout the ruling forbids.
+        The surviving reason: refusing a second *automated* run is a different act
+        from a lockout, and an unqualified refusal reads as the lockout the
+        standing no-lockout ruling forbids. So the closing lines have to name
+        manual control and say where it stands.
+
+        What is no longer claimed is that it stands untouched. Since ``ff27bc1`` a
+        run started from the same GUI takes a scoped rig claim and the Manual tab
+        *does* hold back the controls that run is driving, until it is paused —
+        which is why ``busy_rig_message`` now states the carve-out rather than
+        denying it. This test therefore pins the message's wording, not the scope
+        of the refusal: assert the phrase is present, and leave the accuracy of
+        the surrounding sentence to the tests of the mechanism that enforces it.
         """
         _write_foreign(_isolated_scope)
         text = busy_rig_message(foreign_run_lock(_isolated_scope), action="X")
