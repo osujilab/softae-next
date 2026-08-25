@@ -224,13 +224,15 @@ def test_temperature_refusal_releases_the_rh_loop_and_still_parks(
     # Released by the approach itself -- at the run's own setpoint, so it is the
     # loop this run started that came down.
     assert dried == [30.0]
-    # The park behind it now asks for the dry purge too. This assertion was the
-    # reverse when `_release_rh` was the only opt-in; a refusal is an `aborted`
-    # exit, which is ORDERLY, so the park no longer re-zeroes the axis the
-    # release just dried. `_release_rh` remains necessary regardless -- under
-    # `--end-state hold` there is no park behind it at all.
+    # The park behind it asks for nothing: since the ruling of 2026-08-24 every
+    # park dry-purges, so there is no argument left to carry and no way for the
+    # park to re-zero the axis the release just dried. This assertion has now
+    # been all three things -- `is False` when `_release_rh` was the only opt-in,
+    # `is True` when orderly exits opted in, and absent now that the choice is
+    # gone. `_release_rh` remains necessary regardless: under `--end-state hold`
+    # there is no park behind it at all.
     assert parks and parks[-1]["retract_head"] is None
-    assert parks[-1]["rh_dry_purge"] is True
+    assert "rh_dry_purge" not in parks[-1]
     assert _rows(tmp_path, "rel") == []
 
 
@@ -408,38 +410,74 @@ def _park_spy(monkeypatch) -> list:
     return parks
 
 
-def test_end_state_park_requests_the_dry_purge_on_an_orderly_exit(
+def test_end_state_park_leaves_the_humidifier_dry_on_an_orderly_exit(
         tmp_path, monkeypatch):
-    """An end-of-run park is orderly, so the humidifier is dried, not zeroed.
+    """An end-of-run park leaves dry gas flowing, not both valves shut.
 
-    Duty 0 is the firmware's auto-shutoff -- both Aalborg valves closed -- so
-    the default park threw away the descent the run had just paid hours for.
+    Duty 0 is the firmware's auto-shutoff -- both Aalborg valves closed -- so a
+    zeroing park threw away the descent the run had just paid hours for.
+
+    **Read after `main` returns, which is after `disconnect_all`.** Nothing is
+    patched over the driver and nothing over the park: a spy on a call name would
+    pass against a no-op, and this is the duty the Trinket would be sitting at.
     """
-    parks = _park_spy(monkeypatch)
+    seen = _capture_manager(monkeypatch)
     assert V.main(["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
                    "--temp-setpoint-c", "25", "--validation-name", "ord",
                    "--project", str(tmp_path), "--mock", "--min-treatment", "1",
                    "--drift-check", "0"]) == V.EXIT_OK
-    assert parks and parks[-1]["rh_dry_purge"] is True
+    assert seen, "the run built no manager, so this test proved nothing"
+    rh = seen[-1].get("rh_controller")
+    assert rh._duty == pytest.approx(0.01)     # out_min -- dry air, still flowing
+    assert rh._duty != 0.0                     # NOT the firmware's valve shutoff
 
 
-def test_end_state_park_keeps_duty_zero_on_a_fault_exit(tmp_path, monkeypatch):
-    """The other half of the same rule, and the reason it is a rule.
+def test_end_state_park_leaves_the_humidifier_dry_on_a_fault_exit_too(
+        tmp_path, monkeypatch):
+    """**Inverts** the former `test_end_state_park_keeps_duty_zero_on_a_fault_exit`.
 
-    Every exit in `cmd_run` lands in one `finally` and one `safe_park` call, so
-    opting the park in is not a decision about the success path -- it decides
-    the humidifier's end state on the fault paths too. `core/safe_park.py`
-    records an operator ruling that fault-class parks keep zeroing immediately,
-    and `outcome["status"]` is what keeps the two apart.
+    That test pinned the opposite: a fault-class park kept duty 0, on the earlier
+    operator ruling that an exit leaving gas flowing for ~25 s is not a safety
+    stop. **Operator ruling 2026-08-24 reversed it** -- dry gas carries very
+    little volatile species, so the flow is not the hazard the old rule took it
+    for, while duty 0 collapses the chamber to room RH on every fault, including
+    the ones an operator clears a minute later.
+
+    It is kept as its own test rather than folded into the orderly one because
+    the fault path is the half whose *behaviour* actually changed, and because
+    the two reach the same `finally` by different routes.
     """
-    parks = _park_spy(monkeypatch)
+    seen = _capture_manager(monkeypatch)
     monkeypatch.setattr(H.HoldWatch, "poll", lambda self:
                         (_ for _ in ()).throw(RuntimeError("bus died")))
     assert V.main(["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
                    "--temp-setpoint-c", "25", "--validation-name", "flt",
                    "--project", str(tmp_path), "--mock", "--min-treatment", "1",
                    "--drift-check", "0"]) == V.EXIT_FAILED
-    assert parks and parks[-1]["rh_dry_purge"] is False
+    assert seen, "the run built no manager, so this test proved nothing"
+    rh = seen[-1].get("rh_controller")
+    assert rh._duty == pytest.approx(0.01)
+    assert rh._duty != 0.0
+
+
+def test_the_end_of_run_park_asks_for_no_humidifier_end_state(
+        tmp_path, monkeypatch):
+    """This call site no longer passes the deprecated `rh_dry_purge` argument.
+
+    The parameter survives on `safe_park` only because two call sites in another
+    session's GUI files still pass it; deleting it now would raise `TypeError`
+    there. When they drop it the parameter goes, and a kwarg re-added here would
+    be dead today and a `TypeError` that day -- on the park path, of all places.
+    So the absence is pinned rather than assumed.
+    """
+    parks = _park_spy(monkeypatch)
+    assert V.main(["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
+                   "--temp-setpoint-c", "25", "--validation-name", "noflag",
+                   "--project", str(tmp_path), "--mock", "--min-treatment", "1",
+                   "--drift-check", "0"]) == V.EXIT_OK
+    assert parks, "the run parked nothing, so this test proved nothing"
+    assert "rh_dry_purge" not in parks[-1]
+    assert parks[-1]["retract_head"] is None
 
 
 def test_end_state_hold_leaves_the_humidifier_dry_commanded_not_zeroed(
@@ -3543,9 +3581,16 @@ class TestRunNarration:
             # run can now stall because its spectra stopped fitting -- which,
             # without these two, is indistinguishable in the only surviving
             # record from a run that stalled because the film kept moving.
-            "n_modelled", "excluded_by_channel"}
+            "n_modelled", "excluded_by_channel",
+            # WHICH gate said so. `settle_check` and `rate_check` are siblings
+            # and a `settled` from one is not a `settled` from the other, so a
+            # reader of this record who cannot tell them apart cannot interpret
+            # it. Unconditional, unlike the rate's own fields: the criterion that
+            # routed is a property of every round, including this default one.
+            "settle_criterion"}
 
         judged = rounds[-1]                        # the round the gate acted on
+        assert judged["settle_criterion"] == "deviation"
         assert judged["settled"] is True
         assert judged["tol_rel"] == pytest.approx(0.10)
         assert judged["participating"] == [18, 19, 20]
@@ -3796,3 +3841,534 @@ class TestRunNarration:
         # The park is narrated, and it precedes the finish.
         types = [e["type"] for e in events]
         assert types.index("park") < len(events) - 2
+
+
+# ── S6-series: the criterion selector and surviving-channel mode ─────────────
+#
+# `20260821T173111Z_eis_validate` (tol 0.10) and `20260821T192508Z_eis_validate`
+# (tol 0.20) both ran 11 rounds to `ceiling` on the same board at 40 C / 10 %RH
+# and recorded nothing. The failure is not drift: ch18 ran 13, 11, 164, 90, 7 %
+# and ch28 was 14 % in the first run and 94 % in the second. A film cannot do
+# that -- it is a fitted R1 excursion moving through a trailing 3-round window --
+# so selecting "stable" channels from a prior run selects noise, and the run
+# needs a criterion that can say "this cell cannot be judged" without saying
+# "this cell is moving".
+
+#: R1 of a flat CONTROL cell: apex ~18 kHz, well above `baseline_ok_hz`.
+_R_CONTROL = 1.0e4
+#: R1 values whose apexes land inside the resolving window, so a survivor set can
+#: be asked whether it still carries both arms.
+_R_TREATMENT = 5.3e6
+_R_TREATMENT_B = 4.0e6
+#: A cell alternating ~2.6x about a STABLE mean -- ch25's shape. Its deviation is
+#: ~45 % every round, so the deviation criterion never clears it and never
+#: certifies; its residual is ~45 % too, so the rate criterion calls it
+#: unjudgeable rather than moving. That difference is the whole feature.
+_R_UNJUDGEABLE = (1.0e4, 2.6e4)
+#: The same shape inside the resolving window, so a board can be built whose
+#: only TREATMENT cell is one the criterion cannot speak for. Both values fit --
+#: a cell that merely fails to fit leaves the window as `no_value` and is a
+#: different finding.
+_R_UNJUDGEABLE_TREATMENT = (3.0e6, 8.0e6)
+
+
+def _flat(value, rounds):
+    return [float(value)] * rounds
+
+
+def _alternating(rounds, values=_R_UNJUDGEABLE):
+    return [values[index % 2] for index in range(rounds)]
+
+
+def _survivor_settle(tmp_path, series, *, rounds=8, on_round=None, **flags):
+    """`settle_phase` over a scripted board long enough for a RATE window.
+
+    Six rounds is the fewest at which a rate interval is worth quoting, so every
+    test here runs eight: the deviation criterion's window is three and the
+    difference between them is the thing under test.
+
+    Every *flag* goes in through the real CLI, on `_scripted_settle`'s
+    precedent, so a test asserting on the criterion is asserting on the whole
+    path an operator actually uses rather than on a plan field set by hand.
+    """
+    plan = _plan(tmp_path, channels=",".join(str(c) for c in series), **flags)
+    period_s = 90.0
+    plan.settle_max_hold_s = period_s * (rounds - 1)
+    index = {"n": -1}
+
+    def measure(channel):
+        if channel == plan.channels[0]:
+            index["n"] += 1
+        values = series[channel]
+        return _sweep_at(values[min(index["n"], len(values) - 1)])
+
+    clock = H.VirtualClock()
+    return plan, H.settle_phase(_manager(), plan, measure, sleep=clock.sleep,
+                                now=clock, min_hold_first_s=0.0,
+                                round_period_s=period_s, on_round=on_round)
+
+
+def _partitionable_board(rounds=8):
+    """Two quiet CONTROL cells, two quiet TREATMENT cells, one unjudgeable."""
+    return {
+        18: _flat(_R_CONTROL, rounds), 19: _flat(_R_CONTROL, rounds),
+        20: _flat(_R_TREATMENT, rounds), 21: _flat(_R_TREATMENT_B, rounds),
+        22: _alternating(rounds),
+    }
+
+
+def test_settle_criterion_default_is_the_shipped_one_and_is_pinned_to_it():
+    """The restated word, pinned to the criterion's home for the reason
+    `DEFAULT_SETTLE_TOL_REL` is: this module holds no module-level `softae`
+    imports, so a divergence has to fail here rather than at the bench."""
+    from softae.analysis.equilibration import (
+        SETTLE_CRITERIA,
+        SETTLE_CRITERION_DEVIATION,
+    )
+
+    assert H.DEFAULT_SETTLE_CRITERION == SETTLE_CRITERION_DEVIATION
+    assert {"deviation", "rate", "both"} == set(SETTLE_CRITERIA)
+
+
+def test_settle_phase_the_default_criterion_computes_no_rate_at_all(tmp_path):
+    """At the defaults nothing about the rate exists -- not in the outcome, not
+    in the payload, not on the console. `--survivors off` is the same claim one
+    level up, and both are what "byte-identical until an operator opts in"
+    means."""
+    payloads = []
+    _plan_used, outcome = _survivor_settle(
+        tmp_path, _partitionable_board(), on_round=payloads.append)
+
+    assert outcome.verdict == "ceiling"        # ch22 holds it, as it always did
+    assert outcome.survivors == [] and outcome.dropped == {}
+    assert outcome.survivor_projected == {} and outcome.survivor_refusal == ""
+    assert outcome.pooled_rate_per_hour is None
+    assert payloads and all(p["settle_criterion"] == "deviation" for p in payloads)
+    assert all("rate_settled" not in p for p in payloads)
+
+
+def test_settle_phase_both_mode_verdict_is_identical_to_deviation(tmp_path):
+    """Shadow mode routes on deviation, and "identical" is asserted field by
+    field over the whole outcome rather than on `verdict` alone."""
+    board = _partitionable_board()
+    shipped_payloads, shadow_payloads = [], []
+    _p1, shipped = _survivor_settle(tmp_path, board,
+                                    on_round=shipped_payloads.append)
+    _p2, shadow = _survivor_settle(
+        tmp_path, board, settle_criterion="both",
+        settle_rate_tol_dec_per_h=0.1, on_round=shadow_payloads.append)
+
+    for name in ("verdict", "n_rounds", "elapsed_s", "projected",
+                 "tolerance_achievable", "noise_floor_rel"):
+        assert getattr(shipped, name) == getattr(shadow, name), name
+    # Every shipped field of every round, except the one word that says WHICH
+    # gate routed -- which differs precisely because the operator asked for the
+    # shadow, and which a reader of the record needs in order to interpret it.
+    for shipped_round, shadow_round in zip(shipped_payloads, shadow_payloads):
+        for key, value in shipped_round.items():
+            if key != "settle_criterion":
+                assert shadow_round[key] == value, key
+    assert all(p["settle_criterion"] == "both" for p in shadow_payloads)
+
+
+def test_settle_phase_both_mode_reports_the_rate_it_did_not_route_on(tmp_path):
+    """The other half: an identical verdict is worthless as a shadow if no rate
+    came back with it. This is the record a bench run compares the two criteria
+    from, so the per-cell numbers have to be in it."""
+    payloads = []
+    _plan_used, outcome = _survivor_settle(
+        tmp_path, _partitionable_board(), settle_criterion="both",
+        settle_rate_tol_dec_per_h=0.1, on_round=payloads.append)
+    judged = [p for p in payloads if "rate_settled" in p]
+
+    assert judged, "the shadow rate must reach the round record"
+    assert judged[-1]["rate_quiet"] == [18, 19, 20, 21]
+    assert judged[-1]["rate_moving"] == []
+    assert judged[-1]["rate_unjudgeable"] == [22]
+    assert judged[-1]["rate_dec_per_h_by_channel"]["18"] == pytest.approx(0.0)
+    # ...and it still routed on nothing: the verdict is the deviation one.
+    assert outcome.verdict == "ceiling"
+    # Recorded even with `--survivors off`, because a denominator is not routing.
+    assert outcome.survivors == [18, 19, 20, 21]
+    assert outcome.dropped == {22: "unsettleable"}
+
+
+def test_settle_phase_survivors_off_leaves_the_ceiling_a_ceiling(tmp_path):
+    """The flag is what converts a refusal into a partition, and without it the
+    partition is recorded and has no routing power whatsoever."""
+    _plan_used, outcome = _survivor_settle(
+        tmp_path, _partitionable_board(), settle_criterion="both",
+        settle_rate_tol_dec_per_h=0.1)
+
+    assert outcome.verdict == "ceiling" and not outcome.certified
+    assert outcome.survivor_projected == {}
+    with pytest.raises(H.RefuseToStart, match="ceiling"):
+        H.assert_settle_licensed(outcome)
+
+
+def test_settle_phase_survivors_partitions_at_the_ceiling_with_reasons(
+        tmp_path, capsys):
+    """The feature: proceed on the cells the criterion could speak for, and say
+    which cells it could not and why."""
+    _plan_used, outcome = _survivor_settle(
+        tmp_path, _partitionable_board(), settle_criterion="both",
+        settle_rate_tol_dec_per_h=0.1, survivors="on")
+    lines = capsys.readouterr().out.splitlines()
+
+    assert outcome.verdict == "survivors"
+    assert not outcome.certified           # a weaker claim, not a clean hold
+    assert outcome.survivors == [18, 19, 20, 21]
+    assert outcome.dropped == {22: "unsettleable"}
+    assert outcome.survivor_refusal == ""
+    assert outcome.survivor_projected[R.CONTROL] == 2
+    assert outcome.survivor_projected[R.TREATMENT] == 2
+    H.assert_settle_licensed(outcome)      # licensed, and never silently
+    announced = [ln for ln in lines if "SURVIVORS" in ln]
+    assert announced and "ch22 (unsettleable)" in announced[0]
+    # The bias is named where a reader meets it, not only in a docstring.
+    assert any("CONDITIONAL ON SETTLING" in ln for ln in lines)
+
+
+def test_settle_phase_survivors_never_drops_a_cell_proven_to_be_moving(tmp_path):
+    """A moving cell is evidence about the SAMPLE and blocks; an unjudgeable one
+    is an absence and may be dropped. Collapsing the two would let a partition
+    certify a board that is still drying, which is the failure the criterion was
+    built to prevent rather than to introduce."""
+    board = _partitionable_board()
+    # ch23: R1 climbing steadily over the hold, so sigma is falling -- a drying
+    # film, with scatter far below its trend.
+    board[23] = [_R_CONTROL * (1.0 + 0.12 * index) for index in range(8)]
+    _plan_used, outcome = _survivor_settle(
+        tmp_path, board, settle_criterion="both",
+        settle_rate_tol_dec_per_h=0.1, survivors="on")
+
+    assert outcome.verdict == "ceiling"                 # NOT survivors
+    assert outcome.dropped[23] == "rate_moving"
+    assert "PROVEN to be still moving" in outcome.survivor_refusal
+    with pytest.raises(H.RefuseToStart, match="did not rescue it"):
+        H.assert_settle_licensed(outcome)
+
+
+def test_settle_phase_survivors_below_min_channels_refuses_rather_than_proceeding(
+        tmp_path):
+    """Checked AFTER the drop. Falling back to the whole board would be treating
+    an absence of evidence as evidence, which is the error `settle_check`'s own
+    `evaluable`/`settled` split exists to refuse."""
+    rounds = 8
+    board = {18: _flat(_R_CONTROL, rounds), 20: _flat(_R_TREATMENT, rounds),
+             22: _alternating(rounds), 23: _alternating(rounds),
+             24: _alternating(rounds)}
+    _plan_used, outcome = _survivor_settle(
+        tmp_path, board, settle_criterion="both",
+        settle_rate_tol_dec_per_h=0.1, survivors="on")
+
+    assert outcome.survivors == [18, 20]
+    assert outcome.verdict == "ceiling"
+    assert "below the settle gate's minimum of 3" in outcome.survivor_refusal
+    assert "absence of evidence" in outcome.survivor_refusal
+
+
+def test_settle_phase_survivors_with_one_arm_missing_refuses_because_d3_needs_both(
+        tmp_path):
+    """A survivor set that is all CONTROL has proven nothing: D1, D2 and D4 are
+    TREATMENT statistics and D3 is the CONTROL noise floor."""
+    rounds = 8
+    board = {18: _flat(_R_CONTROL, rounds), 19: _flat(_R_CONTROL, rounds),
+             20: _flat(_R_CONTROL, rounds),
+             21: _alternating(rounds, _R_UNJUDGEABLE_TREATMENT)}
+    _plan_used, outcome = _survivor_settle(
+        tmp_path, board, settle_criterion="both",
+        settle_rate_tol_dec_per_h=0.1, survivors="on")
+
+    assert outcome.survivors == [18, 19, 20]
+    assert outcome.verdict == "ceiling"
+    assert "carry no TREATMENT cell" in outcome.survivor_refusal
+
+
+def test_settle_phase_the_rate_criterion_certifies_on_its_quiet_cells_and_names_the_rest(
+        tmp_path):
+    """A `settled` under the rate criterion is ALREADY conditional on settling.
+
+    `rate_check` aggregates per cell -- a cell it cannot judge does not block --
+    so a board certifies on its quiet cells while an unjudgeable one sits inside
+    it. Those cells are recorded rather than certified by silence, which is what
+    lets the run stamp their rows apart from the survivors'.
+    """
+    _plan_used, outcome = _survivor_settle(
+        tmp_path, _partitionable_board(), settle_criterion="rate",
+        settle_rate_tol_dec_per_h=0.1, survivors="on")
+
+    assert outcome.verdict == "settled" and outcome.certified
+    assert outcome.survivors == [18, 19, 20, 21]
+    assert outcome.dropped == {22: "unsettleable"}
+    # The partition is recorded even though nothing was refused -- the flag, not
+    # the verdict, is what says the rows must carry it.
+    assert outcome.survivor_projected[R.TREATMENT] == 2
+
+
+def _stamped_cell(channel, hold_certified):
+    """One minimal cell whose rows carry *hold_certified* -- enough for H1 and
+    for the population census, and nothing else."""
+    cell = f"{channel}:30:25:1"
+
+    def row(measurement_id, arm, sigma):
+        return R.SweepRecord(
+            measurement_id=measurement_id, run_id="run", channel=channel,
+            timestamp="2026-08-22T00:00:00", seconds=10.0,
+            params={"eis_validation_arm": arm, "eis_validation_cell": cell,
+                    "eis_validation_hold_certified": hold_certified,
+                    "eis_validation_hold_excursion": False,
+                    "eis_validation_apex_hz": 30.0,
+                    "eis_validation_arc_state": "closed",
+                    "eis_validation_band_below_apex_decades": 1.5,
+                    "eis_validation_band_min_decades": 1.0,
+                    "eis_validation_f_lo_hz": 1.351},
+            sigma=sigma, sigma_is_bound=False, r1_ohm=1.0 / sigma,
+            gate_verdict="accept", gate_log=[], fit_arc_state="closed")
+
+    return R.Cell(key=cell, channel=channel,
+                  reference=row(channel * 10, R.ARM_REFERENCE, 1e-6),
+                  scout=row(channel * 10 + 1, R.ARM_SCOUT, 1.2e-6),
+                  follow_up=row(channel * 10 + 2, R.ARM_FOLLOW_UP, 1.1e-6))
+
+
+def test_a_survivor_stamp_withholds_h1_and_does_not_yet_exclude_the_dropped_row():
+    """**A spec premise that does not hold, pinned as the behaviour it is.**
+
+    Section 6.4 asserts that a dropped row "is excluded from the statistics by
+    machinery that already exists -- no new filter". It is not. The only reader
+    of `hold_certified` in the rule module builds the SET of certifications for
+    H1; nothing filters rows out of D1-D4, which are partitioned by BAND. So a
+    survivors run today does two things, and only one of them was intended:
+
+    * H1 withholds, because the set is not `{"settled"}` -- the conservative
+      direction, and arguably the correct one for a conditioned population;
+    * a dropped cell is still counted as USABLE and still enters the accuracy
+      tables, which is the half that matters and the half the spec promised was
+      already handled. The only thing that removes a row from those tables today
+      is a warn-grade excursion.
+
+    `eis_validate_rule.py` is not this change's to edit, so this test records the
+    gap rather than closing it. If a later edit teaches the rule module to filter
+    on the stamp, this test is where the change announces itself.
+    """
+    from softae.tools import eis_validate_rule as RULE
+
+    cells = [_stamped_cell(18, "survivors"), _stamped_cell(19, "survivors"),
+             _stamped_cell(20, "dropped_unevaluable")]
+    verdict = RULE.evaluate(cells, min_treatment=1)
+    h1 = [c for c in verdict.criteria if c.name.startswith("H1")][0]
+
+    h2 = [c for c in verdict.criteria if c.name.startswith("H2")][0]
+
+    assert h1.status != "PASS"
+    assert "survivors" in h1.observed and "dropped_unevaluable" in h1.observed
+    assert verdict.outcome != "GO"
+    # ...and all three cells, the dropped one included, are still USABLE. That
+    # is the gap: the stamp is recorded and nothing acts on it.
+    assert "3 usable" in h2.observed
+
+
+def test_survivor_row_stamp_separates_a_moving_cell_from_an_unjudgeable_one():
+    """The row stamp is coarse where the artifact is fine-grained, and it is
+    deliberately NOT spelled `dropped_unsettleable`: `unsettleable` names one
+    specific refusal and three others land here too."""
+    from softae.analysis.equilibration import (
+        DROPPED_STILL_MOVING,
+        DROPPED_UNEVALUABLE,
+    )
+
+    assert H.survivor_row_stamp("rate_moving") == DROPPED_STILL_MOVING
+    for why in ("rate_undetectable", "rate_span_too_short", "unsettleable",
+                "no_value", "absent"):
+        assert H.survivor_row_stamp(why) == DROPPED_UNEVALUABLE
+
+
+def test_survivor_partition_accounts_for_every_channel_including_absent_ones():
+    """An unexplained absence from both lists is how a denominator goes
+    missing, which is exactly what made the two 2026-08-21 runs undiagnosable."""
+    from types import SimpleNamespace
+
+    from softae.analysis.equilibration import EXCLUDED_SIGMA_NULL
+
+    rate = SimpleNamespace(
+        quiet=[18, 19], moving=[20],
+        by_channel={18: SimpleNamespace(refusal=""),
+                    19: SimpleNamespace(refusal=""),
+                    20: SimpleNamespace(refusal="rate_moving")},
+        excluded={21: EXCLUDED_SIGMA_NULL})
+    survivors, dropped = H.survivor_partition(rate, (18, 19, 20, 21, 22))
+
+    assert survivors == [18, 19]
+    # `no_value`, not `sigma_null`: the run's event stream forbids the
+    # observable's vocabulary, and this map is bound for it.
+    assert dropped == {20: "rate_moving", 21: "no_value", 22: "absent"}
+
+
+def test_the_survivor_reasons_carry_no_observable_vocabulary():
+    """The stream's own rule, and the new record is bound by it: `sigma_null`
+    and `railed_R1` both spell forbidden substrings, so a drop reason is
+    narrated in words that say the same thing without naming the quantity."""
+    from types import SimpleNamespace
+
+    from softae.analysis.equilibration import EXCLUDED_RAILED, EXCLUDED_SIGMA_NULL
+
+    rate = SimpleNamespace(quiet=[], moving=[], by_channel={},
+                           excluded={18: EXCLUDED_SIGMA_NULL,
+                                     19: EXCLUDED_RAILED})
+    _survivors, dropped = H.survivor_partition(rate, (18, 19))
+
+    text = json.dumps(dropped).lower()
+    for forbidden in ("r1", "sigma", "fit", "ohms"):
+        assert forbidden not in text, forbidden
+
+
+# ── S6b: the plan-level refusals, before anything is heated ──────────────────
+
+def test_validate_plan_a_rate_criterion_without_a_band_is_refused(tmp_path):
+    plan = _plan(tmp_path, settle_criterion="rate")
+    with pytest.raises(H.RefuseToStart, match="needs --settle-rate-tol-dec-per-h"):
+        H.validate_plan(plan)
+
+
+def test_validate_plan_a_rate_band_above_the_maximum_is_refused(tmp_path):
+    """`SETTLE_TOL_REL_MAX`'s argument, in the rate's unit: a band set too TIGHT
+    is self-correcting because both of its refusals are non-evaluable, while one
+    set too LOOSE certifies and the run looks exactly like a correct one."""
+    plan = _plan(tmp_path, settle_criterion="rate",
+                 settle_rate_tol_dec_per_h=H.SETTLE_RATE_TOL_DEC_PER_H_MAX + 0.1)
+    with pytest.raises(H.RefuseToStart) as excinfo:
+        H.validate_plan(plan)
+
+    assert "DECADES PER HOUR" in str(excinfo.value)
+    assert "factor of" in str(excinfo.value)
+
+
+def test_validate_plan_survivors_on_the_deviation_criterion_is_refused(tmp_path):
+    """The partition rests on telling MOVING from UNJUDGEABLE, and for a 3-round
+    window the deviation statistic IS the window noise floor -- so partitioning
+    on it would drop the moving cells along with the noisy ones."""
+    plan = _plan(tmp_path, survivors="on")
+    with pytest.raises(H.RefuseToStart, match="needs --settle-criterion"):
+        H.validate_plan(plan)
+
+
+def test_validate_plan_survivors_without_headroom_is_refused(tmp_path):
+    """Refused at the prompt, not after ninety minutes at temperature."""
+    plan = _plan(tmp_path, channels="18,19,20", settle_criterion="rate",
+                 settle_rate_tol_dec_per_h=0.025, survivors="on",
+                 min_treatment=4)
+    with pytest.raises(H.RefuseToStart, match="before a single one is dropped"):
+        H.validate_plan(plan)
+
+
+def test_validation_plan_fingerprint_covers_the_criterion_and_the_survivor_flag(
+        tmp_path):
+    """A `--resume` that switched criterion mid-run is exactly the after-the-fact
+    criterion choice `eis_validate_rule` opens by forbidding -- and this is the
+    resume that would be TEMPTING, because the operator who hits a ceiling has a
+    looser criterion in hand and a half-finished run on disk.
+
+    Conditional inclusion, on `settle_tol_rel`'s precedent, so every checkpoint
+    written before these fields existed keeps its fingerprint.
+    """
+    shipped = _plan(tmp_path).fingerprint()
+
+    assert _plan(tmp_path, settle_criterion="deviation").fingerprint() == shipped
+    # A rate band typed beside `deviation` changes nothing that was measured.
+    assert _plan(tmp_path, settle_rate_tol_dec_per_h=0.03).fingerprint() == shipped
+
+    both = _plan(tmp_path, settle_criterion="both",
+                 settle_rate_tol_dec_per_h=0.025).fingerprint()
+    wider = _plan(tmp_path, settle_criterion="both",
+                  settle_rate_tol_dec_per_h=0.05).fingerprint()
+    survivors = _plan(tmp_path, settle_criterion="both",
+                      settle_rate_tol_dec_per_h=0.025,
+                      survivors="on").fingerprint()
+
+    assert len({shipped, both, wider, survivors}) == 4
+
+
+# ── S6c: what the run does with the partition ────────────────────────────────
+
+def test_run_context_stamps_a_dropped_cell_apart_from_a_surviving_one(tmp_path):
+    """`hold_certified` is per CHANNEL under a partition, because the run
+    proceeded and this cell is not one the gate could speak for. The rule module
+    already filters populations on this column, so the exclusion costs no new
+    machinery while the data survives on disk."""
+    from softae.analysis.equilibration import DROPPED_UNEVALUABLE
+
+    ctx = _context(tmp_path, _manager(), _plan(tmp_path))
+    ctx.hold_certified = "survivors"
+    ctx.dropped = {22: DROPPED_UNEVALUABLE}
+
+    assert ctx.certification(18) == "survivors"
+    assert ctx.certification(22) == DROPPED_UNEVALUABLE
+    # And with no partition at all, every channel reads the run's own verdict.
+    assert _context(tmp_path, _manager(),
+                    _plan(tmp_path)).certification(22) == "settled"
+
+
+def test_min_treatment_is_recomputed_on_the_survivors_not_on_the_board(
+        tmp_path, monkeypatch):
+    """AFTER the drop, never before. The board's census says nothing about the
+    set that will actually be certified, so a run whose survivors carry one
+    TREATMENT cell must refuse against `--min-treatment 2` even though the board
+    projected three."""
+    plan = _plan(tmp_path, min_treatment=2, settle_criterion="both",
+                 settle_rate_tol_dec_per_h=0.025, survivors="on")
+    outcome = H.SettleOutcome(
+        verdict="survivors", n_rounds=8, elapsed_s=630.0,
+        apex_by_channel={}, projected={R.TREATMENT: 3, R.CONTROL: 2},
+        rh_median_pct=30.0, survivors=[18, 19, 20], dropped={21: "unsettleable"},
+        survivor_projected={R.TREATMENT: 1, R.CONTROL: 2})
+
+    monkeypatch.setattr(V, "approach_condition", lambda *a, **k: [])
+    monkeypatch.setattr(V, "settle_phase", lambda *a, **k: outcome)
+    monkeypatch.setattr(V, "soak_phase", lambda *a, **k: None)
+    ctx = _context(tmp_path, _manager(), plan)
+
+    with pytest.raises(H.RefuseToStart) as excinfo:
+        V._establish_condition(ctx, plan, list(plan.channels))
+
+    assert "only 1 channel(s) SURVIVED into TREATMENT" in str(excinfo.value)
+    # The whole-board count would have passed, which is the bug being closed.
+    assert outcome.projected[R.TREATMENT] >= plan.min_treatment
+
+
+def test_the_dropped_set_and_its_reasons_reach_the_run_artifact(
+        tmp_path, monkeypatch):
+    """Without this record "11 of 13 settled" is unrecoverable after the fact,
+    which is precisely the state both 2026-08-21 runs left behind."""
+    plan = _plan(tmp_path, min_treatment=1, settle_criterion="both",
+                 settle_rate_tol_dec_per_h=0.025, survivors="on")
+    outcome = H.SettleOutcome(
+        verdict="survivors", n_rounds=8, elapsed_s=630.0,
+        apex_by_channel={}, projected={R.TREATMENT: 2, R.CONTROL: 2},
+        rh_median_pct=30.0, survivors=[18, 19], dropped={20: "unsettleable"},
+        survivor_projected={R.TREATMENT: 1, R.CONTROL: 1},
+        pooled_rate_per_hour=0.023)
+
+    monkeypatch.setattr(V, "approach_condition", lambda *a, **k: [])
+    monkeypatch.setattr(V, "settle_phase", lambda *a, **k: outcome)
+    monkeypatch.setattr(V, "soak_phase", lambda *a, **k: None)
+    monkeypatch.setattr(V, "HoldWatch", lambda **k: None)
+    ctx = _context(tmp_path, _manager(), plan)
+    # The real narration, through the real opener: a `RunContext` built by hand
+    # carries the inert one, which writes nothing -- and a test asserting on an
+    # artifact that was never opened would pass against a record nobody wrote.
+    ctx.narration = N.open_narration(ctx.run_dir)
+    try:
+        V._establish_condition(ctx, plan, list(plan.channels))
+    finally:
+        ctx.narration.close()
+
+    records = [e for e in _stream(ctx.run_dir) if e["type"] == "settle_survivors"]
+    assert len(records) == 1
+    assert records[0]["survivors"] == [18, 19]
+    assert records[0]["dropped"] == {"20": "unsettleable"}
+    assert records[0]["floors_ok"] is True
+    assert records[0]["pooled_rate_dec_per_h"] == pytest.approx(0.01, abs=1e-3)
+    # ...and the drop reached the row stamps, so the population filter sees it.
+    assert ctx.certification(20) == "dropped_unevaluable"
+    assert ctx.certification(18) == "survivors"

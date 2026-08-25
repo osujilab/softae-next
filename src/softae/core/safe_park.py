@@ -67,11 +67,32 @@ PURGE_SUSPENDED_NOTE = (
 )
 
 #: Roughly how long the Trinket firmware holds the last commanded ``ctrl`` before
-#: its deadman forces ``ctrl = 0`` and shuts both Aalborg PSVs:
-#: ``ctrl_timeout = 20`` iterations of a ~1.25 s loop. Named here rather than
-#: imported from the driver because only *reports* need the number — the driver's
-#: behaviour does not — and :mod:`softae.core` deliberately does not import
-#: :mod:`softae.drivers` at module scope.
+#: its deadman forces ``ctrl = 0`` and shuts both Aalborg PSVs.
+#:
+#: **This is a derived number, and the derivation is written out because the
+#: number alone cannot stay true on its own.** From
+#: ``scripts/trinket_firmware/dac0_rh/code.py``:
+#:
+#: * ``ctrl_timeout = 20`` — consecutive failed reads before ``ctrl`` and
+#:   ``ctrl_latent`` are both forced to ``0``;
+#: * one failed pass of the main loop costs ``usb_cdc.data.timeout = 0.75`` s
+#:   blocked in ``readline``, plus ``time.sleep(0.4) + time.sleep(0.1)`` = 0.5 s
+#:   of PWM staging → **~1.25 s per pass**;
+#: * ``20 × 1.25 s ≈ 25 s``.
+#:
+#: So this literal is a *restatement of the firmware's* ``ctrl_timeout``, and
+#: raising ``ctrl_timeout`` on the Trinket makes it a lie with nothing here going
+#: red. It is written down rather than imported because ``scripts/`` is firmware
+#: source, not an importable package, and because :mod:`softae.core` deliberately
+#: does not import :mod:`softae.drivers` at module scope (where the driver keeps
+#: its own copy of this same sentence).
+#:
+#: **Nothing is timed by it.** Every use is operator-facing message text —
+#: :data:`DRY_PURGE_COMMANDED` here, ``HOLD_NOTICE`` and the release report in
+#: :mod:`softae.tools.eis_validate`. No sleep, timer or loop is keyed on it, and
+#: none may be: the purge window belongs to the device, and a host-side timer
+#: would agree with the firmware today and silently truncate the purge the moment
+#: ``ctrl_timeout`` is raised.
 RH_DEADMAN_S = 25.0
 
 #: What the park says when the humidifier was parked to a **dry purge** rather
@@ -307,27 +328,29 @@ def _halt_pumps(syr, pump_ids: Sequence[int], result: SafeParkResult) -> None:
         result.commanded.append(f"pumps {halted} halted")
 
 
-def _park_humidifier(rh, dry_purge: bool, result: SafeParkResult) -> None:
-    """Step 5, in the two end states the humidifier now has.
+def _park_humidifier(rh, result: SafeParkResult) -> None:
+    """Step 5. **Every** park leaves the humidifier purging dry.
 
-    ``dry_purge=False`` — the default and every historical caller — is the path
-    exactly as it was: :meth:`safe_off`, its error attribute read back, the same
-    two strings. Nothing about it is re-derived from the new branch.
+    There is no branch here any more, and no caller can ask for the other end
+    state — see :func:`safe_park` for the operator ruling that removed the
+    choice, and for the earlier ruling it reversed.
+
+    :meth:`safe_off` survives as one thing only: the fallback for a driver that
+    exposes no :meth:`safe_dry` at all.
     """
-    if dry_purge:
-        dry = getattr(rh, "safe_dry", None)
-        if callable(dry):
-            _dry_purge(rh, dry, result)
-            return
-        # Recorded, then fall through to `safe_off` anyway. Deliberately unlike
-        # `_halt_pumps`' refusal to fall back: there the fallback was a
-        # *dispense*, an action carrying its own hazard. Here it is the strictly
-        # safer end state, so refusing it would leave a humidifier energised in
-        # order to make a point about a missing method.
-        result.errors.append(
-            "rh_controller: driver exposes no safe_dry() — no dry purge was "
-            "commanded. Falling back to zeroing the humidifier: safe, but the "
-            "chamber will collapse to room RH")
+    dry = getattr(rh, "safe_dry", None)
+    if callable(dry):
+        _dry_purge(rh, dry, result)
+        return
+    # Recorded, then fall through to `safe_off` anyway. Deliberately unlike
+    # `_halt_pumps`' refusal to fall back: there the fallback was a
+    # *dispense*, an action carrying its own hazard. Here it is the strictly
+    # safer end state, so refusing it would leave a humidifier energised in
+    # order to make a point about a missing method.
+    result.errors.append(
+        "rh_controller: driver exposes no safe_dry() — no dry purge was "
+        "commanded. Falling back to zeroing the humidifier: safe, but the "
+        "chamber will collapse to room RH")
 
     off = getattr(rh, "safe_off", None)
     if not callable(off):
@@ -396,7 +419,7 @@ def safe_park(
     pump_ids: Sequence[int] = DEFAULT_PUMP_IDS,
     safe_temp_C: float = DEFAULT_SAFE_TEMP_C,
     retract_head: bool | None = None,
-    rh_dry_purge: bool = False,
+    rh_dry_purge: bool | None = None,      # deprecated: accepted and ignored
 ) -> SafeParkResult:
     """Drive the rig to a safe state. Never raises.
 
@@ -422,26 +445,49 @@ def safe_park(
 
         ``False`` — leave it lowered, because a human said so (*Safe Exit*).
     rh_dry_purge:
-        Which humidifier end state to park to. ``False`` (default) is duty 0 —
-        what every caller has always got, and what every caller still gets
-        unless it opts in.
+        **Deprecated. Accepted for compatibility, ignored, and scheduled for
+        removal** once the remaining call sites stop passing it. Any value —
+        ``True``, ``False``, a variable — selects the same behaviour, described
+        below. It is retained only so that callers owned by another session keep
+        working across this change; deleting it now would raise ``TypeError`` in
+        their files.
 
-        ``True`` asks the driver for :meth:`~softae.drivers.async_rh_controller.
-        AsyncRHController.safe_dry` instead: PID stopped, setpoint zeroed, duty
-        left at ``out_min``, which on this rig is *dry air*. The Trinket's own
-        deadman shuts both valves ~:data:`RH_DEADMAN_S` s later, so nothing is
-        left energised by a host that has gone away.
+        No ``DeprecationWarning`` is raised, deliberately. This is the park path:
+        it runs during an emergency stop and during interpreter shutdown, and a
+        warning there is noise emitted at the worst possible moment on the one
+        code path that must stay quiet and finish.
 
-        **It is opt-in, and E-stop and every fault-class park deliberately do not
-        opt in** — operator ruling. Zero shuts both PSVs immediately; a dry purge
-        keeps gas moving for the deadman's ~25 s. That is exactly the right trade
-        for a planned GUI restart or a GUI-to-headless changeover, where the
-        alternative is a chamber going 10 %RH to ~50 %RH in tens of seconds and
-        hours of re-drying. It is exactly the wrong trade for an emergency stop:
-        an E-stop that leaves gas flowing for 25 s is not an emergency stop.
+    The humidifier end state, and the ruling that reversed
+    ------------------------------------------------------
+    **Every park now leaves the chamber purging dry** — E-Stop, fault-class
+    campaign park, crash and signal recovery, unclean-shutdown recovery, Ctrl-C,
+    and orderly exit alike. The humidifier is asked for
+    :meth:`~softae.drivers.async_rh_controller.AsyncRHController.safe_dry`: PID
+    stopped, setpoint zeroed, duty left at ``out_min``, which on this rig is
+    *dry air*. The Trinket's own deadman shuts both valves ~:data:`RH_DEADMAN_S`
+    s later, so nothing is left energised by a host that has gone away, and no
+    duration is named on this side (see :data:`RH_DEADMAN_S`).
 
-    Why the default reversed
-    ------------------------
+    **This reverses an earlier ruling. The earlier one is recorded rather than
+    deleted, because the requirement moved and a reader has to be able to see
+    that it moved.** The previous rule was that the dry purge was *opt-in*, and
+    that E-stop and every fault-class park deliberately did not opt in: duty 0
+    shuts both PSVs at once, and — in the words the code carried — *an E-stop
+    that leaves gas flowing for 25 s is not an emergency stop*. That reasoning
+    read the flowing gas itself as the hazard.
+
+    **Operator ruling, 2026-08-24: dry gas carries very little volatile
+    species**, so the flow a dry purge leaves behind is not the hazard the
+    earlier rule took it for — and it is not worth what the alternative costs.
+    That cost falls on exactly the paths the old rule covered: ``ctrl == 0`` is
+    the firmware's auto-shutoff, so a chamber held at 10 %RH re-equilibrates with
+    the ~50 %RH room within tens of seconds, and every park — including one the
+    operator clears a minute later — threw away hours of descent. Both end states
+    shut the valves; the dry one shuts them ~:data:`RH_DEADMAN_S` s later, with
+    dry gas in the line meanwhile.
+
+    Why the ``retract_head`` default reversed
+    -----------------------------------------
     The previous default argued that every automatic caller should retract
     *because nobody is present to decide*. That reasoning is sound about the
     **decision** and wrong about the **capability**. ``head_retract`` is not an
@@ -517,15 +563,14 @@ def safe_park(
         except Exception as exc:
             result.errors.append(f"temperature: {exc}")
 
-    # 5. The humidifier. By default duty 0 — the operator ruled that parking the
-    #    humidifier means what the driver already does on a clean stop — and on
-    #    request a dry purge instead (see `rh_dry_purge`). It sits between the
+    # 5. The humidifier, always to a dry purge — no caller chooses (see the
+    #    docstring for the ruling and the one it reversed). It sits between the
     #    heater and the lamp because ordering here only decides what has already
     #    been written if the process dies mid-park, and a latched heater outranks
     #    a latched humidifier, which outranks a lamp.
     rh = _instrument(manager, "rh_controller", result)
     if rh is not None:
-        _park_humidifier(rh, rh_dry_purge, result)
+        _park_humidifier(rh, result)
 
     # 6. Lamp off.
     lamp = _instrument(manager, "lamp", result)
@@ -540,7 +585,11 @@ def safe_park(
     log(
         "safe_park_done",
         reason=reason or "unspecified",
-        rh_dry_purge=rh_dry_purge,
+        # `rh_dry_purge` is deliberately *not* logged. It no longer selects
+        # anything, so emitting it would put a caller's dead argument into the
+        # record under a name a reader would take for the end state. The end
+        # state is in `commanded`, as `DRY_PURGE_COMMANDED` — the text that names
+        # the actual duty — or in `errors` when the purge did not land.
         ok=result.ok,
         commanded=result.commanded,
         verified=result.verified,
@@ -559,17 +608,22 @@ async def safe_park_async(
     pump_ids: Sequence[int] = DEFAULT_PUMP_IDS,
     safe_temp_C: float = DEFAULT_SAFE_TEMP_C,
     retract_head: bool | None = None,
-    rh_dry_purge: bool = False,
+    rh_dry_purge: bool | None = None,      # deprecated: accepted and ignored
 ) -> SafeParkResult:
     """:func:`safe_park` off the event loop, for async callers (the campaign loop).
 
     The driver calls are blocking serial I/O; running them inline would stall the
     loop for seconds while it is trying to shut down cleanly.
+
+    ``rh_dry_purge`` is **deprecated, accepted and ignored**, exactly as on
+    :func:`safe_park` — it is mirrored here rather than dropped so that the two
+    signatures stay the same shape for as long as either carries it, and it is
+    not forwarded, because there is nothing on the other side to receive it.
     """
     return await asyncio.to_thread(
         safe_park, manager,
         reason=reason, pump_ids=tuple(pump_ids), safe_temp_C=safe_temp_C,
-        retract_head=retract_head, rh_dry_purge=rh_dry_purge,
+        retract_head=retract_head,
     )
 
 
@@ -580,16 +634,18 @@ def dry_purge_humidifier(
 ) -> SafeParkResult:
     """Leave the humidifier dry-commanded, and touch **nothing else**.
 
-    Step 5 of :func:`safe_park` on its own, in the ``rh_dry_purge=True`` end
-    state. Same helpers, same grading, same never-raises contract — so this is
-    not a second path to the humidifier, it is the same one with the other four
-    steps not taken.
+    Step 5 of :func:`safe_park` on its own. Same helper, same grading, same
+    never-raises contract — so this is not a second path to the humidifier, it is
+    the same one with the other four steps not taken. Since the park's end state
+    became unconditional there is no longer any *end state* difference between
+    the two entry points at all: the difference is only which other subsystems
+    are touched.
 
     **Why it exists at all.** There is one caller class that must leave the
     *heater* exactly where it is and still cannot leave the *humidifier* alone:
     an exit that means "the condition stands, a human is here"
-    (``eis-validate --end-state hold``). ``safe_park(rh_dry_purge=True)`` is
-    wrong for it — that drives the heater to
+    (``eis-validate --end-state hold``). :func:`safe_park` is wrong for it — that
+    drives the heater to
     :data:`DEFAULT_SAFE_TEMP_C` and suspends purging, which is precisely what
     such an exit is declining to do. Calling ``rh.safe_dry()`` inline in the
     tool would be the second path this module exists to prevent, and would
@@ -618,7 +674,7 @@ def dry_purge_humidifier(
     result = SafeParkResult()
     rh = _instrument(manager, "rh_controller", result)
     if rh is not None:
-        _park_humidifier(rh, True, result)
+        _park_humidifier(rh, result)
 
     log = logger.error if result.errors else logger.warning
     log(

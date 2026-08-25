@@ -248,19 +248,36 @@ class TestBestEffort:
 # ── The humidifier ───────────────────────────────────────────────────────────
 
 class TestHumidifier:
-    """A parked rig must not keep humidifying.
+    """A parked rig must not keep humidifying, and the park must reach it.
 
-    The safe state is not invented here: the operator ruled it is the one the
-    driver already writes on a clean stop — duty 0. What is new is that the park
-    reaches it at all, on the paths where nothing did.
+    The *end state* is not invented here — see :class:`TestTheParkAlwaysDryPurges`
+    for the operator ruling that fixed it at a dry purge. What this class holds is
+    the older claim, unchanged by that ruling: the park reaches the humidifier at
+    all, on the paths where nothing did, and reports honestly when it cannot.
     """
 
-    def test_the_park_turns_the_humidifier_off(self):
+    def _no_safe_dry(self, **attrs):
+        """A connected driver that predates ``safe_dry`` — the fallback path.
+
+        The ``safe_off`` failure modes below are still live code, but they are no
+        longer reachable through a modern driver: the park asks for ``safe_dry``
+        first and only falls through when the method is genuinely absent. A
+        ``MagicMock`` with no ``spec`` grows a ``safe_dry`` on demand and would
+        quietly stop exercising ``safe_off`` at all — a test that cannot fail.
+        """
+        rh = MagicMock(spec=["is_connected", "safe_off", "last_safe_off_error"])
+        rh.is_connected = True
+        rh.last_safe_off_error = ""
+        for name, value in attrs.items():
+            setattr(rh, name, value)
+        return rh
+
+    def test_the_park_dry_purges_the_humidifier(self):
         mgr = _manager()
         result = safe_park(mgr, reason="unit test")
 
-        mgr._insts["rh_controller"].safe_off.assert_called_once()
-        assert any("humidifier off" in c for c in result.commanded)
+        mgr._insts["rh_controller"].safe_dry.assert_called_once()
+        assert any("DRY-PURGED" in c for c in result.commanded)
 
     def test_the_park_never_calls_stop_instead_of_safe_off(self):
         """``stop()`` writes nothing when ``start()`` was never called, and
@@ -288,23 +305,31 @@ class TestHumidifier:
 
         assert result.ok
         assert any("rh_controller: not connected" in s for s in result.skipped)
+        mgr._insts["rh_controller"].safe_dry.assert_not_called()
         mgr._insts["rh_controller"].safe_off.assert_not_called()
         assert not any("humidifier" in c for c in result.commanded)
 
     def test_a_driver_with_no_safe_off_is_an_error_not_a_silent_skip(self):
         """Mirrors the pump halt: a registered driver that cannot be turned off
-        is a finding, not a non-event."""
+        is a finding, not a non-event.
+
+        Such a driver has no ``safe_dry`` either, so the park reports *both*
+        gaps — the missing dry purge and the missing zeroing — and still does not
+        reach for ``stop``.
+        """
         rh = MagicMock(spec=["is_connected", "stop"])
         rh.is_connected = True
 
         result = safe_park(_manager(rh_controller=rh))
 
         assert any("safe_off" in e for e in result.errors)
+        assert any("no safe_dry()" in e for e in result.errors)
         rh.stop.assert_not_called()
 
     def test_a_raising_safe_off_does_not_block_the_lamp(self):
-        mgr = _manager()
-        mgr._insts["rh_controller"].safe_off.side_effect = RuntimeError("wedged")
+        rh = self._no_safe_dry(safe_off=MagicMock(
+            side_effect=RuntimeError("wedged")))
+        mgr = _manager(rh_controller=rh)
 
         result = safe_park(mgr)
 
@@ -315,58 +340,46 @@ class TestHumidifier:
         """``safe_off`` swallows a comms failure to keep the never-raise
         contract, so a park that only watched for an exception would claim a
         write that never landed."""
-        mgr = _manager()
-        mgr._insts["rh_controller"].last_safe_off_error = (
-            "Failed to send duty cycle: port went away")
+        rh = self._no_safe_dry(
+            last_safe_off_error="Failed to send duty cycle: port went away")
 
-        result = safe_park(mgr)
+        result = safe_park(_manager(rh_controller=rh))
 
         assert any("port went away" in e for e in result.errors)
         assert not any("humidifier off" in c for c in result.commanded)
 
-    def test_the_humidifier_is_zeroed_before_the_lamp(self):
+    def test_the_humidifier_is_parked_before_the_lamp(self):
         order: list[str] = []
         mgr = _manager()
         mgr._insts["temp_controller"].write_sp.side_effect = (
             lambda *a, **k: order.append("temp"))
-        mgr._insts["rh_controller"].safe_off.side_effect = lambda: order.append("rh")
+        mgr._insts["rh_controller"].safe_dry.side_effect = (
+            lambda: order.append("rh"))
         mgr._insts["lamp"].off.side_effect = lambda: order.append("lamp")
 
         safe_park(mgr)
 
         assert order == ["temp", "rh", "lamp"]
 
-    def test_a_mock_rh_controller_is_turned_off_too(self):
-        """``safe_park`` cannot tell a mock from a real driver, so the mock's own
-        ``safe_off`` is what makes every simulated park honest."""
-        from softae.drivers.mock_rh_controller import MockRHController
 
-        rh = MockRHController(name="rh_controller")
-        rh._state = InstrumentState.CONNECTED
-        rh.set_setpoint(45.0)
-        rh.start()
+# ── The park's one humidifier end state ──────────────────────────────────────
 
-        result = safe_park(_manager(rh_controller=rh))
-
-        assert result.ok
-        assert rh._duty == 0.0
-        assert rh._running is False
-        assert rh._setpoint == 0.0
-
-
-# ── The dry-purge park ───────────────────────────────────────────────────────
-
-class TestDryPurgePark:
-    """The other humidifier end state, and it is **opt-in**.
+class TestTheParkAlwaysDryPurges:
+    """**Every** park leaves the chamber purging dry. There is no other option.
 
     ``ctrl`` near 0 is dry air; ``ctrl == 0`` exactly is a firmware special case
     that shuts both Aalborg PSVs, so a park to duty 0 leaves no flow and room air
     wins — a chamber held at 10 %RH goes to ~50 %RH in tens of seconds and every
-    restart costs a re-drying. ``rh_dry_purge=True`` parks to ``out_min`` instead
-    and lets the Trinket's ~25 s deadman close the valves.
+    restart costs a re-drying. The park commands ``out_min`` instead and lets the
+    Trinket's ~25 s deadman close the valves.
 
-    Every existing caller keeps duty 0. An E-stop that leaves gas flowing for
-    25 s is not an E-stop, and that is an operator ruling, not a default.
+    **This reverses an earlier operator ruling** and the reversal is the reason
+    this class exists in this shape. The old rule made the dry purge opt-in and
+    kept E-stop and every fault-class park on duty 0, on the grounds that an
+    E-stop leaving gas flowing for 25 s is not an E-stop. Operator ruling
+    2026-08-24: dry gas carries very little volatile species, so the flow is not
+    the hazard that reasoning took it for, and the collapse it bought on every
+    other park is not worth paying for.
     """
 
     def _mock_rh(self, **config):
@@ -378,51 +391,52 @@ class TestDryPurgePark:
         rh.start()
         return rh
 
-    # -- the default path is untouched ----------------------------------------
+    # -- the invariant itself --------------------------------------------------
 
-    def test_the_park_defaults_to_zeroing_and_never_dry_purges(self):
-        """Additive means additive: the shipped call is byte-for-byte itself."""
+    @pytest.mark.parametrize("kwargs", [
+        pytest.param({}, id="no-flag"),
+        pytest.param({"rh_dry_purge": True}, id="deprecated-true"),
+        pytest.param({"rh_dry_purge": False}, id="deprecated-false"),
+        pytest.param({"rh_dry_purge": None}, id="deprecated-none"),
+    ])
+    def test_the_park_is_dry_however_the_run_ended(self, kwargs):
+        """The end state does not depend on the caller, or on how it got here.
+
+        ``rh_dry_purge`` is still *accepted* — two call sites in another
+        session's files still pass it, and removing the parameter now would raise
+        ``TypeError`` in their code — but it selects nothing. ``False`` is the
+        value that used to mean duty 0, and it is included here precisely because
+        it is the one that changed meaning.
+        """
         mgr = _manager()
 
-        result = safe_park(mgr, reason="unit test")
+        result = safe_park(mgr, reason="unit test", **kwargs)
 
-        mgr._insts["rh_controller"].safe_off.assert_called_once()
-        mgr._insts["rh_controller"].safe_dry.assert_not_called()
-        assert "humidifier off (PID stopped, duty 0)" in result.commanded
+        mgr._insts["rh_controller"].safe_dry.assert_called_once()
+        mgr._insts["rh_controller"].safe_off.assert_not_called()
+        assert any("DRY-PURGED" in c for c in result.commanded)
 
-    def test_the_default_park_leaves_a_real_driver_at_duty_zero(self):
+    def test_the_park_leaves_a_real_driver_at_out_min_and_not_zero(self):
+        """The number on the wire, not a spy on a call name.
+
+        ``safe_park`` cannot tell a mock from a real driver, so this is also what
+        makes every simulated park honest. ``0.0`` here would be the firmware's
+        valve shutoff — the outcome the ruling exists to stop.
+        """
         rh = self._mock_rh()
 
         result = safe_park(_manager(rh_controller=rh))
 
         assert result.ok
-        assert rh._duty == 0.0
-        assert rh.last_safe_dry_duty == 0.0
-
-    # -- the opt-in path -------------------------------------------------------
-
-    def test_the_dry_purge_park_calls_safe_dry_and_not_safe_off(self):
-        mgr = _manager()
-
-        safe_park(mgr, rh_dry_purge=True)
-
-        mgr._insts["rh_controller"].safe_dry.assert_called_once()
-        mgr._insts["rh_controller"].safe_off.assert_not_called()
-
-    def test_the_dry_purge_park_leaves_a_real_driver_at_out_min(self):
-        rh = self._mock_rh()
-
-        result = safe_park(_manager(rh_controller=rh), rh_dry_purge=True)
-
-        assert result.ok
         assert rh._duty == pytest.approx(0.01)
+        assert rh._duty != 0.0
         assert rh._running is False
         assert rh._setpoint == 0.0
 
     def test_the_dry_purge_report_names_the_duty_and_the_deadman(self):
         rh = self._mock_rh(out_min=0.05)
 
-        result = safe_park(_manager(rh_controller=rh), rh_dry_purge=True)
+        result = safe_park(_manager(rh_controller=rh))
 
         (line,) = [c for c in result.commanded if "DRY-PURGED" in c]
         assert "0.05" in line
@@ -437,7 +451,7 @@ class TestDryPurgePark:
         """
         rh = self._mock_rh()
 
-        result = safe_park(_manager(rh_controller=rh), rh_dry_purge=True)
+        result = safe_park(_manager(rh_controller=rh))
 
         assert result.ok
         assert result.errors == []
@@ -457,18 +471,6 @@ class TestDryPurgePark:
         commanded_block = paragraph.split("Commanded (sent")[1]
         assert line in commanded_block
 
-    def test_the_dry_purge_park_still_happens_before_the_lamp(self):
-        order: list[str] = []
-        mgr = _manager()
-        mgr._insts["temp_controller"].write_sp.side_effect = (
-            lambda *a, **k: order.append("temp"))
-        mgr._insts["rh_controller"].safe_dry.side_effect = lambda: order.append("rh")
-        mgr._insts["lamp"].off.side_effect = lambda: order.append("lamp")
-
-        safe_park(mgr, rh_dry_purge=True)
-
-        assert order == ["temp", "rh", "lamp"]
-
     # -- the ways it can go wrong ---------------------------------------------
 
     def test_a_degenerate_out_min_is_an_error_not_a_silent_dry_purge(self):
@@ -478,7 +480,7 @@ class TestDryPurgePark:
         RH collapses with nothing naming the cause."""
         rh = self._mock_rh(out_min=0.0)
 
-        result = safe_park(_manager(rh_controller=rh), rh_dry_purge=True)
+        result = safe_park(_manager(rh_controller=rh))
 
         assert not result.ok
         assert any("out_min" in e for e in result.errors)
@@ -494,7 +496,7 @@ class TestDryPurgePark:
         rh.is_connected = True
         rh.last_safe_off_error = ""
 
-        result = safe_park(_manager(rh_controller=rh), rh_dry_purge=True)
+        result = safe_park(_manager(rh_controller=rh))
 
         rh.safe_off.assert_called_once()
         assert any("no safe_dry()" in e for e in result.errors)
@@ -504,7 +506,7 @@ class TestDryPurgePark:
         mgr = _manager()
         mgr._insts["rh_controller"].safe_dry.side_effect = RuntimeError("wedged")
 
-        result = safe_park(mgr, rh_dry_purge=True)
+        result = safe_park(mgr)
 
         assert any("humidity: wedged" in e for e in result.errors)
         mgr._insts["lamp"].off.assert_called_once()
@@ -516,27 +518,23 @@ class TestDryPurgePark:
         mgr = _manager()
         mgr._insts["rh_controller"].last_safe_dry_error = "port went away"
 
-        result = safe_park(mgr, rh_dry_purge=True)
+        result = safe_park(mgr)
 
         assert any("port went away" in e for e in result.errors)
         assert not any("DRY-PURGED" in c for c in result.commanded)
 
-    def test_a_disconnected_rh_controller_is_skipped_on_the_dry_path_too(self):
-        mgr = _manager()
-        mgr._insts["rh_controller"].is_connected = False
-
-        result = safe_park(mgr, rh_dry_purge=True)
-
-        assert result.ok
-        mgr._insts["rh_controller"].safe_dry.assert_not_called()
-
     @pytest.mark.asyncio
-    async def test_the_async_park_forwards_the_dry_purge_flag(self):
+    async def test_the_async_park_dry_purges_too(self):
+        """It no longer forwards a flag — there is none — so what needs pinning
+        is that the two entry points still reach the same end state, and that the
+        deprecated argument is accepted rather than raising ``TypeError`` at the
+        one moment a park must not."""
         mgr = _manager()
 
-        await safe_park_async(mgr, rh_dry_purge=True)
+        await safe_park_async(mgr, rh_dry_purge=False)
 
         mgr._insts["rh_controller"].safe_dry.assert_called_once()
+        mgr._insts["rh_controller"].safe_off.assert_not_called()
 
 
 # ── The vocabulary of the result ─────────────────────────────────────────────
@@ -709,13 +707,18 @@ class TestAsync:
         mgr._insts["syringe"].head_retract.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_async_park_turns_the_humidifier_off(self):
+    async def test_async_park_parks_the_humidifier_too(self):
         """The async wrapper is ``to_thread(safe_park, …)``; it inherits the step
-        rather than restating it, and this is what says so."""
+        rather than restating it, and this is what says so.
+
+        Renamed from ``..._turns_the_humidifier_off``: the step it inherits is a
+        dry purge now, on every park (operator ruling 2026-08-24), so the old
+        name described an end state the wrapper no longer reaches.
+        """
         mgr = _manager()
         result = await safe_park_async(mgr, reason="async test")
-        mgr._insts["rh_controller"].safe_off.assert_called_once()
-        assert any("humidifier off" in c for c in result.commanded)
+        mgr._insts["rh_controller"].safe_dry.assert_called_once()
+        assert any("DRY-PURGED" in c for c in result.commanded)
 
 
 class TestDryPurgeHumidifier:

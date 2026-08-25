@@ -114,10 +114,13 @@ from softae.tools.eis_validate_hold import (
     DEFAULT_DRIFT_CHECK,
     DEFAULT_MIN_TREATMENT,
     DEFAULT_RH_APPROACH_TIMEOUT_S,
+    DEFAULT_SETTLE_CRITERION,
     DEFAULT_SETTLE_MAX_HOLD_S,
+    DEFAULT_SETTLE_RATE_TOL_DEC_PER_H,
     DEFAULT_SETTLE_TOL_REL,
     DEFAULT_SOAK_S,
     DEFAULT_TEMP_APPROACH_TIMEOUT_S,
+    SETTLE_RATE_TOL_DEC_PER_H_MAX,
     SETTLE_TOL_REL_MAX,
     SOAK_CEILING_FACTOR,
     SOAK_PRINT_EVERY_N_POLLS,
@@ -180,28 +183,28 @@ EXAMPLE_CHANNELS = "18-32"
 #: "there is a run id and it is blank".
 CLAIM_KIND = "tool:eis-validate"
 
-#: Exit statuses whose park is an **orderly** one, and which therefore opt the
-#: humidifier into ``safe_park``'s dry purge rather than its duty-0 default.
+#: Exit statuses whose park is an **orderly** one, as opposed to a fault class.
 #:
-#: Every exit path in :func:`cmd_run` -- success, refusal, ``KeyboardInterrupt``
-#: and any unnamed exception -- lands in the *same* ``finally`` and the *same*
-#: ``safe_park`` call, so "opt the end-of-run park in" is not a choice about one
-#: branch: it decides the humidifier's end state on all of them at once. And
-#: ``core/safe_park.py`` records an operator ruling that **fault-class parks keep
-#: zeroing immediately** -- the 25 s flowing window is for orderly exits only.
+#: **Currently unused, and left standing deliberately.** Its only consumer was
+#: the end-of-run ``safe_park`` call, which used it to pick the humidifier's end
+#: state: orderly exits got a dry purge, fault exits kept duty 0. That choice no
+#: longer exists -- operator ruling 2026-08-24, recorded in ``core/safe_park.py``
+#: with the rule it reversed: **every** park dry-purges now, because dry gas
+#: carries very little volatile species and duty 0 is the firmware's
+#: auto-shutoff, which collapses the chamber to room RH.
 #:
-#: So the two are separated by the only thing that distinguishes them here, which
-#: this file already computes for the stream: ``outcome["status"]``.
+#: It is not deleted here because that is a separate decision from the one the
+#: ruling made, and the distinction it draws is still a real one this file
+#: computes cheaply from ``outcome["status"]``:
 #:
 #: * ``done`` -- the run finished, or found nothing to measure.
 #: * ``aborted`` -- a *decision*. A gate refused, or the rig was claimed. Nothing
-#:   faulted; the chamber is exactly the one ``_release_rh`` already dry-purges.
-#: * ``interrupted`` -- the operator pressed Ctrl-C and will very likely restart,
-#:   which is the case the dry purge was built for.
+#:   faulted.
+#: * ``interrupted`` -- the operator pressed Ctrl-C and will very likely restart.
 #:
-#: ``error`` is deliberately absent: an unnamed exception is this harness's fault
-#: class, and it keeps duty 0. Widening this set is a one-word change and an
-#: operator ruling, not a refactor.
+#: ``error`` is absent: an unnamed exception is this harness's fault class.
+#: If nothing has taken it up by the time ``safe_park``'s deprecated
+#: ``rh_dry_purge`` parameter is removed, delete it then.
 ORDERLY_EXIT_STATUSES = frozenset({"done", "aborted", "interrupted"})
 
 #: What ``--end-state hold`` leaves behind, said accurately.
@@ -307,6 +310,14 @@ def build_plan(args: argparse.Namespace) -> ValidationPlan:
         # than raising.
         settle_tol_rel=float(getattr(args, "settle_tol_rel",
                                      DEFAULT_SETTLE_TOL_REL)),
+        # Same `getattr` discipline, same reason: a namespace built by a caller
+        # older than the flag keeps the shipped criterion rather than raising.
+        settle_criterion=str(getattr(args, "settle_criterion",
+                                     DEFAULT_SETTLE_CRITERION)),
+        settle_rate_tol_dec_per_h=float(
+            getattr(args, "settle_rate_tol_dec_per_h",
+                    DEFAULT_SETTLE_RATE_TOL_DEC_PER_H)),
+        survivors=(getattr(args, "survivors", "off") == "on"),
         # Hours in, seconds on the plan: the flag is in the operator's unit and
         # every field beside it is in the arithmetic's.
         soak_s=float(args.soak_h) * 3600.0,
@@ -333,6 +344,13 @@ class RunContext:
     run_dir: Path
     hold_epoch: int = 1
     hold_certified: str = "settled"
+    #: ``{channel: hold_certified}`` for the cells a survivor partition dropped.
+    #: Empty on every run that did not partition, which is every run at the
+    #: defaults. A dropped cell is still SWEPT -- §6.4 of the spec, and the
+    #: cheaper half of the argument: one extra sweep set per phase buys the
+    #: evidence to audit the drop and recalibrate the threshold, where omitting
+    #: the cell loses it the way console scrollback lost the 2026-08-21 rounds.
+    dropped: dict[int, str] = field(default_factory=dict)
     watch: HoldWatch | None = None
     seq: dict[str, int] = field(default_factory=dict)
     consecutive_failures: int = 0
@@ -347,6 +365,19 @@ class RunContext:
     def __post_init__(self) -> None:
         if self.narration is None:
             self.narration = RunNarration(self.run_dir)
+
+    def certification(self, channel: int) -> str:
+        """What ``hold_certified`` this channel's rows carry.
+
+        Per channel and not per run, because under a survivor partition the two
+        differ and the difference is the whole point: the run proceeded, and this
+        cell is not one the gate could speak for.
+        :func:`~softae.tools.eis_validate_rule` already filters populations on
+        this column, so a dropped cell's rows are excluded from every statistic
+        by machinery that exists -- while its data survives on disk, which is
+        what makes the drop auditable.
+        """
+        return self.dropped.get(int(channel), self.hold_certified)
 
     def next_seq(self, cell: str) -> int:
         self.seq[cell] = self.seq.get(cell, 0) + 1
@@ -432,7 +463,7 @@ def persist(ctx: RunContext, eis: Any, arm: str) -> int:
         "eis_validation_rh_sp_pct": ctx.plan.rh_setpoint_pct,
         "eis_validation_temp_sp_C": ctx.plan.temp_setpoint_c,
         "eis_validation_hold_epoch": ctx.hold_epoch,
-        "eis_validation_hold_certified": ctx.hold_certified,
+        "eis_validation_hold_certified": ctx.certification(channel),
         "eis_validation_hold_excursion": bool(
             ctx.watch.excursion if ctx.watch else False),
         "eis_validation_seq": ctx.next_seq(cell),
@@ -745,6 +776,58 @@ def build_parser() -> argparse.ArgumentParser:
                           f"board's own noise floor or no hold length can "
                           f"satisfy it -- the run says so, and names a workable "
                           f"value, at its first judged window")
+    # Which of the two SIBLING criteria routes. `rate_check` is not a mode of
+    # `settle_check` -- they estimate different things -- so this selects the one
+    # that decides, and `both` runs the rate as a SHADOW beside the shipped
+    # criterion. That middle word is the whole reason this flag exists: the rate
+    # criterion has never been measured against a real board, and a criterion
+    # given routing power on the strength of an argument is how the current one
+    # got here.
+    run.add_argument("--settle-criterion",
+                     choices=("deviation", "rate", "both"),
+                     default=DEFAULT_SETTLE_CRITERION,
+                     help="which gate DECIDES. 'deviation' is shipped: "
+                          "max|sigma - mean|/|mean| against --settle-tol-rel, "
+                          "which for a 3-round window is a scatter estimate "
+                          "compared against a drift tolerance. 'rate' regresses "
+                          "ln sigma on t per cell and gates on a 95%% upper "
+                          "bound of the slope, so a cell that is MOVING is told "
+                          "apart from one that is merely too noisy to judge. "
+                          "'both' routes on deviation and reports the rate -- "
+                          "the shadow mode, and the only honest way to get the "
+                          "comparison a cutover needs")
+    # DECADES per hour, not ln-units per hour, and the name carries it. Three
+    # reasons: H3 -- the criterion this gate must eventually GUARANTEE -- is
+    # already in decades (`H3_MAX_HOLD_DRIFT_DEC = 0.05`); the spec derives this
+    # number from it as `0.05 dec / T_meas`, so an operator who computes it
+    # computes decades; and ln-units are the arithmetic's internal unit, which is
+    # not a thing anyone should have to type. The conversion happens once, in
+    # `rate_tol_ln_per_hour`. `--settle-tol-rel`'s help is the model for the
+    # loudness: a comment in `settle_phase` records an operator reading
+    # `spread 0.130` as %RH.
+    run.add_argument("--settle-rate-tol-dec-per-h", dest="settle_rate_tol_dec_per_h",
+                     type=float, default=DEFAULT_SETTLE_RATE_TOL_DEC_PER_H,
+                     help="the rate band, in DECADES OF SIGMA PER HOUR -- not a "
+                          "relative deviation, and not %%RH. 0.025 means a cell "
+                          "moving 0.025 decades in an hour still certifies as "
+                          "still. Derive it from H3: 0.05 dec / (measurement "
+                          "block hours), so a 2 h block wants 0.025. REQUIRED "
+                          "by --settle-criterion rate and both; the run REFUSES "
+                          f"above {SETTLE_RATE_TOL_DEC_PER_H_MAX:g} dec/h, which "
+                          "would certify a cell whose conductivity changes "
+                          "threefold every hour")
+    # Off by default, and it stays off unless it is typed: it changes what the
+    # run is allowed to conclude, not merely how long it waits.
+    run.add_argument("--survivors", choices=("off", "on"), default="off",
+                     help="at the ceiling, PARTITION instead of refusing: "
+                          "proceed on the cells the rate criterion certified "
+                          "quiet, and record every dropped cell with its "
+                          "reason. Cells PROVEN to be moving still refuse -- "
+                          "only cells that could not be JUDGED are droppable. "
+                          "Needs --settle-criterion rate or both. Every result "
+                          "a survivor run produces is CONDITIONAL ON SETTLING, "
+                          "which is fine for 'does the scout resolve the arc?' "
+                          "and wrong for any hold-time or objective number")
     # `--soak-h`, not `--settle-min-hold-s`. Three reasons, in the order they
     # decided it. (1) The name is already taken: `settle_phase` has a
     # `min_hold_first_s` parameter, sourced from the shipped
@@ -1044,23 +1127,25 @@ def cmd_run(args: argparse.Namespace) -> int:
         # an operator the correct response to an unknown is to add no motion to
         # it -- `safe_park`'s default is reversed for exactly this caller class.
         narration.state(PHASE_PARK, end_state=plan.end_state)
-        # ORDERLY, not "successful": see `ORDERLY_EXIT_STATUSES` for why the
-        # humidifier's end state is decided by how the run ended rather than by
-        # which branch below runs. Read here, once, because both branches want it
-        # and the `finally` is the only place `outcome` is settled.
-        orderly = outcome.get("status") in ORDERLY_EXIT_STATUSES
         if plan.end_state == "park":
-            # `rh_dry_purge=orderly` -- an end-of-run park is an orderly exit, and
-            # duty 0 is the firmware's auto-shutoff rather than its dry end: it
-            # closes both Aalborg valves, so a chamber the run spent an hour
-            # drying goes back to room RH in tens of seconds and the operator's
-            # next attempt pays for the whole descent again. The dry purge leaves
-            # `out_min` flowing and lets the ~25 s deadman close the valves.
-            # It does NOT preserve the condition -- the heater still goes to 10 C
-            # and `--resume` still re-equilibrates from scratch, which is what the
+            # The humidifier's end state is no longer this caller's to choose,
+            # and no longer depends on how the run ended. `safe_park` dry-purges
+            # unconditionally -- operator ruling 2026-08-24, recorded in
+            # `core/safe_park.py` along with the opt-in rule it reversed: dry gas
+            # carries very little volatile species, so the flow is not the hazard
+            # the old rule took it for, while duty 0 *is* the firmware's
+            # auto-shutoff and hands a chamber the run spent an hour drying back
+            # to room RH in tens of seconds.
+            #
+            # So the `orderly`/fault split this call used to make is gone. What
+            # changed here in behaviour is the FAULT path: a failed run used to
+            # zero the humidifier and now dry-purges like every other exit.
+            #
+            # A park still does NOT preserve the condition -- the heater goes to
+            # 10 C and `--resume` re-equilibrates from scratch, which is what the
             # line below has always said and still says.
             result = safe_park(manager, reason="eis validation complete",
-                               retract_head=None, rh_dry_purge=orderly)
+                               retract_head=None)
             print(f"\n[park  ] {result.summary()}")
             print("         A PARK ENDS THE CONDITION: the heater is driven to "
                   "10 C and anti-clog purging is suspended. --resume "
@@ -1069,9 +1154,15 @@ def cmd_run(args: argparse.Namespace) -> int:
             # park is the longest thing left in the process -- so a watcher that
             # sees it knows the measurement block is over and the rig is on its
             # way to safe, rather than inferring it from a silence.
+            # No `rh_dry_purge` key. It used to report a *request* -- a decision
+            # this branch made and a watcher could not otherwise see. There is no
+            # request any more, and the field cannot be repurposed to report
+            # success the way the `hold` branch's can: `result.commanded` here
+            # spans pumps, heater and lamp as well, so "commanded and no errors"
+            # would mean *the whole park* succeeded, which is what `ok` already
+            # says. An always-true field would be worse than an absent one.
             narration.record("park", reason="eis validation complete",
-                             ok=bool(getattr(result, "ok", True)),
-                             rh_dry_purge=orderly)
+                             ok=bool(getattr(result, "ok", True)))
         else:
             # The heater is deliberately untouched -- that is what the flag buys,
             # and temperature genuinely holds because the controller keeps its own
@@ -1095,6 +1186,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                 print(f"         {line}")
             print(HOLD_NOTICE.format(rh=plan.rh_setpoint_pct,
                                      deadman=RH_DEADMAN_S))
+            # `rh_dry_purge` is KEPT here, and it survived the ruling because it
+            # never reported a request: it reports whether the dry purge actually
+            # LANDED, which is a different question and still a varying one -- a
+            # degenerate `out_min`, a dead transport or a failed write each turn
+            # it False. `dry_purge_humidifier` touches only the humidifier, so
+            # "commanded and no errors" means exactly that here and nothing
+            # wider. `ok=False` is about the *hold*, not about the purge, which
+            # is why this cannot be folded into it.
             narration.record("park", reason="--end-state hold: not parked",
                              ok=False, held=True,
                              rh_dry_purge=bool(result.commanded
@@ -1253,6 +1352,9 @@ def _establish_condition(ctx: RunContext, plan: ValidationPlan,
     on the far side of a six-hour soak spends the soak to learn something that
     was knowable before it started.
     """
+    from softae.analysis.equilibration import LN_PER_DECADE
+    from softae.tools.eis_validate_hold import survivor_row_stamp
+
     clock = VirtualClock() if plan.mock else None
     pacing: dict[str, Any] = (
         {"sleep": clock.sleep, "now": clock} if clock else {}
@@ -1315,14 +1417,51 @@ def _establish_condition(ctx: RunContext, plan: ValidationPlan,
     # to know when settle fails -- it says whether the cells are even in the
     # resolving window. Printed only on success, it was missing from both of the
     # 2026-08-20 runs that died in this gate.
+    # The partition, and the cells it could not speak for. Recorded whenever the
+    # gate computed a rate at all -- under `--survivors off` too -- because the
+    # denominator is what neither 2026-08-21 run could reconstruct afterwards,
+    # and recording is not routing. `settle_survivors` is a separate record from
+    # `settle_verdict` because it is a claim about WHICH cells, where the verdict
+    # is a claim about the board.
+    if outcome.survivors or outcome.dropped:
+        narration.record(
+            "settle_survivors", mode="on" if plan.survivors else "off",
+            criterion=plan.settle_criterion,
+            survivors=list(outcome.survivors),
+            dropped={str(channel): why
+                     for channel, why in sorted(outcome.dropped.items())},
+            survivor_counts=dict(outcome.survivor_projected),
+            pooled_rate_dec_per_h=(
+                None if outcome.pooled_rate_per_hour is None
+                else round(outcome.pooled_rate_per_hour / LN_PER_DECADE, 6)),
+            floors_ok=not outcome.survivor_refusal,
+            floor_refusal=outcome.survivor_refusal)
     print(render_arc_watch(outcome, plan))
     assert_settle_licensed(outcome)
     ctx.hold_certified = outcome.verdict
+    # Keyed on the FLAG and not on the verdict. Under `--survivors on` the rate
+    # criterion can return `settled` while cells it could not judge sit in the
+    # board -- it certifies on the quiet ones -- and those cells' rows would then
+    # carry `hold_certified="settled"`, which is false for them and is silent
+    # survivorship. Whenever the operator asked for a partition, the partition is
+    # what the rows record.
+    if plan.survivors:
+        ctx.dropped = {channel: survivor_row_stamp(why)
+                       for channel, why in outcome.dropped.items()}
 
-    projected = outcome.projected.get(TREATMENT, 0)
+    # AFTER the drop, never before. `outcome.projected` counts the whole board,
+    # and a board that clears --min-treatment says nothing about the survivor set
+    # that will actually be certified -- so under a partition the denominator is
+    # the survivors. This floor stays here, with the flag that owns it, rather
+    # than moving into `survivor_floors`: one owner per floor.
+    partitioned = bool(plan.survivors)
+    census = outcome.survivor_projected if partitioned else outcome.projected
+    projected = census.get(TREATMENT, 0)
     if plan.settle and projected < plan.min_treatment:
+        scope = ("channel(s) SURVIVED into TREATMENT" if partitioned
+                 else "channel(s) project into TREATMENT")
         raise RefuseToStart(
-            f"only {projected} channel(s) project into TREATMENT, below "
+            f"only {projected} {scope}, below "
             f"--min-treatment {plan.min_treatment}. The resolving window is "
             f"[{plan.ref_close_hz:.2f}, {plan.baseline_ok_hz:.2f}) Hz and the "
             "SETPOINT is the lever, not the sample size: change the condition, "

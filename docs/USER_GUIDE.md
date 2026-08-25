@@ -887,21 +887,42 @@ Both drive the *same* park sequence — there is deliberately no second path to 
 1. Retract dispenser head
 2. Stop all syringe pumps (0, 1, 2)
 3. Set temperature to 10 °C
-4. Turn the humidifier off — PID loop stopped, duty 0
+4. Leave the humidifier **purging dry** — PID loop stopped, setpoint 0, duty held at `out_min` (0.01)
 5. Turn lamp off
 
 Each step is attempted even if others fail. A dialog reports success or lists any errors.
 
-**The humidifier joined the sequence on 2026-08-19.** Parking a rig that keeps humidifying is
-not a park, so every route through this sequence — E-Stop, Safe Exit, the window's X, a
-fault-class park and the unclean-shutdown recovery park at the next launch — now zeroes it. It
-sits between the heater and the lamp because ordering here only decides what has already been
-written if the process dies partway through: a latched heater outranks a latched humidifier,
-which outranks a lamp. The step is graded **commanded, never verified** — nothing reads the
-Trinket back — and an absent or disconnected RH controller is *skipped*, while a driver that
-exposes no way to turn off, or a duty write that failed, is reported as an **error** rather
-than passed over quietly. See [§23](#23-environment-hold--softae-env) for what a park still
-cannot reach.
+**The humidifier joined the sequence on 2026-08-19; what it is parked *to* changed on
+2026-08-24.** Parking a rig that keeps humidifying is not a park, so every route through this
+sequence — E-Stop, Safe Exit, the window's X, a fault-class campaign park, crash and signal
+recovery (Ctrl-C, `SIGTERM`) and the unclean-shutdown recovery park at the next launch — takes
+the humidifier out of PID control. **Until 2026-08-24 they all zeroed the duty; they now all
+leave it purging dry**, and no caller can ask for the other end state. The step sits between the
+heater and the lamp because ordering here only decides what has already been written if the
+process dies partway through: a latched heater outranks a latched humidifier, which outranks a
+lamp. It is graded **commanded, never verified** — nothing reads the Trinket back — and an
+absent or disconnected RH controller is *skipped*, while a driver that exposes no `safe_dry()`,
+or a duty write that failed, is reported as an **error** rather than passed over quietly. See
+[§23](#23-environment-hold--softae-env) for what a park still cannot reach.
+
+**Why the requirement moved.** The RH control value runs 0–1, and near-0 *is* dry air — but
+`ctrl = 0` **exactly** is the firmware's auto-shutoff, which closes **both** Aalborg PSVs, so
+there is no flow at all. Zeroing therefore did not leave the chamber dry; it left it open to the
+room. A chamber held at 10 %RH re-equilibrated with the ~50 %RH room within tens of seconds, so
+every park threw away hours of descent — including one an operator cleared a minute later. The
+earlier rule read the flowing gas itself as the hazard. **Operator ruling, 2026-08-24: dry gas
+carries very little volatile species**, so it is not. Both end states shut the valves; the dry
+one shuts them ~25 s later, with dry gas in the line meanwhile.
+
+> **⚠ An emergency stop no longer produces an immediate no-flow state on the RH axis.** After
+> **⛔ EMERGENCY STOP** the two Aalborg PSVs stay **open with dry gas flowing for roughly 25
+> seconds**, closing only when the Trinket's own deadman fires
+> ([§23](#23-environment-hold--softae-env)). The heater still goes to 10 °C immediately, the
+> pumps still halt immediately, the lamp still goes off immediately — **only the RH axis
+> changed.** This **reverses** the previous rule, under which the dry purge was opt-in and
+> E-Stop and every fault-class park deliberately declined it. The dialog now reports the
+> humidifier under **Commanded** as `DRY-PURGED … Leaving it commanded is DELIBERATE`, not as
+> *humidifier off* — that line is a success, not a softer version of a failure.
 
 ### Safe Exit and the dispenser head
 
@@ -2371,10 +2392,18 @@ humidity number without the air temperature is not actionable. Reporting is not 
 > The paths where no Python runs at all — a `SIGKILL` / *End Task*, a power cut to the host, a
 > blue screen — therefore latch the last duty for about half a minute, **not for hours**.
 >
-> **What the software adds is immediacy and honesty, not the backstop.** Every clean exit, every
-> signal, every park and every fault-class stop zeroes the duty *at once*, so an orderly exit
-> never spends the deadman's 25 s window, and a hold that came off cleanly is distinguishable
-> from one that crashed — a failed zero says so out loud.
+> **What the software adds is immediacy and honesty, not the backstop.** *This* tool's exits —
+> Ctrl-C, the duration elapsing, a driver refusal — still write duty 0 *at once*, so a
+> `softae-env` hold never spends the deadman's 25 s window, and a hold that came off cleanly is
+> distinguishable from one that crashed because the verdict prints either way: a failed zero says
+> so out loud.
+>
+> **The park sequence is the exception, since 2026-08-24, and it spends the window on purpose.**
+> The GUI's E-Stop and Safe Exit, a fault-class campaign park and the unclean-shutdown recovery
+> park no longer zero the duty — they leave the humidifier purging dry at `out_min`, precisely so
+> that the device's deadman, rather than `ctrl = 0`, is what closes the valves
+> ([§8](#8-emergency-stop--safe-exit)). So **a spent deadman window is no longer evidence that
+> something crashed**: on those paths it is the designed exit.
 >
 > **The firmware is no longer un-versioned.** Both devices' code is checked in at
 > [`scripts/trinket_firmware/`](../scripts/trinket_firmware/) as of 2026-08-20, hashed and
