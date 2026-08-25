@@ -615,6 +615,128 @@ class TestDeferralNotCancellation:
         assert alerts == []
 
 
+# ── The dry tick survives a block; the overdue clock survives the dry tick ───
+
+class TestTheBlockedDryTick:
+    """Under the shipped ``actuate = false``, a block must not silence the tick.
+
+    The two halves pull in opposite directions and both are the operator's
+    ruling. Emitting the dry line even when blocked is what makes the cadence
+    visible through a multi-hour claim — an Arrhenius sweep holds one, and
+    before this the harness logged nothing at all for its duration. *Not*
+    calling ``note_purged`` on that path is what keeps ``overdue_s`` growing,
+    because with ``actuate`` off a deferral is the only thing that ever lets it
+    grow: the ordinary dry run resets the timer every interval.
+
+    Reset it here and the badge reads "scheduled" straight through a sweep it is
+    deferring across — which is why the reset is asserted against directly and
+    not merely implied by a state check.
+    """
+
+    @staticmethod
+    def _blocked(actuate: bool = False):
+        """A due purge, ``actuate`` as given, and a whole-rig claim on top."""
+        activity = RigActivity()
+        activity.acquire("arrhenius:sweep")
+        syringe = _Syringe()
+        runner, sched, clock = _due_runner(_Manager(syringe),
+                                           settings=_settings(actuate=actuate),
+                                           activity=activity)
+        return runner, sched, clock, syringe
+
+    @staticmethod
+    def _events(logs, name):
+        return [line for line in logs if line.get("event") == name]
+
+    def test_a_blocked_tick_still_logs_the_dry_run(self):
+        import structlog
+
+        runner, _, _, _ = self._blocked()
+
+        with structlog.testing.capture_logs() as logs:
+            outcome = runner.maybe_purge()
+
+        dry = self._events(logs, "purge_dry_run")
+        assert len(dry) == 1
+        assert dry[0]["blocked_by"] == outcome.skipped_reason
+        assert "arrhenius:sweep" in dry[0]["blocked_by"]
+        assert dry[0]["volumes_uL"] == {0: 10.0, 1: 20.0, 2: 10.0}
+        # The refusal is still recorded under its own name — this adds a line,
+        # it does not rename the deferral out from under anyone grepping for it.
+        assert self._events(logs, "purge_skipped")
+
+    def test_a_blocked_tick_says_it_did_not_reset_the_timer(self):
+        """The one field that separates the two dry lines."""
+        import structlog
+
+        runner, _, _, _ = self._blocked()
+        with structlog.testing.capture_logs() as logs:
+            runner.maybe_purge()
+        assert self._events(logs, "purge_dry_run")[0]["timer_reset"] is False
+
+        free, _, _ = _due_runner(_Manager(), settings=_settings(actuate=False))
+        with structlog.testing.capture_logs() as logs:
+            free.maybe_purge()
+        assert self._events(logs, "purge_dry_run")[0]["timer_reset"] is True
+
+    def test_a_blocked_tick_never_calls_note_purged(self):
+        """Asserted on the call, not on the consequence.
+
+        ``due()`` being non-None afterwards would also hold if the reset landed
+        and the clock had moved on again, so the observable that actually
+        distinguishes "skipped it" from "did it and it did not show" is the call.
+        """
+        runner, sched, _, _ = self._blocked()
+        calls: list = []
+        sched.note_purged = lambda *a, **kw: calls.append(a)   # type: ignore[method-assign]
+
+        runner.maybe_purge()
+
+        assert calls == []
+
+    def test_overdue_keeps_climbing_across_blocked_dry_ticks(self):
+        """The trap: "log the outcome" must not become "reset by another route"."""
+        runner, sched, clock, syringe = self._blocked()
+
+        seen = [sched.due().overdue_s]
+        for _ in range(4):
+            clock.t += 600.0
+            assert runner.maybe_purge().skipped_reason      # still refused
+            seen.append(sched.due().overdue_s)
+
+        assert seen == sorted(seen) and seen[-1] > seen[0] + 2000.0
+        assert syringe.calls == []                          # and nothing moved
+
+    def test_the_actuating_path_is_unchanged_by_a_block(self):
+        """``actuate = true`` gains no dry line and still dispenses nothing."""
+        import structlog
+
+        runner, sched, _, syringe = self._blocked(actuate=True)
+
+        with structlog.testing.capture_logs() as logs:
+            outcome = runner.maybe_purge()
+
+        assert self._events(logs, "purge_dry_run") == []
+        assert outcome.skipped_reason and not outcome.dry_run
+        assert syringe.calls == []
+        assert sched.due() is not None
+
+    def test_a_blocked_tick_is_still_reported_as_a_skip_not_a_dry_run(self):
+        """The outcome's shape is load-bearing for `MainWindow._on_purge_tick`.
+
+        It shows ``summary()`` in the status bar for anything flagged
+        ``performed`` or ``dry_run``; flagging a deferral as a dry run would put
+        a message there every 30 s for the hours a sweep holds the rig.
+        """
+        runner, _, _, _ = self._blocked()
+        outcome = runner.maybe_purge()
+
+        assert outcome.dry_run is False
+        assert outcome.performed is False
+        assert outcome.skipped_reason
+        assert outcome.summary().startswith("purge skipped:")
+
+
 # ── The in-run (anneal) purge ────────────────────────────────────────────────
 
 class TestInRunPurge:

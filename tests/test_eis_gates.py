@@ -131,6 +131,40 @@ class TestPointGates:
         assert r.severity == BLOCK_POINT
         assert r.n_dropped == 3
 
+    def test_quadrant_after_finiteness_drops_exactly_the_nonpositive_real_points(self):
+        """Pin `quadrant.n_dropped` as a *negative-real count*, for its consumer.
+
+        A downstream session reads this number out of ``gate_log_json`` and treats
+        it as "how many points had ``Re Z <= 0``". That reading is only sound
+        because ``gate_finiteness`` is ``FRONT1_PRE_CORRECTION[0]`` and
+        ``gate_quadrant`` is ``[2]``: the phase clause at the top of
+        ``gate_quadrant`` is redundant with ``Re > 0`` for every *finite* point
+        (``np.angle`` is ``atan2 ∈ (−180°, 180°]``), and the one class it rejects
+        that ``Re > 0`` admits — finite positive ``Re`` with non-finite ``Im`` — has
+        already been masked away by the time quadrant runs.
+
+        Reorder the ladder, or relax ``gate_finiteness``, and the consumer starts
+        over-counting with nothing else going red. Hence this test rather than a
+        comment. Note ``<=``, not ``<``: ``Re == 0`` fails the ``Re > 0`` clause
+        while *passing* the phase clause at exactly 90°, so it is dropped too.
+        """
+        f, Z = reference_spectrum()
+        Z = Z.copy()
+        Z[:3] = -np.abs(Z[:3].real) + 1j * Z[:3].imag   # unphysical: Re Z < 0
+        Z[5] = 0.0 + 1j * Z[5].imag                     # the Re == 0 boundary
+        Z[7] = 1000.0 + 1j * np.nan                     # Re > 0, Im NaN: the split class
+
+        # Mirror `run_gates`: finiteness first, then quadrant on the survivors.
+        fin = gate_finiteness(f, Z, _ctx())
+        assert fin.n_dropped == 1, "only the Im-NaN point is non-finite here"
+        survivors = np.where(fin.mask)[0]
+        Z_surv = Z[survivors]
+
+        r = gate_quadrant(f[survivors], Z_surv, _ctx())
+        expected = int((Z_surv.real <= 0).sum())
+        assert expected > 0, "an all-valid spectrum would make this test vacuous"
+        assert r.n_dropped == expected
+
     def test_hf_inductive_truncation_removes_only_the_contiguous_run_at_the_top(self):
         f, Z = hf_phase_artifact(n_points=4)
         r = gate_hf_inductive(f, Z, _ctx())
@@ -463,7 +497,7 @@ class TestValleyFeature:
         ctx = _ctx()
         res = gate_valley_feature(f, Z, ctx)
         assert res.passed and res.severity == "flag"
-        assert "R_sol_valley" in ctx and ctx["R_sol_valley"] > 0
+        assert "R_sol_valley" in res.metrics and res.metrics["R_sol_valley"] > 0
         # Both features are named in the detail so the confusion is visible in the log.
         assert "|Z|min" in res.detail and "different features" in res.detail
 
@@ -480,9 +514,11 @@ class TestValleyFeature:
                                   noise_pct=0.2, seed=11)
         ctx = _ctx()
         res = gate_valley_feature(f, Z, ctx)
-        assert ctx["R_sol_valley"] == pytest.approx(2050.0, rel=0.25)
-        assert ctx["R_sol_valley"] > float(np.min(np.abs(Z)))
+        assert res.metrics["R_sol_valley"] == pytest.approx(2050.0, rel=0.25)
+        assert res.metrics["R_sol_valley"] > float(np.min(np.abs(Z)))
         assert res.metrics["valley_over_zmin"] > 1.0
+        # C: the valley is reported through `metrics`, never by mutating the shared ctx.
+        assert "R_sol_valley" not in ctx and "f_valley" not in ctx
 
     def test_a_spectrum_with_no_interior_minimum_is_rejected_not_approximated(self):
         # A pure series RC has -Z'' falling monotonically: no valley exists, and

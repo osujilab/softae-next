@@ -294,6 +294,8 @@ class PurgeRunner:
         if due is None:
             return PurgeOutcome()
 
+        settings = self._scheduler.settings
+
         blocking = self._blocking_reason(allow_positioning=allow_positioning,
                                          owns_rig=owns_rig)
         if blocking is None:
@@ -306,23 +308,50 @@ class PurgeRunner:
             # recomputes the same purge as still owed, with overdue_s larger.
             logger.info("purge_skipped", context=context, reason=blocking,
                         overdue_s=round(due.overdue_s, 1))
+            if not settings.actuate:
+                # The dry tick is emitted even though the purge was refused, and
+                # WITHOUT `note_purged`. Both halves are the operator's ruling:
+                #
+                # * Emitted, because the harness ships inert and the dry line is
+                #   the only evidence it is alive. A whole-rig claim — an
+                #   Arrhenius sweep holds one for hours — used to suppress the
+                #   dry tick entirely, so a multi-hour run logged no cadence at
+                #   all and "deferring" was indistinguishable from "switched off".
+                # * Without the reset, because under `actuate = false` a deferral
+                #   is the ONLY thing that lets `overdue_s` grow. Resetting here
+                #   would flatten the very signal the purge badge is built on and
+                #   the sidebar would read "scheduled" straight through a sweep it
+                #   was deferring across.
+                self._log_dry_tick(due, context=context, blocked_by=blocking)
             self._note_deferred(due, reason=blocking)
             return PurgeOutcome(skipped_reason=blocking, volumes_uL=due.volumes_uL)
 
-        settings = self._scheduler.settings
         if not settings.actuate:
             # Dry run: report, and reset the timer so the log shows the intended
             # cadence rather than one continuous "overdue" state.
-            logger.info(
-                "purge_dry_run", context=context, volumes_uL=due.volumes_uL,
-                total_uL=due.total_uL, overdue_s=round(due.overdue_s, 1),
-                msg="[purge] actuate is off — nothing dispensed",
-            )
+            self._log_dry_tick(due, context=context, blocked_by=None)
             self._scheduler.note_purged()
             return PurgeOutcome(dry_run=True, volumes_uL=due.volumes_uL)
 
         return self._perform(due, context=context,
                              end_at_idle_rest=end_at_idle_rest)
+
+    def _log_dry_tick(self, due: Any, *, context: str,
+                      blocked_by: str | None) -> None:
+        """The inert harness's one visible heartbeat: a purge came due.
+
+        One event name for both cases, so ``purge_dry_run`` answers "is the
+        schedule running?" without the reader having to know whether the rig
+        happened to be claimed at the time. ``blocked_by`` and ``timer_reset``
+        carry the difference, and ``timer_reset`` is the field that says whether
+        ``overdue_s`` will be back at zero on the next tick.
+        """
+        logger.info(
+            "purge_dry_run", context=context, volumes_uL=due.volumes_uL,
+            total_uL=due.total_uL, overdue_s=round(due.overdue_s, 1),
+            blocked_by=blocked_by, timer_reset=blocked_by is None,
+            msg="[purge] actuate is off — nothing dispensed",
+        )
 
     def _perform(self, due: Any, *, context: str,
                  end_at_idle_rest: bool = True) -> PurgeOutcome:

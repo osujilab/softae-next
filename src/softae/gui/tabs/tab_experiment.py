@@ -110,6 +110,9 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
     _sig_state_change = Signal(str, str)                # old_state, new_state
     _sig_workflow_done = Signal(int)                    # exit_code (0=ok, 1=error)
     _sig_channel_hold = Signal(str, int, float)         # channel, consecutive, timeout_s
+    # The run has come to rest in a pause wait / has left one. Fired on the
+    # executor's asyncio thread, so it crosses here and nowhere else.
+    _sig_pause_hold = Signal(bool)                      # held
     # Public signal: sidebar / external widgets listen to this.
     workflow_status_changed = Signal(str)               # human-readable status text
     catalogs_changed = Signal()                         # re-emitted when the editor saves catalogs
@@ -140,6 +143,18 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
         # The live consecutive-failure prompt, if one is open (see
         # `_ui_channel_hold`) — held only so Qt does not collect it.
         self._hold_box: QMessageBox | None = None
+        #: ``(channel, consecutive, timeout_s)`` of the consecutive-failure
+        #: ceiling the run is being held at, or ``None``.
+        #:
+        #: This records *why* the run is held; ``on_pause_hold`` records
+        #: *whether*. Neither is a substitute for the other and the pair is
+        #: deliberately not collapsed: an ordinary operator pause also fires
+        #: ``on_pause_hold(True)``, and relabelling the button on that would
+        #: strand the operator with no way back. It is the two together that
+        #: identify a ceiling hold — announced by `on_channel_failure_hold`,
+        #: actually entered when the run comes to rest, and left when
+        #: `on_pause_hold(False)` says the wait is over.
+        self._ceiling_hold: tuple[str, int, float] | None = None
         self._results: list[dict[str, Any]] = []
         self._eis_results: list[EISResult] = []  # captured EIS data
         # Task catalog drives step generation (deposition recipes + EIS task
@@ -580,6 +595,7 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
         self._sig_state_change.connect(self._ui_state_change)
         self._sig_workflow_done.connect(self._ui_workflow_done)
         self._sig_channel_hold.connect(self._ui_channel_hold)
+        self._sig_pause_hold.connect(self._ui_pause_hold)
 
     # ── Formulation table ────────────────────────────────────────────────
 
@@ -1775,7 +1791,14 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
                 # the consecutive-failure ceiling fires the same callback, which
                 # is exactly right — that is also a moment the operator should
                 # have the rig.
-                self._executor.on_pause_hold = claim.set_held
+                #
+                # Wrapped rather than assigned because the hold is now also the
+                # only honest source for what the Pause button should *say*
+                # while the run is held. `_pause_hold_callback` keeps the claim
+                # handling first and untouched, and adds the GUI crossing after
+                # it: this runs on the executor's asyncio thread, so the tab is
+                # reached by signal emission and never by a direct widget call.
+                self._executor.on_pause_hold = self._pause_hold_callback(claim)
                 try:
                     loop.run_until_complete(self._executor.run(wf))
                 finally:
@@ -1836,6 +1859,32 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
         self, channel: str, consecutive: int, timeout_s: float
     ) -> None:
         self._sig_channel_hold.emit(str(channel), int(consecutive), float(timeout_s))
+
+    def _pause_hold_callback(self, claim):
+        """Build the ``on_pause_hold`` handler for one run's claim.
+
+        Two things happen when a run comes to rest in a pause wait, and their
+        order is the whole of this function. The claim suspension is the
+        *safety* half — it is what re-enables Manual Control — so it goes first
+        and is not wrapped in anything that could skip it. Telling the tab is a
+        *courtesy*, so a failure there is logged and swallowed rather than
+        allowed to strand a suspension half-applied.
+
+        Called on the executor's asyncio thread. Nothing here may touch a
+        widget; ``_sig_pause_hold`` is the crossing, and it is the same
+        signal-then-slot pattern every other executor callback on this tab uses.
+        """
+        def _on_hold(held: bool) -> None:
+            claim.set_held(held)
+            try:
+                self._sig_pause_hold.emit(bool(held))
+            except Exception:
+                # A deleted tab (shutdown mid-hold) is the realistic case, and
+                # the claim has already moved, which is the part that matters.
+                logger.warning("pause_hold_signal_failed", held=held,
+                               exc_info=True)
+
+        return _on_hold
 
     def _cb_state_change(self, old: ExecutorState, new: ExecutorState) -> None:
         self._sig_state_change.emit(old.name, new.name)
@@ -1980,6 +2029,11 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
         offers the two answers; every other control stays live, including doing
         nothing and going to look at the rig.
         """
+        # Recorded before anything is drawn. `on_channel_failure_hold` fires
+        # before the executor enters its pause wait, so this always lands ahead
+        # of the `_sig_pause_hold(True)` that follows it — same emitting thread,
+        # same queued connection, so the order is FIFO rather than hopeful.
+        self._ceiling_hold = (str(channel), int(consecutive), float(timeout_s))
         QApplication.beep()
         self._lbl_status.setText(
             f"Held — {consecutive} channels failed in a row (last: {channel})"
@@ -2035,6 +2089,43 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
         elif clicked is abort_btn:
             self._executor.abort()
 
+    def _ui_pause_hold(self, held: bool) -> None:
+        """The run came to rest in a pause wait, or left one. GUI thread.
+
+        Only the **ceiling** hold changes what the button says. An ordinary
+        operator pause also fires this callback, and relabelling on that would
+        take away the one control that gets the operator's own pause back.
+
+        **Relabelled, not disabled.** Continuing the plate is one of the two
+        legitimate answers to a ceiling hold, and the prompt that offers it is
+        deliberately non-modal — closing it without answering is a third answer
+        (*I am going to go and look*), after which this button is the only way
+        left to say "carry on". Disabling it would turn the hold into the
+        lockout `_ui_channel_hold` exists to avoid. So the press keeps working
+        and the words stop lying: the run is not waiting for a pause, it is
+        already held, and the button names the answer it actually gives.
+        """
+        if held:
+            if self._ceiling_hold is None:
+                return
+            channel, consecutive, timeout_s = self._ceiling_hold
+            self._btn_pause.setText("▶  Continue plate")
+            self._btn_pause.setToolTip(
+                f"The run is already held for you — {consecutive} channels "
+                f"failed in a row (last: {channel}). Nothing is moving, so "
+                "there is nothing to pause.\n\n"
+                "Press to continue the plate, or Abort to stop the run. If "
+                f"nobody answers within {timeout_s / 60:.0f} min the run parks "
+                "itself and stops."
+            )
+            return
+
+        self._ceiling_hold = None
+        self._btn_pause.setToolTip("")
+        running = (self._executor is not None
+                   and self._executor.state is ExecutorState.RUNNING)
+        self._btn_pause.setText("⏸  Pause" if running else "▶  Resume")
+
     def _ui_state_change(self, old_state: str, new_state: str) -> None:
         if new_state == "PAUSED":
             self._lbl_status.setText("Paused")
@@ -2042,7 +2133,13 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
             # The executor can pause itself (the consecutive-failure hold), and a
             # button still reading "Pause" is then a button that says the opposite
             # of what pressing it does.
-            self._btn_pause.setText("▶  Resume")
+            #
+            # Not while a ceiling hold owns the button, though: `_ui_pause_hold`
+            # has put more specific words on it, and a later PAUSED transition
+            # (an abort racing the hold, a re-entered wait) must not quietly
+            # demote them back to the generic pair.
+            if self._ceiling_hold is None:
+                self._btn_pause.setText("▶  Resume")
         elif new_state == "RUNNING":
             self._lbl_status.setText("Running…")
             self.workflow_status_changed.emit("Running")
@@ -2053,7 +2150,12 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
     def _ui_workflow_done(self, exit_code: int) -> None:
         self._btn_start.setEnabled(True)
         self._btn_pause.setEnabled(False)
+        # Cleared here as well as on leaving the hold: if the tab was torn down
+        # or the signal was lost mid-hold, a stale flag would otherwise mute the
+        # next run's PAUSED relabelling for the life of the process.
+        self._ceiling_hold = None
         self._btn_pause.setText("⏸  Pause")
+        self._btn_pause.setToolTip("")
         self._btn_abort.setEnabled(False)
 
         # `None` (no executor) and `[]` (an executor that skipped nothing) are

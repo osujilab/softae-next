@@ -1153,24 +1153,28 @@ class MainWindow(QMainWindow):
             from softae.core.safe_park import safe_park
 
             retract = not getattr(self, "_skip_exit_retract", False)
-            # ``rh_dry_purge=True``: an orderly exit leaves *dry gas flowing*
-            # rather than zeroing the humidifier. Duty 0 trips the Trinket's
-            # explicit auto-shutoff (`dac0_rh/code.py`, `if ctrl == 0`), which
-            # closes both Aalborg PSVs and lets room air back into the chamber —
-            # so a clean close was collapsing a dry chamber toward room RH and
-            # charging every GUI restart a full re-dry. The host commands
+            # The close leaves the chamber *purging dry* rather than zeroing the
+            # humidifier, and no argument here selects that. Duty 0 trips the
+            # Trinket's explicit auto-shutoff (`dac0_rh/code.py`, `if ctrl == 0`),
+            # which closes both Aalborg PSVs and lets room air back into the
+            # chamber — so a clean close was collapsing a dry chamber toward room
+            # RH and charging every GUI restart a full re-dry. The host commands
             # ``out_min`` and goes away; the *device* decides when to stop, via
             # its own ``ctrl_timeout`` deadman. Nothing here times that window:
             # raising ``ctrl_timeout`` on the Trinket lengthens the purge with no
             # change on this side, which a host-side timer would silently
             # truncate.
             #
-            # Deliberately not extended to the E-Stop, fault-class parks or
-            # crash/unclean-shutdown recovery — operator ruling: an emergency
-            # stop that leaves gas flowing is not an emergency stop. That
-            # boundary is asserted in ``tests/test_safe_exit.py``.
+            # Operator ruling, 2026-08-24: this is now **every** park's end
+            # state, E-Stop and fault-class and crash/unclean-shutdown recovery
+            # included, on the grounds that dry gas carries very little volatile
+            # species. It reverses the earlier ruling this comment used to state
+            # — that the dry exit was opt-in and the safety paths deliberately
+            # stayed out — and the opt-in flag it named is gone. What this file
+            # still asserts in ``tests/test_safe_exit.py`` is that the exit park
+            # reaches the dry purge and encodes no duration for it.
             result = safe_park(self._manager, reason="application closing",
-                               retract_head=retract, rh_dry_purge=True)
+                               retract_head=retract)
             # ``severe``, not ``not ok``. This close is unattended by definition,
             # so the log line is the only account of it — and ``ok`` is true of a
             # park that raised nothing *because it reached nothing*, which on the

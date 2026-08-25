@@ -101,24 +101,26 @@ class _SafeExitWorker(QThread):
     def run(self) -> None:
         from softae.core.safe_park import safe_park
 
-        # ``rh_dry_purge=True`` for the same reason the window's exit park asks
-        # for it, and to the same effect: the two orderly ways out of the GUI
-        # must not leave the chamber in two different humidity states. Duty 0
-        # is not the dry end — it trips the Trinket's auto-shutoff
-        # (`dac0_rh/code.py`, `if ctrl == 0`), closing both PSVs and admitting
-        # room air. ``out_min`` keeps dry gas moving and the device's own
-        # ``ctrl_timeout`` deadman closes the valves; the host sets no duration,
-        # so lengthening ``ctrl_timeout`` on the Trinket lengthens the purge
-        # with no change here.
+        # The chamber is left *purging dry*, and nothing here asks for that.
+        # Operator ruling, 2026-08-24: **every** park purges dry — this button,
+        # the window's close, the E-Stop, fault-class parks and crash recovery
+        # alike — because dry gas carries very little volatile species, so the
+        # flow it leaves behind is not the hazard the earlier opt-in rule took
+        # it for. That reverses the rule this comment used to state, under which
+        # the E-Stop deliberately did not opt in. The choice now lives entirely
+        # inside ``safe_park``; there is no caller-side flag left to pass.
         #
-        # The E-Stop, sitting next to this button, deliberately does *not* opt
-        # in — see ``emergency_stop.py`` and the boundary test in
-        # ``tests/test_safe_exit.py``.
+        # Why dry rather than zeroed: duty 0 is not the dry end. It trips the
+        # Trinket's auto-shutoff (`dac0_rh/code.py`, `if ctrl == 0`), closing
+        # both PSVs and admitting room air. ``out_min`` keeps dry gas moving,
+        # and the device's own ``ctrl_timeout`` deadman closes the valves. The
+        # host names no duration, so lengthening ``ctrl_timeout`` on the Trinket
+        # lengthens the purge with no change here — see
+        # ``tests/test_safe_exit.py`` for both halves as tests.
         result = safe_park(
             self._manager,
             reason="operator safe exit",
             retract_head=self._retract_head,
-            rh_dry_purge=True,
         )
         self.done.emit(result)
 

@@ -527,16 +527,29 @@ class TestTheTabsWireIt:
         tab = ExperimentBuilderTab(mk(config={}))
         try:
             tab._exp_logger = None
-            try:
-                tab._sig_workflow_done.disconnect()
-            except (RuntimeError, TypeError):
-                pass
+            for sig in (tab._sig_workflow_done, tab._sig_pause_hold):
+                try:
+                    sig.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
             executor = self._drive(tab, "_run_workflow_thread",
                                    Workflow(name="cast_series"))
+            # HT *wraps* the handle rather than assigning it bare, because the
+            # same hold now also decides what its Pause button may say while the
+            # run is held at the consecutive-failure ceiling — and that crossing
+            # has to leave the executor's asyncio thread by signal. So the
+            # identity check lives on the sandbox twin below, which still
+            # assigns bare, and what is asserted here is that a handle arrived,
+            # that firing it reaches the claim rather than raising, and that it
+            # did not outlive the claim it points at. Owner-correctness for HT
+            # is pinned against a real registry by `tests/test_tab_experiment.py
+            # ::TestCeilingHoldLegibility::test_the_hold_still_suspends_the_runs_claim`.
+            assert len(executor.seen) == 1 and callable(executor.seen[0])
+            executor.seen[0](True)
+            executor.seen[0](False)
         finally:
             tab.close()
 
-        assert executor.seen == [NULL_RIG_CLAIM.set_held]
         assert executor.on_pause_hold is None, "the handle outlived its claim"
 
     def test_the_sandbox_tab_is_wired_identically(self, qapp, qt):

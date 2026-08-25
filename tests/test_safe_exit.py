@@ -38,13 +38,42 @@ class _Syringe:
         raise AssertionError("a park must not halt pumps with a dispense")
 
 
+class _RH:
+    """A humidity controller double, hand-written rather than a ``MagicMock``.
+
+    Specced by hand on purpose. An unspecced mock grows ``safe_dry`` on demand,
+    so a park that had stopped dry-purging would still look exactly like one
+    that did — ``SUBAGENT_RULES`` §3's first shape, and the one already caught
+    once on this code path.
+
+    ``safe_dry`` and ``safe_off`` are counted separately because the whole
+    question these doubles exist to answer is *which of the two* a park reached.
+    """
+
+    is_connected = True
+    #: What the driver reports it actually held the duty at. Non-zero, because
+    #: zero is the firmware's auto-shutoff rather than its dry end.
+    last_safe_dry_duty = 0.05
+    last_safe_dry_error = ""
+
+    def __init__(self):
+        self.dried = 0
+        self.zeroed = 0
+
+    def safe_dry(self) -> None:
+        self.dried += 1
+
+    def safe_off(self) -> None:
+        self.zeroed += 1
+
+
 class _Manager:
-    def __init__(self, syringe=None):
-        self._syringe = syringe
+    def __init__(self, syringe=None, **instruments):
+        self._instruments = {"syringe": syringe, **instruments}
 
     def get(self, name: str):
-        if name == "syringe":
-            return self._syringe
+        if name in self._instruments:
+            return self._instruments[name]
         raise KeyError(name)
 
 
@@ -158,34 +187,31 @@ class TestHeadIsDown:
         assert not self._detect(_Manager(Broken()))
 
 
-# ── The dry-purge boundary ───────────────────────────────────────────────────
+# ── The purge duration belongs to the device ─────────────────────────────────
 #
-# Asserted over the call sites themselves rather than over behaviour, because
-# the guarantee is about code that does not exist: *no safety path opts in*. A
-# behavioural test can only check the sites someone remembered to write one for,
-# and the failure being guarded against is a future edit adding a fifth site or
-# flipping one of these four. Reading the source is what makes that trip.
+# What used to live here was a *boundary*: an AST sweep proving that the safety
+# paths did not opt into the dry purge while these two exits did. **Operator
+# ruling, 2026-08-24 dissolved that boundary** — every park purges dry now, the
+# E-Stop included, on the grounds that dry gas carries very little volatile
+# species. With no boundary there is nothing for a call-site test to police: the
+# end state is chosen inside ``safe_park``, where no reading of *our* call sites
+# can observe it. Those tests are gone, replaced by behavioural ones over our
+# two paths further down.
+#
+# What survives is the other constraint, which never depended on the boundary:
+# **the purge window is the firmware's and must not be encoded host-side.** That
+# one is still a claim about code that does not exist — no literal, no timer, no
+# duration argument — so reading the source is still the only way to make it
+# trip.
 
 _PARK_FUNCS = {"safe_park", "safe_park_async"}
 
-#: Orderly, operator-initiated exits: dry gas keeps flowing, and the *device*
-#: decides for how long via its own ``ctrl_timeout``.
-DRY_PURGE_SITES = {
+#: The two park call sites this file owns: the Safe Exit button's worker and the
+#: window's exit park. Not a policy set any more — every park behaves alike —
+#: simply the two places our code enters :func:`softae.core.safe_park.safe_park`.
+OUR_PARK_SITES = {
     "src/softae/gui/main_window.py": "_safe_park_on_exit",
     "src/softae/gui/widgets/safe_exit.py": "run",
-}
-
-#: Safety paths. Every one of these zeroes the humidifier immediately, closing
-#: both Aalborg PSVs — operator ruling: an emergency stop that leaves gas
-#: flowing is not an emergency stop.
-ZEROING_SITES = {
-    "src/softae/gui/widgets/emergency_stop.py": "the E-Stop",
-    "src/softae/core/autonomous_wiring.py": "the fault-class campaign park",
-    # Both of this module's parks. ``ParkGuard.park`` is the shared body behind
-    # a signal handler, the campaign CLI's teardown *and* the campaign's abort
-    # catch-all, so an opt-in there could not be confined to the orderly half.
-    "src/softae/core/shutdown.py": "crash and signal recovery",
-    "src/softae/gui/widgets/unclean_shutdown.py": "unclean-shutdown recovery",
 }
 
 
@@ -224,68 +250,8 @@ def _park_calls(rel_path: str):
     return [(owner[k][1], k[0], call) for k, call in sorted(calls.items())]
 
 
-def _dry_purge_arg(call):
-    """The ``rh_dry_purge`` argument node, ``None`` if the call omits it.
-
-    A ``**kwargs`` splat returns the splat node: it cannot be shown to withhold
-    the purge, and on a safety path *unproven* is treated as *failed*.
-    """
-    for kw in call.keywords:
-        if kw.arg in (None, "rh_dry_purge"):
-            return kw.value
-    return None
-
-
-def _is_true(node) -> bool:
-    import ast
-
-    return isinstance(node, ast.Constant) and node.value is True
-
-
-class TestTheDryPurgeIsOrderlyExitsOnly:
-    """The boundary, as a test rather than a promise."""
-
-    @pytest.mark.parametrize("rel_path,what", sorted(ZEROING_SITES.items()))
-    def test_no_safety_path_asks_for_a_dry_purge(self, rel_path, what):
-        import ast
-
-        calls = _park_calls(rel_path)
-        # Anti-vacuity: a renamed import or a moved call must fail here rather
-        # than silently reduce this to an assertion over an empty list.
-        assert calls, f"no safe_park call found in {rel_path} — has {what} moved?"
-
-        for func, line, call in calls:
-            arg = _dry_purge_arg(call)
-            proven_off = arg is None or (isinstance(arg, ast.Constant)
-                                         and arg.value is False)
-            assert proven_off, (
-                f"{rel_path}:{line} ({func}) — {what} must zero the humidifier "
-                "immediately. A dry purge leaves both Aalborg PSVs open until "
-                "the Trinket's own deadman closes them; that is the right trade "
-                "for a planned exit and the wrong one for a safety path."
-            )
-
-    @pytest.mark.parametrize("rel_path,func_name", sorted(DRY_PURGE_SITES.items()))
-    def test_both_orderly_exits_ask_for_a_dry_purge(self, rel_path, func_name):
-        """The other half, and the control on the half above.
-
-        Without it the safety assertion would still pass with the feature
-        deleted entirely — and it is what shows the reader that this file's
-        detector can tell ``True`` from its absence.
-        """
-        sites = [(f, line, call) for f, line, call in _park_calls(rel_path)
-                 if f == func_name]
-        assert len(sites) == 1, (
-            f"expected exactly one park call in {rel_path}::{func_name}, "
-            f"found {len(sites)}"
-        )
-        _f, line, call = sites[0]
-        assert _is_true(_dry_purge_arg(call)), (
-            f"{rel_path}:{line} ({func_name}) — an orderly exit must pass "
-            "rh_dry_purge=True. Duty 0 is the firmware's auto-shutoff, not its "
-            "dry end: it closes both PSVs and lets room air back into the "
-            "chamber."
-        )
+class TestThePurgeWindowIsTheDevices:
+    """The one constraint the 2026-08-24 ruling left standing."""
 
     def test_no_orderly_exit_encodes_the_purge_duration(self):
         """The window belongs to the device, and to no host-side constant.
@@ -295,13 +261,23 @@ class TestTheDryPurgeIsOrderlyExitsOnly:
         silently truncate the purge the moment ``ctrl_timeout`` is raised — the
         wrong value wearing the safe value's clothes. So neither exit site may
         name a duration at all, whether as a literal or as an argument.
+
+        Unchanged by the ruling that dissolved the opt-in boundary above: it was
+        never about *which* paths purge dry, only about who owns the clock.
         """
         import ast
 
-        for rel_path, func_name in sorted(DRY_PURGE_SITES.items()):
-            for func, line, call in _park_calls(rel_path):
-                if func != func_name:
-                    continue
+        for rel_path, func_name in sorted(OUR_PARK_SITES.items()):
+            sites = [(f, line, call) for f, line, call in _park_calls(rel_path)
+                     if f == func_name]
+            # Anti-vacuity, and it used to be supplied by the sibling test that
+            # the ruling removed: a renamed or moved call must fail here rather
+            # than quietly reduce the loop below to zero iterations.
+            assert len(sites) == 1, (
+                f"expected exactly one park call in {rel_path}::{func_name}, "
+                f"found {len(sites)} — has the exit park moved?"
+            )
+            for func, line, call in sites:
                 timing = [kw.arg for kw in call.keywords
                           if kw.arg and any(t in kw.arg for t in
                                             ("duration", "timeout", "seconds",
@@ -391,25 +367,6 @@ class TestTheButton:
 
         assert parked[0]["retract_head"] is True
         assert syr.retracted == 1
-
-    def test_it_asks_for_the_rh_dry_purge(self, qtbot, button, monkeypatch):
-        """Both orderly ways out of the GUI leave the chamber in the same state.
-
-        Safe Exit and the window's own close are the same act with different
-        buttons, so they park the humidifier the same way: dry gas still
-        flowing, the Trinket's ``ctrl_timeout`` deadman closing the valves.
-        Duty 0 is the firmware's auto-shutoff, not its dry end — it shuts both
-        PSVs and admits room air.
-        """
-        btn, _syr, parked = button
-        monkeypatch.setattr(btn, "_ask_head_choice", lambda: True)
-
-        with qtbot.waitSignal(btn.exit_requested, timeout=3000):
-            btn.click()
-
-        assert parked[0]["rh_dry_purge"] is True
-        # The head decision must survive the new argument, not be replaced by it.
-        assert parked[0]["retract_head"] is True
 
     def test_a_raised_head_is_never_asked_about(self, qtbot, monkeypatch):
         """The prompt appears only when there is a decision to make."""
@@ -515,3 +472,139 @@ class TestTheButton:
 
         assert exited == [True]
         assert warned == []
+
+
+# ── Both of our exits reach the dry purge ────────────────────────────────────
+#
+# Behavioural, and deliberately so. The predecessor tests read our call sites
+# for ``rh_dry_purge=True``; after the 2026-08-24 ruling no call site chooses
+# anything, so a reading of the source can no longer tell a path that purges
+# dry from one that does not. These run the **real** ``safe_park`` against a
+# hand-written driver and ask which method it reached.
+
+
+def _spy_on_the_real_park(monkeypatch) -> list:
+    """Let the genuine park run, and collect the results it produced.
+
+    Patching in a *fake* park would only re-assert that our call sites call
+    something; the guarantee at issue is what the humidifier is left doing, and
+    only the real ``safe_park`` decides that.
+    """
+    from softae.core.safe_park import safe_park as real_safe_park
+
+    results: list = []
+
+    def spy(manager, **kwargs):
+        result = real_safe_park(manager, **kwargs)
+        results.append(result)
+        return result
+
+    monkeypatch.setattr("softae.core.safe_park.safe_park", spy)
+    return results
+
+
+def _dismiss_the_park_warning(monkeypatch) -> None:
+    """Answer *Close* to the partial-park dialog, without a human.
+
+    Not decoration. A park that failed to dry-purge lands in ``errors``, and
+    ``SafeExitButton._on_done`` then opens a **modal** warning — so the very
+    scenario these tests exist to catch would hang the suite rather than fail
+    it. Found by mutating the park to zero instead of dry: the run blocked for
+    ten minutes on a dialog nobody could see.
+    """
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(
+        QMessageBox, "warning",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Close))
+
+
+def _assert_dry_purged(rh: _RH, result) -> None:
+    """The chamber was left purging dry, on the driver *and* in the report."""
+    from softae.core.safe_park import DRY_PURGE_COMMANDED, RH_DEADMAN_S
+
+    assert rh.dried == 1, "the park never asked the humidifier for a dry purge"
+    assert rh.zeroed == 0, (
+        "the park zeroed the humidifier — duty 0 is the firmware's auto-shutoff, "
+        "so both PSVs close and room air comes back into the chamber"
+    )
+    # And it is *reported* as the deliberate standing command it is, under
+    # ``commanded`` rather than as a failure. Built from the module's own
+    # constant, so a rewording of the operator text propagates instead of
+    # breaking this.
+    assert DRY_PURGE_COMMANDED.format(duty=rh.last_safe_dry_duty,
+                                      deadman=RH_DEADMAN_S) in result.commanded
+
+
+class TestBothExitsLeaveTheChamberPurgingDry:
+    """Safe Exit and the window's close are the same act with two buttons.
+
+    They must not leave the chamber in two different humidity states — which is
+    the half of the old boundary that survived the ruling, restated as
+    behaviour. Neither test names a duration; the deadman is the device's.
+    """
+
+    def test_the_safe_exit_button_purges_dry(self, qtbot, monkeypatch):
+        from softae.gui.widgets import safe_exit as mod
+
+        rh = _RH()
+        results = _spy_on_the_real_park(monkeypatch)
+        _dismiss_the_park_warning(monkeypatch)
+
+        btn = mod.SafeExitButton(_Manager(_Syringe(up=True), rh_controller=rh))
+        qtbot.addWidget(btn)
+        with qtbot.waitSignal(btn.exit_requested, timeout=3000):
+            btn.click()
+
+        assert len(results) == 1
+        _assert_dry_purged(rh, results[0])
+
+    def test_the_windows_exit_park_purges_dry(self, monkeypatch):
+        """Driven through the real method, with only the attributes it reads.
+
+        Building a whole ``MainWindow`` would buy nothing here and drag the
+        window's construction into a test about the humidifier.
+        """
+        from types import SimpleNamespace
+
+        from softae.gui.main_window import MainWindow
+
+        rh = _RH()
+        results = _spy_on_the_real_park(monkeypatch)
+
+        MainWindow._safe_park_on_exit(
+            SimpleNamespace(_manager=_Manager(_Syringe(up=True),
+                                              rh_controller=rh)))
+
+        assert len(results) == 1, (
+            "the exit park never reached safe_park — note it swallows every "
+            "exception, so a broken call site is silent here"
+        )
+        _assert_dry_purged(rh, results[0])
+
+    def test_the_head_decision_still_reaches_the_park(self, qtbot, monkeypatch):
+        """The control on both tests above.
+
+        They would pass with the head choice dropped on the floor, so the one
+        thing our call sites genuinely still decide is pinned separately. This
+        is what shows the reader that the humidity end state being caller-free
+        is a *fact about the humidifier*, not this file having stopped looking
+        at arguments.
+        """
+        from softae.gui.widgets import safe_exit as mod
+
+        syr = _Syringe(up=False)
+        rh = _RH()
+        results = _spy_on_the_real_park(monkeypatch)
+        _dismiss_the_park_warning(monkeypatch)
+
+        btn = mod.SafeExitButton(_Manager(syr, rh_controller=rh))
+        qtbot.addWidget(btn)
+        monkeypatch.setattr(btn, "_ask_head_choice", lambda: False)
+        with qtbot.waitSignal(btn.exit_requested, timeout=3000):
+            btn.click()
+
+        assert syr.retracted == 0
+        assert any("left lowered" in a for a in results[0].actions)
+        # ...and the chamber is dry either way. The two decisions are independent.
+        _assert_dry_purged(rh, results[0])

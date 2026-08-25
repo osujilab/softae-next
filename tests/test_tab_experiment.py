@@ -320,6 +320,186 @@ class TestRunControls:
         tab._on_abort()
         tab._executor.abort.assert_called_once()
 
+
+def _pump_until(qapp, predicate, *, timeout_s: float = 15.0) -> bool:
+    """Run the Qt event loop from the main thread until *predicate* holds.
+
+    The hold is entered and left on the executor's asyncio thread, so nothing it
+    announces reaches a widget until the main thread pumps. Driving the tab
+    synchronously would exercise a path production never takes.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    qapp.processEvents()
+    return bool(predicate())
+
+
+class TestCeilingHoldLegibility:
+    """The Pause control during a consecutive-failure ceiling hold.
+
+    The executor never self-resumes, so the run sits in ``_hold_for_operator``
+    until the host answers or the deadline parks it. Through all of that the
+    ordinary reading of the button — "Pause / Resume" — describes a state the
+    run is not in: it is not waiting to be paused, it is already held, and the
+    reason is a stack of failed channels the operator has not seen yet.
+    """
+
+    @staticmethod
+    def _wire(tab, manager, *, claim=None, timeout_s: float = 60.0):
+        """Wire a real executor's hold callbacks to the tab, as a run does."""
+        from softae.gui.rig_claim import NULL_RIG_CLAIM
+
+        executor = WorkflowExecutor(
+            manager, max_consecutive_channel_failures=1,
+            channel_hold_timeout_s=timeout_s,
+        )
+        executor._state = ExecutorState.RUNNING
+        executor.on_state_change = tab._cb_state_change
+        executor.on_channel_failure_hold = tab._cb_channel_hold
+        executor.on_pause_hold = tab._pause_hold_callback(
+            NULL_RIG_CLAIM if claim is None else claim
+        )
+        tab._executor = executor
+        tab._btn_pause.setEnabled(True)
+        return executor
+
+    @staticmethod
+    def _hold_on_a_thread(executor) -> threading.Thread:
+        import asyncio
+
+        def _drive() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(executor._hold_for_operator("7", 3))
+            finally:
+                loop.close()
+
+        thread = threading.Thread(target=_drive, daemon=True)
+        thread.start()
+        return thread
+
+    def test_the_control_says_the_run_is_already_held(self, qapp, tab, manager):
+        executor = self._wire(tab, manager)
+        thread = self._hold_on_a_thread(executor)
+        try:
+            assert _pump_until(
+                qapp, lambda: "Continue plate" in tab._btn_pause.text()
+            ), f"button never relabelled (text={tab._btn_pause.text()!r})"
+
+            tip = tab._btn_pause.toolTip()
+            assert "already held" in tip
+            assert "nothing to pause" in tip
+            assert "3 channels" in tip and "7" in tip   # the reason, in words
+            # Relabelled, not disabled: continuing the plate is one of the two
+            # answers, and after the non-modal prompt is dismissed this button
+            # is the only way left to give it.
+            assert tab._btn_pause.isEnabled()
+        finally:
+            executor.abort()
+            thread.join(timeout=10.0)
+            _pump_until(qapp, lambda: not thread.is_alive())
+            if tab._hold_box is not None:
+                tab._hold_box.close()
+        assert not thread.is_alive()
+
+    def test_the_control_returns_to_normal_once_the_hold_ends(
+        self, qapp, tab, manager
+    ):
+        executor = self._wire(tab, manager)
+        thread = self._hold_on_a_thread(executor)
+        try:
+            assert _pump_until(
+                qapp, lambda: "Continue plate" in tab._btn_pause.text()
+            )
+            executor.resume()                       # the operator answers
+            assert _pump_until(qapp, lambda: not thread.is_alive())
+        finally:
+            thread.join(timeout=10.0)
+            if tab._hold_box is not None:
+                tab._hold_box.close()
+
+        assert _pump_until(qapp, lambda: tab._btn_pause.toolTip() == "")
+        assert "Pause" in tab._btn_pause.text()
+        assert "Continue plate" not in tab._btn_pause.text()
+        assert tab._ceiling_hold is None
+
+    def test_the_hold_callback_touches_no_widget_on_its_own_thread(
+        self, qapp, tab, manager
+    ):
+        """The callback fires on the executor's asyncio thread.
+
+        A direct widget call from there is undefined behaviour that mostly
+        looks like it works, so the crossing is asserted as a *delay*: nothing
+        may change until the main thread pumps. Wiring ``on_pause_hold``
+        straight to ``_ui_pause_hold`` fails this and passes everything else.
+        """
+        self._wire(tab, manager)
+        tab._ceiling_hold = ("7", 3, 60.0)
+        before = tab._btn_pause.text()
+        fire = tab._executor.on_pause_hold
+
+        thread = threading.Thread(target=fire, args=(True,), daemon=True)
+        thread.start()
+        thread.join(timeout=10.0)
+        assert not thread.is_alive()
+
+        assert tab._btn_pause.text() == before, "the widget was touched directly"
+        assert _pump_until(
+            qapp, lambda: "Continue plate" in tab._btn_pause.text()
+        ), "the announcement never crossed to the GUI thread"
+
+    def test_an_ordinary_operator_pause_is_left_alone(self, qapp, tab, manager):
+        """Only the ceiling hold is special.
+
+        A run held at the operator's own Pause must keep the button that gets it
+        back; relabelling every hold would strand them.
+        """
+        self._wire(tab, manager)
+        tab._executor._state = ExecutorState.PAUSED
+        tab._ui_state_change("RUNNING", "PAUSED")
+        assert "Resume" in tab._btn_pause.text()
+
+        tab._ui_pause_hold(True)                    # no ceiling hold recorded
+
+        assert "Resume" in tab._btn_pause.text()
+        assert tab._btn_pause.toolTip() == ""
+
+    def test_the_hold_still_suspends_the_runs_claim(self, qapp, tab, manager):
+        """The safety half of the callback survived being wrapped.
+
+        Asserted on the registry rather than on the wiring: a wrapper that
+        forgot ``set_held`` would still relabel the button and still look right.
+        """
+        from softae.core.rig_activity import PURGE_INSTRUMENTS, RigActivity
+        from softae.gui.rig_claim import RigRunClaim
+
+        activity = RigActivity()
+        owner = "ht:plate"
+        activity.acquire(owner, None)
+        executor = self._wire(tab, manager, claim=RigRunClaim(activity, owner))
+
+        thread = self._hold_on_a_thread(executor)
+        try:
+            assert _pump_until(
+                qapp, lambda: "Continue plate" in tab._btn_pause.text()
+            )
+            # Suspended: manual control is permitted, but the rig is not idle.
+            assert activity.conflicts(PURGE_INSTRUMENTS) is None
+            assert activity.suspended_conflict(PURGE_INSTRUMENTS) == owner
+            executor.resume()
+            assert _pump_until(qapp, lambda: not thread.is_alive())
+        finally:
+            thread.join(timeout=10.0)
+            if tab._hold_box is not None:
+                tab._hold_box.close()
+
+        assert activity.conflicts(PURGE_INSTRUMENTS) == owner   # driving again
+
     def test_record_formulation_called_for_selected_channels(self, tab: ExperimentBuilderTab):
         tab._data_store = MagicMock()
         tab._data_store.start_run.return_value = "run123"

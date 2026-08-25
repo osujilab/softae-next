@@ -219,6 +219,8 @@ def gate_quadrant(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> GateResu
     Z = np.asarray(Z, dtype=complex)
     with np.errstate(invalid="ignore"):
         phase = np.degrees(np.angle(Z))
+        # The phase clause is no second criterion — for finite Z it is implied by
+        # `Re > 0`. It guards direct callers that bypass `gate_finiteness`'s mask.
         ok = (Z.real > 0) & (np.abs(phase) <= 90.0 + 1e-9)
     ok = np.asarray(ok, dtype=bool)
     n_bad = int((~ok).sum())
@@ -584,8 +586,6 @@ def gate_valley_feature(
 
     k = cand[0]
     r_valley = float(zr[k])
-    ctx["R_sol_valley"] = r_valley
-    ctx["f_valley"] = float(fs[k])
 
     z_abs = np.abs(Zc)
     z_min = float(np.min(z_abs[np.isfinite(z_abs)])) if np.any(np.isfinite(z_abs)) else float("nan")
