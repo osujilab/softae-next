@@ -879,25 +879,34 @@ def gate_kk_truncation(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> Gat
     staying clear of the arc.
     """
     from softae.analysis.eis.kk import (
+        DEFAULT_KK_C,
+        DEFAULT_KK_MAX_M,
         DEFAULT_KK_MAX_TRUNCATE_FRAC,
         lin_kk,
         low_frequency_run,
     )
+    from softae.analysis.eis.settings import DEFAULT_KK_RESID_PCT
 
     n = int(np.asarray(f).size)
     ok = _all_pass(n)
-    limit = float(_ctx_get(ctx, "gates", "kk_resid_pct", 1.0))
+    limit = float(_ctx_get(ctx, "gates", "kk_resid_pct", DEFAULT_KK_RESID_PCT))
 
     result = lin_kk(f, Z,
                     blocking=bool(_ctx_get(ctx, "cell", "blocking", True)),
-                    c=float(_ctx_get(ctx, "gates", "kk_c", 0.85)),
-                    max_M=int(_ctx_get(ctx, "gates", "kk_max_M", 50)))
+                    c=float(_ctx_get(ctx, "gates", "kk_c", DEFAULT_KK_C)),
+                    max_M=int(_ctx_get(ctx, "gates", "kk_max_M", DEFAULT_KK_MAX_M)))
     if not result.ok:
         return GateResult("kk_truncation", FLAG, True,
                           f"K–K test did not run: {result.error}", ok)
 
-    failing = np.asarray(result.resid_pct, dtype=float) > limit
+    resid = np.asarray(result.resid_pct, dtype=float)
+    failing = resid > limit
+    finite = resid[np.isfinite(resid)]
+    # The median is the statistic ladder-order selection minimises, so logging it is
+    # what lets an operator tell "this spectrum is noisy" from "the ladder under-fit".
     metrics = {"kk_max_resid_pct": result.max_resid_pct,
+               "kk_median_resid_pct": float(np.median(finite)) if finite.size
+               else float("nan"),
                "kk_order_M": float(result.M), "kk_mu": float(result.mu)}
 
     if not failing.any():

@@ -623,13 +623,57 @@ max_abs_z        = 1e12    # |Z| at/above this = open circuit
 # R0-CPE0-p(R1,C0), take R1, divide. "gated" adds admission gates, a per-sample
 # cell constant, and upper bounds where the measurement is resolution-limited.
 #
-# `engine` and `gates.enabled` are deliberately separate, the same two-flag
+# THE DEFAULT IS "legacy", AND IT IS PROVISIONAL. Both engines were measured
+# against a numpy-only physics anchor — Kása circle right-intercept plus
+# low-frequency Re(Y) plateau, no project analysis code — on all ten real
+# probe-3ch-v3 spectra, with `engine` passed explicitly. Legacy is closer on
+# 6 of 10; median error 5.54× low vs 8.75× low; worst case 17.9× vs 224.3×;
+# within 5× of the anchor on 5/10 vs 3/10. The decisive pair is ch32_002 and
+# ch32_003, whose bulk arc sits below the sweep floor so no Kramers-Kronig
+# change can reach them: legacy lands 4.06× and 4.83× low where gated lands
+# 224.3× and 182.7× low. SESSION_MAIL [a97].
+#
+# GATED REMAINS THE DIRECTION OF TRAVEL — this is "not yet", not "never".
+# The gated fitter is the one that converges on this rig's 1e7–1e8 Ω spectra,
+# where `circuit_fitting.fit_circuit` does not, because `fitter.fit_spectrum`
+# scales parameters spanning ~14 orders of magnitude ([e18]). And the two
+# engines fail at OPPOSITE ends of the sweep: gated is better when the arc sits
+# at the top of the band, legacy when it sits at the bottom — which is this
+# rig's present situation, reproduced synthetically (arc truncated at low f:
+# legacy recovers 0.059 of truth, gated 0.014). So what flips this default is
+# getting the arc into the band: extend the sweep downward, or gate on an
+# arc-in-band check (`arc_closure()`) so a truncated arc is never reported as
+# `R1`. Do either and gated becomes the better choice.
+#
+# THE TRUNCATION CAVEAT still holds, and it is now the reason gated is not yet
+# the default rather than a warning about the shipped path. `kk_truncation` can
+# remove low-frequency points before the fit. On spectra whose bulk arc sits at
+# the bottom of the band that removes the arc itself, and the fitted `R1` then
+# lands on a mid-band feature — measured 183×–224× below the independently
+# determined arc resistance on ch32_002/ch32_003, and ~200× on ch32_004, where
+# 13 low-f points were truncated and the fitted floor moved 1.35 Hz -> 26.5 Hz.
+# Since `sigma = cell.sigma(fit.R1)`, that is a ~200× error in sigma on those
+# spectra. Goodness-of-fit RISES in exactly those cases, because a truncated
+# subset is easier to fit — so R² must NOT be read as confirmation here.
+# SESSION_MAIL [a89].
+#
+# THE HONEST QUALIFIER: legacy being closer is not legacy being right. Both
+# engines read LOW on all ten spectra — neither over-reports — and this
+# population is dominated by spectra whose arc was never in the measured band.
+# No fitter recovers what was not measured, so NEITHER engine is fit to report
+# `R1` on 8 of these 10. Legacy's advantage here is largely that it says so: it
+# returns "arc did not close in band — R1 extrapolated" where gated returns a
+# confident wrong number ([a97] §3). The fix is the sweep, not the fitter.
+#
+# `engine` and `gates.enabled` stay deliberately separate, the same two-flag
 # design [purge] uses: engine = "gated" with gates.enabled = false runs every
-# check and logs every verdict while removing nothing. Observe the would-reject
-# log across a campaign before giving these thresholds authority over data —
-# that is the P4 lesson, applied to a strictly larger gate.
+# check and logs every verdict while removing nothing. That pairing is how
+# gated earns the default — observe the would-reject log across a campaign
+# before giving these thresholds authority over data (the P4 lesson, applied to
+# a strictly larger gate). It is not what ships today; today is legacy with the
+# gates off.
 [eis]
-engine = "legacy"          # "legacy" | "gated"
+engine = "legacy"          # "legacy" | "gated" — provisional, see [a97] above
 
 # What a campaign optimises against. Separate from `engine` on purpose, but NOT
 # in the way this comment used to claim. It said the sigma extractor "forces the
@@ -667,9 +711,35 @@ enabled             = false
 # without reference to this rig's spectra. None is calibrated yet.
 tand_slope_max      = -0.3   # d log tanδ/d log f; positive => series parasitic
 cap_flatness_max    = 0.15   # |d log C_app/d log f| before "dispersive"
-kk_resid_pct        = 1.0    # Lin-KK residual ceiling (E4)
-kk_c                = 0.85   # mu-criterion target for ladder order (Schoenleber)
-kk_max_M            = 50     # runtime bound; the mu criterion normally stops first
+# kk_resid_pct / kk_c are NOT engineering defaults from the specification. They are
+# the two thresholds on this list that have been measured against this rig, and both
+# moved off the printed value as a result. SESSION_MAIL [a91].
+kk_resid_pct        = 3.0    # was 1.0. Lin-KK residual ceiling (E4). The rig's
+                             # per-point noise floor is ~3%, measured WITHOUT any K-K
+                             # basis (robust-scaled 3-point second difference of
+                             # log|Z| and phase on the log-f grid): 1.25-5.31% over
+                             # the ten spectra of 20260820T164634Z. The lin-KK median
+                             # at kk_c=0.30 agrees spectrum by spectrum, 1.90-6.85%.
+                             # Two independent estimators, one answer; 1.0 asked the
+                             # gate to resolve drift 3x finer than the measurement
+                             # resolves anything.
+kk_c                = 0.30   # was 0.85 (Schoenleber's published value). At 0.85 the
+                             # mu-criterion stops the Voigt ladder at M~5, which
+                             # leaves a ~2.5% SYSTEMATIC residual with a low-frequency
+                             # lobe on a spectrum that is NOISE-FREE and exactly
+                             # causal by construction - 33 of 53 points over 1% - and
+                             # the gate then truncates the run its own basis created.
+                             # See analysis/eis/kk.py: the durable half of that fix is
+                             # the order-selection rule, not this number.
+kk_max_M            = 50     # the walk reaches this on EVERY spectrum now: mu <=
+                             # kk_c filters candidate orders, it no longer stops
+                             # the walk, which exits early only after 3 consecutive
+                             # orders under the mu floor. The selected rung is the
+                             # one with the minimum median residual. Cost: lin_kk
+                             # went from ~0.04-0.1s to ~0.5-1.0s per 53-point
+                             # spectrum, roughly +16-32s per 32-channel round.
+                             # Lower this to buy that back, at the price of ladder
+                             # flexibility. See analysis/eis/kk.py.
 # Largest fraction of the band the low-f K-K truncation may remove before the
 # spectrum is REJECTED instead of cut. The ladder fit is global, so a drift in the
 # few lowest-frequency points shifts the whole fit and makes almost every point
