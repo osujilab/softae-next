@@ -183,30 +183,6 @@ EXAMPLE_CHANNELS = "18-32"
 #: "there is a run id and it is blank".
 CLAIM_KIND = "tool:eis-validate"
 
-#: Exit statuses whose park is an **orderly** one, as opposed to a fault class.
-#:
-#: **Currently unused, and left standing deliberately.** Its only consumer was
-#: the end-of-run ``safe_park`` call, which used it to pick the humidifier's end
-#: state: orderly exits got a dry purge, fault exits kept duty 0. That choice no
-#: longer exists -- operator ruling 2026-08-24, recorded in ``core/safe_park.py``
-#: with the rule it reversed: **every** park dry-purges now, because dry gas
-#: carries very little volatile species and duty 0 is the firmware's
-#: auto-shutoff, which collapses the chamber to room RH.
-#:
-#: It is not deleted here because that is a separate decision from the one the
-#: ruling made, and the distinction it draws is still a real one this file
-#: computes cheaply from ``outcome["status"]``:
-#:
-#: * ``done`` -- the run finished, or found nothing to measure.
-#: * ``aborted`` -- a *decision*. A gate refused, or the rig was claimed. Nothing
-#:   faulted.
-#: * ``interrupted`` -- the operator pressed Ctrl-C and will very likely restart.
-#:
-#: ``error`` is absent: an unnamed exception is this harness's fault class.
-#: If nothing has taken it up by the time ``safe_park``'s deprecated
-#: ``rh_dry_purge`` parameter is removed, delete it then.
-ORDERLY_EXIT_STATUSES = frozenset({"done", "aborted", "interrupted"})
-
 #: What ``--end-state hold`` leaves behind, said accurately.
 #:
 #: It replaces *"the heater and humidifier are STILL DRIVEN"*, which was half
@@ -898,25 +874,40 @@ def _rig_claim(manager: Any, plan: ValidationPlan, run_id: str,
     caution. It falls back to empty when the stream could not be opened -- see
     :attr:`~softae.tools.eis_validate_narrate.RunNarration.log_path`.
 
-    **Why the ``--mock`` gate is here and not left to ``held_rig_session``.**
-    ``tools/env_hold.py``, the tool this follows, passes its manager in
-    unconditionally on the stated grounds that ``held_rig_session`` "skips the
-    claim entirely when every driver is a mock, so ``--mock`` claims nothing and
-    cannot lock out a real run". That invariant is true there and **false here**,
-    measured rather than assumed: ``session_is_simulated`` recognises a mock by
-    the ``Mock`` prefix on its class name, and ``--mock`` in this tool swaps in
-    :mod:`~softae.tools.eis_validate_mock`'s ``GridAwareMockPico``,
+    **Why the ``--mock`` gate is here rather than left to ``held_rig_session``.**
+    The original reason is **retracted**. It was that
+    :func:`~softae.core.rig_session.session_is_simulated` recognised a mock by
+    the ``Mock`` prefix on its class *name*, while ``--mock`` in this tool swaps
+    in :mod:`~softae.tools.eis_validate_mock`'s ``GridAwareMockPico``,
     ``FastMockTempController`` and ``FastMockRHController`` -- legitimately-named
-    subclasses of the shipped mocks, none of which carries that prefix. An
-    unconditional claim would therefore read a fully simulated manager as
-    **real** and take ``~/.softae/rig.lock`` for a run that touches no hardware:
-    precisely the "a mock run holding the rig turns a dry run into an outage for
-    a real one" the exemption exists to prevent, and it would refuse the
-    operator's GUI on the way.
+    subclasses of the shipped mocks, none of which carries that prefix -- so an
+    unconditional claim read a fully simulated manager as **real** and took
+    machine-scope ``~/.softae/rig.lock`` for a run that touches no hardware,
+    refusing the operator's GUI on the way.
 
-    Repairing the predicate is the better fix and it belongs to
-    ``core/rig_session.py``, which this file may import and must not edit. So the
-    divergence is stated here and reported there, not patched around silently.
+    ``f510af2`` repaired the predicate: it now asks :func:`isinstance` against
+    the shipped mock classes, which subclassing survives, so the exemption
+    reaches this tool's mocks and would suppress the claim on its own. That is
+    measured rather than assumed --
+    ``TestRigClaim.test_a_mock_run_neither_claims_the_rig_nor_asks_who_holds_it``
+    asserts the predicate answers ``True`` for this tool's ``--mock`` manager,
+    then stubs it to ``False`` to prove the gate below still holds alone. A
+    ``--mock`` run therefore declines the claim for two independent reasons now,
+    and both are kept:
+
+    * ``_mock_driver_classes`` is a hand-maintained registry whose own docstring
+      names its failure direction -- a mock added to :mod:`softae.drivers` and
+      forgotten there reads as *real*, as does any driver whose import fails.
+      The exemption can still return a wrong verdict; the mistake is about
+      *membership* now rather than spelling. ``plan.mock`` needs no registry.
+    * It is the same flag the ``foreign_run_lock`` peek in :func:`cmd_run` is
+      gated on, and that peek consults no predicate at all. Gating both on the
+      flag states "a ``--mock`` run claims nothing and is refused nothing" in
+      one currency instead of two.
+
+    ``tools/env_hold.py``, the tool this follows, now gates on its own ``--mock``
+    flag for the same two reasons. The redundancy here is belt and braces, not
+    dead code: do not collapse this into an unconditional ``held_rig_session``.
     """
     if plan.mock:
         return contextlib.nullcontext()

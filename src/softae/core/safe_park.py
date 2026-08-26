@@ -419,7 +419,6 @@ def safe_park(
     pump_ids: Sequence[int] = DEFAULT_PUMP_IDS,
     safe_temp_C: float = DEFAULT_SAFE_TEMP_C,
     retract_head: bool | None = None,
-    rh_dry_purge: bool | None = None,      # deprecated: accepted and ignored
 ) -> SafeParkResult:
     """Drive the rig to a safe state. Never raises.
 
@@ -444,18 +443,6 @@ def safe_park(
         offer, an operator-driven exit).
 
         ``False`` — leave it lowered, because a human said so (*Safe Exit*).
-    rh_dry_purge:
-        **Deprecated. Accepted for compatibility, ignored, and scheduled for
-        removal** once the remaining call sites stop passing it. Any value —
-        ``True``, ``False``, a variable — selects the same behaviour, described
-        below. It is retained only so that callers owned by another session keep
-        working across this change; deleting it now would raise ``TypeError`` in
-        their files.
-
-        No ``DeprecationWarning`` is raised, deliberately. This is the park path:
-        it runs during an emergency stop and during interpreter shutdown, and a
-        warning there is noise emitted at the worst possible moment on the one
-        code path that must stay quiet and finish.
 
     The humidifier end state, and the ruling that reversed
     ------------------------------------------------------
@@ -585,11 +572,12 @@ def safe_park(
     log(
         "safe_park_done",
         reason=reason or "unspecified",
-        # `rh_dry_purge` is deliberately *not* logged. It no longer selects
-        # anything, so emitting it would put a caller's dead argument into the
-        # record under a name a reader would take for the end state. The end
-        # state is in `commanded`, as `DRY_PURGE_COMMANDED` — the text that names
-        # the actual duty — or in `errors` when the purge did not land.
+        # No dry-purge *flag* is logged, and there is nothing left to log one
+        # from: the purge is unconditional, so any such field would be a constant
+        # wearing the name of an end state. What varies — and so what is worth
+        # recording — is whether it landed, which is already here: in `commanded`
+        # as `DRY_PURGE_COMMANDED`, the text that names the actual duty, or in
+        # `errors` when the write, the transport or `out_min` defeated it.
         ok=result.ok,
         commanded=result.commanded,
         verified=result.verified,
@@ -608,17 +596,15 @@ async def safe_park_async(
     pump_ids: Sequence[int] = DEFAULT_PUMP_IDS,
     safe_temp_C: float = DEFAULT_SAFE_TEMP_C,
     retract_head: bool | None = None,
-    rh_dry_purge: bool | None = None,      # deprecated: accepted and ignored
 ) -> SafeParkResult:
     """:func:`safe_park` off the event loop, for async callers (the campaign loop).
 
     The driver calls are blocking serial I/O; running them inline would stall the
     loop for seconds while it is trying to shut down cleanly.
 
-    ``rh_dry_purge`` is **deprecated, accepted and ignored**, exactly as on
-    :func:`safe_park` — it is mirrored here rather than dropped so that the two
-    signatures stay the same shape for as long as either carries it, and it is
-    not forwarded, because there is nothing on the other side to receive it.
+    The signature deliberately mirrors :func:`safe_park`'s exactly. Anything
+    accepted here and not forwarded would be a lie told at the one moment the
+    park path cannot afford one.
     """
     return await asyncio.to_thread(
         safe_park, manager,

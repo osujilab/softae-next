@@ -393,28 +393,37 @@ class TestTheParkAlwaysDryPurges:
 
     # -- the invariant itself --------------------------------------------------
 
-    @pytest.mark.parametrize("kwargs", [
-        pytest.param({}, id="no-flag"),
-        pytest.param({"rh_dry_purge": True}, id="deprecated-true"),
-        pytest.param({"rh_dry_purge": False}, id="deprecated-false"),
-        pytest.param({"rh_dry_purge": None}, id="deprecated-none"),
-    ])
-    def test_the_park_is_dry_however_the_run_ended(self, kwargs):
+    def test_the_park_is_dry_however_the_run_ended(self):
         """The end state does not depend on the caller, or on how it got here.
 
-        ``rh_dry_purge`` is still *accepted* — two call sites in another
-        session's files still pass it, and removing the parameter now would raise
-        ``TypeError`` in their code — but it selects nothing. ``False`` is the
-        value that used to mean duty 0, and it is included here precisely because
-        it is the one that changed meaning.
+        This used to be parametrized over ``rh_dry_purge`` ``True``/``False``/
+        ``None`` — the flag that once chose duty 0 versus a dry purge, and which
+        the 2026-08-24 ruling reduced to an accepted-and-ignored argument. The
+        parameter is now gone from the signature, so there is nothing left to
+        vary: the single unconditional case *is* the invariant.
         """
         mgr = _manager()
 
-        result = safe_park(mgr, reason="unit test", **kwargs)
+        result = safe_park(mgr, reason="unit test")
 
         mgr._insts["rh_controller"].safe_dry.assert_called_once()
         mgr._insts["rh_controller"].safe_off.assert_not_called()
         assert any("DRY-PURGED" in c for c in result.commanded)
+
+    @pytest.mark.parametrize("park", [safe_park, safe_park_async])
+    def test_neither_park_still_accepts_the_retired_dry_purge_flag(self, park):
+        """The removal itself, pinned on both entry points.
+
+        A rejected keyword is the only thing that distinguishes "the choice was
+        deleted" from "the choice is silently ignored" — the second is what the
+        signature said for one commit, and it is indistinguishable from the first
+        at every call site that stopped passing it. Restoring the parameter as a
+        courtesy would restore that ambiguity, so it is asserted rather than
+        assumed. ``safe_park_async`` raises before it ever awaits, which is why
+        no event loop is needed to see it.
+        """
+        with pytest.raises(TypeError, match="rh_dry_purge"):
+            park(_manager(), rh_dry_purge=False)
 
     def test_the_park_leaves_a_real_driver_at_out_min_and_not_zero(self):
         """The number on the wire, not a spy on a call name.
@@ -525,13 +534,13 @@ class TestTheParkAlwaysDryPurges:
 
     @pytest.mark.asyncio
     async def test_the_async_park_dry_purges_too(self):
-        """It no longer forwards a flag — there is none — so what needs pinning
-        is that the two entry points still reach the same end state, and that the
-        deprecated argument is accepted rather than raising ``TypeError`` at the
-        one moment a park must not."""
+        """It forwards no flag, because there is none on either side. What needs
+        pinning is only that the two entry points still reach the same end state
+        — the thing a divergence between the sync and async signatures would
+        quietly break."""
         mgr = _manager()
 
-        await safe_park_async(mgr, rh_dry_purge=False)
+        await safe_park_async(mgr)
 
         mgr._insts["rh_controller"].safe_dry.assert_called_once()
         mgr._insts["rh_controller"].safe_off.assert_not_called()

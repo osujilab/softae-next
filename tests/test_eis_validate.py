@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from softae.server.base_instrument import BaseInstrument, InstrumentState
 from softae.tools import eis_validate as V
 from softae.tools import eis_validate_hold as H
 from softae.tools import eis_validate_mock as M
@@ -462,13 +463,13 @@ def test_end_state_park_leaves_the_humidifier_dry_on_a_fault_exit_too(
 
 def test_the_end_of_run_park_asks_for_no_humidifier_end_state(
         tmp_path, monkeypatch):
-    """This call site no longer passes the deprecated `rh_dry_purge` argument.
+    """This call site passes no humidifier end state, because none exists.
 
-    The parameter survives on `safe_park` only because two call sites in another
-    session's GUI files still pass it; deleting it now would raise `TypeError`
-    there. When they drop it the parameter goes, and a kwarg re-added here would
-    be dead today and a `TypeError` that day -- on the park path, of all places.
-    So the absence is pinned rather than assumed.
+    `rh_dry_purge` is now gone from `safe_park` entirely -- it spent one commit
+    accepted-and-ignored, purely so the GUI call sites could drop it without a
+    `TypeError`, and was deleted once they had. A kwarg re-added here would
+    therefore raise, on the park path of all places, so the absence is pinned
+    rather than assumed.
     """
     parks = _park_spy(monkeypatch)
     assert V.main(["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
@@ -2563,6 +2564,58 @@ async def _boom_async(*_a, **_kw):
     raise AssertionError("no port may be opened on this path")
 
 
+class _UnplaceableDriver(BaseInstrument):
+    """A driver `session_is_simulated` cannot place -- which is what "real" means.
+
+    It opens nothing and moves nothing: `connect` sets a state field and returns.
+    The only property it exists to carry is the one that decides the claim -- it
+    is an instance of no shipped mock class, exactly as a bench `Keithley2400`
+    is an instance of no shipped mock class.
+    """
+
+    async def connect(self) -> None:
+        self._state = InstrumentState.CONNECTED
+
+    async def disconnect(self) -> None:
+        self._state = InstrumentState.DISCONNECTED
+
+    def status(self) -> dict:
+        return {"name": self.name, "state": self._state.name, "error": None}
+
+
+def _reads_as_real(manager, name="keithley"):
+    """Swap one driver so `manager` reads as a REAL rig, and check that it did.
+
+    `session_is_simulated` used to ask whether a driver's class *name* began with
+    `Mock`, and `_manager()` installs `GridAwareMockPico`, `FastMockTempController`
+    and `FastMockRHController` -- simulated subclasses that carry no such prefix --
+    so a plain `_manager()` read as real and a claim was taken. `f510af2` replaced
+    the prefix rule with `isinstance` against the shipped mock classes, which is
+    the correct predicate and which subclassing survives. `_manager()` therefore
+    reads as *simulated* now, the claim is skipped, and every assertion in
+    `TestRigClaim` would be about a lock that was never taken.
+
+    So the "this session opens real ports" fact these tests need is now stated
+    where the predicate actually reads it, rather than smuggled in through a
+    naming accident. `keithley` is the instrument taken over because this tool
+    never touches it and it is not in `MOTION_INSTRUMENTS`, so the arming
+    interlock's separate, name-based probe is left seeing an all-mock rig and
+    stays the documented no-op it is.
+
+    The assertion is the point of the helper. When the predicate next changes,
+    one named failure says so instead of six tests failing as `assert 1 == 0`.
+    """
+    from softae.core.rig_session import session_is_simulated
+
+    existing = manager.get(name)
+    manager._instruments[name] = _UnplaceableDriver(
+        name, dict(getattr(existing, "config", {}) or {}))
+    assert session_is_simulated(manager) is False, (
+        "TestRigClaim's manager still reads as simulated: no claim will be taken "
+        "and every assertion below would be about an absent lock")
+    return manager
+
+
 class TestRigClaim:
     """The tool holds the rig for exactly as long as it holds the ports.
 
@@ -2574,8 +2627,12 @@ class TestRigClaim:
 
     None of these runs passes `--mock`, deliberately: `--mock` is the one mode
     that claims nothing, so a claim test written under it would assert against
-    the exemption instead of the claim. The drivers are mocks all the same --
-    `create_manager` is patched -- and nothing here opens a real port.
+    the exemption instead of the claim. But `--mock` is no longer the *only*
+    thing that claims nothing -- `session_is_simulated` now recognises the
+    fast-clock mock subclasses this harness installs -- so declining the flag is
+    no longer enough on its own. `_run` states the missing half through
+    `_reads_as_real`, and nothing here opens a real port: the stand-in driver's
+    `connect` assigns a field.
     """
 
     ARGV = ["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
@@ -2612,7 +2669,7 @@ class TestRigClaim:
     def _run(self, tmp_path, monkeypatch, *, manager=None, name="claim", extra=()):
         # The manager is built *before* the patch: `_manager` calls the very
         # `create_manager` being replaced, so patching first is a recursion.
-        rig = _manager() if manager is None else manager
+        rig = _reads_as_real(_manager() if manager is None else manager)
         monkeypatch.setattr("softae.drivers.factory.create_manager",
                             lambda **_kw: rig)
         return V.main(self.ARGV + ["--validation-name", name,
@@ -2648,12 +2705,18 @@ class TestRigClaim:
         seen = {}
 
         def _peek(ctx, _plan, _channels):
-            lock = read_run_lock()
-            seen.update(what=lock.what, log_path=lock.log_path, run_id=ctx.run_id)
+            # The lock **or `None`** -- "no claim was taken" and "a claim with
+            # empty fields" are different facts and are not spelled alike. Judged
+            # outside the run, never in here: an exception raised inside
+            # `_establish_condition` is caught by `cmd_run` and re-emerges as
+            # EXIT_FAILED, which is how a missing claim spent seven gates
+            # presenting itself as `assert 1 == 0`.
+            seen.update(lock=read_run_lock(), run_id=ctx.run_id)
 
         monkeypatch.setattr(V, "_establish_condition", _peek)
         assert self._run(tmp_path, monkeypatch) == V.EXIT_OK
-        assert seen["what"] == f"{V.CLAIM_KIND}:{seen['run_id']}"
+        assert seen["lock"] is not None, "the run held the ports and claimed nothing"
+        assert seen["lock"].what == f"{V.CLAIM_KIND}:{seen['run_id']}"
         assert V.CLAIM_KIND == "tool:eis-validate"
 
     def test_the_claim_names_this_runs_own_run_directory(self, tmp_path,
@@ -2674,13 +2737,13 @@ class TestRigClaim:
         seen = {}
 
         def _peek(ctx, _plan, _channels):
-            lock = read_run_lock()
-            seen.update(log_path=lock.log_path, run_dir=str(ctx.run_dir))
+            seen.update(lock=read_run_lock(), run_dir=str(ctx.run_dir))
 
         monkeypatch.setattr(V, "_establish_condition", _peek)
         assert self._run(tmp_path, monkeypatch) == V.EXIT_OK
-        assert seen["log_path"] == seen["run_dir"]
-        assert events_path(seen["log_path"]).exists()
+        assert seen["lock"] is not None, "the run held the ports and claimed nothing"
+        assert seen["lock"].log_path == seen["run_dir"]
+        assert events_path(seen["lock"].log_path).exists()
 
     def test_the_claim_names_nothing_when_the_stream_could_not_be_opened(
             self, tmp_path, monkeypatch, quiet_block):
@@ -2697,9 +2760,14 @@ class TestRigClaim:
         seen = {}
         monkeypatch.setattr(
             V, "_establish_condition",
-            lambda *_a, **_kw: seen.update(log_path=read_run_lock().log_path))
+            lambda *_a, **_kw: seen.update(lock=read_run_lock()))
         assert self._run(tmp_path, monkeypatch) == V.EXIT_OK
-        assert seen["log_path"] == ""
+        # Both halves, because this is the one test where "no claim" and "a claim
+        # naming nothing" would read alike: an absent lock publishes no directory
+        # either, so an assertion on the field alone would pass while the run held
+        # the rig without saying so.
+        assert seen["lock"] is not None, "the run held the ports and claimed nothing"
+        assert seen["lock"].log_path == ""
 
     def test_the_claim_is_taken_before_any_port_is_opened(self, tmp_path,
                                                           monkeypatch, quiet_block):
@@ -2879,12 +2947,20 @@ class TestRigClaim:
         And it is not refused one either: a simulated run that took no lock must
         not be turned away over somebody else's.
 
-        The gate lives in `_rig_claim` rather than in `held_rig_session`'s own
-        exemption because that exemption cannot see it: `session_is_simulated`
-        recognises a mock by its class name's `Mock` prefix, and this tool's
-        `--mock` installs `GridAwareMockPico`, `FastMockTempController` and
-        `FastMockRHController`, none of which carries one. Measured, not assumed
-        -- the assertion below is that measurement.
+        Two runs, because there are now two independent reasons a `--mock` run
+        claims nothing and the first run alone no longer distinguishes them. The
+        gate was written into `_rig_claim` because `held_rig_session`'s exemption
+        could not see this tool's mocks: `session_is_simulated` recognised a mock
+        by its class name's `Mock` prefix, and `--mock` installs
+        `GridAwareMockPico`, `FastMockTempController` and `FastMockRHController`,
+        none of which carries one. `f510af2` replaced the prefix rule with
+        `isinstance` against the shipped mock classes, which subclassing survives,
+        so the exemption now covers them and would suppress the claim on its own.
+
+        The second run is what still pins the gate. The predicate is stubbed to
+        answer "real", putting the exemption out of the way, and
+        `acquire_run_lock` is a landmine on both import paths -- so only
+        `_rig_claim`'s own `plan.mock` gate can keep the run off it.
         """
         from softae.core.rig_session import session_is_simulated
 
@@ -2893,9 +2969,19 @@ class TestRigClaim:
         monkeypatch.setattr("softae.core.rig_session.acquire_run_lock", _boom)
         assert V.main(TestRunRowFinalization.ARGV + [
             "--validation-name", "mk", "--project", str(tmp_path)]) == V.EXIT_OK
-        # The reason the gate cannot be delegated, pinned so a later reader does
-        # not "simplify" `_rig_claim` into an unconditional `held_rig_session`.
-        assert session_is_simulated(_manager()) is False
+        # The exemption reaches this tool's mocks now. Measured, not assumed --
+        # and `_rig_claim`'s docstring records the same fact, keeping the reason
+        # it once gave for the gate as explicitly retracted history rather than
+        # deleting it. The gate survives its own original justification for the
+        # two reasons stated there; the second run below is what pins it.
+        assert session_is_simulated(_manager()) is True
+
+        # And the gate holds without it, so a later reader may not "simplify"
+        # `_rig_claim` into an unconditional `held_rig_session`.
+        monkeypatch.setattr("softae.core.rig_session.session_is_simulated",
+                            lambda _mgr: False)
+        assert V.main(TestRunRowFinalization.ARGV + [
+            "--validation-name", "mk2", "--project", str(tmp_path)]) == V.EXIT_OK
 
     # -- [p37]'s warning, checked rather than assumed -------------------------
 
