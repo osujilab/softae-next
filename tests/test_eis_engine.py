@@ -35,7 +35,31 @@ def _gated(enabled: bool = True) -> EISSettings:
 
 
 class TestEngineSelection:
-    def test_an_unconfigured_rig_selects_the_legacy_engine_because_the_gated_path_is_unvalidated(self):
+    def test_an_unconfigured_rig_selects_the_engine_whose_failure_mode_is_better_understood(self):
+        """The shipped default is ``legacy``, and this is provisional, not settled.
+
+        Measured against a numpy-only physics anchor (Kása circle right-intercept plus
+        low-f Re(Y) plateau, no project analysis code) on all ten real probe-3ch-v3
+        spectra with ``engine`` passed explicitly, legacy is closer on 6/10: median
+        error 5.54× low vs 8.75×, worst case 17.9× vs 224.3×, within 5× on 5/10 vs
+        3/10. The decisive pair is ch32_002/ch32_003, whose arc sits below the sweep
+        floor: legacy 4.06× and 4.83× low, gated 224.3× and 182.7× low ([a97] §1-§2).
+
+        The test's name is the claim, and it is literal rather than rhetorical. Legacy
+        is the engine that reports "arc did not close in band — R1 extrapolated" where
+        gated returns a confident wrong number ([a97] §3); the failure mode is better
+        understood because legacy announces it. Legacy is not thereby *right* — both
+        engines read low on all ten, and on 8 of the 10 neither is fit to report R1,
+        because the arc was never in the measured band.
+
+        Gated stays the direction of travel. Its deficit is concentrated on arcs below
+        the sweep floor — the mechanism `kk_truncation` ([a89]) describes — so
+        extending the sweep downward, or gating on ``arc_closure()``, is what flips
+        this assertion back. Expect that; do not treat this as permanent.
+
+        The second assertion is a separate claim from the first and survives either
+        setting unchanged: gates run and LOG under this default, and refuse nothing.
+        """
         assert eis_settings().engine == "legacy"
         assert eis_settings().gates.enabled is False
 
@@ -440,11 +464,21 @@ class TestGatedEngine:
         assert any("observing only" in i for i in report.quality.issues)
 
     def test_the_gate_log_survives_onto_the_report_for_every_spectrum(self):
+        # The subject is the one in the name: the log reaches the report, entry by
+        # entry, for every spectrum. Exhaustiveness was never part of that. This line
+        # once read `set(entry) == {...}`, and that closed set — incidental to the
+        # subject — made an unrelated field added to `as_log_entry` look like a
+        # regression here. The entry is an **open record**: these five keys are the
+        # contract every reader relies on, and extra keys are not a breakage.
+        # If the "no unexpected keys" property is wanted, it deserves its own named
+        # test written against `as_log_entry` in analysis/eis/gates.py, where the
+        # shape is actually defined — not a rider on this one.
         report = analyze_spectrum(as_eis_result(*reference_spectrum()),
                                   cell=CELL, settings=_gated())
         assert report.gate_log
+        required = {"gate", "severity", "passed", "detail", "n_dropped"}
         for entry in report.gate_log:
-            assert set(entry) == {"gate", "severity", "passed", "detail", "n_dropped"}
+            assert required <= set(entry), f"entry missing {required - set(entry)}"
 
     def test_a_stuck_instrument_is_rejected_before_anything_is_fitted(self):
         report = analyze_spectrum(as_eis_result(*stuck_instrument()),
@@ -835,3 +869,60 @@ class TestTelemetryNeverCostsASpectrum:
                     "text": "not a number", "none": None, "obj": object()}
         assert _finite_metrics(poisoned) == {"good": 1.5}
         assert _finite_metrics(None) == {}
+
+
+# ── The legacy dropped-point count ───────────────────────────────────────────
+
+class TestLegacyDroppedPointCountIsNotVacuous:
+    """A legacy report must count the points its own fitter withheld.
+
+    :attr:`SpectrumReport.n_dropped` sums ``n_dropped`` over the gate log, and this
+    engine runs no gates — so it answered ``0`` for every spectrum. That was
+    *vacuously* true only while ``fit_circuit`` fitted every point it was handed.
+    Once the finiteness mask landed there the zero became a falsehood: ``ch22_003``
+    carries ``fit.n_points_dropped = 1`` against a stored ``n_points_dropped`` of
+    ``0`` — a row asserting that nothing was withheld from a fit that withheld a
+    point. An absent count reads as absent; a wrong one does not.
+    """
+
+    @staticmethod
+    def _one_non_finite_point():
+        f, Z = reference_spectrum()
+        Z = np.asarray(Z, dtype=complex).copy()
+        Z[7] = complex(np.nan, Z[7].imag)
+        return as_eis_result(f, Z)
+
+    def test_a_clean_legacy_spectrum_still_reports_no_dropped_points(self):
+        # The control, and it is not ceremony: without it a hardcoded ``1`` would
+        # satisfy the test below. The property is "reads the fit", not "is non-zero".
+        report = analyze_spectrum(as_eis_result(*reference_spectrum()),
+                                  cell=CELL, engine="legacy")
+        assert report.fit.n_points_dropped == 0
+        assert report.n_dropped == 0
+
+    def test_a_legacy_report_counts_the_point_its_fitter_withheld(self):
+        report = analyze_spectrum(self._one_non_finite_point(),
+                                  cell=CELL, engine="legacy")
+        # Precondition, asserted rather than assumed: the finiteness mask really did
+        # fire on this fixture. Should it stop firing, both numbers fall to 0 and the
+        # test would pass while testing nothing — SUBAGENT_RULES §3's first shape. It
+        # fails as a broken fixture instead.
+        assert report.fit.n_points_dropped == 1
+        # The falsehood itself. A revert to the gate-log sum makes this 0.
+        assert report.n_dropped == 1
+
+    def test_the_count_arrives_without_a_gate_entry_that_never_ran(self):
+        # The whole reason ``_legacy_report`` returns a subclass rather than
+        # synthesising a gate-log record. Carrying the number in a fabricated entry
+        # would satisfy the test above and fail this one — it trades a wrong number
+        # for a wrong provenance, and every reader of ``gate_log_json`` would then
+        # describe a check this engine does not perform.
+        report = analyze_spectrum(self._one_non_finite_point(),
+                                  cell=CELL, engine="legacy")
+        assert report.n_dropped == 1
+        assert report.gate_log == ()
+        assert report.mask is None
+        # And the count stays out of the operator-facing cell, which still says only
+        # that no gates ran. A non-zero ``n_dropped`` reaches ``gate_summary``'s
+        # second branch on any engine but this one.
+        assert report.gate_summary() == "—"
