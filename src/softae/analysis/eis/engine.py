@@ -162,6 +162,54 @@ def _sigma_from_R(
     )
 
 
+class _LegacyReport(SpectrumReport):
+    """A legacy report whose dropped-point count comes from the fitter's own mask.
+
+    :attr:`SpectrumReport.n_dropped` sums ``n_dropped`` over the gate log, and this
+    path runs no gates — so it answered ``0`` for every spectrum. That was
+    *vacuously* true while ``fit_circuit`` fitted every point it was handed. It
+    stopped being true when the finiteness mask landed there: ``ch22_003`` drops one
+    non-finite point, its ``FitResult.n_points_dropped`` says ``1``, and the row
+    ``_fit_report_columns`` wrote off this property still asserted that none had been
+    dropped. A stored zero that used to mean "nothing drops here" now means "one
+    point was withheld and this row does not say so", which is worse than absent.
+
+    **Overridden here rather than in** :class:`SpectrumReport` because the two counts
+    have different provenance and only this branch may conflate them. The gated
+    engine truncates *before* fitting, records every removal in the gate log, and
+    hands the fitter data those gates already cleaned — so adding the fitter's own
+    mask on top there would double-count, and its counting is deliberately untouched.
+
+    **A subclass rather than a synthesised log entry.** Carrying the number in a
+    fabricated ``gate_log`` record would put a gate in the log that never ran, and
+    every reader of that column — ``gate_summary``, ``recommend``, the analysis tab —
+    would then describe a check this engine does not perform. That trades a wrong
+    number for a wrong provenance, which is the worse of the two.
+
+    .. warning::
+       **This subclass will not compare equal to a field-identical**
+       :class:`SpectrumReport`. A dataclass ``__eq__`` tests
+       ``other.__class__ is self.__class__``, so ``legacy_report == SpectrumReport(
+       engine="legacy", fit=..., ...)`` is ``False`` no matter how carefully the
+       fields are matched. Nothing in the tree compares reports today, which is
+       exactly what makes it a trap for whoever writes that comparison first: it
+       will present as a *data* mismatch and send them hunting through σ and the
+       fit, when it is a *type* mismatch and nothing is wrong with the values.
+       ``isinstance`` is unaffected and is what every consumer actually uses.
+
+       **The better home is** ``report.py``: a two-line fallback inside
+       :attr:`SpectrumReport.n_dropped` — the gate-log sum when there is a gate log,
+       the fit's own count when there is not — removes the subclass and this hazard
+       together. It was not done there because at the time of writing that file was
+       UNCLAIMED under the shared-tree ownership map, and unclaimed is not free.
+       Whoever takes ``report.py`` should collapse this.
+    """
+
+    @property
+    def n_dropped(self) -> int:
+        return int(getattr(self.fit, "n_points_dropped", 0) or 0)
+
+
 def _legacy_report(
     eis_result: Any, cell: CellConstant | None, model_name: str
 ) -> SpectrumReport:
@@ -208,8 +256,11 @@ def _legacy_report(
             re_contact_verified=cell.re_contact_verified,
         )
 
-    return SpectrumReport(engine="legacy", fit=fit, sigma=sigma, quality=quality,
-                          gate_log=(), mask=None, cell=cell)
+    # ``gate_log`` stays empty and ``mask`` stays ``None`` — this engine really does
+    # run no gates, and saying otherwise is what the subclass above exists to avoid.
+    # ``n_dropped`` comes off the fit instead.
+    return _LegacyReport(engine="legacy", fit=fit, sigma=sigma, quality=quality,
+                         gate_log=(), mask=None, cell=cell)
 
 
 def _two_point_fit(eis_result: Any, model_name: str) -> Any | None:

@@ -17,6 +17,7 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 from softae.analysis.circuit_fitting import FitResult
+from softae.analysis.eis.report import SigmaReport, SpectrumReport
 from softae.analysis.eis_data import EISResult
 from softae.gui.widgets.eis_visualizer_widget import (
     DEFAULT_GEOMETRY,
@@ -65,12 +66,56 @@ def entry(sample_eis) -> EISEntry:
 # ── fit_entry ────────────────────────────────────────────────────────────────
 
 
-def test_fit_entry_sets_geometry_and_sigma(monkeypatch, entry, sample_fit):
-    monkeypatch.setattr(
-        "softae.analysis.circuit_fitting.fit_circuit",
-        lambda eis, model_name: sample_fit,
-    )
+@pytest.fixture
+def inject_fit(monkeypatch):
+    """Install a stub ``analyze_spectrum`` returning *fit*, and hand back the stub.
+
+    **Why this seam and not ``fit_circuit``.** These two tests used to patch
+    :func:`softae.analysis.circuit_fitting.fit_circuit`. But ``fit_entry`` calls
+    :func:`~softae.analysis.eis.engine.analyze_spectrum` with ``engine`` left unset
+    *by design* — its docstring says so — so ``[eis] engine`` chooses what gets
+    called underneath. Only the legacy engine reaches ``fit_circuit``; the gated one
+    fits through ``fitter.fit_spectrum``, the patch intercepted nothing, and the
+    injected ``FitResult`` never arrived. ``analyze_spectrum`` is ``fit_entry``'s
+    actual collaborator and is the same seam under both engines, so a test stubbing
+    it pins the contract without pinning the configuration.
+
+    **The contract under test is engine-independent**: ``fit_entry`` sets ``fit``,
+    sets ``geometry``, and derives ``sigma`` from that geometry — or leaves it
+    ``None`` when the fit did not converge.
+
+    The σ arithmetic is deliberately *not* stubbed. This mirrors ``_legacy_report``'s
+    σ branch and computes the value from the real
+    :class:`~softae.analysis.eis.geometry.CellConstant` that ``fit_entry`` itself
+    built out of ``(L, t, w)``, so the σ assertions still exercise production
+    arithmetic and the geometry→σ link rather than a number the stub chose.
+    """
+
+    def install(fit):
+        def _analyze(eis_result, *, cell=None, model_name="simpleSalt", **kwargs):
+            sigma = SigmaReport(mode="unavailable", R_reported_ohm=float(fit.R1))
+            if cell is not None and fit.success:
+                sigma = SigmaReport(mode="value", value=cell.sigma(fit.R1),
+                                    R_reported_ohm=float(fit.R1),
+                                    K_per_cm=cell.K_per_cm)
+            return SpectrumReport(engine="stub", fit=fit, sigma=sigma, quality=None)
+
+        stub = MagicMock(side_effect=_analyze)
+        monkeypatch.setattr("softae.analysis.eis.engine.analyze_spectrum", stub)
+        return stub
+
+    return install
+
+
+def test_fit_entry_sets_geometry_and_sigma(inject_fit, entry, sample_fit):
+    stub = inject_fit(sample_fit)
     out = fit_entry(entry, "simpleSalt", 0.3, 0.1, 0.25)
+    # The stub was REACHED. Without this the test reports green while testing
+    # nothing at all whenever `fit_entry` stops calling what we patched — which is
+    # exactly how the previous `fit_circuit` fixture died under `engine = "gated"`,
+    # and it was caught only because it happened to also fail.
+    stub.assert_called_once()
+    assert stub.call_args.kwargs["model_name"] == "simpleSalt"
     assert out is entry
     assert entry.fit is sample_fit
     assert entry.geometry == (0.3, 0.1, 0.25)
@@ -78,18 +123,16 @@ def test_fit_entry_sets_geometry_and_sigma(monkeypatch, entry, sample_fit):
     assert entry.sigma == pytest.approx(0.3 / (500.0 * 0.1 * 0.25))
 
 
-def test_fit_entry_failed_fit_yields_none_sigma(monkeypatch, entry):
+def test_fit_entry_failed_fit_yields_none_sigma(inject_fit, entry):
     failed = FitResult(
         model_name="simpleSalt",
         parameters=np.array([0.0]),
         R0=0.0, R1=0.0, R0_guess=0.0, R1_guess=0.0,
         z_indices=[0, 1], success=False, error_msg="did not converge",
     )
-    monkeypatch.setattr(
-        "softae.analysis.circuit_fitting.fit_circuit",
-        lambda eis, model_name: failed,
-    )
+    stub = inject_fit(failed)
     fit_entry(entry, "simpleSalt", 0.2, 0.175, 0.2)
+    stub.assert_called_once()          # see the note in the sibling test above
     assert entry.fit is failed
     assert entry.geometry == (0.2, 0.175, 0.2)
     assert entry.sigma is None
