@@ -23,10 +23,21 @@ Spelled as ``python -m`` in everything printed, for the reason
 ``tools/equilibration.py`` states: whether the :data:`CONSOLE_SCRIPT` entry point
 resolves is a fact about when the venv was last installed from, not about the tool.
 
-**What this does not close.** The park path and this tool between them zero the
-duty on every clean exit, every signal and every fault-class stop. A ``SIGKILL``,
-a power cut or a blue screen still latches the Trinket at its last PWM duty,
-because no Python runs. Only a firmware deadman closes that, and there is none.
+**How every exit ends.** Clean, signalled or faulted alike, the chamber is left
+**purging dry** rather than zeroed: PID stopped, setpoint 0, duty held at
+``out_min``, which on this rig is *dry air*. This is the park path's ruling
+(``core.safe_park``, operator 2026-08-24) reaching the one tool that never routed
+through it — and this is the tool it matters most in, because a four-hour hold at
+10 %RH is exactly the state that ``ctrl == 0`` throws away: zero is the firmware's
+auto-shutoff, both Aalborg PSVs close at once, and the room wins in tens of
+seconds.
+
+**What this does not close.** A ``SIGKILL``, a power cut or a blue screen runs no
+Python, so nothing here writes anything and the Trinket is left at its last
+commanded duty. The firmware's own deadman does close that — ``ctrl_timeout``
+forces ``ctrl = 0`` roughly :data:`~softae.core.safe_park.RH_DEADMAN_S` s after
+the last command it received — but it is the *firmware's* guarantee, arriving on
+the firmware's schedule, and nothing on this side is timed by it.
 """
 
 from __future__ import annotations
@@ -36,6 +47,7 @@ import asyncio
 import contextlib
 import signal
 import sys
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -43,6 +55,15 @@ from typing import Any, Callable
 
 import structlog
 
+# The one number, imported rather than restated. `RH_DEADMAN_S`'s own comment
+# says why a second copy is the hazard: it is a *restatement of the firmware's*
+# `ctrl_timeout`, so a literal here would agree today and quietly lie the moment
+# the Trinket is retuned. At module scope, unlike every other `softae` import in
+# this file, because `_report_restore` runs from a signal handler and from
+# interpreter teardown — neither is a place to take the import lock. Nothing
+# else of `core.safe_park` is used: this tool deliberately does not route
+# through the park (see `install_handlers`).
+from softae.core.safe_park import RH_DEADMAN_S
 from softae.tools import run_finalizer, use_utf8_console
 
 logger = structlog.get_logger(__name__)
@@ -171,6 +192,9 @@ def plan_text(args) -> str:
         f"    heartbeat     one line every "
         f"{float(getattr(args, 'heartbeat_s', DEFAULT_HEARTBEAT_S)):g} s",
         f"    recording to  {store_kind}",
+        "    on exit       the humidifier is left PURGING DRY, not zeroed",
+        f"                  (duty = out_min; the Trinket's deadman shuts both "
+        f"valves ~{RH_DEADMAN_S:g} s later)",
         "  " + "=" * 68,
         "  No verdict stops the hold. A humidity that is off command is announced",
         "  as an alert row and printed; it is not a reason for software to stop",
@@ -224,16 +248,25 @@ class HoldSession:
         self._run_async = run_async
         self._exit_started = False
         self.in_progress = False
-        self.safe_off_error = ""
+        #: Why the chamber is **not** purging dry — ``""`` when it is. The
+        #: teardown's whole verdict lives in these three, and they are three
+        #: rather than one because there are three end states an operator has to
+        #: tell apart: purging, zeroed instead, and unknown.
+        self.purge_error = ""
+        #: The duty actually put on the wire, so the report can name it.
+        self.purge_duty = 0.0
+        #: The fallback landed: no dry purge, but the humidifier really is off.
+        #: Safe hardware, lost chamber — a warning, never the alarm.
+        self.zeroed_instead = False
 
     def safe_exit(self, status: str) -> None:
-        """Zero the humidifier, say whether it worked, close the row, disconnect."""
+        """Leave the chamber purging dry, say so, close the row, disconnect."""
         if self._exit_started:
             return
         self._exit_started = True
         self.in_progress = True
         try:
-            self._zero_humidifier()
+            self._dry_purge_humidifier()
             self._report_restore()
             self.finalize(status)
             self._disconnect()
@@ -245,40 +278,122 @@ class HoldSession:
     # problem leaves the *later* steps undone, and the later steps here are the
     # run row and the rig claim.
 
-    def _zero_humidifier(self) -> None:
+    def _dry_purge_humidifier(self) -> None:
+        """Leave the chamber purging dry — ``safe_park._park_humidifier``'s shape.
+
+        ``safe_off`` survives as one thing only: the fallback for a driver that
+        exposes no ``safe_dry`` at all. It is *recorded* and then taken anyway,
+        which is that function's discipline and for its reason — zeroing is the
+        strictly safer end state, so refusing it would leave a humidifier
+        energised in order to make a point about a missing method.
+
+        The driver's own degenerate-``out_min`` fallback is **not** re-implemented
+        here. It reports itself through ``last_safe_dry_error``, and that message
+        says in its own words that the humidifier was zeroed instead — which is
+        what stops :meth:`_report_restore` misdescribing it.
+        """
+        dry = getattr(self.rh, "safe_dry", None)
+        if not callable(dry):
+            self.purge_error = "driver exposes no safe_dry()"
+            self._zero_as_fallback()
+            return
+        try:
+            dry()
+        except Exception as exc:                       # noqa: BLE001 - never raise
+            self.purge_error = str(exc)
+            return
+        # `safe_dry` never raises on a comms failure — the park's never-raise
+        # contract read back into the driver — so without this the teardown would
+        # announce a purge that never reached the Trinket. Non-`str` means no
+        # report, so a driver predating the attribute is not accused of a failure
+        # it never had.
+        err = getattr(self.rh, "last_safe_dry_error", "")
+        if isinstance(err, str) and err:
+            self.purge_error = err
+            return
+        duty = getattr(self.rh, "last_safe_dry_duty", 0.0)
+        self.purge_duty = float(duty) if isinstance(duty, (int, float)) else 0.0
+
+    def _zero_as_fallback(self) -> None:
+        """The pre-``safe_dry`` driver's end state. Appends to :attr:`purge_error`."""
         off = getattr(self.rh, "safe_off", None)
         if not callable(off):
-            self.safe_off_error = "driver exposes no safe_off()"
+            self.purge_error += (" and no safe_off() -- nothing in this process "
+                                 "stopped the humidifier")
             return
         try:
             off()
         except Exception as exc:                       # noqa: BLE001 - never raise
-            self.safe_off_error = str(exc)
+            self.purge_error += f"; the fallback to safe_off() also failed: {exc}"
             return
         err = getattr(self.rh, "last_safe_off_error", "")
-        self.safe_off_error = err if isinstance(err, str) else ""
+        if isinstance(err, str) and err:
+            self.purge_error += f"; the fallback to safe_off() also failed: {err}"
+            return
+        self.zeroed_instead = True
 
     def _report_restore(self) -> None:
         """To **stderr**, including the good news.
 
-        ``--quiet > hold.log`` must still show on the terminal whether the
-        humidifier came off; the failure case names the setpoint it may still be
-        driving, which is the difference between an operator who walks away and
-        one who does not.
+        ``--quiet > hold.log`` must still show on the terminal how the chamber
+        was left, which is the difference between an operator who walks away and
+        one who does not. What that sentence *means* changed with the end state,
+        and the three branches below are the whole of the change:
+
+        * **purging** — success, and it leaves gas deliberately flowing. So the
+          line has to say the flow is the point, or an operator reads a
+          successful teardown as a humidifier nobody switched off. Same problem
+          ``safe_park.DRY_PURGE_COMMANDED`` solved, same three moves: name the
+          duty, call the standing command deliberate, say what shuts the valves.
+        * **zeroed instead** — the hardware is off and safe, and the chamber is
+          gone. Under the old teardown this *was* the success case, which is
+          exactly why it now needs saying out loud rather than passing silently.
+        * **unknown** — nothing confirmed either. The only alarm, and it no
+          longer *asserts* the humidifier is still driving: the driver's
+          degenerate-``out_min`` fallback lands here having genuinely zeroed the
+          device, and its own message says so directly above.
         """
-        if self.safe_off_error:
-            print(f"  !!!! HUMIDIFIER WAS NOT TURNED OFF: {self.safe_off_error}",
-                  file=sys.stderr)
-            print(f"       It may still be driving {self.setpoint_pct:g} %RH.",
-                  file=sys.stderr)
-            print("       CHECK IT AT THE RIG -- nothing further will turn it off.",
-                  file=sys.stderr)
+        def say(*lines: str) -> None:
+            for line in lines:
+                print(line, file=sys.stderr)
+
+        def reason(indent: str) -> str:
+            # Wrapped, because the message that most needs reading is the
+            # longest: the driver's degenerate-`out_min` report runs past 200
+            # characters, and the sentence that stops the headline above it
+            # being a misdescription is at the *end* of it.
+            return textwrap.fill(self.purge_error, width=78,
+                                 initial_indent=indent, subsequent_indent=indent)
+
+        if self.zeroed_instead:
+            say("  !! NO DRY PURGE -- THE HUMIDIFIER WAS ZEROED INSTEAD:",
+                reason("     "),
+                "     The hardware is safe: PID stopped, duty 0, both valves shut.",
+                "     But nothing is flowing, so the chamber collapses to room RH within",
+                "     tens of seconds. This hold's dried state is lost, not merely ending.")
             return
-        print("  Humidifier off: PID stopped, duty 0, setpoint 0.", file=sys.stderr)
+        if self.purge_error:
+            say("  !!!! NO DRY PURGE WAS CONFIRMED, AND THE HUMIDIFIER'S STATE IS UNKNOWN:",
+                reason("       "),
+                f"       It may still be driving {self.setpoint_pct:g} %RH, and the chamber"
+                f" is not being purged.",
+                "       Nothing else in this process will act on it. CHECK IT AT THE RIG.")
+            return
+        say(f"  Humidifier DRY-PURGED: PID stopped, setpoint 0, duty held at "
+            f"{self.purge_duty:g} = dry air.",
+            "     Gas is STILL FLOWING and that is DELIBERATE -- not a humidifier left on.",
+            f"     The Trinket's deadman shuts both valves ~{RH_DEADMAN_S:g} s from now; the"
+            f" chamber",
+            "     keeps its dry state over the changeover instead of collapsing to room RH.")
 
     def _disconnect(self) -> None:
-        # After the safe_off, never before: a disconnected driver has no serial
-        # handle and cannot be zeroed at all.
+        # After the dry purge, never before: a disconnected driver has no serial
+        # handle and nothing can be commanded through it at all.
+        #
+        # And the purge survives this call rather than being undone by it:
+        # `safe_dry` stops the PID loop itself, so `disconnect`'s own
+        # `_stop_pid_loop` finds `_running` already False and returns having
+        # written nothing. The `out_min` duty is what stays on the wire.
         try:
             self._run_async(self.manager.disconnect_all())
         except Exception:                              # noqa: BLE001 - never raise
@@ -547,7 +662,7 @@ def _run_hold(args, manager, store, run_id, finalize, seconds, *,
         # started has nothing to preserve by continuing, and continuing means
         # walking away for four hours from a chamber that may not be being
         # driven at all. Letting this raise into the generic error path — which
-        # finalizes the row and runs the safe_off — is the intended outcome.
+        # finalizes the row and runs the dry purge — is the intended outcome.
         rh.set_setpoint(float(args.rh))
         if not rh.status().get("running", False):
             rh.start()

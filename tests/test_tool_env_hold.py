@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from softae.core.run_lock import RunLock, RunLockHeld
+from softae.core.safe_park import RH_DEADMAN_S
 from softae.drivers.contracts import RH_FAULT, RHHoldVerdict, rh_watchdog_config
 from softae.errors import SafetyError
 from softae.tools import env_hold
@@ -115,10 +116,22 @@ class FakeStore:
 
 
 class FakeRH:
+    """A modern driver: ``safe_dry`` is what the teardown reaches for.
+
+    ``safe_off`` is kept, and its counter with it, precisely so a test can assert
+    the dry purge did **not** quietly become a zeroing again — a fake without it
+    would make that substitution invisible.
+    """
+
+    out_min = 0.01
+
     def __init__(self) -> None:
         self.setpoint: float | None = None
         self.running = False
+        self.safe_dry_calls = 0
         self.safe_off_calls = 0
+        self.last_safe_dry_error = ""
+        self.last_safe_dry_duty = 0.0
         self.last_safe_off_error = ""
         self.set_setpoint_error: Exception | None = None
 
@@ -135,6 +148,12 @@ class FakeRH:
 
     def get_TH(self) -> tuple[float, float]:
         return 22.5, 44.0
+
+    def safe_dry(self) -> None:
+        self.safe_dry_calls += 1
+        self.running = False
+        self.setpoint = 0.0
+        self.last_safe_dry_duty = self.out_min
 
     def safe_off(self) -> None:
         self.safe_off_calls += 1
@@ -453,7 +472,7 @@ class TestSignalPath:
                            lambda _s: None, run_async=lambda c: c.close(),
                            setpoint_pct=45.0), rh
 
-    def test_the_handler_zeroes_the_humidifier_once(self):
+    def test_the_handler_dry_purges_the_humidifier_once(self):
         session, rh = self._session()
         previous = signal.getsignal(signal.SIGINT)
         restore = install_handlers(session, signals=(signal.SIGINT,))
@@ -464,9 +483,10 @@ class TestSignalPath:
         finally:
             restore()
             signal.signal(signal.SIGINT, previous)
-        assert rh.safe_off_calls == 1
+        assert rh.safe_dry_calls == 1
+        assert rh.safe_off_calls == 0
 
-    def test_a_second_signal_during_teardown_does_not_zero_twice(self):
+    def test_a_second_signal_during_teardown_does_not_purge_twice(self):
         """A second write sequence down the same serial line is declined, which
         is ``ParkGuard``'s discipline for the same reason."""
         rh = FakeRH()
@@ -475,20 +495,20 @@ class TestSignalPath:
         restore = install_handlers(session, signals=(signal.SIGINT,))
         handler = signal.getsignal(signal.SIGINT)
 
-        original_safe_off = rh.safe_off
+        original_safe_dry = rh.safe_dry
 
         def _reentrant():
-            original_safe_off()
+            original_safe_dry()
             handler(signal.SIGINT, None)     # must be declined, not re-entered
 
-        rh.safe_off = _reentrant
+        rh.safe_dry = _reentrant
         try:
             with pytest.raises(KeyboardInterrupt):
                 handler(signal.SIGINT, None)
         finally:
             restore()
             signal.signal(signal.SIGINT, previous)
-        assert rh.safe_off_calls == 1
+        assert rh.safe_dry_calls == 1
 
     def test_the_handler_restores_the_previous_disposition(self):
         """A second Ctrl-C must reach the default handler, or an operator
@@ -507,6 +527,173 @@ class TestSignalPath:
             signal.signal(signal.SIGINT, previous)
 
 
+# ── The teardown's end state ─────────────────────────────────────────────────
+
+class TestTheExitLeavesTheChamberPurgingDry:
+    """Every exit — clean, signalled or faulted — leaves dry air flowing.
+
+    ``ctrl`` near 0 is *dry* and ``ctrl == 0`` **exactly** is the firmware's
+    auto-shutoff, which closes both Aalborg PSVs; a chamber held at 10 %RH then
+    meets the ~50 %RH room within tens of seconds. This tool's entire purpose is
+    sitting on a setpoint for hours, so its exit is the one that threw that away
+    most expensively. Operator ruling 2026-08-24, the same one ``core.safe_park``
+    records — and this tool never routed through ``safe_park``, which is why the
+    park's own conversion did not reach it.
+
+    Three end states, and the tests below are here because an operator has to be
+    able to tell them apart at a glance on a terminal at 3 a.m.
+    """
+
+    def _teardown(self, rh):
+        session = HoldSession(rh, FakeManager(rh), FakeStore(), lambda _s: None,
+                              run_async=lambda c: c.close(), setpoint_pct=45.0)
+        session.safe_exit("done")
+        return session
+
+    def _headline(self, rh, capsys) -> str:
+        self._teardown(rh)
+        return capsys.readouterr().err.splitlines()[0]
+
+    def _no_safe_dry(self):
+        """A driver predating ``safe_dry`` — the fallback path, and the only way
+        to reach it.
+
+        ``spec=`` is load-bearing rather than tidy: an unspecced ``MagicMock``
+        grows ``safe_dry`` on demand, so a test meaning to exercise the *absence*
+        of the method would silently exercise the happy path and pass forever.
+        Same trap and same fix as ``test_safe_park.TestHumidifier._no_safe_dry``.
+        """
+        rh = MagicMock(spec=["safe_off", "last_safe_off_error"])
+        rh.last_safe_off_error = ""
+        assert not hasattr(rh, "safe_dry"), "the spec is what lets this test fail"
+        return rh
+
+    def test_the_exit_dry_purges_and_never_zeroes(self, capsys):
+        """The substitution this test exists to catch: ``safe_off`` is not a
+        cheaper spelling of ``safe_dry``, it is the opposite end state."""
+        rh = FakeRH()
+
+        self._teardown(rh)
+
+        assert rh.safe_dry_calls == 1
+        assert rh.safe_off_calls == 0
+        err = capsys.readouterr().err
+        assert "DRY-PURGED" in err
+        assert "0.01 = dry air" in err       # the duty is named, not implied
+
+    def test_the_success_line_says_the_standing_command_is_deliberate(self, capsys):
+        """A success that leaves gas flowing has to say so *and* say why, or a
+        clean teardown reads as a humidifier nobody managed to switch off. This
+        is the requirement ``safe_park.DRY_PURGE_COMMANDED`` was written against.
+        """
+        self._teardown(FakeRH())
+
+        err = capsys.readouterr().err
+        assert "STILL FLOWING" in err
+        assert "DELIBERATE" in err
+        assert f"~{RH_DEADMAN_S:g} s" in err   # what closes the valves, and when
+
+    def test_a_driver_with_no_safe_dry_falls_back_to_safe_off(self, capsys):
+        """The fallback is *taken*, not refused, which is
+        ``safe_park._park_humidifier``'s discipline and for its reason: zeroing
+        is the strictly safer end state, so refusing it would leave a humidifier
+        energised to make a point about a missing method.
+        """
+        rh = self._no_safe_dry()
+
+        session = self._teardown(rh)
+
+        rh.safe_off.assert_called_once()
+        assert session.zeroed_instead is True
+
+    def test_the_missing_safe_dry_is_reported_not_silent(self, capsys):
+        """A fallback nobody hears about is how a driver swap becomes months of
+        unexplained RH collapses. Reported in the safe direction, never hidden."""
+        self._teardown(self._no_safe_dry())
+
+        err = capsys.readouterr().err
+        assert "ZEROED INSTEAD" in err
+        assert "no safe_dry()" in err
+        assert "collapses to room RH" in err
+        assert "DRY-PURGED" not in err
+
+    def test_a_raising_safe_dry_leaves_the_humidifier_reported_as_unknown(self, capsys):
+        rh = FakeRH()
+
+        def _boom():
+            raise RuntimeError("port went away")
+
+        rh.safe_dry = _boom
+
+        self._teardown(rh)
+
+        err = capsys.readouterr().err
+        assert "STATE IS UNKNOWN" in err
+        assert "port went away" in err
+        assert "45 %RH" in err
+        assert "CHECK IT AT THE RIG" in err
+
+    def test_a_swallowed_dry_write_failure_is_not_announced_as_a_purge(self, capsys):
+        """``safe_dry`` swallows a comms failure to keep the never-raise
+        contract, so a teardown that only watched for an exception would announce
+        a purge that never reached the Trinket."""
+        rh = FakeRH()
+        rh.safe_dry = lambda: setattr(rh, "last_safe_dry_error", "no serial transport")
+
+        self._teardown(rh)
+
+        err = capsys.readouterr().err
+        assert "no serial transport" in err
+        assert "DRY-PURGED" not in err
+
+    def test_the_drivers_own_zeroing_fallback_is_quoted_not_contradicted(self, capsys):
+        """The degenerate-``out_min`` case, which the driver handles itself.
+
+        It calls ``safe_off`` internally and reports it through
+        ``last_safe_dry_error``. Nothing here can detect that from outside, so
+        the report must not *assert* an end state it does not know: the old
+        line's *"nothing further will turn it off"* would have been flatly false
+        here. It says the state is unknown and prints the driver's own sentence,
+        which says what actually happened.
+        """
+        rh = FakeRH()
+        message = ("config [instruments.rh_controller] out_min = 0 is not "
+                   "positive, so there is no dry-purge duty to command: duty 0 "
+                   "shuts both valves. The humidifier was zeroed instead — safe, "
+                   "but the chamber will collapse to room RH.")
+        rh.safe_dry = lambda: setattr(rh, "last_safe_dry_error", message)
+
+        self._teardown(rh)
+
+        err = capsys.readouterr().err
+        # Flattened: the reason is wrapped to the terminal, so asserting on raw
+        # lines would pin today's wrap points rather than today's meaning.
+        flat = " ".join(err.split())
+        assert "The humidifier was zeroed instead" in flat
+        assert "nothing further will turn it off" not in flat
+        # A possibility, never an assertion — the sentence above corrects it.
+        assert "It may still be driving 45 %RH" in flat
+
+    def test_the_three_end_states_lead_with_three_different_headlines(self, capsys):
+        """None of the three may read as a softer version of another, and the
+        alarm marker belongs to the one outcome that is actually an alarm."""
+        purged = self._headline(FakeRH(), capsys)
+        zeroed = self._headline(self._no_safe_dry(), capsys)
+
+        broken = FakeRH()
+
+        def _boom():
+            raise RuntimeError("wedged")
+
+        broken.safe_dry = _boom
+        unknown = self._headline(broken, capsys)
+
+        assert len({purged, zeroed, unknown}) == 3
+        assert "!!!!" in unknown
+        assert "!!!!" not in zeroed
+        assert "!!" not in purged
+
+
 # ── The run row ──────────────────────────────────────────────────────────────
 
 class TestRunRow:
@@ -515,7 +702,7 @@ class TestRunRow:
                                  seconds=0.0)
         assert code == EXIT_OK
         assert store.status == "done"
-        assert rh.safe_off_calls == 1
+        assert rh.safe_dry_calls == 1
         assert store.closed is True
 
     def test_an_interrupted_bounded_hold_is_interrupted_and_fails(self, monkeypatch):
@@ -527,7 +714,7 @@ class TestRunRow:
                                  seconds=14400.0)
         assert code == EXIT_FAILED
         assert store.status == "interrupted"
-        assert rh.safe_off_calls == 1
+        assert rh.safe_dry_calls == 1
 
     def test_an_until_signal_hold_stopped_by_the_operator_succeeds(self, monkeypatch):
         """The status still records that nothing but a person decided the end;
@@ -547,7 +734,7 @@ class TestRunRow:
                                  rh=rh, seconds=0.0)
         assert code == EXIT_FAILED
         assert store.status == "aborted"
-        assert rh.safe_off_calls == 1
+        assert rh.safe_dry_calls == 1
 
     def test_an_unnamed_exception_is_recorded_as_error(self, monkeypatch):
         def _blow_up(*_a, **_k):
