@@ -38,6 +38,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+import structlog
+
+logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Circuit model registry
@@ -111,6 +114,13 @@ class FitResult:
     #: ``"bound"`` | ``"bound_unqualified"``.  Legacy always reports ``"split"``,
     #: which is what it has always done.
     report_mode: str = "split"
+    #: How many of the spectrum's points the optimiser actually saw, and how many
+    #: :func:`usable_points` withheld from it.  These describe *this fitter's* mask
+    #: only — the gated engine reports its own drops through ``gate_log`` — and they
+    #: exist because a fit on 37 of 53 points and a fit on all 53 are different
+    #: measurements that were previously indistinguishable in the result.
+    n_points_used: int = 0
+    n_points_dropped: int = 0
 
     def sigma(self, L: float, t: float, w: float) -> float:
         """Ionic conductivity σ = L / (R1 · t · w)  [S/cm].
@@ -231,13 +241,106 @@ def extract_features(freq: np.ndarray, z_real: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# Admissible points
+# ---------------------------------------------------------------------------
+
+#: Fallback for ``[quality] min_points`` when the config system cannot be reached at
+#: all.  Equal to :data:`softae.analysis.quality.DEFAULT_MIN_POINTS`, which is also the
+#: shipped value, so this changes nothing when it fires — it exists so that a fitter
+#: cannot be silently relaxed by a broken loader.
+FALLBACK_MIN_FIT_POINTS = 8
+
+
+def usable_points(freq, z_real, z_imag_neg) -> np.ndarray:
+    """Which points may reach the optimiser: finite ``Z``, finite ``f``, ``f > 0``.
+
+    Deliberately the **same predicate** as
+    :func:`softae.analysis.eis.gates.gate_finiteness` and
+    :func:`softae.analysis.eis.fitter._fit_with_covariance` — ``isfinite(f) &
+    isfinite(Z) & (f > 0)`` — because two definitions of "usable point" in one codebase
+    is the defect one layer up from the one this fixes.
+
+    Three things that predicate settles, none of them obvious:
+
+    * **Real and imaginary parts are judged jointly, not separately.** ``np.isfinite``
+      on a complex array is already the conjunction, and it has to be: ``curve_fit``
+      is handed ``hstack([Z.real, Z.imag])``, so a point whose ``Z''`` is NaN cannot
+      contribute its ``Z'`` either. Half a point is not a point.
+    * **Frequency is masked as well as impedance.** ``curve_fit`` only rejects a
+      non-finite *ordinate*, so a NaN frequency would pass its check and then poison
+      the circuit evaluation instead of failing loudly. ``f ≤ 0`` goes for the same
+      reason it does in ``gate_finiteness``: the model is evaluated at ``jω``, and a
+      non-positive frequency is not a measurement.
+    * **Duplicate frequencies are *not* dropped here**, though ``gate_finiteness``
+      drops them. That check protects the Kramers–Kronig basis and the topology
+      triad's ``polyfit(log10(f), …)``, neither of which runs on this path, and
+      removing points from spectra that fit correctly today would be a behaviour
+      change unrelated to finiteness. ``fitter.py`` — the closer precedent, being a
+      fitter rather than a gate — omits it for the same reason.
+
+    Returns a boolean mask over the first ``min(len(freq), len(z_real),
+    len(z_imag_neg))`` points.
+    """
+    f = np.asarray(freq, dtype=float)
+    zr = np.asarray(z_real, dtype=float)
+    zi = np.asarray(z_imag_neg, dtype=float)
+    n = int(min(f.size, zr.size, zi.size))
+    return (
+        np.isfinite(f[:n]) & np.isfinite(zr[:n]) & np.isfinite(zi[:n]) & (f[:n] > 0)
+    )
+
+
+def _min_fit_points(override: int | None = None) -> int:
+    """How many usable points a fit must be supported by.
+
+    Sourced from ``[quality] min_points``, which is not a borrowed number: its existing
+    consumer :func:`softae.analysis.quality.validate_eis_trace` already spells it
+    ``if n_finite < min_points`` and calls the result "usable points". That is the same
+    question asked here, of the same spectrum, one stage earlier — so a second knob
+    would only let the trace validator and the fitter disagree about whether the same
+    file is fittable.
+
+    ``[eis.gates] min_fit_pts`` is the other candidate and is deliberately not used:
+    it belongs to the gated engine's settings object, which this legacy path does not
+    build and must not start depending on. Both ship at 8.
+    """
+    if override is not None:
+        return int(override)
+    try:
+        from softae.analysis.quality import quality_config
+
+        return int(quality_config()["min_points"])
+    except Exception:  # config system unreachable — do not relax the requirement
+        logger.warning("eis_fit_min_points_unresolved", exc_info=True)
+        return FALLBACK_MIN_FIT_POINTS
+
+
+# ---------------------------------------------------------------------------
 # Fitting
 # ---------------------------------------------------------------------------
 
 def fit_circuit(eis_result, model_name: str = "simpleSalt", *,
                 fit_plots: bool = False,
-                fixed_params: dict[str, float] | None = None) -> FitResult:
+                fixed_params: dict[str, float] | None = None,
+                min_points: int | None = None) -> FitResult:
     """Fit an equivalent-circuit model to EIS data.
+
+    Non-finite points are **masked, not fatal.** ``curve_fit`` calls
+    ``asarray_chkfinite`` on its ordinate, so before this every spectrum carrying a
+    single NaN failed whole: ``ch22_003`` failed with 52 good points of 53, exactly as
+    its sibling with 37 of 53 did, and the pair were read as a hardware fault for two
+    days because a spectrum that cannot be fitted looks like a spectrum that is wrong.
+    See :func:`usable_points` for what "usable" means and why it is that and not
+    something else.
+
+    The mask is applied to the initial-guess extraction as well as to the optimiser,
+    which is not optional: ``extract_features`` takes ``np.argmin``, and ``argmin``
+    returns the index of the NaN, so a masked fit given unmasked guesses starts from
+    ``r0_guess = nan``.
+
+    **Nothing is dropped silently.** Every drop is logged and counted into
+    ``FitResult.n_points_dropped``, and a spectrum reduced below *min_points* usable
+    points is refused with a message saying so rather than fitted on the remnant.
 
     Parameters
     ----------
@@ -249,6 +352,9 @@ def fit_circuit(eis_result, model_name: str = "simpleSalt", *,
         If True, display Nyquist / Bode fit overlays (requires matplotlib).
     fixed_params : dict, optional
         Parameter values to hold fixed during fitting.
+    min_points : int, optional
+        Override the ``[quality] min_points`` floor. For tests that need to pin the
+        threshold rather than inherit the operator's configuration.
 
     Returns
     -------
@@ -265,10 +371,64 @@ def fit_circuit(eis_result, model_name: str = "simpleSalt", *,
     config = CIRCUIT_MODELS[model_name]
     z_idx = config["z_indices"]
 
-    # Extract features for initial guesses
-    features = extract_features(
+    mask = usable_points(
         eis_result.frequency, eis_result.z_real, eis_result.z_imag_neg
     )
+    n_total = int(mask.size)
+    n_kept = int(mask.sum())
+    n_dropped = n_total - n_kept
+
+    fit_freq = np.asarray(eis_result.frequency, dtype=float)[:n_total]
+    fit_z_real = np.asarray(eis_result.z_real, dtype=float)[:n_total]
+    fit_z_imag_neg = np.asarray(eis_result.z_imag_neg, dtype=float)[:n_total]
+
+    if n_dropped:
+        # The floor is checked only when this mask actually removed something. A short
+        # all-finite sweep is an operator's deliberate choice of preset and has always
+        # been fitted; revoking that would be a capability change smuggled in under a
+        # finiteness fix. What is new here is the *remnant*, and a remnant is what this
+        # guard exists to refuse.
+        need = _min_fit_points(min_points)
+        if n_kept < need:
+            reason = (
+                f"only {n_kept} of {n_total} points are usable (need {need}): "
+                f"{n_dropped} point(s) dropped as non-finite or f <= 0"
+            )
+            logger.warning(
+                "eis_fit_refused_too_few_points", model=model_name,
+                n_total=n_total, n_used=n_kept, n_dropped=n_dropped, need=need,
+                detail=reason,
+            )
+            return FitResult(
+                model_name=model_name,
+                parameters=np.full(len(config["initial_guess"]), np.nan),
+                R0=np.nan, R1=np.nan, R0_guess=np.nan, R1_guess=np.nan,
+                z_indices=z_idx,
+                success=False,
+                error_msg=reason,
+                n_points_used=n_kept,
+                n_points_dropped=n_dropped,
+            )
+
+        fit_freq = fit_freq[mask]
+        fit_z_real = fit_z_real[mask]
+        fit_z_imag_neg = fit_z_imag_neg[mask]
+        # The surviving band is the useful half of this message: on ch22_001 the
+        # dropped points are a contiguous run at the *top* (6.45 kHz-200 kHz), which
+        # reads as a high-frequency resolution limit rather than scattered noise.
+        logger.info(
+            "eis_fit_points_dropped", model=model_name,
+            n_total=n_total, n_used=n_kept, n_dropped=n_dropped,
+            detail=(
+                f"{n_dropped} of {n_total} points non-finite or f <= 0; fitting the "
+                f"remaining {n_kept} over "
+                f"{fit_freq.min():.4g}-{fit_freq.max():.4g} Hz"
+            ),
+        )
+
+    # Extract features for initial guesses — on the masked arrays, because argmin
+    # over a NaN returns the NaN.
+    features = extract_features(fit_freq, fit_z_real, fit_z_imag_neg)
     r0_guess = features["r0_guess"]
     r1_guess = features["r1_guess"]
 
@@ -295,8 +455,16 @@ def fit_circuit(eis_result, model_name: str = "simpleSalt", *,
         constants = {"R0": r0_guess, "R1": r1_guess, "C0": 2e-10}
 
     # Build complex impedance: Z = Z' + jZ'' (note Z'' stored as -Z'')
-    Z = eis_result.z_real + 1j * (-eis_result.z_imag_neg)
-    freq = eis_result.frequency
+    #
+    # ``Z``/``freq`` are the *masked* arrays — they are what the optimiser sees.  The
+    # full grid is kept separately because ``z_fit`` must stay aligned with
+    # ``eis_result``: ``compute_fit_quality`` indexes the two together and applies its
+    # own finiteness mask, and ``tab_analysis`` overlays ``z_fit`` on the measured
+    # trace. A ``z_fit`` one element shorter than the spectrum it annotates would
+    # silently shift every point after the drop.
+    Z = fit_z_real + 1j * (-fit_z_imag_neg)
+    freq = fit_freq
+    full_freq = np.asarray(eis_result.frequency, dtype=float)
 
     try:
         from impedance.models.circuits import CustomCircuit  # type: ignore
@@ -313,9 +481,11 @@ def fit_circuit(eis_result, model_name: str = "simpleSalt", *,
 
         params = model.parameters_
 
-        # Capture fitted impedance for later overlay without re-fitting.
+        # Capture fitted impedance for later overlay without re-fitting.  Predicted on
+        # the full grid: the circuit is defined at every frequency, whether or not the
+        # instrument returned a number there.
         try:
-            _z_fit = model.predict(freq)
+            _z_fit = model.predict(full_freq)
         except Exception:
             _z_fit = None
 
@@ -348,6 +518,8 @@ def fit_circuit(eis_result, model_name: str = "simpleSalt", *,
             z_indices=z_idx,
             z_fit=_z_fit,
             quality=_quality,
+            n_points_used=n_kept,
+            n_points_dropped=n_dropped,
         )
 
     except Exception as exc:
@@ -362,6 +534,8 @@ def fit_circuit(eis_result, model_name: str = "simpleSalt", *,
             z_indices=z_idx,
             success=False,
             error_msg=str(exc),
+            n_points_used=n_kept,
+            n_points_dropped=n_dropped,
         )
 
 
