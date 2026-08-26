@@ -239,14 +239,24 @@ class TestDataStoreHalf:
         assert [r["channel"] for r in summary["rows"]] == [1, 2]
         assert all(r["sigma"] is not None for r in summary["rows"])
 
-    def test_the_engine_column_reads_legacy_even_though_the_gated_engine_ran(
+    def test_the_engine_column_reads_unknown_because_the_router_declares_nothing(
             self, shadow_project):
-        # Not a bug in the tool — the point of it. `_fit_report_columns(None)` stamps
-        # 'legacy' because the router does not pass a report, so the column cannot
-        # distinguish "the config said legacy" from "this site never asked".
+        # Still not a bug in the tool — but the column no longer lies about it.
+        # `_fit_report_columns(None)` used to stamp 'legacy', which was true only while
+        # `[eis] engine` was legacy and inverts the moment it is gated: a shadow
+        # campaign's whole point is that the gated engine ran. It now stamps
+        # FIT_ENGINE_UNKNOWN, so "this site never asked" is distinguishable from "the
+        # config said legacy" — which is what makes section 1's log the *corroborating*
+        # evidence rather than the only evidence.
+        from softae.core.data_store import FIT_ENGINE_UNKNOWN
+
         project, run_id = shadow_project
         summary = db_summary(str(project), run_id)
-        assert set(summary["engines"]) == {"legacy"}
+        # The LITERAL, not the constant. Comparing the rendered column against the
+        # same constant that produced it is SUBAGENT_RULES §3's test that cannot
+        # fail — it passes just as happily if the constant is rebound to 'legacy'.
+        assert set(summary["engines"]) == {"unknown"}
+        assert FIT_ENGINE_UNKNOWN == "unknown"
         assert all(r["gate_verdict"] is None for r in summary["rows"])
 
     def test_the_report_says_the_engine_column_is_stamped_not_observed(

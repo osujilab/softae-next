@@ -507,6 +507,15 @@ class TestTheEstimatorIsLabelledOnTheRow:
                        "estimator", None) is None
 
     def test_record_fit_stamps_the_estimator_into_the_engine_column(self, tmp_path):
+        """The estimator half is read off the fit, so it survives an undeclared engine.
+
+        The undeclared row used to read bare ``'two_point'``, because the engine half
+        defaulted to ``'legacy'`` and ``_engine_label`` drops the prefix there. Pre-gate
+        diversion only happens on the GATED path, so that spelling put a gated row into
+        the legacy population — under ``[eis] engine = "gated"`` it is the router's
+        every diverted row. ``'unknown_two_point'`` states the half that is evidenced
+        and withholds the half that is not.
+        """
         from softae.core.data_store import DataStore
 
         store = DataStore(tmp_path / "project")
@@ -517,7 +526,8 @@ class TestTheEstimatorIsLabelledOnTheRow:
 
             plain = _two_point_fit(eis, "simpleSalt")
             store.record_fit(mid, plain)
-            assert store.query_fits(measurement_id=mid)[0]["engine"] == "two_point"
+            assert store.query_fits(
+                measurement_id=mid)[0]["engine"] == "unknown_two_point"
 
             from softae.analysis.eis.report import SigmaReport, SpectrumReport
 
@@ -527,11 +537,27 @@ class TestTheEstimatorIsLabelledOnTheRow:
                                                    sigma=SigmaReport()))
             assert store.query_fits(
                 measurement_id=mid2)[0]["engine"] == "gated_two_point"
+
+            # A row that DECLARES legacy still drops the prefix — the bare spelling was
+            # never wrong, only its reachability from an undeclared caller was.
+            mid3 = store.record_measurement(run_id, eis)
+            store.record_fit(mid3, _two_point_fit(eis, "simpleSalt"),
+                             report=SpectrumReport(engine="legacy",
+                                                   sigma=SigmaReport()))
+            assert store.query_fits(measurement_id=mid3)[0]["engine"] == "two_point"
         finally:
             store.close()
 
-    def test_an_unlabelled_fit_stores_exactly_what_it_always_stored(self, tmp_path):
-        """The no-regression half: every row written before this change is untouched."""
+    def test_an_unlabelled_fit_declares_no_engine_rather_than_claiming_legacy(
+            self, tmp_path):
+        """An ordinary fit with no report names no engine — it does not name ``legacy``.
+
+        ``record_fit`` learns the engine from the report and from nothing else, so a
+        caller that passes none has supplied no evidence for either engine. The old
+        ``'legacy'`` was true by coincidence of ``[eis] engine`` and inverts the moment
+        that setting moves; the same spectrum fitted both ways differs in R₁ by ~55×,
+        and this column is what a reader splits the populations on.
+        """
         from softae.analysis.circuit_fitting import FitResult
         from softae.core.data_store import DataStore
 
@@ -542,7 +568,7 @@ class TestTheEstimatorIsLabelledOnTheRow:
             store.record_fit(mid, FitResult(
                 model_name="simpleSalt", parameters=np.array([50.0, 1e5]),
                 R0=50.0, R1=1e5, R0_guess=50.0, R1_guess=1e5, z_indices=[0, 1]))
-            assert store.query_fits(measurement_id=mid)[0]["engine"] == "legacy"
+            assert store.query_fits(measurement_id=mid)[0]["engine"] == "unknown"
         finally:
             store.close()
 
@@ -558,7 +584,11 @@ class TestSchemaEpochFive:
     def test_epoch_five_is_a_data_epoch_naming_population_and_authorisation(self):
         from softae.core.data_store import SCHEMA_EPOCHS
 
-        version, kind, note = SCHEMA_EPOCHS[-1]
+        # Located by VERSION, never by position. `SCHEMA_EPOCHS[-1]` read epoch 5
+        # only for as long as epoch 5 was the last one, so appending epoch 6 —
+        # the ordinary operation on an append-only ledger — broke a test about
+        # epoch 5's content for a reason that had nothing to do with its content.
+        version, kind, note = next(e for e in SCHEMA_EPOCHS if e[0] == 5)
         assert version == 5
         assert kind == "data-epoch"
         assert "2026-08-18" in note

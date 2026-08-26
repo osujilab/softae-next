@@ -61,6 +61,11 @@ class _FakeFitResult:
     R1: float = 1000.0
     success: bool = True
     error_msg: str = ""
+    #: Which route produced ``R1``. The engine sets this as a plain attribute on the
+    #: real ``FitResult`` (``engine.py``: ``fit.estimator = TWO_POINT``) rather than
+    #: declaring it, and ``_engine_label`` reads it with ``getattr(..., None)``, so
+    #: ``None`` here is the ordinary CPE fit — the same thing an unset attribute means.
+    estimator: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -914,6 +919,154 @@ class TestFitResults:
         store.record_fit(mid, _FakeFitResult(model_name="simpleSalt"))
         store.record_fit(mid, _FakeFitResult(model_name="flexSalt"))
         assert len(store.query_fits(model_name="flexSalt")) == 1
+
+
+# ---------------------------------------------------------------------------
+# fit_results.engine — the column that separates two incomparable populations
+# ---------------------------------------------------------------------------
+
+
+class TestTheEngineColumnIsAClaimAndNotADefault:
+    """The same spectrum fitted by the two engines differs in R₁ by up to 55×.
+
+    Measured on ch32_002: 3.758e7 Ω legacy against 6.802e5 Ω gated, and σ = K/R
+    inverts it. ``fit_results.engine`` is the only per-row thing that separates those
+    populations, so a row whose label is wrong is worse than a row with no label —
+    only the second can be excluded from an analysis.
+
+    ``record_fit`` learns the engine from the ``SpectrumReport`` it is handed and from
+    nothing else. Three of its four call sites hand it none.
+    """
+
+    def test_a_fit_recorded_without_a_report_declares_no_engine(
+            self, store_with_run) -> None:
+        from softae.core.data_store import FIT_ENGINE_UNKNOWN
+
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        store.record_fit(mid, _FakeFitResult())
+        # The LITERAL is what is pinned. Asserting the column against the constant
+        # that wrote it is SUBAGENT_RULES §3's test that cannot fail: rebind the
+        # constant to 'legacy' and both sides move together, green throughout.
+        assert store.query_fits(measurement_id=mid)[0]["engine"] == "unknown"
+        assert FIT_ENGINE_UNKNOWN == "unknown"
+
+    def test_the_undeclared_value_is_not_legacy(self, store_with_run) -> None:
+        """Named separately because 'not legacy' is the whole defect.
+
+        ``'legacy'`` was correct only while ``[eis] engine`` was ``legacy``; the
+        operator is setting it to ``gated``, at which point the literal states the
+        opposite of what ran. A test that only pinned the new spelling would still
+        pass if someone restored the old one under a renamed constant.
+        """
+        from softae.core.data_store import FIT_ENGINE_UNKNOWN
+
+        assert FIT_ENGINE_UNKNOWN not in ("legacy", "gated")
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        store.record_fit(mid, _FakeFitResult())
+        assert store.query_fits(measurement_id=mid)[0]["engine"] != "legacy"
+
+    @pytest.mark.parametrize("declared", ["legacy", "gated"])
+    def test_a_declared_engine_is_recorded_verbatim(
+            self, store_with_run, declared: str) -> None:
+        """Both directions, so the sentinel cannot be a blanket that swallows reports.
+
+        SUBAGENT_RULES §3: the conservative answer here would be to stamp 'unknown' on
+        everything, which would pass any test that only checked the undeclared path
+        while destroying the labels the gated cutover depends on.
+        """
+        from softae.analysis.eis.report import SigmaReport, SpectrumReport
+
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        store.record_fit(mid, _FakeFitResult(),
+                         report=SpectrumReport(engine=declared, sigma=SigmaReport()))
+        assert store.query_fits(measurement_id=mid)[0]["engine"] == declared
+
+    def test_a_report_that_declares_no_engine_is_also_unknown(
+            self, store_with_run) -> None:
+        """The ``getattr`` fallback, which a real SpectrumReport can never reach.
+
+        ``SpectrumReport.engine`` has no default, so only a duck-typed stand-in gets
+        here — and such an object has declared no engine either.
+        """
+        class _ReportWithoutAnEngine:
+            sigma = None
+            cell = None
+            quality = None
+            mask = None
+            gate_log = ()
+
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        store.record_fit(mid, _FakeFitResult(), report=_ReportWithoutAnEngine())
+        assert store.query_fits(measurement_id=mid)[0]["engine"] == "unknown"
+
+    def test_the_column_is_never_null_so_no_reader_needs_a_null_branch(
+            self, store_with_run) -> None:
+        """``'unknown'`` and not NULL, and this is the reason it is a value.
+
+        NULL would need the column to stop being NOT NULL — a twelve-step table
+        rebuild in SQLite, on the table holding every fit the rig has recorded — and
+        would collide with the meaning NULL already carries three columns to the right
+        on ``arc_state``: *never annotated*. Every ``fit_results`` row WAS annotated.
+        """
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        store.record_fit(mid, _FakeFitResult())
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM fit_results WHERE engine IS NULL"
+        ).fetchone()[0] == 0
+
+    def test_nothing_backfills_or_rewrites_an_already_labelled_row(self) -> None:
+        """Rows stored as ``'legacy'`` were legacy; a sweep would destroy a true label.
+
+        Asserted over the source rather than over a database because the claim is that
+        no such code exists — a fixture can only show that one path did not run it.
+        """
+        import ast
+        from pathlib import Path
+
+        source = (Path(__file__).resolve().parents[1] / "src" / "softae" / "core"
+                  / "data_store.py").read_text(encoding="utf-8")
+        assert "UPDATE fit_results" not in source
+        migrations = [n.name for n in ast.walk(ast.parse(source))
+                      if isinstance(n, ast.FunctionDef) and n.name.startswith("_migrate")]
+        assert not any("engine" in name for name in migrations)
+
+    def test_the_setting_is_never_read_at_write_time(self) -> None:
+        """"What the config said when the row was INSERTed" is a different claim.
+
+        ``analyze_spectrum`` takes an ``engine=`` override AND a whole ``settings=``
+        override (``tools/shadow_rehearse.py`` uses the second to run gated against a
+        legacy config), and ``record_fit`` may be called for a fit produced minutes
+        earlier by a path that never consulted the config. Resolving ``[eis] engine``
+        here would be a fact about the process wearing a fact about the fit — and,
+        unlike the sentinel, undetectable when wrong.
+        """
+        from pathlib import Path
+
+        source = (Path(__file__).resolve().parents[1] / "src" / "softae" / "core"
+                  / "data_store.py").read_text(encoding="utf-8")
+        assert "eis_settings" not in source
+
+    def test_the_estimator_half_survives_an_undeclared_engine(
+            self, store_with_run) -> None:
+        """``_engine_label`` composes, so the evidenced half is still recorded.
+
+        The estimator is read off the FIT, so it is known even when the engine is not.
+        Pre-gate diversion only happens on the gated path, so the old default spelled
+        such a row bare ``'two_point'`` — i.e. *legacy* — which is precisely the
+        unlabelled-biased-R₁ failure epoch 5 exists to prevent.
+        """
+        from softae.analysis.eis.engine import TWO_POINT
+
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        store.record_fit(mid, _FakeFitResult(estimator=TWO_POINT))
+        assert store.query_fits(
+            measurement_id=mid)[0]["engine"] == "unknown_two_point"
 
 
 # ---------------------------------------------------------------------------

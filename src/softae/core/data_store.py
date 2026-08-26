@@ -61,6 +61,44 @@ logger = structlog.get_logger(__name__)
 #: fact from ``'unavailable'`` meaning *recorded as absent*.
 FORMULATION_THICKNESS_METHODS = THICKNESS_METHODS + ("unavailable",)
 
+#: What ``fit_results.engine`` holds when the writer was never told which engine ran.
+#:
+#: The column is the only thing that separates gated-engine fits from legacy-engine
+#: ones, and the two are not comparable: the same spectrum fitted both ways has been
+#: measured at R₁ = 3.758e7 Ω against 6.802e5 Ω, a factor of 55, and σ = K/R inverts
+#: that. A row whose label is wrong is worse than a row with no label, because only
+#: the second one can be excluded.
+#:
+#: ``record_fit`` learns the engine from the ``SpectrumReport`` it is handed, and
+#: three of its four call sites hand it none (``analysis/eis/router.py`` deliberately —
+#: P.18 — plus both GUI fit paths). Stamping ``'legacy'`` on those rows was correct
+#: only for as long as ``[eis] engine`` *was* ``legacy``; the moment the operator sets
+#: it to ``gated`` the literal becomes an assertion the writer had no evidence for, in
+#: the exact column a reader would use to split the two populations. "Undeclared is
+#: unknown, never empty" — so an undeclared row says so.
+#:
+#: **Not resolved from ``[eis] engine`` at write time**, which would look like the
+#: honest fix and is not the same claim. ``analyze_spectrum`` takes both an ``engine=``
+#: override and a whole ``settings=`` override (``tools/shadow_rehearse.py`` uses the
+#: second to run gated against a legacy config), and ``record_fit`` can be called for a
+#: fit produced minutes earlier or by a path that never consulted the config at all.
+#: "What the config said when the row was INSERTed" would be a fact about the process,
+#: dressed as a fact about the fit — and, unlike this sentinel, undetectable when wrong.
+#:
+#: **``'unknown'`` rather than NULL.** NULL would need the column to stop being
+#: ``NOT NULL``, which in SQLite is a twelve-step table rebuild rather than an
+#: ``ALTER``, on the one table that holds every fit this rig has ever recorded — a
+#: large price for a distinction the value already carries. It is also this schema's
+#: established spelling for *looked, and cannot tell*: ``arc_state`` reserves NULL for
+#: *never annotated* and spends ``'unknown'`` on exactly this state, three columns to
+#: the right in the same row, and ``measurements.electrode_mode`` does the same.
+#: ``record_fit`` did look — it was simply not told — so it is the ``'unknown'`` case.
+#:
+#: **Nothing is backfilled.** Rows already stored under ``engine = 'legacy'`` were
+#: legacy, and a sweep that rewrote them to ``'unknown'`` would destroy a true label to
+#: make a point about a false one.
+FIT_ENGINE_UNKNOWN = "unknown"
+
 #: Seed rows for the ``schema_version`` epoch ledger, ``(version, kind, note)``.
 #:
 #: Append-only and **never rewritten**: a row already in a database is a statement
@@ -133,6 +171,36 @@ SCHEMA_EPOCHS: tuple[tuple[int, str, str], ...] = (
      "is the whole point, since [a53] records that the failure mode on this rig is "
      "biased R1 flowing through UNLABELLED. Shipped DISABLED; the epoch begins for a "
      "given database when someone arms the flag, not when this row was seeded"),
+    (6, "data-epoch",
+     "2026-08-26 fit_results.arc_state and arc_f_peak_hz may now carry a real verdict "
+     "on a spectrum the previous rule refused. arc_closure() returned UNKNOWN if ANY "
+     "point in the sweep was non-finite - all or nothing; it now masks the unusable "
+     "points and judges the remnant whenever the remnant clears [quality] min_points. "
+     "Column, type and units are unchanged - arc_state is still the same TEXT verdict "
+     "- and that is precisely why this is an epoch and not a schema note: it is "
+     "version 2's and version 5's situation, where the name held still and the "
+     "meaning moved, and not version 3's, where the numbers held still and the names "
+     "moved. SCOPE, and it is narrow: the divergence is ONE-DIRECTIONAL (UNKNOWN -> a "
+     "verdict, never the reverse) and CONFINED to spectra carrying unusable points; a "
+     "spectrum whose sweep was fully finite is untouched, and provably so. Measured "
+     "over the 1440-spectrum characterisation run: 33 carry at least one unusable "
+     "point, and the smallest remnant is 9 of 25, so every one of them clears "
+     "min_points=5 and is judged rather than refused. THERE IS NO PER-ROW "
+     "DISCRIMINATOR, and that is the whole reason this row has to exist. Version 5 "
+     "could point at fit_results.engine, which carries 'gated_two_point' on exactly "
+     "the diverted rows, so that population is SELECT-able rather than inferred from "
+     "a timestamp; arc_state has no column recording which rule produced it, so a "
+     "post-change reader CANNOT tell 'genuinely unjudgeable' from 'refused by the old "
+     "rule on a sweep that was 90% fine'. This date is the only thing that separates "
+     "them. ArcClosure.n_dropped now travels in gate_log_json, which fixes that "
+     "forward and says nothing whatever about the rows already stored. NO BACKFILL - "
+     "the stored 'unknown' rows genuinely were computed under the old rule and are "
+     "the only record of what it did, and recomputing them would manufacture the "
+     "false comparability this ledger exists to prevent, the same argument "
+     "_migrate_experiment_skipped_channels makes for leaving NULL alone. "
+     "COMPARABILITY: rows either side of this date are comparable only among "
+     "themselves ON THE POPULATION THAT CARRIES UNUSABLE POINTS; the fully-finite "
+     "population is continuous across it"),
 )
 
 # ---------------------------------------------------------------------------
@@ -267,6 +335,21 @@ CREATE TABLE IF NOT EXISTS fit_results (
     -- pair is idempotent by construction: on a fresh database the CREATE supplies
     -- these and every `if name not in cols` is false; on a legacy one the CREATE is
     -- a no-op and the ALTERs supply them.
+    -- `engine` holds 'legacy', 'gated', either of those refined by `_engine_label`
+    -- ('gated_two_point', 'two_point'), or 'unknown' -- see FIT_ENGINE_UNKNOWN. It
+    -- is never NULL, and the NOT NULL is deliberate rather than inherited: NULL is
+    -- spent three columns down (`arc_state`) on *never annotated*, and every
+    -- `fit_results` row was annotated -- by a writer that either knew the engine or
+    -- said it did not.
+    --
+    -- The SQL DEFAULT is a MIGRATION ARTEFACT and no longer a writer's default.
+    -- `record_fit` names this column in every INSERT, and it is the only INSERT into
+    -- this table, so the literal below is reached by exactly one thing: the
+    -- `ALTER TABLE ADD COLUMN` in `_migrate_fit_gate_columns` backfilling rows that
+    -- predate the column. 'legacy' is the right answer THERE and only there -- those
+    -- rows were written before a gated engine existed to run. It stays, verbatim in
+    -- both places per the note above; changing it would demand a table rebuild and
+    -- would retroactively unlabel a population that is correctly labelled.
     engine              TEXT    NOT NULL DEFAULT 'legacy',
     gate_verdict        TEXT,
     gate_log_json       TEXT    NOT NULL DEFAULT '[]',
@@ -579,11 +662,26 @@ def _f_or_none(value: Any) -> float | None:
 def _fit_report_columns(report: Any | None) -> dict[str, Any]:
     """Gate/covariance columns for one ``fit_results`` row.
 
-    Returns the legacy defaults when *report* is ``None``, so a row written by the
-    unchanged path means precisely what it has always meant.
+    Without a *report* every gate column falls to the value that says *this row has
+    nothing to report* — a NULL ``gate_verdict``, an empty ``gate_log_json``, the
+    ``'split'`` report mode the legacy path has always implied. Those are absences,
+    and they read as absences.
+
+    ``engine`` is the exception, because it is the one column here that is not an
+    absence but a **claim**, and the claim it used to make was ``'legacy'``. That was
+    true only by coincidence of configuration: see :data:`FIT_ENGINE_UNKNOWN` for why
+    the coincidence ends the moment ``[eis] engine`` is set to ``gated``, and why
+    resolving the setting here would substitute one unfalsifiable claim for another.
+    An undeclared row now says :data:`FIT_ENGINE_UNKNOWN`.
+
+    The same sentinel backs the ``getattr`` below: a *report* that carries no
+    ``engine`` attribute has not declared one either, and a real
+    :class:`~softae.analysis.eis.report.SpectrumReport` cannot be built without it, so
+    the fallback is only ever reached by something duck-typed that genuinely does not
+    know.
     """
     defaults: dict[str, Any] = {
-        "engine": "legacy",
+        "engine": FIT_ENGINE_UNKNOWN,
         "gate_verdict": None,
         "gate_log_json": "[]",
         "n_points_used": None,
@@ -615,7 +713,7 @@ def _fit_report_columns(report: Any | None) -> dict[str, Any]:
     n_dropped = getattr(report, "n_dropped", None)
 
     defaults.update(
-        engine=str(getattr(report, "engine", "legacy")),
+        engine=str(getattr(report, "engine", None) or FIT_ENGINE_UNKNOWN),
         gate_verdict=getattr(verdict, "value", None) or (
             str(verdict) if verdict is not None else None),
         gate_log_json=_safe_json(list(getattr(report, "gate_log", ()) or [])),
@@ -685,14 +783,25 @@ def _engine_label(engine: str, fit_result: Any) -> str:
     can hold both kinds written the same afternoon.
 
     ``engine`` is refined rather than joined by a second column, because that column
-    already answers *what produced this number* — ``'legacy'``, ``'gated'``, and now
-    ``'gated_two_point'`` — and a parallel ``estimator`` column would be a second
-    spelling of one fact, which is how two columns start disagreeing.
+    already answers *what produced this number* — ``'legacy'``, ``'gated'``,
+    ``'gated_two_point'``, and :data:`FIT_ENGINE_UNKNOWN` — and a parallel
+    ``estimator`` column would be a second spelling of one fact, which is how two
+    columns start disagreeing.
 
     Read off the **fit**, the same deviation :func:`_arc_columns` makes and for the
     same reason: a fit reaches this table from callers that pass no report at all, and
     a label that only survives on reported rows is a label that goes missing exactly
     where the epoch matters. Anything unlabelled is left exactly as it was.
+
+    **The composition is what makes an undeclared row still useful.** The estimator is
+    read off the fit, so it is known even when the engine is not: an undeclared
+    two-point row lands as ``'unknown_two_point'``, which states the half that is
+    evidenced and withholds the half that is not. That is also the row this function
+    used to get most wrong — pre-gate diversion only happens on the gated path, so
+    under ``[eis] engine = "gated"`` a report-less two-point fit was labelled bare
+    ``'two_point'``, spelling *legacy* into the one population epoch 5 exists to keep
+    separable. The ``!= "legacy"`` test below is unchanged and still means what it
+    said; only its input stopped lying.
     """
     from softae.analysis.eis.engine import TWO_POINT
 
@@ -1291,9 +1400,13 @@ class DataStore:
         :class:`~softae.analysis.circuit_fitting.FitResult` instance.
 
         *report* is an optional
-        :class:`~softae.analysis.eis.report.SpectrumReport` from the gated engine.
-        When absent — which is every legacy-engine call — the gate columns take their
-        defaults and the row means exactly what such a row has always meant.
+        :class:`~softae.analysis.eis.report.SpectrumReport` from either engine, and it
+        is **the only thing that tells this method which engine ran**. When absent the
+        gate columns take their defaults and ``engine`` records
+        :data:`FIT_ENGINE_UNKNOWN` — not ``'legacy'``, which would be a claim about
+        physics made by a method that was handed no evidence for it, and which
+        silently inverts as soon as ``[eis] engine`` is ``gated``. Pass *report* to
+        get a labelled row; three of this method's four call sites currently do not.
 
         The four ``arc_*`` columns are the one exception to that split: they come
         from *fit_result*, never from *report*, so they populate whether or not a
@@ -3107,6 +3220,14 @@ class DataStore:
         Every one is nullable or defaults to what the legacy path already does, so an
         existing row keeps meaning exactly what it meant: ``engine='legacy'``,
         ``report_mode='split'``, ``dead_height_cm=0.0``, ``sigma_is_bound=0``.
+
+        The ``engine`` backfill is the **only** surviving use of that literal, and it
+        is still correct: a row this ALTER reaches predates the gated engine, so
+        ``'legacy'`` is a fact about it and not a guess. New rows no longer take the
+        SQL default at all — :func:`_fit_report_columns` supplies
+        :data:`FIT_ENGINE_UNKNOWN` when nothing declared an engine. **No backfill in
+        the other direction**: rewriting these rows to ``'unknown'`` would spend a
+        true label to make a point about a false one.
 
         ``gate_log_json`` holds ``run_gates``' log verbatim — R17's "named gate and
         reason" with no translation layer between the check and the record.

@@ -103,6 +103,105 @@ class TestArcClosureIsRobustToOneNoisyPoint:
         assert arc_closure(f, y).state == OPEN
 
 
+class TestArcClosureJudgesTheUsablePointsRatherThanRefusingWhole:
+    """``ch22_003``: 52 usable points of 53, ``fit_ok=True``, ``arc_closed=False``,
+    ``reason='non-finite point in the sweep'``.
+
+    That pair of answers is what a hardware fault looks like — an unclosed reference
+    electrode — and ch22 was read as one for two days. ``fit_circuit`` was cured by
+    :func:`~softae.analysis.circuit_fitting.usable_points`; this is the other half,
+    and these tests are what stops the refusal coming back."""
+
+    def test_arc_closure_one_unusable_point_among_many_still_returns_a_verdict(self):
+        f, y = semicircle(npts=53)
+        y[3] = np.nan
+        arc = arc_closure(f, y)
+        assert arc.state == CLOSED
+        assert arc.n_dropped == 1
+        assert arc.f_peak_hz > arc.f_low_hz
+
+    def test_arc_closure_one_unusable_point_does_not_move_the_verdict(self):
+        # The excluded point is not near the peak, so the arc it is read off is the
+        # same arc. A verdict that flipped here would mean the mask, not the rule,
+        # was deciding.
+        f, y = semicircle(npts=53)
+        clean = arc_closure(f, y)
+        y[3] = np.nan
+        assert arc_closure(f, y).state == clean.state
+        assert arc_closure(f, y).f_peak_hz == pytest.approx(clean.f_peak_hz)
+
+    def test_arc_closure_open_verdict_survives_an_unusable_point_too(self):
+        # Both directions, so the mask cannot be quietly biasing toward CLOSED.
+        f, y = semicircle(f_peak=2.0, f_lo=20.0, npts=53)
+        y[3] = np.nan
+        arc = arc_closure(f, y)
+        assert arc.state == OPEN
+        assert arc.n_dropped == 1
+
+    def test_arc_closure_non_positive_frequency_is_excluded_like_a_non_finite_one(self):
+        # The shared predicate is `isfinite(f) & isfinite(Z) & (f > 0)`, not just
+        # finiteness: `band_below_apex_decades` is `log10(f_apex / f_low)`, and a
+        # zero floor makes that infinite rather than wrong-looking.
+        f, y = semicircle(npts=53)
+        f = f.copy()
+        f[-1] = 0.0
+        arc = arc_closure(f, y)
+        assert arc.n_dropped == 1
+        assert arc.f_low_hz > 0.0
+
+    def test_arc_closure_phase_is_read_at_the_lowest_surviving_frequency(self):
+        # Severity must describe a point the verdict actually saw. Masking `f` and
+        # `y` but not `phase` would misalign the arrays and report a neighbour's.
+        f, y = semicircle(f_peak=2.0, f_lo=20.0, npts=53)
+        phase = np.linspace(-10.0, -80.0, f.size)      # f descends, so phase[-1] is the floor
+        f = f.copy()
+        f[-1] = np.nan
+        arc = arc_closure(f, y, phase)
+        assert arc.phase_low_deg == pytest.approx(phase[-2])
+
+    def test_arc_closure_phase_of_a_kept_point_is_not_itself_a_reason_to_drop(self):
+        # Phase is severity only and is documented as NaN-able. Admitting it to the
+        # predicate would drop points for a field the state never consults.
+        f, y = semicircle(npts=53)
+        phase = np.full(f.size, -45.0)
+        phase[7] = np.nan
+        arc = arc_closure(f, y, phase)
+        assert arc.n_dropped == 0
+        assert arc.state == CLOSED
+
+    def test_arc_closure_masked_verdict_is_still_order_invariant(self):
+        f, y = semicircle(npts=53)
+        y[3] = np.nan
+        ascending, descending = arc_closure(f[::-1], y[::-1]), arc_closure(f, y)
+        assert ascending.state == descending.state
+        assert ascending.f_peak_hz == pytest.approx(descending.f_peak_hz)
+        assert ascending.n_dropped == descending.n_dropped
+
+    def test_arc_closure_reports_the_exclusion_in_the_operator_facing_detail(self):
+        f, y = semicircle(npts=53)
+        y[3] = np.nan
+        assert "1 unusable point(s) excluded" in arc_closure(f, y).detail
+
+    def test_arc_closure_dropped_count_reaches_the_gate_log_record(self):
+        # `as_record`'s readers sum `n_dropped` across entries; it was a hardcoded
+        # zero, which is the only reason no key had to be added for this.
+        f, y = semicircle(npts=53)
+        y[3] = np.nan
+        assert arc_closure(f, y).as_record()["n_dropped"] == 1
+
+    def test_engine_legacy_path_fits_and_judges_the_same_gappy_spectrum(self):
+        # End to end on the shipped engine — the ch22_003 pair of answers, which
+        # must now agree with each other instead of contradicting.
+        f, Z = reference_spectrum()
+        Z = Z.astype(complex).copy()
+        Z[3] = complex(np.nan, np.nan)
+        report = analyze_spectrum(as_eis_result(f, Z), cell=CELL, engine="legacy")
+        assert report.fit.success is True
+        assert report.fit.n_points_dropped == 1
+        assert report.fit.arc_closure.state != UNKNOWN
+        assert report.fit.arc_closure.n_dropped == 1
+
+
 class TestArcClosureRefusesRatherThanGuesses:
     def test_arc_closure_too_few_points_reads_unknown(self):
         f, y = semicircle(npts=4)
@@ -111,10 +210,30 @@ class TestArcClosureRefusesRatherThanGuesses:
         assert arc.state != CLOSED
         assert "4 points" in arc.reason
 
-    def test_arc_closure_non_finite_point_reads_unknown(self):
+    def test_arc_closure_remnant_below_min_points_reads_unknown(self):
+        # Refusing must stay possible. What changed is *what* is refused: a sweep
+        # whose survivors cannot support a verdict, not a sweep with one bad sample.
         f, y = semicircle()
-        y[3] = np.nan
-        assert arc_closure(f, y).state == UNKNOWN
+        y[4:] = np.nan                       # 4 usable of 25, below min_points=5
+        arc = arc_closure(f, y)
+        assert arc.state == UNKNOWN
+        assert "4 of 25 points are usable" in arc.reason
+        assert arc.n_dropped == 21
+
+    def test_arc_closure_wholly_non_finite_sweep_reads_unknown(self):
+        f, y = semicircle()
+        arc = arc_closure(f, np.full(y.size, np.nan))
+        assert arc.state == UNKNOWN
+        assert "0 of 25" in arc.reason
+
+    def test_arc_closure_short_sweep_is_refused_as_short_not_as_unusable(self):
+        # The two refusals are not the same finding and must not read alike: an
+        # operator who chose a 4-point preset has a configuration problem, not a
+        # data-quality one.
+        f, y = semicircle(npts=4)
+        arc = arc_closure(f, y)
+        assert arc.reason == "4 points, need 5"
+        assert arc.n_dropped == 0
 
     def test_arc_closure_flat_sweep_reads_unknown(self):
         f, _ = semicircle()
@@ -219,7 +338,10 @@ class TestTheAnnotationIsPersisted:
         assert row["gate_log_json"] == "[]"
         assert row["success"] == 1
         assert row["gate_verdict"] is None
-        assert row["engine"] == "legacy"
+        # `engine` is the one column here that is a claim rather than an absence, and
+        # no report was passed, so nothing declared one. The `engine="legacy"` above
+        # is an argument to `analyze_spectrum`, which `record_fit` never sees.
+        assert row["engine"] == "unknown"
         assert json.loads(row["parameters_json"]) == pytest.approx(
             fit.parameters.tolist())
 
@@ -273,6 +395,71 @@ def arc_verdict_before_the_extension(freq, z_imag_neg, *, min_points: int = 5):
     return OPEN, float(f_s[0])
 
 
+#: The epoch-6 boundary, as ``SCHEMA_EPOCHS`` version 6 (2026-08-26, data-epoch)
+#: states it. Rows fitted **before** it were produced by the all-or-nothing
+#: finiteness rule; rows fitted **on or after** it were produced by the masking one.
+#:
+#: Compared as a plain string against ``fit_results.fitted_at``, and that is sound
+#: rather than lucky: measured over the shipped database, all 3619 rows are exactly
+#: 32 characters of ``YYYY-MM-DDTHH:MM:SS.ffffff+00:00``, none NULL and not one
+#: carrying any other UTC offset. Fixed width, zero-padded, single offset — so
+#: lexicographic order *is* chronological order and no parsing is needed. A column
+#: that mixed offsets would make this comparison quietly wrong and would have to be
+#: parsed instead, which is why the format is asserted here in words.
+EPOCH6_BOUNDARY = "2026-08-26"
+
+
+def _peak_agrees(computed: float, stored: float | None) -> bool:
+    """``arc_f_peak_hz`` round-trips a NaN peak as SQL NULL, so absent equals absent.
+
+    ``_f_or_none`` is what writes the column and every UNKNOWN verdict carries a NaN
+    peak, so a bare ``==`` would read a correctly stored refusal as a mismatch.
+    :meth:`~TestTheExtensionMovedNothingThatWasAlreadyStored._replay` already makes
+    the same both-absent allowance against the frozen baseline. On the shipped
+    database this changes nothing today — all 91 fully-usable rows store a real
+    number — it is what keeps the post-boundary branch below correct for the first
+    genuinely unjudgeable spectrum the new rule refuses.
+    """
+    if stored is None:
+        return computed != computed
+    return computed == stored
+
+
+def check_stored_arc_row(*, stored_state, stored_peak, fitted_at, arc, where) -> str:
+    """Assert one stored ``fit_results`` row against a freshly computed *arc*.
+
+    The partition is the claim, not a convenience. ``fitted_at`` says which rule
+    wrote the row, and an epoch sanctions a difference between two rules — so it can
+    only ever excuse a row that the *old* rule wrote. Returns ``'exact'``,
+    ``'epoch6_judged'`` or ``'epoch6_refused'`` so callers can pin the population.
+    """
+    if fitted_at >= EPOCH6_BOUNDARY:
+        # Written BY the masking rule. It must reproduce exactly — unusable points
+        # and all. Without this branch a gappy row written next week would be waved
+        # through the epoch relaxation below on the strength of a difference that
+        # cannot exist, because only one rule ever ran on it.
+        assert arc.state == stored_state, where
+        assert _peak_agrees(arc.f_peak_hz, stored_peak), where
+        return "exact"
+    if arc.n_dropped == 0:
+        # Pre-boundary and fully usable: the two rules read the identical array, so
+        # this is the original assertion at its original strength.
+        assert arc.state == stored_state, where
+        assert _peak_agrees(arc.f_peak_hz, stored_peak), where
+        return "exact"
+    # Pre-boundary and gappy — the only population epoch 6 speaks about, and the
+    # divergence is one-directional: the old rule refused every spectrum carrying an
+    # unusable point, so the stored value can only be `unknown`. Anything else means
+    # the mask is *moving* a judged row, which epoch 6 does not sanction.
+    assert stored_state == UNKNOWN, where
+    if arc.state == UNKNOWN:
+        # Still refused, but now for the informative reason: the remnant rather
+        # than a single bad sample.
+        assert "usable" in arc.reason, where
+        return "epoch6_refused"
+    return "epoch6_judged"
+
+
 class TestTheExtensionMovedNothingThatWasAlreadyStored:
     """A1/A11 — the additive-only constraint, which is what keeps this change out of
     T7.9's epoch-grade scope. ``arc_state`` and ``arc_f_peak_hz`` are populated
@@ -286,17 +473,44 @@ class TestTheExtensionMovedNothingThatWasAlreadyStored:
     DB = Path("C:/Users/Osuji/softae_data/db/softae.db")
 
     def _replay(self, paths):
+        """Agreement with the frozen baseline, plus a *measured* account of the one
+        class where this tree deliberately stopped agreeing.
+
+        The finiteness change moves stored ``arc_state`` on exactly one class of
+        spectrum: the ones carrying an unusable point, which the baseline refuses
+        whole and this now judges on the remnant. That is the finding
+        :func:`arc_verdict_before_the_extension` was written to surface, and it is
+        surfaced here rather than papered over — the divergence is asserted to be
+        one-directional (baseline UNKNOWN → a verdict) and confined to spectra with
+        ``n_dropped > 0``. Everything with a fully usable sweep is pinned as before.
+
+        Returns ``(diverged, judged)`` so the callers can pin the blast radius.
+        """
         xr = pytest.importorskip("xarray")
+        diverged = judged = 0
         for path in paths:
             with xr.open_dataset(path, engine="h5netcdf") as ds:
                 f = ds["frequency_hz"].values
                 y = ds["z_imag_neg"].values
             arc = arc_closure(f, y)
             expected_state, expected_peak = arc_verdict_before_the_extension(f, y)
+            if arc.n_dropped:
+                diverged += 1
+                # One-directional: the baseline can only have refused. If it had a
+                # verdict here, the mask would be *changing* a judged spectrum,
+                # which is T7.9's territory and not this change's.
+                assert expected_state == UNKNOWN, path.name
+                if arc.state == UNKNOWN:
+                    # Still refused, but for the informative reason.
+                    assert "usable" in arc.reason, path.name
+                else:
+                    judged += 1
+                continue
             assert arc.state == expected_state, path.name
             assert (arc.f_peak_hz == expected_peak
                     or (arc.f_peak_hz != arc.f_peak_hz
                         and expected_peak != expected_peak)), path.name
+        return diverged, judged
 
     def test_arc_state_and_f_peak_unchanged_over_a_sample_of_the_corpus(self):
         # Every twelfth spectrum of the 1440, deterministically — the same property
@@ -304,7 +518,10 @@ class TestTheExtensionMovedNothingThatWasAlreadyStored:
         # tier-1 run still meets real data.
         if not self.CORPUS:
             pytest.skip("characterisation run not present on this machine")
-        self._replay(self.CORPUS[::12])
+        diverged, judged = self._replay(self.CORPUS[::12])
+        # Measured: 3 of the 120 sampled. Pinned rather than tolerated, because a
+        # silent widening of this class is the thing that would be hard to notice.
+        assert (diverged, judged) == (3, 3)
 
     @pytest.mark.slow
     def test_arc_state_and_f_peak_unchanged_over_the_stored_corpus(self):
@@ -313,13 +530,32 @@ class TestTheExtensionMovedNothingThatWasAlreadyStored:
         # runs by default.
         if not self.CORPUS:
             pytest.skip("characterisation run not present on this machine")
-        self._replay(self.CORPUS)
+        diverged, judged = self._replay(self.CORPUS)
+        # 33 of 1440 carry an unusable point; the smallest remnant is 9 of 25, so
+        # every one of them clears `min_points=5` and is judged rather than refused.
+        # This is the non-fallback path proved on real data, not on constructions.
+        assert (diverged, judged) == (33, 33)
 
     def test_stored_arc_columns_are_reproduced_exactly_by_the_extended_function(self):
         """The other direction: not "agrees with a frozen copy" but "agrees with what
         is actually written down". These rows were computed by the un-extended
-        function, so any drift would be visible here as a changed column."""
+        function, so any drift would be visible here as a changed column.
+
+        One class of drift is **sanctioned**, and only that one: ``SCHEMA_EPOCHS``
+        version 6 (2026-08-26, data-epoch) records that ``arc_state`` may now hold a
+        verdict where the old all-or-nothing finiteness rule stored ``unknown``.
+
+        ``fitted_at`` splits the table into the two halves that claim needs, and the
+        split is what keeps this test stable while the database grows. The
+        **pre-boundary** half was written by the old rule, is frozen, and is the only
+        half an epoch can excuse, so its populations are pinned exactly. The
+        **post-boundary** half was written by the new rule, so it must reproduce
+        exactly — gaps and all — and is guarded by equality rather than by a count,
+        which holds at any size. Counting the growing half would be a number that goes
+        red for a legitimate reason, and the predictable repair is to loosen it.
+        """
         import sqlite3
+        from collections import Counter
 
         from softae.analysis.eis_data import EISResult
 
@@ -329,7 +565,7 @@ class TestTheExtensionMovedNothingThatWasAlreadyStored:
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
-                "SELECT f.arc_state, f.arc_f_peak_hz, m.eis_file_path "
+                "SELECT f.arc_state, f.arc_f_peak_hz, f.fitted_at, m.eis_file_path "
                 "FROM fit_results f JOIN measurements m "
                 "  ON m.measurement_id = f.measurement_id "
                 "WHERE f.arc_state IS NOT NULL AND m.eis_file_path IS NOT NULL"
@@ -337,19 +573,86 @@ class TestTheExtensionMovedNothingThatWasAlreadyStored:
         finally:
             conn.close()
 
-        checked = 0
+        before: Counter[str] = Counter()
+        checked = after = 0
         for row in rows:
             path = self.DB.parent.parent / row["eis_file_path"]
             if not path.exists():
                 continue
-            result = EISResult.load(path)
-            arc = arc_closure(result.frequency, result.z_imag_neg,
-                              getattr(result, "phase", None))
-            assert arc.state == row["arc_state"], path.name
-            assert arc.f_peak_hz == row["arc_f_peak_hz"], path.name
             checked += 1
+            result = EISResult.load(path)
+            outcome = check_stored_arc_row(
+                stored_state=row["arc_state"], stored_peak=row["arc_f_peak_hz"],
+                fitted_at=row["fitted_at"], where=path.name,
+                arc=arc_closure(result.frequency, result.z_imag_neg,
+                                getattr(result, "phase", None)))
+            if row["fitted_at"] >= EPOCH6_BOUNDARY:
+                # Asserted exact inside, and deliberately NOT pinned: this half gains
+                # a row every time the rig fits a spectrum.
+                after += 1
+            else:
+                before[outcome] += 1
         if checked == 0:
             pytest.skip("no stored arc verdicts with a readable spectrum")
+        # Measured against the shipped DataStore, not guessed: 101 joinable rows with
+        # a readable spectrum, every one of them fitted between 2026-08-17 and
+        # 2026-08-25 and so pre-boundary. 91 have a fully usable sweep; 10 carry
+        # unusable points, and 9 of those now get a verdict where the old rule stored
+        # `unknown`. The tenth keeps 2 of 34 points, below `min_points`, and is still
+        # refused — the non-fallback refusal proved on real data rather than on a
+        # construction. Pinned exactly, in the style of the `_replay` tests above,
+        # because a silent widening of this class is what would otherwise go
+        # unnoticed. These three numbers cannot move on their own: nothing writes to
+        # a row after it is fitted, so a change here is a change in the rule.
+        assert (before["exact"], before["epoch6_judged"],
+                before["epoch6_refused"]) == (91, 9, 1), (
+            f"{checked} rows checked, {after} of them post-boundary")
+
+    def test_a_row_fitted_after_the_boundary_reproduces_exactly_unusable_points_and_all(
+        self, tmp_path
+    ):
+        """The post-boundary half of the partition, which the shipped database cannot
+        exercise: all 101 of its joinable arc rows were fitted between 2026-08-17 and
+        2026-08-25, so the branch that *refuses* to relax has no real row to fire on
+        and would be code proved by nothing.
+
+        So one is constructed, in the one shape that matters — a spectrum carrying an
+        unusable point, fitted now. ``record_fit`` stamps ``fitted_at`` off the clock,
+        which is on or after the boundary by construction. Without the partition this
+        row would be waved through the epoch branch on the strength of a difference
+        between two rules, when only one rule ever touched it.
+        """
+        from softae.core.data_store import DataStore
+
+        f, Z = reference_spectrum()
+        Z = Z.astype(complex).copy()
+        Z[3] = complex(np.nan, np.nan)
+        eis = as_eis_result(f, Z)
+
+        store = DataStore(tmp_path / "post_epoch6")
+        try:
+            run_id = store.start_run("arc-post-epoch6")
+            measurement_id = store.record_measurement(run_id, eis)
+            fit = analyze_spectrum(eis, cell=CELL, engine="legacy").fit
+            fit_id = store.record_fit(measurement_id, fit, L_cm=0.2, t_cm=0.015,
+                                      w_cm=0.2)
+            row = dict(store._conn.execute(
+                "SELECT arc_state, arc_f_peak_hz, fitted_at FROM fit_results "
+                "WHERE fit_id = ?", (fit_id,)).fetchone())
+        finally:
+            store.close()
+
+        arc = arc_closure(eis.frequency, eis.z_imag_neg, getattr(eis, "phase", None))
+        # The two preconditions that make this the case the live table has none of.
+        assert row["fitted_at"] >= EPOCH6_BOUNDARY, row["fitted_at"]
+        assert arc.n_dropped > 0
+        # And the stored verdict is a real one, so a relaxation that fired here would
+        # be comparing the new rule against itself.
+        assert row["arc_state"] != UNKNOWN
+        assert check_stored_arc_row(
+            stored_state=row["arc_state"], stored_peak=row["arc_f_peak_hz"],
+            fitted_at=row["fitted_at"], arc=arc,
+            where="constructed post-boundary row") == "exact"
 
     def test_as_record_is_unchanged(self):
         # The record travels in `fit_results.gate_log_json`, whose readers sum
@@ -404,16 +707,19 @@ class TestTheInteriorApexIsForPlanningNotForTheVerdict:
                       arc.band_below_apex_decades):
             assert value != value
 
-    @pytest.mark.parametrize("case", ["mismatched", "too_few", "non_finite", "flat"])
+    @pytest.mark.parametrize("case", ["mismatched", "too_few", "remnant", "flat"])
     def test_new_fields_are_nan_on_every_unknown_path(self, case):
         f, y = arc_with_blocking_tail()
         if case == "mismatched":
             arc = arc_closure(f, y[:-1])
         elif case == "too_few":
             arc = arc_closure(f[:4], y[:4])
-        elif case == "non_finite":
+        elif case == "remnant":
+            # Was `non_finite` with a single NaN, which no longer reaches UNKNOWN —
+            # that spectrum is now judged, and `TestArcClosureJudgesTheUsablePoints…`
+            # is where it went. What still refuses is a remnant too small to judge.
             y = y.copy()
-            y[3] = np.nan
+            y[4:] = np.nan
             arc = arc_closure(f, y)
         else:
             arc = arc_closure(f, np.ones(f.size))

@@ -134,6 +134,12 @@ class ArcClosure:
     #: actions, and one score cannot tell them apart.
     band_below_apex_decades: float = float("nan")
 
+    #: Points :func:`~softae.analysis.circuit_fitting.usable_points` withheld from
+    #: the verdict. Last field, for the same positional reason as the block above.
+    #: It is *this* function's count, not the fitter's: the two masks differ by
+    #: ``Z′``, which the arc rule never reads.
+    n_dropped: int = 0
+
     @property
     def closed(self) -> bool:
         return self.state == CLOSED
@@ -145,6 +151,11 @@ class ArcClosure:
         where = f"−Z″ peak at {self.f_peak_hz:.4g} Hz, sweep floor {self.f_low_hz:.4g} Hz"
         if self.phase_low_deg == self.phase_low_deg:
             where += f", phase there {self.phase_low_deg:.1f}°"
+        if self.n_dropped:
+            # Said on the judged spectra too, not only the refused ones: a verdict
+            # read off a remnant is still a verdict about fewer points than the
+            # operator asked the instrument for.
+            where += f", {self.n_dropped} unusable point(s) excluded"
         if self.state == OPEN:
             return f"arc did not close in band ({where}) — R1 extrapolated"
         return f"arc closed in band ({where})"
@@ -160,7 +171,7 @@ class ArcClosure:
             "gate": "arc_closure",
             "severity": "annotate",
             "passed": self.state == CLOSED,
-            "n_dropped": 0,
+            "n_dropped": self.n_dropped,
             "detail": self.detail,
             "state": self.state,
             "f_peak_hz": _finite_or_none(self.f_peak_hz),
@@ -201,26 +212,72 @@ def arc_closure(
     The three interior-apex fields are computed alongside and reported alongside;
     they never enter the rule above, so ``state`` and ``f_peak_hz`` are what they
     have always been on every spectrum this rig has stored.
+
+    **Unusable points are excluded, not fatal.** Until now a single non-finite
+    sample refused the whole spectrum, which is the defect
+    :func:`~softae.analysis.circuit_fitting.fit_circuit` had until its mask landed —
+    and while only half of it was cured ``ch22_003`` read ``fit_ok=True,
+    arc_closed=False`` on 52 good points of 53, which is what a hardware fault looks
+    like. Measured over the 1440-spectrum characterisation run: 33 spectra carry at
+    least one unusable point, and every one of them retains at least 9 of its 25.
+    Refusing stays possible and stays *reported* — it now names the remnant instead
+    of a single bad sample, because "one point was NaN" tells an operator nothing
+    about whether the surviving sweep could be judged.
     """
     f = np.asarray(freq, dtype=float).ravel()
     y = np.asarray(z_imag_neg, dtype=float).ravel()
     if f.size != y.size:
         return ArcClosure(UNKNOWN, reason=f"{f.size} frequencies vs {y.size} points")
     if f.size < min_points:
+        # Ahead of the mask, and with its wording untouched: a sweep the operator
+        # asked to be short is not a finiteness finding and must not be reported as
+        # one. What the mask below produces is a *remnant*, which is different.
         return ArcClosure(UNKNOWN, reason=f"{f.size} points, need {min_points}")
-    if not (np.isfinite(f).all() and np.isfinite(y).all()):
-        return ArcClosure(UNKNOWN, reason="non-finite point in the sweep")
+
+    # The fitter's predicate, imported rather than restated — two definitions of
+    # "usable point" in one codebase is the defect one layer up from this one, and
+    # `usable_points` already carries the reasoning for `f > 0` and for judging the
+    # array jointly. Deferred because `arc.py` is a numpy-only leaf that `scout`,
+    # `equilibration` and two tools import, and `circuit_fitting` is an 868-line
+    # module none of them otherwise need at import time; there is no cycle, since
+    # `circuit_fitting` has no top-level softae imports.
+    #
+    # `y` is passed for both impedance arguments deliberately. The predicate is a
+    # conjunction, so repeating an array is idempotent, and this verdict reads only
+    # `f` and `−Z″` — a point whose `Z′` is unusable still carries an intact `−Z″`.
+    # `fit_circuit` must drop it because `curve_fit` is handed
+    # `hstack([Z.real, Z.imag])`; this rule has no such stake, so the two counts can
+    # legitimately differ and `n_dropped` is documented as this function's own.
+    from softae.analysis.circuit_fitting import usable_points
+
+    mask = usable_points(f, y, y)
+    n_kept, n_dropped = int(mask.sum()), int(mask.size - mask.sum())
+    if n_kept < min_points:
+        # The same sentence `fit_circuit` refuses with, so an operator meeting both
+        # refusals on one spectrum reads one explanation rather than two.
+        return ArcClosure(
+            UNKNOWN,
+            reason=(f"only {n_kept} of {mask.size} points are usable "
+                    f"(need {min_points})"),
+            n_dropped=n_dropped,
+        )
+    f, y = f[mask], y[mask]
 
     order = np.argsort(f)
     f_s, y_s = f[order], y[order]
     if f_s[0] == f_s[-1] or y_s.max() == y_s.min():
-        return ArcClosure(UNKNOWN, reason="degenerate sweep")
+        return ArcClosure(UNKNOWN, reason="degenerate sweep", n_dropped=n_dropped)
 
     ph = float("nan")
     if phase is not None:
         p = np.asarray(phase, dtype=float).ravel()
-        if p.size == f.size:
-            ph = float(p[order][0])
+        if p.size == mask.size:
+            # Masked with the rest, so the severity is read at the lowest *surviving*
+            # frequency rather than at a point the verdict never saw. Phase itself is
+            # not in the predicate: it is severity only, its absence is already NaN by
+            # contract, and admitting it would drop points for a field the state never
+            # consults — a third definition by the back door.
+            ph = float(p[mask][order][0])
 
     # Parallel result, computed off the same sorted arrays so it inherits the
     # order-invariance above for free. It feeds only the three new fields — the
@@ -236,7 +293,8 @@ def arc_closure(
 
     peak = int(np.argmax(y_s))
     if peak != 0:
-        return ArcClosure(CLOSED, float(f_s[peak]), float(f_s[0]), ph, **interior)
+        return ArcClosure(CLOSED, float(f_s[peak]), float(f_s[0]), ph,
+                          n_dropped=n_dropped, **interior)
 
     trailing = y_s[:TRAILING_POINTS]
     # Each rise is judged against the point it climbs *to*, never against the floor
@@ -247,8 +305,10 @@ def arc_closure(
         # frequency: the arc's real peak is up-sweep, so report that one.
         runner_up = 1 + int(np.argmax(y_s[1:]))
         return ArcClosure(CLOSED, float(f_s[runner_up]), float(f_s[0]), ph,
-                          reason="lone excursion at the sweep floor", **interior)
-    return ArcClosure(OPEN, float(f_s[0]), float(f_s[0]), ph, **interior)
+                          reason="lone excursion at the sweep floor",
+                          n_dropped=n_dropped, **interior)
+    return ArcClosure(OPEN, float(f_s[0]), float(f_s[0]), ph,
+                      n_dropped=n_dropped, **interior)
 
 
 def annotate_arc_closure(fit: Any, eis_result: Any) -> ArcClosure:
@@ -258,6 +318,13 @@ def annotate_arc_closure(fit: Any, eis_result: Any) -> ArcClosure:
     :func:`~softae.analysis.eis.engine._demote_if_railed`. A railed fit reports a
     property of ``CIRCUIT_MODELS``; an extrapolated R₁ still reports the film, and
     demoting a third of every run would cost far more evidence than it saved.
+
+    ``_legacy_report`` passes the **unmasked** spectrum here, deliberately: the
+    exclusion belongs in :func:`arc_closure`, so every caller of it — ``scout``,
+    ``equilibration``, ``eis_validate`` — gets the same treatment rather than only
+    the two that happen to route through this wrapper. ``fit.n_points_dropped`` and
+    ``fit.arc_closure.n_dropped`` are therefore separate counts of separate masks;
+    see :attr:`ArcClosure.n_dropped`.
     """
     arc = arc_closure(
         getattr(eis_result, "frequency", ()),
