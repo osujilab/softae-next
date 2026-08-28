@@ -292,6 +292,33 @@ def _demote_if_railed(fit: Any) -> str:
     the settle criterion, the analysis tab, ``fit_results.sigma_S_per_cm``) takes
     a constant that is a property of ``CIRCUIT_MODELS`` for an observation.
 
+    Since 2026-08-27 :func:`~softae.analysis.eis.models.railed_measurand` answers for
+    ``R_series`` as well as ``R_bulk``, and the three actions below are applied
+    identically whichever of the two railed. ``R1 = NaN`` in particular is *not*
+    conditional on R₁ being the railed one, and that is a decision rather than an
+    oversight:
+
+    * ``R_series`` and ``R_bulk`` are in series and the optimiser trades between them
+      at near-zero cost — the whole subject of :func:`_resolve_reported_resistance`.
+      An ``R_series`` collapsed to 1e-62 Ω means ``R1`` has absorbed it, so ``R1`` is
+      ``R_series + R_bulk`` reported under the split's name. Keeping it would store a
+      σ that is wrong by an unknown, sample-dependent fraction while looking healthy.
+    * There is no weaker setting available. ``DataStore.record_fit`` derives σ from
+      ``fit_result.R1 and fit_result.R1 > 0`` and **never consults ``success``**, so
+      ``success = False`` alone suppresses nothing. The choice is σ or no σ.
+    * A pegged *nuisance* parameter (``C_par``, the CPE terms) is deliberately **not**
+      demoted, and that boundary was established empirically rather than assumed.
+      Demoting on every pegged parameter was implemented first and reverted: the
+      blocking-electrode CPE rails on ordinary spectra, so it demoted whole boards —
+      14 settle-phase tests in ``test_eis_validate.py`` went red, σ went null
+      board-wide, the survivor set fell under ``DEFAULT_SETTLE_MIN_CHANNELS`` and the
+      verdict moved from ``ceiling`` to ``not_evaluable``. On the stored corpus that
+      rule demotes 539 of 3 618 fits (14.9 %) where the defect is 222.
+
+    **Operator-visible**, at the narrowed scope: 222 of 3 618 stored ``simpleSalt``
+    fits (6.1 %) have the shape that now loses its σ, 210 of which carry one today.
+    Historical rows are not rewritten — this changes what future fits report.
+
     Three things change, and each closes one of those routes:
 
     ``success = False``

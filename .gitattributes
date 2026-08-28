@@ -1,0 +1,46 @@
+# Line endings, normalised in the repository.
+#
+# This machine has `core.autocrlf=true` and the repository had no `.gitattributes`,
+# so ten files carried CRLF in the index and printed
+#
+#     warning: in the working copy of '<path>', LF will be replaced by CRLF the
+#     next time Git touches it
+#
+# on every `git diff` any session ran. The warning is noise, but it is noise on the
+# one command three sessions use to see each other's work, and all three independently
+# named this file as the fix.
+#
+# `text=auto eol=lf` makes LF the stored form and the checked-out form, which is the
+# end state all three sessions named.
+#
+# MEASURED, so nobody expects more of this file than it delivers: adding it does NOT
+# silence the warning today. It inverts it. Before: 8 warnings, all "LF will be
+# replaced by CRLF" (files whose working copy is LF). After: 7 warnings, all "CRLF
+# will be replaced by LF" — a disjoint set, being the files whose working copy is
+# CRLF from having been checked out under `autocrlf` before this file existed. Each
+# one clears the first time that file is staged, and the set empties completely only
+# after the renormalisation pass below. The `git diff` output itself is unaffected:
+# no file shows a spurious whole-file rewrite, which was the risk worth checking.
+#
+# THE RENORMALISATION PASS IS DELIBERATELY NOT DONE HERE. `git add --renormalize .`
+# rewrites line endings across the whole tree, which would rewrite files other
+# sessions are actively editing — there were 13 dirty files in another session's
+# working set when this landed. Adding the file alone lets normalisation take effect
+# per-file as each is next touched, which is the incremental, conflict-free path. The
+# sweep is a separate, operator-timed step.
+
+* text=auto eol=lf
+
+# Binary, so Git never attempts a line-ending translation or a textual diff on them.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
+*.xlsx binary
+*.zip binary
+*.pyc binary

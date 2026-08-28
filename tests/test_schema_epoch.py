@@ -87,7 +87,12 @@ class TestEpochLedger:
     def test_the_data_epoch_row_names_the_correction_and_its_magnitude(
             self, store) -> None:
         """The note must be enough to act on without consulting the mail archive."""
-        epoch = next(r for r in store.schema_epochs() if r["kind"] == "data-epoch")
+        # Located by VERSION, never by kind-and-position. `kind == "data-epoch"` read
+        # epoch 2 only for as long as epoch 2 was the *first* data-epoch and
+        # `schema_epochs()` returned rows in version order — and epoch 5 is a
+        # data-epoch too, so this already depended on the ordering rather than on
+        # anything about epoch 2. It survives appends and breaks on any insertion.
+        epoch = next(r for r in store.schema_epochs() if r["version"] == 2)
         assert "2026-08-07" in epoch["note"]
         assert "deposit_area_mm2" in epoch["note"]
         assert "18.704" in epoch["note"] and "4.676" in epoch["note"]
