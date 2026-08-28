@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from softae.core.data_store import DataStore
+from softae.core.data_store import FIT_QUALITY_COLUMNS, DataStore
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +66,10 @@ class _FakeFitResult:
     #: declaring it, and ``_engine_label`` reads it with ``getattr(..., None)``, so
     #: ``None`` here is the ordinary CPE fit — the same thing an unset attribute means.
     estimator: str | None = None
+    #: Goodness-of-fit metrics, as ``compute_fit_quality`` leaves them on the real
+    #: ``FitResult``. Empty by default because that is what a failed fit — or one
+    #: with no ``z_fit`` to compare against — actually carries.
+    quality: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1628,9 +1632,24 @@ class TestArcColumns:
 
     def test_a_fresh_database_has_the_arc_columns_from_the_ddl_not_only_from_the_migration(
             self, store: DataStore) -> None:
-        # `_DDL` and the migration are two descriptions of one schema; covering only
-        # the migration lets the DDL drift until a fresh install and an upgraded one
-        # disagree about what a fit row contains.
+        """`_DDL` and the migration are two descriptions of one schema.
+
+        Covering only the migration lets the DDL drift until a fresh install and an
+        upgraded one disagree about what a fit row contains.
+
+        **The `_DDL` TEXT assertion is the load-bearing one, and the PRAGMA below
+        cannot substitute for it.** `_migrate_fit_gate_columns` runs on EVERY open,
+        including a brand-new database, so its ALTER loop supplies any column the
+        DDL omitted and `PRAGMA table_info` reads back identically either way —
+        green on a `_DDL` that declares none of these. The text is also what a
+        future hand actually edits. Do not "simplify" this back to the PRAGMA.
+        """
+        from softae.core.data_store import _DDL
+
+        for name in sorted(ARC_COLUMNS):
+            assert f"\n    {name} " in _DDL, f"{name} missing from _DDL"
+        # Kept alongside, not traded away: the text proves the DECLARATION exists,
+        # this proves the column reached the opened database.
         assert ARC_COLUMNS <= _fit_results_columns(store)
 
     def test_a_legacy_database_gains_the_arc_columns_from_the_migration(
@@ -1782,13 +1801,30 @@ class TestArcColumns:
 
     def test_a_nan_peak_frequency_is_stored_as_null_not_as_nan(
             self, store_with_run) -> None:
-        # `_f_or_none` is the file's NaN -> NULL boundary and the columns go through
-        # it, so a phase-less spectrum lands as NULL rather than as a number that
-        # reads as present to anything checking only for None.
+        """`_f_or_none` is the file's NaN -> NULL boundary and these columns use it.
+
+        **The `_arc_columns` assertion is the load-bearing one, and the round trip
+        below cannot substitute for it.** Measured on sqlite3 3.40.1: the driver
+        binds a Python NaN to NULL by itself, `IS NULL` true, so a stored row reads
+        NULL whether or not `_f_or_none` ever ran — an implementation that passed
+        NaN straight through would pass a database assertion. The boundary earns its
+        place on the way OUT, per its own docstring: a NaN that survives reads as a
+        number to anything checking only for `None`, so "absent" has to be one state
+        before the value reaches the driver at all. Do not "simplify" this back to
+        the round trip.
+        """
+        from softae.core.data_store import _arc_columns
+
+        fit = _annotated(phase=float("nan"))
+        mapped = _arc_columns(fit)
+        assert mapped["arc_phase_low_deg"] is None
+        assert mapped["arc_f_peak_hz"] == pytest.approx(20.0)
+
+        # Kept alongside, not traded away: this proves the mapped value survives the
+        # INSERT and the SELECT as an absence.
         store, run_id = store_with_run
         mid = store.record_measurement(run_id, _make_eis_result())
-        fid = store.record_fit(mid, _annotated(phase=float("nan")))
-        row = self._row(store, fid)
+        row = self._row(store, store.record_fit(mid, fit))
         assert row["arc_state"] == "open"
         assert row["arc_phase_low_deg"] is None
 
@@ -1803,6 +1839,304 @@ class TestArcColumns:
         assert store._conn.execute(
             "SELECT gate_log_json FROM fit_results WHERE fit_id = ?",
             (fid,)).fetchone()[0] == "[]"
+
+
+# ---------------------------------------------------------------------------
+# Goodness of fit — five columns, sourced from the fit and not from the report
+# ---------------------------------------------------------------------------
+
+
+#: Measured on ch25_001 (1.5x from the numpy Kasa anchor) and ch32_004 (271x),
+#: legacy fitter, run live on two stored spectra. The pair is used rather than
+#: round numbers because the discrimination is the point: `residual_rms_pct`
+#: separates these two by 34x where `r_squared` separates them by 1.8x.
+_GOOD_FIT_QUALITY = {
+    "chi2": 0.4147, "chi2_reduced": 0.0207, "r_squared": 0.948,
+    "residual_rms_pct": 38.6, "residual_max_pct": 121.3,
+}
+_BAD_FIT_QUALITY = {
+    "chi2": 84.11, "chi2_reduced": 4.2055, "r_squared": 0.521,
+    "residual_rms_pct": 1297.4, "residual_max_pct": 4820.9,
+}
+
+
+def _with_quality(quality: dict | None):
+    """A fit carrying `quality`, as `fit_circuit` leaves one."""
+    fit = _FakeFitResult()
+    fit.quality = quality
+    return fit
+
+
+class TestFitQualityColumns:
+    """Five columns instead of nothing at all.
+
+    ``FitResult.quality`` has been computed at fit time since P4.1 and discarded at
+    this boundary ever since, so the database held 3619 fits and not one number
+    saying whether any of them described its data. A non-converged fit still reports
+    an ``R1``, and the sigma derived from it is indistinguishable from a good one
+    without these.
+
+    Both metrics are DIMENSIONLESS, which is why they can carry a threshold at all:
+    this formulation space spans ~10 decades of conductivity, so no absolute bound on
+    ``R1`` or ``sigma_S_per_cm`` is writable.
+    """
+
+    def _row(self, store: DataStore, fid: int) -> dict:
+        return dict(store._conn.execute(
+            "SELECT chi2, chi2_reduced, r_squared, residual_rms_pct, "
+            "residual_max_pct FROM fit_results WHERE fit_id = ?",
+            (fid,)).fetchone())
+
+    # ── Schema ──────────────────────────────────────────────────────────────
+
+    def test_the_columns_are_declared_in_the_ddl_and_not_only_in_the_migration(
+            self, store: DataStore) -> None:
+        """Asserted against the `_DDL` TEXT, and that is not pedantry.
+
+        The migration runs on every open, including on a brand-new database, so
+        `PRAGMA table_info` alone cannot tell a DDL-declared column from one the
+        ALTER loop supplied — a fresh store looks identical either way. `_DDL` is
+        what a future hand edits, and the two descriptions of one schema drift
+        exactly where nothing checks the text.
+        """
+        from softae.core.data_store import _DDL
+
+        assert set(FIT_QUALITY_COLUMNS) <= _fit_results_columns(store)
+        for name in FIT_QUALITY_COLUMNS:
+            assert f"\n    {name} " in _DDL, f"{name} missing from _DDL"
+
+    def test_the_column_names_are_the_metric_names_untranslated(self) -> None:
+        """The dict keys `compute_fit_quality` returns ARE the column names.
+
+        A rename between the metric and its column is how a reader ends up querying
+        a number that is no longer the one the fitter computed. Asserted against
+        `quality.py`'s own return, not against a second list written here.
+        """
+        import inspect
+
+        from softae.analysis import quality as quality_mod
+
+        source = inspect.getsource(quality_mod.compute_fit_quality)
+        for name in FIT_QUALITY_COLUMNS:
+            assert f'"{name}"' in source
+
+    def test_no_goodness_of_fit_column_carries_a_not_null_default(
+            self, store: DataStore) -> None:
+        """The `gate_log_json` shape, refused deliberately.
+
+        `gate_log_json TEXT NOT NULL DEFAULT '[]'` makes absence structurally
+        unobservable: 100% "coverage" by null-check, 99.4% empty in fact. NULL here
+        must stay reachable, because a fit that recorded no metrics is a different
+        row from one that scored badly.
+        """
+        decls = _fit_results_declarations(store)
+        for name in FIT_QUALITY_COLUMNS:
+            type_, notnull, default = decls[name]
+            assert type_ == "REAL"
+            assert notnull == 0, f"{name} is NOT NULL"
+            assert default is None, f"{name} defaults to {default!r}"
+
+    # ── `record_fit` population ─────────────────────────────────────────────
+
+    def test_record_fit_stores_all_five_metrics_from_a_populated_quality_dict(
+            self, store_with_run) -> None:
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        fid = store.record_fit(mid, _with_quality(_GOOD_FIT_QUALITY))
+        assert self._row(store, fid) == pytest.approx(_GOOD_FIT_QUALITY)
+
+    def test_the_report_less_path_populates_the_columns(
+            self, store_with_run) -> None:
+        """The whole design constraint, made executable.
+
+        `record_fit` receives a *fit* at all four call sites and a *report* at
+        exactly one (`tools/eis_validate.py`). `analysis/eis/router.py`,
+        `gui/tabs/tab_analysis.py` and `gui/tabs/tab_manual.py` pass none. An
+        implementation that read `report.quality` would leave these columns as empty
+        as `gate_verdict` is — 126 rows of 3619 — while every test that passed a
+        report stayed green.
+        """
+        import inspect
+
+        from softae.core import data_store as ds_mod
+
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        # No `report=`, exactly as the three call sites call it.
+        fid = store.record_fit(mid, _with_quality(_BAD_FIT_QUALITY))
+        assert self._row(store, fid) == pytest.approx(_BAD_FIT_QUALITY)
+        # ...and the source pins WHERE it read them from, because a future edit that
+        # moved the read into `_fit_report_columns` would still pass the assertion
+        # above for as long as a report happened to be absent.
+        assert "report" not in inspect.signature(
+            ds_mod._fit_quality_columns).parameters
+
+    def test_a_fit_with_no_quality_stores_null_and_null_is_not_zero(
+            self, store_with_run) -> None:
+        """NULL means *not recorded*; 0.0 is a real, and terrible, `r_squared`.
+
+        `compute_fit_quality` returns exactly 0.0 for `r_squared` when the trace has
+        no variance (`ss_tot == 0`), so the two states genuinely both occur and a
+        sentinel would fuse them.
+        """
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        absent = store.record_fit(mid, _with_quality({}))
+        # A sibling row carrying REAL zeros, so the assertion below discriminates
+        # rather than merely restating the fixture: a sentinel implementation would
+        # make these two rows identical and only this pair notices.
+        zeroed = store.record_fit(mid, _with_quality(
+            dict.fromkeys(FIT_QUALITY_COLUMNS, 0.0)))
+
+        assert self._row(store, absent) == dict.fromkeys(FIT_QUALITY_COLUMNS, None)
+        assert self._row(store, zeroed) == dict.fromkeys(FIT_QUALITY_COLUMNS, 0.0)
+        for name in FIT_QUALITY_COLUMNS:
+            nulls = store._conn.execute(
+                f"SELECT fit_id FROM fit_results WHERE {name} IS NULL").fetchall()
+            zeros = store._conn.execute(
+                f"SELECT fit_id FROM fit_results WHERE {name} = 0.0").fetchall()
+            assert [r[0] for r in nulls] == [absent], name
+            assert [r[0] for r in zeros] == [zeroed], name
+
+    def test_a_recorded_zero_r_squared_is_stored_as_zero_and_not_as_null(
+            self, store_with_run) -> None:
+        # The other half of the distinction: a fit that scored 0.0 must be
+        # distinguishable from one that scored nothing, or the column answers a
+        # different question than the one asked of it.
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        fid = store.record_fit(mid, _with_quality(dict(_BAD_FIT_QUALITY,
+                                                       r_squared=0.0)))
+        assert self._row(store, fid)["r_squared"] == 0.0
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM fit_results WHERE r_squared IS NULL"
+        ).fetchone()[0] == 0
+
+    def test_a_fit_object_with_no_quality_attribute_at_all_stores_null(
+            self, store_with_run) -> None:
+        # Pre-P4.1 fits and duck-typed stand-ins have no `quality` attribute; the
+        # honest record for them is the same NULL, not an AttributeError.
+        class _NoQuality:
+            model_name = "simpleSalt"
+            parameters = [1.0]
+            R0 = 100.0
+            R1 = 1000.0
+            success = True
+            error_msg = ""
+
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        fid = store.record_fit(mid, _NoQuality())
+        assert self._row(store, fid) == dict.fromkeys(FIT_QUALITY_COLUMNS, None)
+
+    def test_a_nan_metric_becomes_none_at_the_boundary_not_at_the_driver(
+            self, store_with_run) -> None:
+        """Asserted on `_fit_quality_columns`, and the round trip CANNOT assert it.
+
+        Measured: sqlite3 3.40.1 binds a Python NaN to NULL by itself, so a stored
+        row reads NULL whether or not `_f_or_none` ran — an implementation that
+        skipped the boundary entirely would pass a database assertion. (This is
+        exactly the vacuity `test_a_nan_peak_frequency_is_stored_as_null_not_as_nan`
+        above still has; reported, not fixed here.) `_f_or_none` earns its place on
+        the way OUT, per its own docstring: a NaN that survives reads as a number to
+        anything checking only for `None`, so "absent" must be one state before the
+        value ever reaches the driver.
+        """
+        from softae.core.data_store import _fit_quality_columns
+
+        fit = _with_quality(dict(_GOOD_FIT_QUALITY, residual_max_pct=float("nan")))
+        mapped = _fit_quality_columns(fit)
+        assert mapped["residual_max_pct"] is None
+        assert mapped["r_squared"] == pytest.approx(0.948)
+
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        row = self._row(store, store.record_fit(mid, fit))
+        assert row["residual_max_pct"] is None
+
+    def test_an_unexpected_quality_key_is_ignored_rather_than_stored(
+            self, store_with_run) -> None:
+        # The mapping is over `FIT_QUALITY_COLUMNS`, not over the dict, so a new
+        # metric appearing upstream cannot become an unbound INSERT parameter — it
+        # is simply not persisted until a column exists for it.
+        from softae.core.data_store import _fit_quality_columns
+
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        fit = _with_quality(dict(_GOOD_FIT_QUALITY, aic=17.0))
+        # The KEY SET is what is pinned. Asserting only that the row came back right
+        # would pass a pass-through implementation too, since `record_fit` names its
+        # INSERT columns and would simply ignore the extra key — until the day
+        # something iterates the mapping instead of indexing it.
+        assert set(_fit_quality_columns(fit)) == set(FIT_QUALITY_COLUMNS)
+        fid = store.record_fit(mid, fit)                 # must not raise
+        assert self._row(store, fid) == pytest.approx(_GOOD_FIT_QUALITY)
+        assert "aic" not in _fit_results_columns(store)
+
+    # ── The T7.9 boundary ───────────────────────────────────────────────────
+
+    def test_a_report_less_record_fit_writes_no_gate_verdict(
+            self, store_with_run) -> None:
+        """P.18 / T7.9 is deferred on the operator's bench shadow run.
+
+        `gate_verdict` is derived from the *report* and there is no separate switch,
+        so any call site that starts passing one starts persisting verdicts — from
+        gates measured anti-correlated with accuracy, under thresholds that have no
+        per-row record yet (`SHADOW_CAMPAIGN.md:420`). These columns must not smuggle
+        that across: adding them changes what a report-less call stores about the
+        FIT and nothing about what it stores about the GATES.
+        """
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        fid = store.record_fit(mid, _with_quality(_GOOD_FIT_QUALITY))
+
+        verdict, log = store._conn.execute(
+            "SELECT gate_verdict, gate_log_json FROM fit_results WHERE fit_id = ?",
+            (fid,)).fetchone()
+        assert verdict is None
+        assert log == "[]"
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM fit_results WHERE gate_verdict IS NOT NULL"
+        ).fetchone()[0] == 0
+
+    # ── Round trip and migration ────────────────────────────────────────────
+
+    def test_query_fits_returns_the_metrics(self, store_with_run) -> None:
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        store.record_fit(mid, _with_quality(_GOOD_FIT_QUALITY))
+
+        row, = store.query_fits(measurement_id=mid)
+        assert {k: row[k] for k in FIT_QUALITY_COLUMNS} == pytest.approx(
+            _GOOD_FIT_QUALITY)
+
+    def test_a_legacy_database_gains_the_columns_and_its_old_rows_read_null(
+            self, tmp_path: Path) -> None:
+        # No backfill: the residual needs the spectrum AND the fitted trace, and
+        # `z_fit` was never stored, so nothing recoverable after the fact
+        # reconstructs a metric for a 2026-07 row. NULL is the honest record — the
+        # same argument `_migrate_experiment_skipped_channels` makes.
+        project = tmp_path / "legacy_quality"
+        _build_legacy_fit_results_db(project)
+
+        with DataStore(project) as store:
+            assert set(FIT_QUALITY_COLUMNS) <= _fit_results_columns(store)
+            assert self._row(store, 1) == dict.fromkeys(FIT_QUALITY_COLUMNS, None)
+
+    def test_the_addition_takes_no_new_schema_epoch_row(self) -> None:
+        """A change of shape, not of meaning — T2.3's condition for skipping one.
+
+        No stored value's interpretation moves: every pre-existing column keeps its
+        value, and the new ones are NULL on every row written before them. Contrast
+        epochs 2, 5 and 6, where a column held still and its meaning moved.
+        """
+        from softae.core.data_store import SCHEMA_EPOCHS
+
+        assert not any(
+            any(name in note for name in FIT_QUALITY_COLUMNS)
+            for _, _, note in SCHEMA_EPOCHS
+        )
+        assert max(v for v, _, _ in SCHEMA_EPOCHS) == 6
 
 
 # ---------------------------------------------------------------------------

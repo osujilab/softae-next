@@ -379,7 +379,33 @@ CREATE TABLE IF NOT EXISTS fit_results (
     arc_state           TEXT,
     arc_f_peak_hz       REAL,
     arc_f_low_hz        REAL,
-    arc_phase_low_deg   REAL
+    arc_phase_low_deg   REAL,
+    -- Goodness of fit (P4.1), computed at fit time by `compute_fit_quality` and,
+    -- until now, discarded at this boundary. A non-converged fit still reports an
+    -- `R1`, and the sigma derived from it is indistinguishable from a good one
+    -- without these -- which is the whole reason `FitResult.quality` exists.
+    -- Measured on two stored spectra, legacy fitter, against the numpy Kasa
+    -- anchor: ch25_001 (1.5x off) scores r_squared 0.948 / residual_rms_pct 38.6,
+    -- ch32_004 (271x off) scores 0.521 / 1297.4. `residual_rms_pct` separates the
+    -- two by 34x where `r_squared` separates them by 1.8x. Both are
+    -- DIMENSIONLESS, which is the property that matters here: this formulation
+    -- space spans ~10 decades of conductivity, so no absolute threshold on `R1`
+    -- or `sigma_S_per_cm` can be written down at all.
+    --
+    -- Sourced from the FIT, never from the report, the same deviation
+    -- `_arc_columns` makes and for the same reason -- see `_fit_quality_columns`.
+    --
+    -- NOT ONE carries a NOT NULL DEFAULT, and that is binding rather than
+    -- stylistic. NULL means *the fit recorded no metrics* -- it failed, or it
+    -- produced no `z_fit` to compare against -- and 0.0 is a real, and terrible,
+    -- `r_squared`. A DEFAULT would make absence structurally unobservable, which
+    -- is exactly the shape `gate_log_json TEXT NOT NULL DEFAULT '[]'` has: 100%
+    -- "coverage" by null-check, 99.4% empty in fact.
+    chi2                REAL,
+    chi2_reduced        REAL,
+    r_squared           REAL,
+    residual_rms_pct    REAL,
+    residual_max_pct    REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_fit_results_measurement_id ON fit_results(measurement_id);
@@ -770,6 +796,43 @@ def _arc_columns(fit_result: Any) -> dict[str, Any]:
             "arc_f_peak_hz": _f_or_none(arc.f_peak_hz),
             "arc_f_low_hz": _f_or_none(arc.f_low_hz),
             "arc_phase_low_deg": _f_or_none(arc.phase_low_deg)}
+
+
+#: The goodness-of-fit keys :func:`softae.analysis.quality.compute_fit_quality`
+#: returns, which are also the column names. Spelled once, and NOT translated on
+#: the way in: a rename between the metric and its column is how a reader ends up
+#: querying a number that is no longer the one the fitter computed.
+FIT_QUALITY_COLUMNS: tuple[str, ...] = (
+    "chi2", "chi2_reduced", "r_squared", "residual_rms_pct", "residual_max_pct",
+)
+
+
+def _fit_quality_columns(fit_result: Any) -> dict[str, Any]:
+    """The goodness-of-fit columns for one row — read off the FIT, not the report.
+
+    **This makes the same deviation from :func:`_fit_report_columns`' report-only
+    convention that :func:`_arc_columns` makes, and for the same reason.**
+    ``record_fit`` is handed a *fit* at all four of its call sites and a *report* at
+    exactly one (``tools/eis_validate.py``); ``analysis/eis/router.py``,
+    ``gui/tabs/tab_analysis.py`` and ``gui/tabs/tab_manual.py`` pass none. Sourcing
+    these from ``report.quality`` would leave the columns as empty as ``gate_verdict``
+    is today — 126 populated rows in 3619 — and a column that empties itself is worse
+    than no column at all.
+
+    ``FitResult.quality`` is populated at fit time by
+    :func:`~softae.analysis.quality.compute_fit_quality`, inside ``fit_circuit``
+    itself, so it is present for every fit that came through either engine including
+    the report-less callers.
+
+    **Nothing is passed through that is not one of** :data:`FIT_QUALITY_COLUMNS`, so
+    a new key appearing in the quality dict cannot silently become an unbound INSERT
+    parameter. Every value goes through :func:`_f_or_none`, the file's NaN→NULL
+    boundary, and a metric the fit did not record lands as NULL — which is a
+    different fact from a metric that came out zero, and the DDL says why that
+    distinction is not allowed to collapse.
+    """
+    quality = getattr(fit_result, "quality", None) or {}
+    return {name: _f_or_none(quality.get(name)) for name in FIT_QUALITY_COLUMNS}
 
 
 def _engine_label(engine: str, fit_result: Any) -> str:
@@ -1408,9 +1471,10 @@ class DataStore:
         silently inverts as soon as ``[eis] engine`` is ``gated``. Pass *report* to
         get a labelled row; three of this method's four call sites currently do not.
 
-        The four ``arc_*`` columns are the one exception to that split: they come
-        from *fit_result*, never from *report*, so they populate whether or not a
-        report is passed. :func:`_arc_columns` says why.
+        The four ``arc_*`` columns and the five goodness-of-fit columns are the
+        exceptions to that split: they come from *fit_result*, never from *report*,
+        so they populate whether or not a report is passed. :func:`_arc_columns` and
+        :func:`_fit_quality_columns` say why.
 
         Returns the new ``fit_id``.
         """
@@ -1442,6 +1506,10 @@ class DataStore:
         # columns landed carry the literal "[]" there, and the older rows that
         # carried the record in the JSON are still read by `shadow_db`'s fallback.
         extra.update(_arc_columns(fit_result))
+        # Same deviation, same reason: the goodness-of-fit metrics are computed
+        # inside `fit_circuit` and hang on the fit, so they reach this table from the
+        # three call sites that pass no report at all. See `_fit_quality_columns`.
+        extra.update(_fit_quality_columns(fit_result))
         extra["engine"] = _engine_label(extra["engine"], fit_result)
         # A bounded σ is not a value.  Storing it in ``sigma_S_per_cm`` would let any
         # reader that does not check ``sigma_is_bound`` treat a ceiling as a
@@ -1460,10 +1528,13 @@ class DataStore:
                 rho_series_bulk, sigma_is_bound, sigma_rel_unc, phase_headroom,
                 model_free_R_ohm, K_per_cm, K_route, dead_height_cm,
                 thickness_method, thickness_unc_cm,
-                arc_state, arc_f_peak_hz, arc_f_low_hz, arc_phase_low_deg)
+                arc_state, arc_f_peak_hz, arc_f_low_hz, arc_phase_low_deg,
+                chi2, chi2_reduced, r_squared, residual_rms_pct,
+                residual_max_pct)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?)""",
+                       ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?)""",
             (
                 measurement_id,
                 run_id,
@@ -1504,6 +1575,11 @@ class DataStore:
                 extra["arc_f_peak_hz"],
                 extra["arc_f_low_hz"],
                 extra["arc_phase_low_deg"],
+                extra["chi2"],
+                extra["chi2_reduced"],
+                extra["r_squared"],
+                extra["residual_rms_pct"],
+                extra["residual_max_pct"],
             ),
         )
         self._conn.commit()
@@ -3240,6 +3316,25 @@ class DataStore:
         written before anything looked. NULL means never annotated, and there is
         nothing to prove otherwise for a row written in July.
 
+        **The five goodness-of-fit columns ride along here too**, for the same
+        reason the ``arc_*`` four do: five more nullable additions to the same table,
+        and a third PRAGMA pass over ``fit_results`` would buy nothing.
+
+        **No backfill and no new** :data:`SCHEMA_EPOCHS` **row**, following
+        :meth:`_migrate_experiment_skipped_channels` and, more directly, the ``arc_*``
+        columns above — which took no epoch row either; epoch 6 records a change to
+        the arc *rule*, not the arrival of the columns. Historical rows keep NULL,
+        meaning *no goodness-of-fit metric was recorded for this fit*, which is the
+        exact truth about them: ``compute_fit_quality`` ran, its answer was handed to
+        ``FitResult.quality``, and this method dropped it on the floor. Nothing
+        recoverable after the fact reconstructs it — the residual needs the spectrum
+        *and* the fitted trace, and ``z_fit`` was never stored. Recomputing from the
+        stored parameters would manufacture a metric under today's fitter for a row
+        fitted by an older one, which is the false comparability the ledger exists to
+        prevent. This is a change of *shape*, not of meaning: no stored value's
+        interpretation moves, which is the condition T2.3 set for skipping an epoch
+        row.
+
         **The ``arc_state`` index is created here and cannot be created in ``_DDL``.**
         That script runs at ``__init__`` before any migration, where a legacy
         ``fit_results`` still lacks the column and ``CREATE INDEX`` would raise
@@ -3277,6 +3372,11 @@ class DataStore:
             "arc_f_peak_hz": "REAL",
             "arc_f_low_hz": "REAL",
             "arc_phase_low_deg": "REAL",
+            "chi2": "REAL",
+            "chi2_reduced": "REAL",
+            "r_squared": "REAL",
+            "residual_rms_pct": "REAL",
+            "residual_max_pct": "REAL",
         }
         changed = False
         for name, decl in additions.items():
