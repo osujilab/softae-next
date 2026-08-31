@@ -532,6 +532,103 @@ class TestBoundReporting:
         assert report.ok
 
 
+class TestHeadroomNumerator:
+    """``decide_report_mode``'s numerator: minimum ``tan δ``, not median (spec §6).
+
+    Conservatism runs in opposite directions on the two sides of ``tan δ / tan ε``. The
+    median was the shipped statistic and it over-qualifies the sample: every state in the
+    commissioning figure converges on ``tan δ ≈ 5`` at 10⁵ Hz, so a band median is
+    dominated by the region where every spectrum looks alike. This lives on the gated
+    branch only in production, but ``shadow_rehearse`` forces ``engine="gated"``, which is
+    the instrument the arming evidence is meant to come from.
+    """
+
+    FREQ = np.logspace(0.0, 5.0, 41)
+    FLOOR = 0.0026                    # tan(0.149°), the measured resistive floor
+
+    @classmethod
+    def _envelope(cls, *, in_band: bool = True) -> SimpleNamespace:
+        return SimpleNamespace(phase_noise_measured=True, tand_floor=cls.FLOOR,
+                               phase_noise_valid_at=lambda _z: in_band)
+
+    @classmethod
+    def _spectrum(cls, tand: np.ndarray, C: float = 1e-10) -> np.ndarray:
+        """``Z`` with a prescribed ``tan δ`` per point, built in admittance."""
+        f = cls.FREQ
+        return 1.0 / (tand * 2.0 * np.pi * f * C + 1j * 2.0 * np.pi * f * C)
+
+    def test_the_headroom_is_the_minimum_loss_tangent_over_the_floor(self):
+        from softae.analysis.eis.report import decide_report_mode
+
+        tand = np.full(self.FREQ.size, 5.0)
+        tand[10] = 0.05
+        _, _, headroom = decide_report_mode(
+            self.FREQ, self._spectrum(tand), envelope=self._envelope(), cell=CELL)
+        assert headroom == pytest.approx(0.05 / self.FLOOR, rel=1e-6)
+
+    def test_a_spectrum_whose_only_loss_is_high_frequency_is_reported_as_a_bound(self):
+        """The defect, as behaviour rather than as arithmetic.
+
+        One low-loss point at 0.005 among a band converging on ``tan δ = 5``. The median
+        gives a headroom of ~1900 and calls this a measured value; the minimum gives ~1.9
+        and calls it a bound. Same spectrum, opposite claim.
+        """
+        from softae.analysis.eis.report import decide_report_mode
+
+        tand = np.full(self.FREQ.size, 5.0)
+        tand[10] = 0.005
+        mode, _, headroom = decide_report_mode(
+            self.FREQ, self._spectrum(tand), envelope=self._envelope(), cell=CELL)
+        assert headroom < 3.0
+        assert mode == "bound"
+        assert float(np.median(tand)) / self.FLOOR > 3.0      # the median would pass
+
+    def test_a_spectrum_with_real_loss_everywhere_is_still_a_value(self):
+        # Negative control: the minimum must not turn every spectrum into a bound.
+        from softae.analysis.eis.report import decide_report_mode
+
+        mode, _, headroom = decide_report_mode(
+            self.FREQ, self._spectrum(np.full(self.FREQ.size, 5.0)),
+            envelope=self._envelope(), cell=CELL)
+        assert mode == "value"
+        assert headroom == pytest.approx(5.0 / self.FLOOR, rel=1e-6)
+
+    def test_non_positive_loss_tangents_are_excluded_and_the_exclusion_is_logged(self):
+        """A negative ``tan δ`` says the passive quadrant failed at that point — not that
+        the sample's loss is under the floor. Admitting it would drive the *minimum*
+        negative and force a bound for a reason that is not resolution. It is dropped, but
+        the drop is announced, because masking these silently is half of what made the
+        median look defensible.
+        """
+        from softae.analysis.eis import report as report_module
+
+        emitted: list[tuple[str, dict]] = []
+        original = report_module.logger.info
+        report_module.logger.info = lambda ev, **kw: emitted.append((ev, kw))
+        try:
+            tand = np.full(self.FREQ.size, 5.0)
+            tand[:4] = -0.5
+            tand[10] = 0.05
+            _, _, headroom = report_module.decide_report_mode(
+                self.FREQ, self._spectrum(tand), envelope=self._envelope(), cell=CELL)
+        finally:
+            report_module.logger.info = original
+
+        assert headroom == pytest.approx(0.05 / self.FLOOR, rel=1e-6)
+        excluded = [kw for ev, kw in emitted if ev == "eis_tand_points_excluded"]
+        assert excluded and excluded[0]["n_excluded"] == 4
+
+    def test_a_spectrum_with_no_positive_loss_tangent_is_an_unqualified_bound(self):
+        from softae.analysis.eis.report import decide_report_mode
+
+        mode, provisional, headroom = decide_report_mode(
+            self.FREQ, self._spectrum(np.full(self.FREQ.size, -0.5)),
+            envelope=self._envelope(), cell=CELL)
+        assert mode == "bound_unqualified"
+        assert provisional
+        assert np.isnan(headroom)
+
+
 class TestVocabularyBridge:
     def test_dropped_points_reduce_to_suspect_because_the_spectrum_itself_survived(self):
         from softae.analysis.eis.gates import BLOCK_POINT, GateResult

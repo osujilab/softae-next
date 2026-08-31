@@ -203,6 +203,35 @@ def decide_report_mode(
       10⁴ Ω resistive characterisation, and an instrument constant carried three
       decades without comment is how the withdrawn ``Z_φ`` ceiling was born.
     * ``ε`` unmeasured → provisional bound. Never a value.
+
+    **The numerator is the MINIMUM ``tan δ``, not the median, and the asymmetry is the
+    whole point.** ``derive_phase_table`` carries an evidenced refusal to use a minimum —
+    across a sweep it is the single luckiest point, and a phase floor that small qualifies
+    almost any spectrum as a value. That refusal is correct for the **instrument**, which
+    is the *denominator*, and applying it to the *numerator* as well was the defect this
+    function shipped with. Conservatism runs in opposite directions on the two sides of a
+    ratio: understating the **sample's** own margin errs toward reporting a *bound*, which
+    is the safe direction; a median over-qualifies the sample and throws that direction
+    away. Concretely, every state in the commissioning figure converges on ``tan δ ≈ 5`` at
+    10⁵ Hz, so a band median is dominated by the region where every spectrum looks alike —
+    the statistic meant to detect *"there is no measurement here"* was being computed where
+    nothing distinguishes anything.
+
+    Non-positive ``tan δ`` is still excluded, because a ratio needs a positive numerator
+    and a negative ``tan δ`` is a statement that the passive-quadrant assumption failed at
+    that point, **not** evidence that the sample's loss is under the floor. Admitting it
+    would drive the minimum negative and force a bound for a reason that is not resolution.
+    The exclusion is **logged rather than silent**, because masking these without saying so
+    is half of what made the median look defensible. Most of them are the points
+    :func:`~softae.analysis.eis.measurability.negative_conductance_count` counts as S3, but
+    not all: a passive *inductive* point has ``tan δ < 0`` with ``Re Z > 0``, so the log
+    line is the only place it is recorded.
+
+    .. note::
+       A second masking site remains and is **not** fixed here: ``engine.py`` calls this on
+       the *survivors* of ``gate_quadrant``, so the excluded count seen below is already
+       net of that drop. That site is coupled to the envelope wiring and is scoped
+       separately.
     """
     if cell is None:
         return "unavailable", False, float("nan")
@@ -225,11 +254,19 @@ def decide_report_mode(
         return "bound_unqualified", True, float("nan")
 
     tand = loss_tangent(Z)
-    tand = tand[np.isfinite(tand) & (tand > 0)]
+    finite = np.isfinite(tand)
+    n_excluded = int(np.count_nonzero(finite & (tand <= 0)))
+    tand = tand[finite & (tand > 0)]
+    if n_excluded:
+        logger.info(
+            "eis_tand_points_excluded", n_excluded=n_excluded, n_used=int(tand.size),
+            msg="non-positive loss tangent outside the passive quadrant, excluded from "
+                "the headroom numerator (see measurability.negative_conductance_count)",
+        )
     if tand.size == 0:
         return "bound_unqualified", True, float("nan")
 
-    headroom = float(np.median(tand)) / floor
+    headroom = float(np.min(tand)) / floor
     resolution_limited = headroom < float(tand_headroom_mult)
 
     if resolution_limited:
