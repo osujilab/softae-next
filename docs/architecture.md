@@ -123,6 +123,73 @@ flowchart TD
     M --> N[Emit completion state]
 ```
 
+## EIS gate cascade — Front 1 / Front 2
+
+`analysis.eis.gates` decides whether an impedance spectrum is admissible *before* a conductivity is extracted from it. The cascade runs in three stages, with fixture correction and the circuit fit interleaved between them, because each stage asks a question the previous stage's data could not answer.
+
+```mermaid
+flowchart TD
+    A[Raw instrument record: f, Z] --> B["FRONT1_PRE_CORRECTION — 6 gates"]
+    B --> C{block_spectrum?}
+    C -->|Yes| R[Reject: correction and fit both skipped]
+    C -->|No| D[Apply fixture correction]
+    D --> E["FRONT1_POST_CORRECTION — 8 gates, incl. topology triad"]
+    E --> F{block_spectrum?}
+    F -->|Yes| R
+    F -->|No| G[Circuit fit on surviving points]
+    G --> H["FRONT2_GATES — 6 gates, post-fit"]
+    H --> I[SpectrumReport: verdict, gate log, surviving mask]
+```
+
+| Stage | Constant | Gates | Runs on, and asks |
+|---|---|---|---|
+| 1 | `FRONT1_PRE_CORRECTION` | 6 | The raw instrument record — *did the instrument record something real?* Correcting first would let a subtraction rescue a spectrum the measurement itself failed. |
+| 2 | `FRONT1_POST_CORRECTION` | 8, including the 3-member `TOPOLOGY_TRIAD` | Fixture-corrected data — *does this spectrum contain the physics being extracted?* Only answerable once the fixture's own contribution is gone. |
+| 3 | `FRONT2_GATES` | 6 | The fitted model — *is the fit trustworthy?* |
+
+A 21st gate, `gate_cross_spectrum_duplicates`, is defined and covered by tests but is called from no production path: it is series-level, needing two or more independent spectra, and `run_gates` sees one spectrum at a time.
+
+### The organising result: Front 1 discriminates, Front 2 does not
+
+Measured over 40 magnitude-matched spectra from `20260825T154521Z_arrhenius_sweep` — median `|Z|` held to 5×10⁵–2×10⁶ Ω, so scale cannot be what separates them; 21 operator-valid, 10 transitional, 9 dead — with each gate evaluated in isolation at its own cascade stage. `sep` is the true-positive rate minus the false-positive rate against the operator's labels.
+
+| Gate | Stage | `sep` | Judges |
+|---|---|---|---|
+| `residual_norm` | Front 2 | **+0.81** | the fit's failure to describe the data |
+| `tand_slope` | Front 1 post | +0.52 | data |
+| `kk_truncation` | Front 1 post | +0.30 | data |
+| `finiteness` | Front 1 pre | +0.22 | data |
+| `magnitude` | Front 1 pre | +0.22 | data |
+| `min_points` | Front 1 post | +0.11 | data |
+| `series_rc` | Front 1 post | +0.11 | data |
+| `valley_feature` | Front 1 post | +0.11 | data |
+| `quadrant` | Front 1 pre | +0.04 | data |
+| `residual_structure` | Front 2 | +0.03 | fit |
+| `phase_noise_extrapolated` | Front 1 pre | 0.00 | fires on 40/40 — no discrimination |
+| `monotonic_frequency` | Front 1 pre | 0.00 | silent on this corpus |
+| `stuck_instrument` | Front 1 pre | 0.00 | silent on this corpus |
+| `hf_inductive` | Front 1 post | 0.00 | silent on this corpus |
+| `plateau_in_band` | Front 1 post | 0.00 | silent on this corpus |
+| `pegged_parameters` | Front 2 | 0.00 | silent on this corpus |
+| `relative_standard_error` | Front 2 | 0.00 | silent on this corpus |
+| `cap_flatness` | Front 1 post | −0.11 | a dispersion exponent, not an admissibility verdict |
+| `degeneracy` | Front 2 | −0.65 | fit |
+| `model_free_crosscheck` | Front 2 | −0.97 | fit — a near-perfect inversion |
+
+Every gate with positive separation judges the **data**; every gate at zero or below judges the **fit**. There are two named exceptions, one in each direction. `residual_norm` judges the fit's *failure to describe* the data and is therefore a data statement wearing a fit statement's clothes — which is why it is both the strongest gate here and the only blocking Front-2 gate. `cap_flatness` is a Front-1 gate that computes a dispersion exponent rather than an admissibility verdict, and so sits on the Front-2 side of the dichotomy despite its stage.
+
+### Why this is structural, not a fact about one corpus
+
+The 5-parameter covariance is rank-deficient on every spectrum that fits. Over all 54 spectra, 30 produce a covariance at all and **30 of 30 are rank-deficient** — 29 at rank 2 of 5, one at rank 3 — at condition numbers from 5.7×10²⁴ to 1.3×10²⁶. The other 24 produce no covariance at all, and the covariance gates then pass by fail-open. **So there are zero spectra on which those gates do what they were written to do.** Every post-fit statistic is taken along the optimiser's ridge rather than across the sample; `ρ(R_series, R_bulk) = ±1.000000` exactly is the R0/R1 block of that ridge.
+
+**Rank here is threshold-dependent, and the threshold must be named wherever the number is quoted.** `np.linalg.matrix_rank`'s default tolerance is `rcond·max(σ)`. At a condition number near 10²⁵ the three missing singular directions are not merely poorly determined — they are beyond float64's ability to represent *as determined* relative to the largest. "Rank 2 of 5" is therefore a true and useful statement **about a chosen threshold**, and quoting it without the threshold overstates it.
+
+### What ships
+
+`[eis] engine = "legacy"` and `[eis.gates] enabled = false`, so the gated engine is not entered on the shipped path and no gate executes there. Inside the gated engine, `enabled` gates **spectrum-level rejection only**: `run_gates` applies `block_point` masks unconditionally, so points are dropped from the fit whether or not the flag is set.
+
+> **This section describes the cascade as it currently stands and is expected to be revised.** A consolidation is approved in direction and is pending re-measurement; the resulting gate count is a hypothesis, not a plan. The long-form treatment — all 21 gates, their thresholds, and the framework sections each implements — is `docs/EIS_GATE_FRAMEWORK_new.md`, which is untracked and cannot survive a fresh checkout, so the summary above is the committed record.
+
 ## Notes
 
 - The workflow executor is async and tier-based for parallelizable steps.
