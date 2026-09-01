@@ -25,6 +25,16 @@ as the root cause of the hardest-to-diagnose failure in that campaign — a corr
 that quietly corrupted data and produced plausible-looking but wrong results
 downstream. The log is the mitigation and it is not optional.
 
+**Front 1 discriminates; Front 2 does not** — measured, not assumed. Over 40 spectra of
+``20260825T154521Z_arrhenius_sweep`` held to a common magnitude band (median ``|Z|`` in
+5×10⁵–2×10⁶ Ω, so nothing separates them by scale), every gate with positive separation
+against the operator's labels judges the **data**, and every gate at zero or below judges
+the **fit**. The one exception is :func:`gate_residual_norm`, which judges the fit's
+*failure to describe* the data and is therefore a data statement wearing a fit statement's
+clothes — which is why it is both the only blocking Front-2 gate and the strongest gate
+here (sep +0.81 against ``arc_state``'s +0.94; :func:`gate_model_free_crosscheck` is −0.97,
+a near-perfect inversion). The cause is structural and is stated at :data:`FRONT2_GATES`.
+
 .. note::
    Two deliberate deviations from the printed specification, both explained at their
    gate: the topology triad runs as a **group** rather than stopping at the first
@@ -80,6 +90,47 @@ class GateResult:
     detail: str
     mask: np.ndarray
     metrics: dict[str, float] = field(default_factory=dict)
+    #: False when this gate could not evaluate its criterion at all — the input it
+    #: needs was absent, degenerate, or too small to judge. ``passed`` is then a
+    #: fail-open placeholder and NOT a verdict: it says the spectrum was not
+    #: refused, never that the check found nothing wrong.
+    #:
+    #: Defaulted ``True`` because 49 construction sites in this file are positional
+    #: and a trailing defaulted field changes none of them — which does mean a gate
+    #: author who forgets it reports having checked. :meth:`unchecked` is the price
+    #: paid for that: every honest branch goes through one greppable constructor
+    #: rather than through a keyword somebody has to remember.
+    checked: bool = True
+
+    def __post_init__(self) -> None:
+        # `passed=False, checked=False` would be "the check did not run and the
+        # spectrum is refused" — a state no gate here is entitled to occupy, and one
+        # that would cost every reader the ability to conclude anything from
+        # `checked` alone. Cheaper to raise at construction than to find it in a log
+        # six weeks later.
+        if not self.checked and not self.passed:
+            raise ValueError(
+                f"gate {self.name!r}: checked=False requires passed=True — a gate "
+                f"that could not evaluate its criterion must fail open, not refuse "
+                f"the spectrum"
+            )
+
+    @classmethod
+    def unchecked(
+        cls,
+        name: str,
+        severity: str,
+        reason: str,
+        mask: np.ndarray,
+        metrics: dict[str, float] | None = None,
+    ) -> "GateResult":
+        """This gate could not evaluate its criterion. Fail open, and say so.
+
+        ``passed=True`` preserves the module's fail-open posture — a gate that cannot
+        check must not discard a measurement. ``checked=False`` is what stops that
+        posture from being reported as a clean result.
+        """
+        return cls(name, severity, True, reason, mask, metrics or {}, checked=False)
 
     @property
     def n_dropped(self) -> int:
@@ -90,10 +141,15 @@ class GateResult:
 
     def as_log_entry(self) -> dict[str, Any]:
         """The runner's log shape — R17's 'named gate and reason', untranslated."""
+        # `checked` goes here and **only** here. `metrics` never reaches
+        # `gate_log_json` — `gate_metrics` flattens it into `QualityReport.metrics`,
+        # which `_fit_report_columns` does not read — so a `checked` living there
+        # would be invisible to every query over the column.
         return {
             "gate": self.name,
             "severity": self.severity,
             "passed": bool(self.passed),
+            "checked": bool(self.checked),
             "detail": self.detail,
             "n_dropped": self.n_dropped,
         }
@@ -165,8 +221,8 @@ def gate_monotonic_frequency(
     f = np.asarray(f, dtype=float)
     ok = _all_pass(f.size)
     if f.size <= 2:
-        return GateResult("monotonic_frequency", FLAG, True,
-                          "too few points to judge", ok)
+        return GateResult.unchecked("monotonic_frequency", FLAG,
+                                    "too few points to judge", ok)
     d = np.diff(f)
     good = bool(np.all(d > 0) or np.all(d < 0))
     return GateResult(
@@ -215,6 +271,19 @@ def gate_quadrant(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> GateResu
     Points are dropped in every case — they are artefact either way — but only the
     detail string differs, because the correct response ranges from "expected, ignore"
     to "repeat with RE tied to CE" to "this really is the instrument".
+
+    .. warning::
+       **"Artefact either way" is right about the points and wrong about the cost of
+       dropping them.** Measured over the 40-spectrum corpus, the violations do not sit at
+       a band edge where :func:`gate_hf_inductive`'s "safe to remove" argument would apply
+       — they *bracket the phase minimum*. Channel 1 at 40 °C: minimum 75.3 Hz, violations
+       75.3–280 Hz. Channel 19 at 60 °C: minimum 1042 Hz, violations 389–2010 Hz. Phase
+       minima reach −105°, −116°, −119°. The detection and the ``|Z''|²`` attribution above
+       are both correct; the *mask* is what costs, because it deletes the ``−Z''`` peak that
+       determines ``R_bulk`` on 16 of 21 operator-valid spectra. Hence sep +0.04: a gate
+       right about the physics and destructive in effect. Left as ``block_point`` because
+       nothing arms it under the shipped config and changing a severity is a behaviour
+       change; the note is here so the next reader weighs mask against log deliberately.
     """
     Z = np.asarray(Z, dtype=complex)
     with np.errstate(invalid="ignore"):
@@ -313,8 +382,8 @@ def gate_phase_noise_extrapolated(
     ok = _all_pass(mag.size)
     finite = np.isfinite(mag)
     if not finite.any():
-        return GateResult("phase_noise_extrapolated", FLAG, True,
-                          "no finite points to judge", ok)
+        return GateResult.unchecked("phase_noise_extrapolated", FLAG,
+                                    "no finite points to judge", ok)
 
     env = ctx.get("envelope")
     z_med = float(np.median(mag[finite]))
@@ -350,8 +419,8 @@ def gate_stuck_instrument(
     ok = _all_pass(mag.size)
     finite = mag[np.isfinite(mag)]
     if finite.size <= 2:
-        return GateResult("stuck_instrument", BLOCK_SPECTRUM, True,
-                          "too few points to judge", ok)
+        return GateResult.unchecked("stuck_instrument", BLOCK_SPECTRUM,
+                                    "too few points to judge", ok)
     stuck = bool(np.allclose(finite, finite[0], rtol=1e-9, atol=0.0))
     return GateResult(
         "stuck_instrument", BLOCK_SPECTRUM, not stuck,
@@ -431,6 +500,20 @@ def gate_tand_slope(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> GateRe
     threshold = float(_ctx_get(ctx, "gates", "tand_slope_max", -0.3))
 
     if slope != slope:
+        # DELIBERATELY NOT `GateResult.unchecked`, and this is settled — do not
+        # re-litigate it here. "Insufficient valid tanδ points" is an absence of
+        # input, so on the face of it this belongs with the `checked=False` sites;
+        # but it is the one such branch that returns `passed=False`, on a
+        # `BLOCK_SPECTRUM` that `reduce_gates` turns into REJECT. Marking it
+        # `checked=False, passed=False` would be the sole exception to the
+        # `__post_init__` invariant, and an invariant with an exception no longer
+        # lets a consumer conclude anything from `checked` alone. Flipping `passed`
+        # instead would change which spectra are rejected — a verdict change
+        # smuggled into a record change. So the site keeps `passed=False,
+        # checked=True` and is carried as a known mis-spelling, alongside
+        # `gate_series_rc`'s NaN-slope branch, which is the same failure at the same
+        # severity and returns the opposite verdict. Resolving the pair needs a
+        # verdict change and its own wave.
         return GateResult("tand_slope", BLOCK_SPECTRUM, False,
                           "insufficient valid tanδ points to take a slope", ok,
                           {"tand_slope": float("nan")})
@@ -466,6 +549,28 @@ def gate_cap_flatness(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> Gate
     ``C_app`` only *is* the geometric capacitance above the relaxation corner. Over the
     full band a well-formed spectrum reads −0.66 and would be called dispersive; over
     the top decade the same spectrum reads −0.07 and a genuinely dispersive one −1.30.
+
+    .. warning::
+       **That last paragraph does not hold on this fixture, and the gate's verdict here is
+       arithmetic rather than physics.** The top decade (20–200 kHz) is *resistive*, not
+       capacitive: the crossover where ``|Z''|`` falls below ``Z'`` sits at 3.9–14 kHz on
+       37 of 39 spectra, and measured phase inside the window is −13° to −37° where a
+       capacitive regime reads ≈ −90°. Above that crossover ``|Z''|`` stops falling, so
+       ``1/(ω|Z''|)`` goes as ``1/ω`` and the slope is −1 whatever the sample is. The
+       crossover is set by ``R_series`` and stray ``C`` — fixture properties — which is why
+       the fire rate is exactly 100 % and not merely high.
+
+       Moved one decade *below* the crossover the statistic becomes meaningful and becomes
+       a different quantity: it measures the CPE exponent ``n``, running 1.02 → 0.40 from
+       40 to 90 °C and reproducing across three independent channels. It still fires on
+       11 of 21 operator-valid spectra against 1 of 8 dead ones, because dispersion rises
+       as the film conducts — on a real electrolyte the dispersive reading is the healthy
+       one. No threshold turns a measurement of ``n`` into a validity test, so this is an
+       instrument for ``n(T)`` to report beside the fit, and the escalation the framework
+       offers must not be taken. Measured sep −0.11 over the 40-spectrum corpus.
+
+       Behaviour is deliberately unchanged: this is a ``flag``, nothing consumes it as a
+       verdict, and moving the window would change what every stored ``cap_slope`` means.
     """
     f = np.asarray(f, dtype=float)
     C = apparent_capacitance(f, Z)
@@ -475,9 +580,10 @@ def gate_cap_flatness(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> Gate
     threshold = float(_ctx_get(ctx, "gates", "cap_flatness_max", 0.15))
 
     if slope != slope:
-        return GateResult("cap_flatness", FLAG, True,
-                          "insufficient valid C_app points to take a slope", ok,
-                          {"cap_slope": float("nan")})
+        return GateResult.unchecked(
+            "cap_flatness", FLAG,
+            "insufficient valid C_app points to take a slope", ok,
+            {"cap_slope": float("nan")})
 
     passed = abs(slope) <= threshold
     return GateResult(
@@ -505,9 +611,10 @@ def gate_series_rc(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> GateRes
     si = log_slope(f, np.abs(np.imag(Z)))
 
     if sr != sr or si != si:
-        return GateResult("series_rc_topology", BLOCK_SPECTRUM, True,
-                          "insufficient points to take Z′/Z″ slopes", ok,
-                          {"zreal_slope": sr, "zimag_slope": si})
+        return GateResult.unchecked(
+            "series_rc_topology", BLOCK_SPECTRUM,
+            "insufficient points to take Z′/Z″ slopes", ok,
+            {"zreal_slope": sr, "zimag_slope": si})
 
     series_like = (abs(sr) < 0.15) and (si < -0.85)
     return GateResult(
@@ -561,6 +668,15 @@ def gate_valley_feature(
     Severity is ``block_spectrum`` when no interior minimum exists (there is nothing to
     extract, and falling back to the ``|Z|`` minimum is the error itself) and ``flag``
     otherwise, recording both features so the confusion is visible in the log.
+
+    .. warning::
+       **The guarded confusion is not the only one.** This distinguishes the valley from
+       the ``|Z|`` minimum; it does not distinguish the valley from
+       :func:`gate_plateau_in_band`'s flat run — and on the 40-spectrum corpus the two
+       *agree with each other* on the same wrong feature, the high-frequency series run at
+       8.6×10⁴–1.0×10⁵ Ω, against a fitted ``R_bulk`` of 2×10⁷–3.4×10⁸ Ω. ``R_sol_valley``
+       and ``plateau_R_ohm`` are two independent estimates of ``R_series + R_bulk``, so
+       their ratio is a consistency check available for nothing; it is not taken.
     """
     freq = np.asarray(f, dtype=float)
     Zc = np.asarray(Z, dtype=complex)
@@ -577,6 +693,8 @@ def gate_valley_feature(
         if np.isfinite(zi[k]) and zi[k] < zi[k - 1] and zi[k] < zi[k + 1]
     ]
     if not cand:
+        # KEEP `passed=False`. No interior minimum is a finding about the spectrum,
+        # not a missing input: there is genuinely no valley to resolve.
         return GateResult(
             "valley_feature", BLOCK_SPECTRUM, False,
             "no interior −Z'' local minimum: no resolvable valley — do NOT fall "
@@ -624,6 +742,9 @@ def gate_min_points(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> GateRe
 # by the time a fit exists the data has already been admitted — so every one is a
 # ``flag``, with the single exception of a residual norm so large that the model
 # plainly does not describe the data at all.
+#
+# That framing extends one step further on this rig, and the extension is measured: a
+# Front-2 statistic here describes the *optimiser*, not the sample. See FRONT2_GATES.
 
 def gate_pegged_parameters(
     f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]
@@ -633,12 +754,19 @@ def gate_pegged_parameters(
     A pegged parameter is unidentified: the data pushed it as far as the optimiser
     allowed, so its value is a property of the *bound* rather than of the sample, and
     the standard error reported beside it is meaningless.
+
+    .. note::
+       Silence from this gate is not reassurance. It fired on zero of the 40-spectrum
+       corpus, because the failure on this fixture is not a bound but a **ridge**: at
+       ``ρ = ±1`` the optimiser halts anywhere along a flat direction, and nowhere along it
+       is a box constraint. A clean bounds test is fully consistent with a completely
+       unidentified split.
     """
     ok = _all_pass(np.asarray(f).size)
     cov = getattr(ctx.get("fit"), "covariance", None)
     if cov is None:
-        return GateResult("pegged_parameters", FLAG, True,
-                          "no covariance available", ok)
+        return GateResult.unchecked("pegged_parameters", FLAG,
+                                    "no covariance available", ok)
 
     tol = float(_ctx_get(ctx, "gates", "bound_tol", 1e-3))
     pegged = cov.pegged(tol)
@@ -658,13 +786,23 @@ def gate_relative_standard_error(
     Nuisance parameters may legitimately be loose; the resistance the conductivity is
     computed from may not. Only the reported resistance is checked — flagging a badly
     determined CPE exponent on every spectrum would be noise.
+
+    .. warning::
+       **When ``ρ`` is exactly ±1 the covariance is singular, and a relative standard error
+       read out of it is not a measurement.** The degenerate branch below reported
+       **5.7×10⁻¹⁰** on the singular case of the 40-spectrum corpus — an unidentified
+       quantity claiming sub-nanoscale precision, and passing. That is the worst available
+       shape: unknown spelled with the same token as clean. Nothing here is changed, because
+       the branch is what feeds the engine's sum reporting; but a reader should treat a very
+       *small* ``rel_se_measurand`` beside ``cov.singular`` as "not determined", never as
+       tight.
     """
     ok = _all_pass(np.asarray(f).size)
     fit = ctx.get("fit")
     cov = getattr(fit, "covariance", None)
     if cov is None:
-        return GateResult("relative_standard_error", FLAG, True,
-                          "no covariance available", ok)
+        return GateResult.unchecked("relative_standard_error", FLAG,
+                                    "no covariance available", ok)
 
     from softae.analysis.eis.models import roles_for
 
@@ -683,6 +821,19 @@ def gate_relative_standard_error(
         label = b
 
     limit = float(_ctx_get(ctx, "gates", "max_rel_se", 0.10))
+    if degenerate and rel != rel:
+        # The site the whole ruling turns on. A singular covariance makes `sum_se`
+        # NaN, `rel` NaN, and `passed = not (rel == rel and …)` unconditionally
+        # True — "cannot check" arriving spelled exactly as "checked and clean",
+        # with a detail that reads "determined to nan%". The verdict is unchanged;
+        # what changes is that the record now says which of the two it was.
+        return GateResult.unchecked(
+            "relative_standard_error", FLAG,
+            f"{label} NOT DETERMINED — the covariance is degenerate, so the "
+            f"standard error carries no information about this measurand",
+            ok, {"rel_se_measurand": rel},
+        )
+
     passed = not (rel == rel and rel > limit)
     return GateResult(
         "relative_standard_error", FLAG, passed,
@@ -698,12 +849,27 @@ def gate_degeneracy(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> GateRe
     Advisory *here* only because the behaviour has already happened: the engine
     selects sum-vs-split from ``ρ`` before this runs, so the gate's job is to record
     that the choice was made and why, not to ask anyone to make it.
+
+    .. warning::
+       **The test is one-sided and half the degeneracy on this rig is on the other side.**
+       ``ρ`` is exactly ±1.000000 on all 28 fits of the 40-spectrum corpus that returned a
+       covariance, and **eight of them are ρ = +1.000000**, which passes ``rho > −0.95``
+       cleanly. Positive degeneracy is the same rank deficiency with the ridge running the
+       other way and the reported split is just as invented. Note also that the variance
+       argument the threshold rests on inverts with the sign: at ρ = +1 it is the
+       *difference* whose variance collapses, so ``Σ₀₀ + Σ₁₁ + 2Σ₀₁`` is largest exactly
+       where the split is worst. Combined with the ``cov is None`` fail-open above — which
+       returns the shape of a pass for a spectrum never checked — this is what produces the
+       measured sep of −0.65. The threshold and the comparison are left exactly as they are:
+       ``rho_degenerate`` is a config key and the engine reads ``ρ`` for its own sum-vs-split
+       decision, so changing either here would move behaviour, not documentation.
     """
     ok = _all_pass(np.asarray(f).size)
     fit = ctx.get("fit")
     cov = getattr(fit, "covariance", None)
     if cov is None:
-        return GateResult("degeneracy", FLAG, True, "no covariance available", ok)
+        return GateResult.unchecked("degeneracy", FLAG,
+                                    "no covariance available", ok)
 
     from softae.analysis.eis.models import roles_for
 
@@ -713,11 +879,17 @@ def gate_degeneracy(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> GateRe
     threshold = float(_ctx_get(ctx, "gates", "rho_degenerate", -0.95))
 
     if cov.singular:
+        # KEEP `passed=False, checked=True`. This gate asks whether the series/bulk
+        # split is identifiable; a singular covariance is not a missing input to
+        # that question, it *is* the answer, and the answer is no. Marking it
+        # unchecked would misdescribe a real finding as an absence and would move
+        # every such spectrum off SUSPECT — a verdict change smuggled into a record
+        # change.
         return GateResult("degeneracy", FLAG, False,
                           "covariance singular — the split is unidentifiable", ok,
                           {"rho": float("nan")})
     if not (rho == rho):
-        return GateResult("degeneracy", FLAG, True, "ρ unavailable", ok)
+        return GateResult.unchecked("degeneracy", FLAG, "ρ unavailable", ok)
 
     passed = rho > threshold
     return GateResult(
@@ -739,19 +911,30 @@ def gate_model_free_crosscheck(
     band (see :func:`~softae.analysis.eis.admittance.model_free_r_bulk`), so a large
     disagreement often means "the plateau is marginal here" rather than "the fit is
     wrong". Advisory for exactly that reason.
+
+    .. warning::
+       **Measured, the check is inverted — sep −0.97, 3 % agreement with ``arc_state``, the
+       most inverted statistic in the corpus.** The hedge above understates it: the spectra
+       on which the two routes *agreed* were overwhelmingly the dead ones. ``1/max(Re Y)``
+       degrades as the plateau leaves the band, which is the same condition that leaves the
+       fitted split unidentified, so the two estimates fail *together and toward each
+       other*. Two routes sharing a failure mode are not an independent cross-check — the
+       property that makes a geometry series a validation is precisely the one missing here.
+       So agreement says nothing; only a disagreement localises a regime worth looking at.
     """
     from softae.analysis.eis.admittance import model_free_r_bulk
 
     ok = _all_pass(np.asarray(f).size)
     fit = ctx.get("fit")
     if fit is None or not getattr(fit, "success", False):
-        return GateResult("model_free_crosscheck", FLAG, True, "no fit to compare", ok)
+        return GateResult.unchecked("model_free_crosscheck", FLAG,
+                                    "no fit to compare", ok)
 
     fitted = float(getattr(fit, "R1", float("nan")))
     free = model_free_r_bulk(Z)
     if not (fitted == fitted and free == free) or fitted <= 0:
-        return GateResult("model_free_crosscheck", FLAG, True,
-                          "cross-check unavailable", ok)
+        return GateResult.unchecked("model_free_crosscheck", FLAG,
+                                    "cross-check unavailable", ok)
 
     pct = abs(free - fitted) / fitted * 100.0
     passed = pct <= 25.0
@@ -783,15 +966,15 @@ def gate_residual_structure(
     fit = ctx.get("fit")
     z_fit = getattr(fit, "z_fit", None)
     if fit is None or z_fit is None:
-        return GateResult("residual_structure", FLAG, True,
-                          "no fitted curve to take residuals from", ok)
+        return GateResult.unchecked("residual_structure", FLAG,
+                                    "no fitted curve to take residuals from", ok)
 
     measured = np.asarray(Z, dtype=complex)
     fitted = np.asarray(z_fit, dtype=complex)
     n = int(min(measured.size, fitted.size))
     if n < 8:
-        return GateResult("residual_structure", FLAG, True,
-                          "too few points for a runs test", ok)
+        return GateResult.unchecked("residual_structure", FLAG,
+                                    "too few points for a runs test", ok)
 
     resid = np.real(measured[:n] - fitted[:n])
     good = np.isfinite(resid) & (resid != 0)
@@ -800,6 +983,8 @@ def gate_residual_structure(
     n_pos = int((signs > 0).sum())
     n_neg = n_tot - n_pos
     if n_tot < 8 or n_pos == 0 or n_neg == 0:
+        # KEEP `passed=False`. An all-one-sign residual set is a finding — the model
+        # sits offset from the data — not an absence of evidence.
         return GateResult("residual_structure", FLAG, False,
                           "every residual has the same sign — the model is offset "
                           "from the data", ok, {"runs_z": float("nan")})
@@ -809,8 +994,14 @@ def gate_residual_structure(
     var = (2.0 * n_pos * n_neg * (2.0 * n_pos * n_neg - n_tot)) / (
         n_tot ** 2 * (n_tot - 1))
     if var <= 0:
-        return GateResult("residual_structure", FLAG, True,
-                          "runs-test variance undefined", ok)
+        # Specced UNCHECKED and marked as such — but see
+        # `test_residual_structure_variance_branch_is_arithmetically_unreachable`:
+        # with `n_tot >= 8` and both signs present, `2·n_pos·n_neg >= 2(n_tot−1) >
+        # n_tot`, so this branch cannot be entered by any input at all. It is kept
+        # (the guard is cheap and the arithmetic is not obvious) and marked for
+        # consistency, not because anything reaches it.
+        return GateResult.unchecked("residual_structure", FLAG,
+                                    "runs-test variance undefined", ok)
 
     z = (runs - expected) / float(np.sqrt(var))
     passed = abs(z) <= 3.0
@@ -835,8 +1026,8 @@ def gate_residual_norm(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> Gat
     metrics = getattr(fit, "quality", None) or {}
     rms = metrics.get("residual_rms_pct")
     if rms is None:
-        return GateResult("residual_norm", BLOCK_SPECTRUM, True,
-                          "no residual metrics available", ok)
+        return GateResult.unchecked("residual_norm", BLOCK_SPECTRUM,
+                                    "no residual metrics available", ok)
 
     limit = float(_ctx_get(ctx, "gates", "residual_hard_pct", 100.0))
     passed = not (rms == rms and rms > limit)
@@ -850,6 +1041,24 @@ def gate_residual_norm(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> Gat
 
 
 #: Front-2 gates. Run after fitting, with the fit supplied as ``ctx["fit"]``.
+#:
+#: **None of these is an admission criterion on this fixture, and the reason is structural.**
+#: ``ρ(R_series, R_bulk)`` is exactly ±1.000000 on all 28 fits of the 40-spectrum corpus
+#: that produced a covariance at all: the 2×2 resistance block is rank-deficient, so only
+#: the sum is ever determined and never the split. Every statistic below is then taken
+#: along a flat direction — a standard error of 5.7×10⁻¹⁰ on a singular covariance, a
+#: correlation that is a numerical identity rather than an estimate, a bounds test that
+#: finds nothing because the parameter is sliding along a valley floor rather than resting
+#: on a bound. That follows from a coplanar cell whose relaxation corner sits near a band
+#: edge, not from these files, so it will not improve with more data of the same kind.
+#:
+#: The measured separations say the same thing from the other side: ``degeneracy`` −0.65,
+#: ``model_free_crosscheck`` −0.97 (its two estimates fail *together*, toward each other,
+#: as the plateau leaves the band — so agreement between them is not independence).
+#: :func:`gate_residual_norm` is the exception at +0.81, and it is the exception precisely
+#: because it does not judge the fit: it asks whether the data is describable at all.
+#:
+#: So these are the right questions and they stay in the log. Arm Front 1; record Front 2.
 FRONT2_GATES: tuple[Callable[..., GateResult], ...] = (
     gate_residual_norm,
     gate_residual_structure,
@@ -896,8 +1105,11 @@ def gate_kk_truncation(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> Gat
                     c=float(_ctx_get(ctx, "gates", "kk_c", DEFAULT_KK_C)),
                     max_M=int(_ctx_get(ctx, "gates", "kk_max_M", DEFAULT_KK_MAX_M)))
     if not result.ok:
-        return GateResult("kk_truncation", FLAG, True,
-                          f"K–K test did not run: {result.error}", ok)
+        # The one site where the file already argued for this shape in prose: the
+        # docstring's "a test that could not run is an absence of evidence" is served
+        # by `checked=False`, not by `passed=True` alone. Verdict unchanged.
+        return GateResult.unchecked("kk_truncation", FLAG,
+                                    f"K–K test did not run: {result.error}", ok)
 
     resid = np.asarray(result.resid_pct, dtype=float)
     failing = resid > limit
@@ -972,6 +1184,18 @@ def gate_plateau_in_band(
 
     A useful side effect: the plateau median is a better ``R`` estimate than the
     model-free one precisely where the model-free one degrades, and it is reported.
+
+    .. warning::
+       **A flat run is necessary for the plateau and not sufficient, and the measured
+       failure is that it can be the wrong flat run.** On cold spectra of the 40-spectrum
+       corpus the widest flat window lands at 8.6×10⁴–1.0×10⁵ Ω — the high-frequency
+       *series* feature — while the fit reports ``R_bulk`` of 2×10⁷–3.4×10⁸ Ω. The gate then
+       certifies a plateau, reports a ``plateau_R_ohm`` two to three decades below the
+       measurand, and passes; its measured sep of 0.00 is that false negative, not health.
+       :func:`gate_valley_feature` settles on the same feature, so the two agree with each
+       other and disagree with the fit by 12× to 190× on six spectra. Both numbers reach the
+       log side by side and nothing compares them — comparing ``plateau_R_ohm`` against
+       ``R_sol_valley`` is a free consistency check that is currently declined.
     """
     freq = np.asarray(f, dtype=float)
     Zc = np.asarray(Z, dtype=complex)
@@ -983,8 +1207,8 @@ def gate_plateau_in_band(
     good = usable & (Zc.real > 0)
     if int(usable.sum()) < 2:
         # Nothing measurable — an absence of evidence, so a flag rather than a verdict.
-        return GateResult("plateau_in_band", FLAG, True,
-                          "too few finite points to measure a plateau", ok)
+        return GateResult.unchecked("plateau_in_band", FLAG,
+                                    "too few finite points to measure a plateau", ok)
     if int(good.sum()) < 2:
         # Measurable, but with no positive resistive component anywhere. That is not
         # missing evidence, it is evidence of absence: a purely reactive response has
@@ -1049,6 +1273,13 @@ def gate_plateau_in_band(
 #: These ask one question: *did the instrument record something real?* Correcting
 #: first would let a subtraction rescue a spectrum the measurement itself failed —
 #: a railed point is railed, and removing a few ohms of lead does not un-rail it.
+#:
+#: **This half is where the discrimination lives.** Measured over 40 magnitude-matched
+#: spectra, every gate that separated the operator's good spectra from his bad ones judges
+#: the data, and all of them are Front-1 gates (:func:`gate_tand_slope` +0.52,
+#: :func:`gate_kk_truncation` +0.30, :func:`gate_finiteness` and :func:`gate_magnitude`
+#: +0.22 each). The contrast with :data:`FRONT2_GATES` is the framework's organising result,
+#: not a ranking of this corpus.
 FRONT1_PRE_CORRECTION: tuple[Callable[..., GateResult], ...] = (
     gate_finiteness,
     gate_monotonic_frequency,
@@ -1066,6 +1297,14 @@ FRONT1_PRE_CORRECTION: tuple[Callable[..., GateResult], ...] = (
 #: data — an uncorrected series parasitic or an uncorrected HF artifact can invert
 #: the very slopes the triad tests." A fixture ``R_short`` **is** a series parasitic,
 #: which makes :func:`gate_tand_slope` the sharp case rather than a hypothetical one.
+#:
+#: Two members do **not** share this half's discriminating power, and both are documented at
+#: the gate rather than reordered here. :func:`gate_cap_flatness` computes a dispersion
+#: exponent on this fixture rather than a validity verdict, so it sits on the Front-2 side
+#: of the dichotomy despite being a Front-1 gate. :func:`gate_plateau_in_band` and
+#: :func:`gate_valley_feature` can settle on the same high-frequency series feature, agree
+#: with each other, and both be wrong by two decades — the one confusion §3.7b does not
+#: guard, since it guards the valley against the ``|Z|`` minimum instead.
 FRONT1_POST_CORRECTION: tuple[Callable[..., GateResult], ...] = (
     gate_hf_inductive,        # §6 step 5
     gate_kk_truncation,       # §6 step 6 — K–K sees corrected, HF-truncated data
@@ -1233,8 +1472,12 @@ def run_gates(
         except Exception as exc:  # a broken gate must not discard a measurement
             logger.warning("eis_gate_raised", gate=getattr(gate, "__name__", "?"),
                            exc_info=True)
-            r = GateResult(getattr(gate, "__name__", "unknown"), FLAG, True,
-                           f"gate raised and was skipped: {exc}", _all_pass(idx.size))
+            # A crash and a pass were the same log line until this became
+            # `unchecked`. This site alone justifies the field: [p74] §5(b) reported
+            # two spectra crashing the engine, and nothing in the record said so.
+            r = GateResult.unchecked(
+                getattr(gate, "__name__", "unknown"), FLAG,
+                f"gate raised and was skipped: {exc}", _all_pass(idx.size))
 
         results.append(r)
         log.append(r.as_log_entry())

@@ -39,8 +39,10 @@ from softae.analysis.eis.gates import (
     gate_tand_slope,
     run_gates,
 )
+from softae.analysis.eis.admittance import log_slope, parallel_branch_window
 from softae.analysis.eis.policy import build_context
 from softae.analysis.eis.settings import GateSettings
+from tests.test_eis_kk import RIG_FREQ
 
 
 def _ctx(**overrides):
@@ -122,6 +124,101 @@ class TestTopologyAdmission:
     def test_the_series_rc_test_agrees_with_the_loss_tangent_on_a_clean_spectrum(self):
         f, Z = reference_spectrum()
         assert gate_series_rc(f, Z, _ctx()).passed
+
+
+class TestTandWindowShapes:
+    """§3.5.1 — the slope window is the *falling segment*, not "above the argmax".
+
+    ``tan δ`` takes three shapes on this fixture, and an ``argmax``-only anchor is
+    correct for one of them. The other two are the discriminator's whole job:
+
+    * **unimodal, peak in band** — the CPE limb rises, peaks, then falls to the top of
+      the sweep. Anchor at the peak; today's window, and this class pins it unchanged.
+    * **U-shaped, peak below band** — a larger ``R_bulk`` pushes the relaxation corner
+      below 1.351 Hz, so what is left in band is the falling limb plus the
+      high-frequency rise (``Z → R_series``, ``Im Z → 0``, ``tan δ → ∞``). ``argmax``
+      then lands on the low-frequency *endpoint* and ``f >= f_peak`` is the entire
+      band — returned by the **primary** path, since that mask clears ``min_points``,
+      so nothing distinguishes it from a legitimate selection. This is the rig's
+      normal condition at large ``R_bulk``, not an edge case.
+    * **monotone rising** — a series parasitic. No falling segment exists, and the
+      full-band fallback is load-bearing: the global fit then correctly returns ``+1``
+      and the gate rejects. Narrowing this shape would break the discriminator.
+    """
+
+    @staticmethod
+    def _tand(Z):
+        """``tan δ`` computed independently of the module under test."""
+        return np.asarray(Z).real / np.abs(np.asarray(Z).imag)
+
+    def test_tand_window_with_an_interior_peak_runs_from_the_peak_to_the_top_of_band(self):
+        # Regression pin. The default synthetic has its tanδ minimum at the top of the
+        # sweep, so "peak → first minimum above it" *is* "at or above the peak" — the
+        # numbers the module docstring quotes (global -0.24, windowed -0.83) must not
+        # move, and neither must the mask.
+        f, Z = reference_spectrum()
+        tand = self._tand(Z)
+        f_peak = float(f[int(np.argmax(tand))])
+
+        window = parallel_branch_window(f, Z)
+        assert np.array_equal(window, f >= f_peak)
+        assert window[int(np.argmax(f))], "the top of the band belongs to this window"
+        assert 0 < int(window.sum()) < f.size, "a real selection, not the whole band"
+        assert log_slope(f[window], tand[window]) == pytest.approx(-0.82, abs=0.02)
+
+    def test_tand_window_with_the_peak_below_the_sweep_stops_at_the_tand_minimum(self):
+        # The rig's own grid at rig R_bulk. Fitting through the high-frequency rise
+        # reads -0.49 against a -0.3 threshold; the falling segment reads -0.85.
+        f, Z = reference_spectrum(RIG_FREQ, R_bulk=5.0e7)
+        tand = self._tand(Z)
+        ascending = np.argsort(f)
+
+        assert int(np.argmax(tand[ascending])) == 0, (
+            "fixture must be the U shape — the peak has to sit at the low endpoint")
+        assert tand[ascending][-1] > tand[ascending].min(), "and it must rise again"
+
+        window = parallel_branch_window(f, Z)
+        assert not window.all(), "the full band is the pre-fix degenerate answer"
+        assert not window[int(np.argmax(f))], "the rising HF tail must be excluded"
+        f_trough = float(f[ascending][int(np.argmin(tand[ascending]))])
+        assert float(f[window].max()) == f_trough
+        assert float(f[window].min()) == float(f.min()), "the falling limb starts low"
+
+        assert log_slope(f[window], tand[window]) == pytest.approx(-0.85, abs=0.02)
+        assert log_slope(f, tand) == pytest.approx(-0.49, abs=0.02), (
+            "the full-band fit is what the old anchor returned here")
+
+    def test_tand_window_on_a_monotone_rising_series_parasitic_falls_back_to_full_band(self):
+        # Load-bearing: a series parasitic's maximum *is* the top of the band, so the
+        # falling segment is empty. The full-band fit is what makes the slope read +1
+        # and the gate reject; a narrowed window would report NaN instead.
+        f, Z = pure_series_rc(RIG_FREQ)
+        tand = self._tand(Z)
+        ascending = np.argsort(f)
+        assert int(np.argmax(tand[ascending])) == tand.size - 1, "monotone rising"
+
+        window = parallel_branch_window(f, Z)
+        assert window.all(), "no falling segment exists; the whole band is the answer"
+
+        r = gate_tand_slope(f, Z, _ctx())
+        assert r.metrics["tand_slope"] == pytest.approx(1.0, abs=0.01)
+        assert not r.passed and r.severity == BLOCK_SPECTRUM
+
+    def test_tand_window_with_too_few_valid_points_returns_the_full_band(self):
+        # Three usable points spread across a 41-point sweep: too few to locate a peak,
+        # but enough that a peak-to-trough span would still clear min_points in the
+        # *original* array — so the guard has to be what returns the full band here.
+        f, Z = reference_spectrum()
+        Z = Z.copy()
+        drop = np.ones(f.size, dtype=bool)
+        drop[[0, 20, 40]] = False
+        Z[drop] = -np.abs(Z[drop].real) + 1j * Z[drop].imag   # tanδ <= 0 ⇒ unusable
+
+        tand = self._tand(Z)
+        assert int((np.isfinite(tand) & (tand > 0)).sum()) == 3, "fewer than min_points"
+
+        window = parallel_branch_window(f, Z)
+        assert window.all() and window.size == f.size
 
 
 class TestPointGates:
@@ -475,8 +572,38 @@ class TestGateResult:
         assert pointwise.n_dropped == 1
 
     def test_the_log_entry_shape_is_the_one_the_framework_specifies(self):
+        # `checked` joined the five framework keys with the gate-record split. This
+        # assertion is deliberately still *closed*: `as_log_entry` is where the log
+        # shape is defined, so this is the one place a silently-added key should
+        # register as a change (test_eis_engine's parallel assertion is a subset
+        # check precisely so that adding a key here does not read as a regression
+        # there).
         entry = GateResult("x", FLAG, True, "d", np.ones(2, bool)).as_log_entry()
-        assert set(entry) == {"gate", "severity", "passed", "detail", "n_dropped"}
+        assert set(entry) == {"gate", "severity", "passed", "checked", "detail",
+                              "n_dropped"}
+        assert entry["checked"] is True, "a gate that ran reports checked=True"
+
+    def test_a_gate_that_could_not_check_says_so_in_the_log_entry(self):
+        entry = GateResult.unchecked("x", FLAG, "no input", np.ones(2, bool)).as_log_entry()
+        assert entry["checked"] is False
+        assert entry["passed"] is True, "fail-open posture is preserved"
+
+    def test_checked_defaults_true_so_the_49_positional_constructions_are_unchanged(self):
+        assert GateResult("x", FLAG, True, "d", np.ones(2, bool)).checked is True
+
+    def test_unchecked_and_refusing_is_refused_at_construction(self):
+        # `passed=False, checked=False` is "the check did not run and the spectrum is
+        # refused" — a state no gate is entitled to occupy. Enforcing it is what lets
+        # a consumer conclude something from `checked` alone; an invariant with an
+        # exception would force every reader to consult both fields.
+        with pytest.raises(ValueError, match="fail open"):
+            GateResult("x", FLAG, False, "d", np.ones(2, bool), checked=False)
+
+    def test_the_invariant_permits_the_three_states_that_are_meaningful(self):
+        mask = np.ones(2, bool)
+        assert GateResult("x", FLAG, True, "d", mask).passed          # checked, clean
+        assert not GateResult("x", FLAG, False, "d", mask).passed     # checked, found it
+        assert GateResult.unchecked("x", FLAG, "d", mask).passed      # could not check
 
 
 class TestValleyFeature:
@@ -616,3 +743,333 @@ class TestCrossSpectrumDuplicates:
 
         f, Z = reference_spectrum()
         assert gate_cross_spectrum_duplicates([("only", f, Z)]).passed
+
+
+# ── The `checked=False` census ───────────────────────────────────────────────
+
+
+def _failed_legacy_fit():
+    """A ``FitResult`` shaped exactly as the legacy path produces on a failed fit.
+
+    Not a stand-in: ``covariance`` is documented as ``None`` on the legacy path
+    *always* (``circuit_fitting.FitResult``), ``quality`` is empty when the fit
+    produced no ``z_fit`` to compare against, and ``z_fit`` is ``None`` for the same
+    reason. This one object is therefore the everyday shape the shipped engine hands
+    to :data:`FRONT2_GATES`, and it drives six of the census sites at once.
+    """
+    from softae.analysis.circuit_fitting import FitResult
+
+    return FitResult(
+        model_name="randles", parameters=np.array([]),
+        R0=float("nan"), R1=float("nan"), R0_guess=1.0, R1_guess=1.0,
+        z_indices=[], success=False, error_msg="fit did not converge",
+    )
+
+
+def _fit_with(covariance, *, success=False, R1=float("nan"), z_fit=None):
+    """A production ``FitResult`` carrying *covariance* — the gated path's shape."""
+    from softae.analysis.circuit_fitting import FitResult
+
+    return FitResult(
+        model_name="blocking_coplanar", parameters=np.array([50.0, 2000.0]),
+        R0=50.0, R1=R1, R0_guess=50.0, R1_guess=2000.0, z_indices=[0, 1],
+        success=success, z_fit=z_fit, covariance=covariance,
+    )
+
+
+def _checked_by_gate(results):
+    return {r.name: r.checked for r in results}
+
+
+class TestCouldNotCheckCensus:
+    """Every site that cannot evaluate its criterion reports ``checked is False``.
+
+    Spec §3.3 item 2 — the guard that actually holds the shape, because
+    ``checked: bool = True`` means a forgotten keyword reports having checked. Per
+    ``SUBAGENT_RULES`` §3.1(e) each branch is driven from **production-shaped input**
+    wherever one exists, and through :func:`run_gates` wherever the runner can reach
+    it, rather than from a hand-built ``ctx`` that forces the branch.
+
+    Three sites cannot be reached that way and each says so at its own test:
+    ``phase_noise_extrapolated`` and ``plateau_in_band`` are filtered out by earlier
+    gates in the runner, ``residual_structure``'s ``n < 8`` needs ``min_fit_pts``
+    below the shipped 8, and ``residual_structure``'s variance branch is
+    arithmetically unreachable from any input at all.
+
+    **No verdict moves.** Every site below already returned ``passed=True`` before
+    this field existed, which is spec §3.8's positive control, and each test asserts
+    it alongside ``checked``.
+    """
+
+    # ── Front 1, through the real runner ──────────────────────────────────────
+
+    def test_a_two_point_survivor_set_leaves_three_front1_gates_unable_to_judge(self):
+        """The measured empty-well shape: most of a 20-point sweep non-finite.
+
+        Production-reachable, and observed on the rig — an empty well returned 4
+        finite points of 20 where a cast well returned 20. With two finite points
+        ``gate_finiteness`` masks the rest and the survivors reach
+        ``monotonic_frequency``, ``stuck_instrument`` and the K–K ladder, none of
+        which can say anything about two points.
+        """
+        f, Z = reference_spectrum()
+        f, Z = f[:20].copy(), Z[:20].copy()
+        Z[2:] = np.nan + 1j * np.nan
+
+        _, results, log = run_gates(f, Z, _ctx())
+        checked = _checked_by_gate(results)
+
+        for name in ("monotonic_frequency", "stuck_instrument", "kk_truncation"):
+            assert checked[name] is False, name
+        # Fail-open preserved: none of the three refused the spectrum.
+        assert all(r.passed for r in results if r.checked is False)
+        # And the runner's own log carries it, which is the only route to the column.
+        assert {e["gate"]: e["checked"] for e in log}["stuck_instrument"] is False
+
+    def test_the_kk_ladder_failing_to_run_is_recorded_as_an_absence_not_a_pass(self):
+        # No monkeypatch: `lin_kk` genuinely cannot build a ladder on two points, so
+        # this is the gate's own "K–K test did not run" branch on real input.
+        f, Z = reference_spectrum()
+        r = gate_kk_truncation(f[:2], Z[:2], _ctx())
+        assert "did not run" in r.detail
+        assert r.passed and r.checked is False
+
+    def test_a_record_with_no_reactance_leaves_the_topology_triad_unable_to_judge(self):
+        """``Im Z ≡ 0`` starves both slope-based topology gates of usable points.
+
+        ``tan δ`` and ``C_app`` both divide by ``|Z''|``, and ``log_slope`` needs five
+        strictly-positive pairs, so ``cap_flatness`` and ``series_rc_topology`` return
+        NaN slopes. Reached through the runner on a full-length sweep — the K–K
+        residual limit is relaxed only to get past an unrelated gate that would
+        otherwise stop the chain before the triad.
+
+        **This is also the exhibit for the one site left deliberately alone.**
+        ``tand_slope`` fails on the *same* absence at the *same* severity and returns
+        the opposite verdict; see the comment at that branch in ``gates.py``.
+        """
+        f, Z = reference_spectrum()
+        Z = np.abs(Z.real) + 0j
+
+        _, results, _ = run_gates(f, Z, _ctx(kk_resid_pct=1e9))
+        checked = _checked_by_gate(results)
+        by_name = {r.name: r for r in results}
+
+        assert checked["cap_flatness"] is False
+        assert checked["series_rc_topology"] is False
+        assert by_name["cap_flatness"].passed and by_name["series_rc_topology"].passed
+
+        assert by_name["tand_slope"].checked is True, (
+            "left alone deliberately — see the comment at gate_tand_slope's NaN "
+            "branch; marking it unchecked would be the sole exception to the "
+            "passed/checked invariant")
+        assert not by_name["tand_slope"].passed, "and its verdict must not move"
+
+    # ── Front 2, through the real runner, as engine.py calls it ───────────────
+
+    def test_a_failed_legacy_fit_leaves_every_front2_gate_unable_to_judge(self):
+        """Six sites at once, from the shape the shipped engine produces daily.
+
+        ``engine.py`` runs ``run_gates(f_ok, Z_ok, ctx, FRONT2_GATES)`` with
+        ``ctx["fit"]`` set; the legacy path carries no ``FitCovariance`` at all, so
+        the three ``cov is None`` branches are not an edge case there but the norm.
+        Before this field, all six reported ``passed=True`` — indistinguishable, to
+        every consumer, from six gates that checked and found nothing wrong.
+        """
+        from softae.analysis.eis.gates import FRONT2_GATES
+
+        f, Z = reference_spectrum()
+        ctx = _ctx()
+        ctx["fit"] = _failed_legacy_fit()
+
+        _, results, _ = run_gates(f, Z, ctx, FRONT2_GATES)
+        checked = _checked_by_gate(results)
+
+        assert set(checked) == {
+            "residual_norm", "residual_structure", "pegged_parameters",
+            "relative_standard_error", "degeneracy", "model_free_crosscheck",
+        }, "every Front-2 gate must have run — none may short-circuit the chain"
+        assert all(v is False for v in checked.values()), checked
+        assert all(r.passed for r in results), "fail-open, and no verdict moves"
+
+    def test_a_singular_covariance_leaves_the_measurand_not_determined(self):
+        """§3.5(i) — the site the whole ruling turns on.
+
+        ``fit_with_covariance`` sets ``singular = not np.all(np.isfinite(pcov))`` and
+        keeps the NaN ``pcov``, which is exactly the object built here. ``sum_se`` is
+        then NaN, ``rel`` is NaN, and ``passed = not (rel == rel and …)`` is
+        unconditionally ``True`` — "cannot check" wearing "checked and clean", with a
+        detail that used to read *"determined to nan%"*.
+        """
+        from softae.analysis.eis.fitter import FitCovariance
+        from softae.analysis.eis.gates import gate_relative_standard_error
+
+        f, Z = reference_spectrum()
+        ctx = _ctx()
+        ctx["fit"] = _fit_with(FitCovariance(
+            names=("R0", "R1"), values=np.array([50.0, 2000.0]),
+            pcov=np.full((2, 2), np.nan), singular=True))
+
+        r = gate_relative_standard_error(f, Z, ctx)
+        assert r.passed and r.checked is False
+        assert np.isnan(r.metrics["rel_se_measurand"])
+
+    def test_the_same_singular_covariance_is_still_a_finding_for_degeneracy(self):
+        """§3.5(ii) — the KEEP that stops this wave from moving a verdict.
+
+        ``gate_degeneracy`` asks whether the series/bulk split is identifiable. A
+        singular covariance is not a missing input to that question; it is the
+        answer. Marking it unchecked would move every such spectrum off SUSPECT.
+        """
+        from softae.analysis.eis.fitter import FitCovariance
+        from softae.analysis.eis.gates import gate_degeneracy
+
+        f, Z = reference_spectrum()
+        ctx = _ctx()
+        ctx["fit"] = _fit_with(FitCovariance(
+            names=("R0", "R1"), values=np.array([50.0, 2000.0]),
+            pcov=np.full((2, 2), np.nan), singular=True))
+
+        r = gate_degeneracy(f, Z, ctx)
+        assert not r.passed and r.checked is True
+        assert "unidentifiable" in r.detail
+
+    def test_a_correlation_that_cannot_be_formed_is_an_absence_not_a_pass(self):
+        # Finite `pcov` — so `singular` is False and the branch above is not the one
+        # taken — but a zero variance makes `rho`'s denominator zero. curve_fit
+        # returns a zero diagonal for a parameter the Jacobian does not constrain.
+        from softae.analysis.eis.fitter import FitCovariance
+        from softae.analysis.eis.gates import gate_degeneracy
+
+        cov = FitCovariance(names=("R0", "R1"), values=np.array([50.0, 2000.0]),
+                            pcov=np.array([[0.0, 0.0], [0.0, 100.0]]))
+        assert not cov.singular and np.isnan(cov.rho("R0", "R1"))
+
+        f, Z = reference_spectrum()
+        ctx = _ctx()
+        ctx["fit"] = _fit_with(cov)
+        r = gate_degeneracy(f, Z, ctx)
+        assert r.passed and r.checked is False and "unavailable" in r.detail
+
+    def test_a_purely_reactive_record_makes_the_model_free_cross_check_impossible(self):
+        # `1/max(Re Y)` needs a positive real admittance somewhere. A record with no
+        # resistive component anywhere has none, so the cross-check has nothing to
+        # compare the fit against — with the fit itself perfectly healthy.
+        from softae.analysis.eis.gates import gate_model_free_crosscheck
+
+        f, Z = reference_spectrum()
+        reactive = 0.0 - 1j * np.abs(Z.imag)
+        ctx = _ctx()
+        ctx["fit"] = _fit_with(None, success=True, R1=2000.0)
+
+        r = gate_model_free_crosscheck(f, reactive, ctx)
+        assert r.passed and r.checked is False
+        assert "unavailable" in r.detail
+
+    # ── The runner's own exception handler ────────────────────────────────────
+
+    def test_a_gate_that_raises_is_recorded_as_unchecked_not_as_a_pass(self):
+        """§3.5(iv) — the site that justifies the field even on its own.
+
+        A crash and a pass were the same log line. The raiser is injected here, but
+        the mechanism is not hypothetical: [p74] §5(b) reported two real spectra
+        crashing the engine, and nothing in their record said so.
+        """
+        def exploding(f, Z, ctx):
+            raise RuntimeError("boom")
+
+        f, Z = reference_spectrum()
+        mask, results, log = run_gates(f, Z, _ctx(), gates=(exploding,))
+        assert mask.all(), "fail-open: a broken gate must not discard a measurement"
+        assert results[0].passed and results[0].checked is False
+        assert log[0]["checked"] is False and "boom" in log[0]["detail"]
+
+    # ── Sites the runner cannot reach — stated, not dressed up ────────────────
+
+    def test_phase_noise_with_no_finite_points_is_unchecked_but_only_synthetically(self):
+        """SYNTHETIC-ONLY, and the reason is a property of the runner.
+
+        ``gate_phase_noise_extrapolated`` sits fifth in ``FRONT1_PRE_CORRECTION``.
+        For its ``mag`` to have no finite entry, ``gate_finiteness`` must first have
+        masked every point — and ``run_gates`` then finds an empty index set, records
+        ``min_points`` and breaks before this gate is ever called. The branch is
+        therefore only reachable by calling the gate directly.
+        """
+        from softae.analysis.eis.gates import gate_phase_noise_extrapolated
+
+        f, Z = reference_spectrum()
+        blank = np.full(f.size, np.nan + 1j * np.nan)
+
+        _, results, _ = run_gates(f, blank, _ctx())
+        assert "phase_noise_extrapolated" not in {r.name for r in results}, (
+            "if the runner ever reaches it, this test's premise has changed")
+
+        r = gate_phase_noise_extrapolated(f, blank, _ctx())
+        assert r.passed and r.checked is False
+
+    def test_plateau_with_too_few_finite_points_is_unchecked_but_only_synthetically(self):
+        """SYNTHETIC-ONLY. ``gate_min_points`` runs first and blocks the chain.
+
+        ``plateau_in_band`` is last in ``FRONT1_POST_CORRECTION`` and ``min_points``
+        is third; fewer than two usable points cannot clear the shipped
+        ``min_fit_pts = 8``, so the runner stops before the plateau is measured.
+        """
+        from softae.analysis.eis.gates import gate_plateau_in_band
+
+        f, Z = reference_spectrum()
+        r = gate_plateau_in_band(f[:1], Z[:1], _ctx())
+        assert r.passed and r.checked is False
+        assert "too few finite points" in r.detail
+
+    def test_a_runs_test_on_under_eight_points_is_unchecked_but_needs_a_lowered_gate(self):
+        """Reachable only with ``min_fit_pts`` below the shipped 8.
+
+        The engine fits the points that survived ``gate_min_points``, and ``z_fit``
+        is the same length, so ``n < 8`` cannot occur while that gate needs 8.
+        """
+        from softae.analysis.eis.gates import gate_residual_structure
+
+        f, Z = reference_spectrum()
+        f, Z = f[:6], Z[:6]
+        ctx = _ctx()
+        ctx["fit"] = _fit_with(None, success=True, z_fit=Z * 1.01)
+
+        r = gate_residual_structure(f, Z, ctx)
+        assert r.passed and r.checked is False
+        assert "too few points" in r.detail
+
+    def test_residual_structure_variance_branch_is_arithmetically_unreachable(self):
+        """The ``var <= 0`` guard cannot be entered by any input, production or not.
+
+        It is marked ``unchecked`` for consistency with its neighbours, and this test
+        records why no census entry drives it: with ``n_tot >= 8`` and both signs
+        present, ``2·n_pos·n_neg`` is minimised at ``n_pos = 1`` and equals
+        ``2(n_tot − 1)``, which exceeds ``n_tot`` for every ``n_tot >= 2``. So the
+        numerator ``2·n_p·n_n·(2·n_p·n_n − n_tot)`` is strictly positive, and the
+        denominator ``n_tot²(n_tot − 1)`` is too. Reported as a finding rather than
+        covered by a monkeypatch that would only prove the monkeypatch works.
+        """
+        for n_tot in range(8, 60):
+            for n_pos in range(1, n_tot):
+                n_neg = n_tot - n_pos
+                var = (2.0 * n_pos * n_neg * (2.0 * n_pos * n_neg - n_tot)) / (
+                    n_tot ** 2 * (n_tot - 1))
+                assert var > 0, (n_tot, n_pos)
+
+    # ── The list itself ───────────────────────────────────────────────────────
+
+    def test_the_unchecked_site_list_is_pinned_so_a_new_one_cannot_arrive_unnoticed(self):
+        """Spec §3.5's table, counted at source.
+
+        A census that only asserts the known sites cannot notice a *new* fail-open
+        branch. Counting `GateResult.unchecked` call sites in the module is what
+        turns "these nineteen are marked" into "exactly these nineteen exist", so
+        adding a twentieth is a deliberate act with a test to update.
+        """
+        import inspect
+
+        import softae.analysis.eis.gates as gates_module
+
+        source = inspect.getsource(gates_module)
+        assert source.count("GateResult.unchecked(") == 19, (
+            "the §3.5 census moved — update this count and the tests above "
+            "together, and say which site changed")

@@ -99,7 +99,7 @@ def log_slope(x: np.ndarray, y: np.ndarray, *, min_points: int = 5) -> float:
 def parallel_branch_window(
     freq: np.ndarray, Z: np.ndarray, *, min_points: int = 5
 ) -> np.ndarray:
-    """Frequencies at or above the ``tan δ`` maximum — where parallel conduction shows.
+    """The falling segment of ``tan δ`` — the only band where parallel conduction shows.
 
     **This window is a deliberate deviation from framework §3.5.1**, which fits the
     loss-tangent slope globally across the whole sweep. That prescription is only
@@ -113,10 +113,42 @@ def parallel_branch_window(
     the same spectrum above its ``tan δ`` peak gives −0.83 and passes comfortably. So
     fitting globally would discard exactly the data this rig produces.
 
-    Falling back to the full band when too few points sit above the peak is not a
-    safety valve, it is part of the discriminator: a series parasitic has ``tan δ``
-    rising monotonically, so its maximum *is* the top of the band, and the full-band
-    fit then correctly returns ``+1``.
+    One rule covers every shape: **the window runs from the global maximum to the first
+    minimum above it**, which is the falling segment adjacent to the peak.
+
+    ==========================  ==================  ===========================
+    shape                       ``tan δ`` maximum   window
+    ==========================  ==================  ===========================
+    unimodal, peak in band      interior            peak → top of band
+    U-shaped, peak below band   low endpoint        low end → the ``tan δ`` min
+    monotone rising             top endpoint        empty ⇒ **full band**
+    ==========================  ==================  ===========================
+
+    Rows one and three are the same expression: when ``tan δ`` falls all the way to the
+    top of the sweep the trough *is* the last point and the window is simply "at or
+    above the peak", and when it rises monotonically the trough is the peak itself and
+    the one-point window falls through to the full band.
+
+    Row two is the rig's **normal** condition, not an edge case. A larger ``R_bulk``
+    pushes the relaxation corner down in frequency, and past roughly ``R_bulk = 5×10⁷``
+    the true peak has migrated *below* the sweep's 1.351 Hz floor. What remains in band
+    is the falling limb plus the high-frequency rise where ``Z → R_series`` and
+    ``Im Z → 0``, so ``tan δ → ∞`` — real physics, not noise. Anchoring on ``argmax``
+    alone put the anchor on the low-frequency endpoint, ``f >= f_peak`` selected the
+    whole band, and — this is the part that made it invisible — that mask has more than
+    ``min_points`` entries, so it was returned by the *primary* path looking exactly
+    like a legitimate above-peak selection while meaning the opposite. Measured at rig
+    ``R_bulk``, including the rising tail dragged the slope from −0.85 to −0.49
+    (5×10⁷) and −0.42 (10⁸) against a −0.3 threshold: still passing, but with a third
+    of the margin, and degrading with ``R_bulk``.
+
+    Falling back to the full band when the falling segment is too short is not a safety
+    valve, it is part of the discriminator: a series parasitic has ``tan δ`` rising
+    monotonically, so its maximum *is* the top of the band, and the full-band fit then
+    correctly returns ``+1``.
+
+    Order-agnostic: the rig sweeps high→low, so the anchors are found on a sorted copy
+    and applied as scalar frequency comparisons against the original array.
     """
     f = np.asarray(freq, dtype=float)
     tand = loss_tangent(Z)
@@ -126,8 +158,15 @@ def parallel_branch_window(
     if int(ok.sum()) < int(min_points):
         return full
 
-    f_peak = float(f[ok][int(np.argmax(tand[ok]))])
-    window = f >= f_peak
+    ascending = np.argsort(f[ok])
+    f_asc, tand_asc = f[ok][ascending], tand[ok][ascending]
+
+    i_peak = int(np.argmax(tand_asc))
+    i_trough = i_peak + int(np.argmin(tand_asc[i_peak:]))
+
+    window = f >= float(f_asc[i_peak])
+    if i_trough < tand_asc.size - 1:      # a rising tail sits above the trough
+        window &= f <= float(f_asc[i_trough])
     return window if int(window.sum()) >= int(min_points) else full
 
 
