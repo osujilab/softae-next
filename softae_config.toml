@@ -705,6 +705,39 @@ engine = "legacy"          # "legacy" | "gated" — provisional, see [a97] above
 # maximise conductivity, minimise impedance, same goal expressed two ways.
 objective = "auto"         # "auto" | "sigma" | "mean_abs_z"
 
+# How many function evaluations the LEGACY fitter (`analysis/circuit_fitting.py`,
+# `fit_circuit`) may spend on one spectrum. Without this it inherits impedance.py's
+# `maxfev = 1e5` at `ftol = 1e-13`, and the GUI's Analysis/Arrhenius fit then looks
+# hung — because for one spectrum in 54 it effectively is.
+#
+# MEASURED, on the operator-curated 20260825T154521Z_arrhenius_sweep corpus (54
+# spectra, 9 channels x 6 temperatures, all role='sample', all legacy):
+#
+#   nfev over the 49 spectra reaching the optimiser   min 6 | median 12 | p95 31 | max 65
+#   wall clock                                        53 of 54 under 0.22 s
+#   THE TAIL, ONE SPECTRUM (mid 3840, ch20, 60.1 C)   348.56 s at 100 % CPU,
+#                                                     ~100,000 nfev, RAISES, R1 = NaN
+#   next slowest after it                             0.21 s
+#
+# So the gap between "worst fit that converges" (65 nfev on simpleSalt, 87 on
+# flexSalt) and "fit that will never converge" (~1e5) is three orders wide and
+# empty, and 2000 sits in it with ~23x headroom.
+#
+# A CAP CANNOT DEGRADE A NUMBER SILENTLY, which is the property that makes this
+# safe rather than a tuning knob: `curve_fit` RAISES when the budget runs out — it
+# never returns a best-so-far — so a cap either does not fire (bit-identical fit) or
+# fires and the fit fails as it was already going to. Swept across caps 20 -> 5000
+# on that corpus: max |dR1|/R1 = 0.000, always. There is no silent-degradation
+# regime to be cautious of here.
+#
+# 2000 is deliberately the SAME NUMBER as [eis.pregate] max_nfev below, so the
+# codebase carries one answer to "how long may a fit run" and not two.
+#
+# 0 or a negative value means NO CAP — impedance.py's own 1e5, i.e. exactly the
+# behaviour that shipped before this key existed. Not a large number standing in
+# for "off": the kwarg is omitted entirely.
+legacy_max_nfev = 2000
+
 [eis.gates]
 enabled             = false
 # Every threshold below is an engineering default from the specification, chosen

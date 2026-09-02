@@ -398,3 +398,293 @@ class TestUsablePointsMatchesTheGate:
         assert not theirs[5], "gate_finiteness is expected to drop the duplicate"
         assert ours.all(), "the legacy fit mask deliberately keeps it"
         np.testing.assert_array_equal(np.delete(ours, 5), np.delete(theirs, 5))
+
+
+# ── Optimiser budget ─────────────────────────────────────────────────────
+
+#: The real pathological spectrum, not a fixture of one.  Measurement 3840 of
+#: ``20260825T154521Z_arrhenius_sweep`` (ch20, 60.1 C) is the one spectrum in 54 that
+#: spends ~100,000 function evaluations and 348 s at 100 % CPU before raising anyway,
+#: and it is the reason this budget exists.  Its ``usable_points`` mask is all-true
+#: (34 of 34), so it isolates the optimiser from the finiteness path cleanly.
+PATHOLOGICAL_SPECTRUM = Path(
+    r"C:\Users\Osuji\softae_data\runs\20260825T154521Z_arrhenius_sweep"
+    r"\eis\eis_ch20_T60_RH0.txt"
+)
+
+
+def _count_circuit_evaluations(monkeypatch) -> dict[str, int]:
+    """Count every circuit evaluation the optimiser makes; return a live counter.
+
+    ``impedance.models.circuits.fitting.wrapCircuit`` builds the residual function
+    ``curve_fit`` is handed, so it is the one point every evaluation passes through and
+    the honest place to measure the optimiser's spend. The count is not ``nfev``: it
+    includes the finite-difference jacobian's calls, and runs ~5.2x the budget.
+    """
+    import impedance.models.circuits.fitting as impedance_fitting
+
+    box = {"n": 0}
+    original = impedance_fitting.wrapCircuit
+
+    def counting(circuit, constants):
+        inner = original(circuit, constants)
+
+        def wrapped(*args, **kwargs):
+            box["n"] += 1
+            return inner(*args, **kwargs)
+
+        return wrapped
+
+    monkeypatch.setattr(impedance_fitting, "wrapCircuit", counting)
+    return box
+
+
+def _config_overlay(monkeypatch, **eis_keys):
+    """Replace keys in ``[eis]`` at the loader, leaving every other section alone.
+
+    ``softae.config.loader.load`` is the one parse point ``_legacy_max_nfev`` reads,
+    the same one ``eis_settings`` reads ``engine`` from, so patching here exercises the
+    real resolution end to end.  Patching ``_legacy_max_nfev`` itself would test the
+    test.  Every other section is carried through from the real file because the
+    quality grader and the engine read their own.
+    """
+    from softae.config import loader
+
+    overlaid = dict(loader.load())
+    overlaid["eis"] = {**(overlaid.get("eis") or {}), **eis_keys}
+    monkeypatch.setattr(loader, "load", lambda *a, **k: overlaid)
+
+
+class TestFitCircuitOptimiserBudget:
+    """The optimiser gets a bounded number of evaluations, and says when it runs out.
+
+    The measured defect: ``fit_circuit`` passed no iteration budget, so it inherited
+    impedance.py's ``maxfev = 1e5`` at ``ftol = 1e-13``.  Over the 54-spectrum
+    ``20260825T154521Z_arrhenius_sweep`` corpus, 53 spectra fit in under 0.22 s and one
+    — measurement 3840 — burned **348.56 s at 100 % CPU and then raised**, which is
+    what the GUI's "hung" Arrhenius fit actually was.
+
+    A cap is safe here for one specific reason, asserted below rather than assumed:
+    ``curve_fit`` **raises** when the budget is exhausted and never returns a degraded
+    best-so-far, so a cap either does not fire (bit-identical ``R1``) or fires and the
+    fit fails as it was already going to.
+    """
+
+    @pytest.fixture
+    def clean(self) -> EISResult:
+        pytest.importorskip("impedance")
+        f, Z = reference_spectrum()
+        return as_eis_result(f, Z, channel=22)
+
+    # -- the cap reaches the optimiser, on both call sites -----------------
+
+    def test_the_cap_reaches_the_bounded_call_site(self, clean):
+        """``simpleSalt`` carries ``bounds``, so it takes the ``bounds=`` branch.
+
+        Pinned against the *same* spectrum fitting fine at a generous cap, so this
+        asserts the budget did the failing and not the data.
+        """
+        assert CIRCUIT_MODELS["simpleSalt"]["bounds"] is not None, (
+            "premise of this test: simpleSalt must take the bounded branch"
+        )
+        starved = fit_circuit(clean, "simpleSalt", max_nfev=2)
+        roomy = fit_circuit(clean, "simpleSalt", max_nfev=5000)
+
+        assert roomy.success, "the clean synthetic must fit, or this proves nothing"
+        assert not starved.success
+        assert starved.failure_kind == "budget_exhausted"
+
+    def test_the_cap_reaches_the_unbounded_call_site(self, clean):
+        """``flexSalt`` has ``bounds = None``, so it takes the other branch.
+
+        Both branches are exercised because the correct kwarg is not obvious: impedance
+        fills in default bounds when given none, so *both* reach ``curve_fit`` bounded
+        and run ``trf``.  A ``max_nfev=`` spelling works on neither.
+        """
+        assert CIRCUIT_MODELS["flexSalt"]["bounds"] is None, (
+            "premise of this test: flexSalt must take the unbounded branch"
+        )
+        starved = fit_circuit(clean, "flexSalt", max_nfev=2)
+        roomy = fit_circuit(clean, "flexSalt", max_nfev=5000)
+
+        assert roomy.success, "the clean synthetic must fit, or this proves nothing"
+        assert not starved.success
+        assert starved.failure_kind == "budget_exhausted"
+
+    def test_a_cap_that_does_not_fire_changes_nothing(self, clean):
+        """The no-op property the safety argument rests on, asserted not assumed.
+
+        If a cap could return a *degraded* fit rather than raising, every number on this
+        path would move when the default landed.  Bit-identical is the claim, so
+        bit-identical is the assertion — not ``approx``.
+        """
+        for name in ("simpleSalt", "flexSalt"):
+            capped = fit_circuit(clean, name, max_nfev=5000)
+            uncapped = fit_circuit(clean, name, max_nfev=0)
+            assert capped.success and uncapped.success
+            assert capped.R1 == uncapped.R1, name
+            assert capped.R0 == uncapped.R0, name
+
+    # -- where the number comes from --------------------------------------
+
+    def test_the_default_budget_comes_from_config(self, clean, monkeypatch):
+        """``[eis] legacy_max_nfev`` governs a call that passes no ``max_nfev``.
+
+        Driven through the loader rather than through the argument, because the argument
+        path is already covered above and the thing at risk is the *wiring* — a fitter
+        that silently ignored the key would pass every argument-level test.
+        """
+        _config_overlay(monkeypatch, legacy_max_nfev=2)
+        starved = fit_circuit(clean, "simpleSalt")
+
+        assert not starved.success
+        assert starved.failure_kind == "budget_exhausted"
+        assert "budget of 2 function evaluations" in starved.error_msg
+
+    def test_the_shipped_default_is_2000(self):
+        """The shipped file, read as the operator's rig reads it.
+
+        2000 is not arbitrary: it is ~23x the worst *converging* fit measured on the
+        corpus (65 nfev on simpleSalt, 87 on flexSalt) and 2 % of what the pathological
+        spectrum wants, and it is the same number as ``[eis.pregate] max_nfev`` so the
+        codebase carries one answer rather than two.
+        """
+        from softae.analysis.circuit_fitting import (
+            DEFAULT_LEGACY_MAX_NFEV,
+            _legacy_max_nfev,
+        )
+        from softae.config import loader
+
+        assert DEFAULT_LEGACY_MAX_NFEV == 2000
+        assert _legacy_max_nfev() == 2000
+        eis_cfg = loader.load().get("eis", {}) or {}
+        assert eis_cfg.get("legacy_max_nfev") == 2000, (
+            "the shipped softae_config.toml must carry the key, not rely on the fallback"
+        )
+        assert eis_cfg.get("pregate", {}).get("max_nfev") == DEFAULT_LEGACY_MAX_NFEV, (
+            "one number for 'how long may a fit run', not two"
+        )
+
+    def test_a_caller_argument_beats_config(self, clean, monkeypatch):
+        """Precedence, in the direction :func:`_min_fit_points` already set."""
+        _config_overlay(monkeypatch, legacy_max_nfev=2)
+
+        assert not fit_circuit(clean, "simpleSalt").success, (
+            "premise: config alone must starve this fit"
+        )
+        assert fit_circuit(clean, "simpleSalt", max_nfev=5000).success
+
+    @pytest.mark.parametrize("off", [0, -1, -2000])
+    def test_zero_or_negative_means_no_cap(self, clean, monkeypatch, off):
+        """"Off" omits the kwarg entirely rather than passing a large number.
+
+        The distinction matters: passing a large ``maxfev`` is still *our* number, and
+        the documented meaning of 0 is impedance.py's own ``1e5`` — the exact behaviour
+        that shipped before this key existed.
+        """
+        from softae.analysis.circuit_fitting import _legacy_max_nfev
+
+        assert _legacy_max_nfev(off) is None
+        _config_overlay(monkeypatch, legacy_max_nfev=off)
+        assert _legacy_max_nfev() is None
+        assert fit_circuit(clean, "simpleSalt").success
+
+    # -- the two refusals must not read alike ------------------------------
+
+    def test_budget_and_dropped_point_refusals_are_distinct(self, clean):
+        """The operator read one of these as "the EIS gates are enabled".
+
+        Both surface as red text in the GUI's Error column, so they are pinned apart
+        both structurally (``failure_kind``) and in wording — and the budget message is
+        required to say in words that no gate was involved, because that is the
+        inference that was actually drawn.
+        """
+        budget = fit_circuit(clean, "simpleSalt", max_nfev=2)
+        remnant = fit_circuit(
+            _poke_nonfinite(clean, slice(4, None)), "simpleSalt", min_points=8
+        )
+
+        assert budget.failure_kind == "budget_exhausted"
+        assert remnant.failure_kind == "too_few_points"
+        assert budget.failure_kind != remnant.failure_kind
+
+        assert "budget" in budget.error_msg and "NOT a gate" in budget.error_msg
+        assert "no gate rejected this spectrum" in budget.error_msg
+        assert "usable" not in budget.error_msg, (
+            "the budget refusal must not borrow the remnant refusal's vocabulary"
+        )
+        assert "budget" not in remnant.error_msg
+        assert "usable" in remnant.error_msg and "need 8" in remnant.error_msg
+
+    def test_a_budget_refusal_reports_no_r1_rather_than_a_bad_one(self, clean):
+        """σ = K/R consumes a NaN loudly and a wrong float silently."""
+        got = fit_circuit(clean, "simpleSalt", max_nfev=2)
+        assert not got.success
+        assert np.isnan(got.R1) and np.isnan(got.R0)
+
+    def test_a_successful_fit_carries_no_failure_kind(self, clean):
+        """"Did not fail" must not be spelled with the same token as "failed somehow"."""
+        got = fit_circuit(clean, "simpleSalt")
+        assert got.success
+        assert got.failure_kind == ""
+
+    def test_an_unrelated_fit_error_is_not_labelled_a_budget_failure(self, clean):
+        """The classifier keys on ``curve_fit``'s wording, so prove it discriminates.
+
+        ``simpleSaltMembrane`` raises from ``CustomCircuit.__init__`` — before the
+        optimiser is reached at all — which is precisely the shape that must *not* be
+        reported as an exhausted budget.
+        """
+        got = fit_circuit(clean, "simpleSaltMembrane", max_nfev=2)
+        assert not got.success
+        assert got.failure_kind == "fit_error"
+        assert "budget" not in got.error_msg
+
+    # -- the real manifold, not a fixture of it ----------------------------
+
+    def test_the_real_pathological_spectrum_is_capped(self, monkeypatch):
+        """Measurement 3840 itself, because a synthetic would not prove the plumbing.
+
+        Asserted under a *small* cap: the point is that the budget fires on this real
+        spectrum through the real ``EISResult.load`` path, not to re-run the 7 s or
+        348 s cases in the suite.  The spectrum's own mask is all-finite, so this
+        isolates the optimiser from :func:`usable_points` entirely.
+
+        **The work done is counted, not inferred from the refusal.**  An earlier draft
+        of this test asserted only the message, and a mutation that deleted the kwarg
+        from the ``model.fit`` call left it green — because the fit still raised the
+        same wording, 379 s later.  That is the 3.1(d) shape exactly: an assertion on
+        the report rather than on the thing being reported.  ``wrapCircuit`` is the
+        single point every circuit evaluation passes through, so counting there
+        measures the optimiser's spend directly.
+
+        Calibration: this spectrum costs ~480 evaluations at a cap of 100 and ~10,300
+        at 2000 (~5.2 per unit of budget, the jacobian's finite differences), against
+        ~5e5 uncapped.  5000 sits a decade below the uncapped cost and an order above
+        the capped one, so neither noise nor a scipy step-size change can move it.
+        """
+        pytest.importorskip("impedance")
+        if not PATHOLOGICAL_SPECTRUM.exists():
+            pytest.skip(
+                f"real corpus absent: {PATHOLOGICAL_SPECTRUM}. This test is the only "
+                "one here that exercises the production manifold; a green suite "
+                "without it has NOT checked that the cap fires on real data."
+            )
+
+        real = EISResult.load(PATHOLOGICAL_SPECTRUM)
+        assert usable_points(
+            real.frequency, real.z_real, real.z_imag_neg
+        ).all(), "premise: 3840 is all-finite, so only the budget can refuse it"
+
+        n_eval = _count_circuit_evaluations(monkeypatch)
+        got = fit_circuit(real, "simpleSalt", max_nfev=100)
+
+        assert not got.success
+        assert got.failure_kind == "budget_exhausted"
+        assert got.n_points_dropped == 0
+        assert "budget of 100 function evaluations" in got.error_msg
+        assert np.isnan(got.R1)
+        assert 0 < n_eval["n"] < 5000, (
+            f"the cap did not bound the optimiser: {n_eval['n']} circuit evaluations "
+            "for a budget of 100. Uncapped this spectrum costs ~5e5 and 348 s."
+        )

@@ -42,6 +42,12 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
+#: Values of :attr:`FitResult.failure_kind`.  Three distinguishable refusals, because
+#: they were indistinguishable in the GUI and got read as one thing.
+FAILURE_TOO_FEW_POINTS = "too_few_points"
+FAILURE_BUDGET_EXHAUSTED = "budget_exhausted"
+FAILURE_FIT_ERROR = "fit_error"
+
 # ---------------------------------------------------------------------------
 # Circuit model registry
 # ---------------------------------------------------------------------------
@@ -121,6 +127,15 @@ class FitResult:
     #: measurements that were previously indistinguishable in the result.
     n_points_used: int = 0
     n_points_dropped: int = 0
+    #: *Why* the fit failed, as a token rather than as prose: ``""`` when it did not,
+    #: else :data:`FAILURE_TOO_FEW_POINTS`, :data:`FAILURE_BUDGET_EXHAUSTED` or
+    #: :data:`FAILURE_FIT_ERROR`.  It exists because the first two both surface in the
+    #: GUI's Error column as a refusal and were read there as "the EIS gates are
+    #: enabled" — neither is a gate, and they are not each other.  ``error_msg`` says
+    #: which in words; this says which in a value a caller can branch on, and no
+    #: existing field can (``success`` is one bit, ``n_points_dropped`` is nonzero for
+    #: a *successful* masked fit too).
+    failure_kind: str = ""
 
     def sigma(self, L: float, t: float, w: float) -> float:
         """Ionic conductivity σ = L / (R1 · t · w)  [S/cm].
@@ -316,13 +331,117 @@ def _min_fit_points(override: int | None = None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Optimiser budget
+# ---------------------------------------------------------------------------
+
+#: Shipped default for ``[eis] legacy_max_nfev``, and the fallback when the config
+#: system cannot be reached.  Deliberately the same 2000 as ``[eis.pregate] max_nfev``
+#: so the codebase carries one number for "how long may a fit run" rather than two.
+#:
+#: The gap it sits in is three orders wide and empty.  Over the 54-spectrum
+#: ``20260825T154521Z_arrhenius_sweep`` corpus the worst *converging* fit costs 65
+#: function evaluations on ``simpleSalt`` and 87 on ``flexSalt`` (median 12, p95 31),
+#: while the one pathological spectrum — measurement 3840, ch20, 60.1 C — spends
+#: ~100,000 over 348 s at 100 % CPU and then raises anyway.  2000 is ~23x headroom
+#: over the worst success and 2 % of the cost of the one failure.
+DEFAULT_LEGACY_MAX_NFEV = 2000
+
+#: ``curve_fit``'s wording when it runs out of evaluations.  Matched as a substring
+#: because it arrives wrapped: impedance.py lets ``scipy`` raise, and the text is
+#: ``"Optimal parameters not found: The maximum number of function evaluations is
+#: exceeded."``  Lower-cased before comparison so the leading "The" cannot matter.
+_BUDGET_EXHAUSTED_SIGNATURE = "maximum number of function evaluations is exceeded"
+
+
+def _legacy_max_nfev(override: int | None = None) -> int | None:
+    """The optimiser's evaluation budget for this legacy path, or ``None`` for none.
+
+    Read from ``[eis] legacy_max_nfev`` through :mod:`softae.config.loader` — the same
+    single parse point :func:`softae.analysis.eis.settings.eis_settings` reads ``[eis]
+    engine`` from, so a test that patches the loader moves both and there is no second
+    mechanism to keep in step.  It is read *here* rather than added to ``EISSettings``
+    because ``EISSettings`` is the **gated** engine's settings object, which this path
+    does not build and must not start depending on — exactly the reasoning
+    :func:`_min_fit_points` gives for preferring ``[quality] min_points`` over
+    ``[eis.gates] min_fit_pts``.
+
+    **Zero or negative means uncapped**, and returns ``None`` so the caller omits the
+    kwarg entirely and inherits impedance.py's own ``maxfev = 1e5``.  That is the
+    pre-cap behaviour restored exactly, not approximated by a large number.
+
+    A caller-supplied *override* wins over configuration, matching
+    :func:`_min_fit_points`'s precedence.
+    """
+    if override is not None:
+        raw: Any = override
+    else:
+        try:
+            from softae.config import loader
+
+            raw = (loader.load().get("eis", {}) or {}).get(
+                "legacy_max_nfev", DEFAULT_LEGACY_MAX_NFEV
+            )
+        except Exception:  # config system unreachable — cap anyway, do not hang
+            logger.warning("eis_fit_max_nfev_unresolved", exc_info=True)
+            raw = DEFAULT_LEGACY_MAX_NFEV
+
+    try:
+        budget = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("eis_fit_max_nfev_uninterpretable", value=repr(raw))
+        budget = DEFAULT_LEGACY_MAX_NFEV
+    return budget if budget > 0 else None
+
+
+def _budget_exhausted_message(
+    budget: int | None, model_name: str, n_dropped: int = 0
+) -> str:
+    """The refusal an operator reads when the optimiser ran out of evaluations.
+
+    Written to be unmistakable against the *other* refusal this module produces — the
+    ``usable_points`` remnant message — because in the GUI's Error column both are just
+    red text, and one was read as "the EIS gates are enabled". Neither is a gate, so
+    this says so in words rather than leaving it to be inferred.
+
+    *n_dropped* is taken rather than assumed: a spectrum can lose points to
+    :func:`usable_points` **and then** exhaust the budget on what survived, and a
+    message that flatly claimed "no points were withheld" would be false exactly there —
+    which is the same "unknown spelled as clean" mistake this message exists to undo.
+
+    ASCII only, deliberately: this string reaches a Qt table, a console and a log file,
+    and the em dashes elsewhere in this module do not survive all three.
+    """
+    if budget is None:
+        limit = "impedance.py's own ceiling (the [eis] legacy_max_nfev cap is disabled)"
+        knob = "Set [eis] legacy_max_nfev to a positive number to fail faster instead."
+    else:
+        limit = f"its budget of {budget} function evaluations"
+        knob = (
+            "Raise [eis] legacy_max_nfev to allow a longer fit, or set it to 0 or a "
+            "negative number for no cap."
+        )
+    points = (
+        "no points were withheld for being non-finite"
+        if n_dropped == 0
+        else f"separately, {n_dropped} non-finite point(s) had been dropped first"
+    )
+    return (
+        f"optimiser evaluation budget exhausted: the '{model_name}' fit stopped at "
+        f"{limit} without converging, so this spectrum has no fitted R1. "
+        f"This is the fitter's own iteration limit, NOT a gate - no gate rejected "
+        f"this spectrum and {points}. {knob}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Fitting
 # ---------------------------------------------------------------------------
 
 def fit_circuit(eis_result, model_name: str = "simpleSalt", *,
                 fit_plots: bool = False,
                 fixed_params: dict[str, float] | None = None,
-                min_points: int | None = None) -> FitResult:
+                min_points: int | None = None,
+                max_nfev: int | None = None) -> FitResult:
     """Fit an equivalent-circuit model to EIS data.
 
     Non-finite points are **masked, not fatal.** ``curve_fit`` calls
@@ -342,6 +461,16 @@ def fit_circuit(eis_result, model_name: str = "simpleSalt", *,
     ``FitResult.n_points_dropped``, and a spectrum reduced below *min_points* usable
     points is refused with a message saying so rather than fitted on the remnant.
 
+    **The optimiser is given a budget, and running out of it is safe.** Without one it
+    inherits impedance.py's ``maxfev = 1e5`` at ``ftol = 1e-13``, which on measurement
+    3840 of ``20260825T154521Z_arrhenius_sweep`` burned **348 s at 100 % CPU** and then
+    raised regardless — the GUI's Arrhenius fit looked hung because, for that one
+    spectrum in 54, it effectively was.  A cap cannot degrade a result silently:
+    ``curve_fit`` **raises** when the budget is exhausted rather than returning a
+    best-so-far, so a cap either does not fire (bit-identical fit) or fires and the fit
+    fails as it was already going to.  Measured across caps from 20 to 5000 on that
+    corpus, ``max |ΔR1|/R1 = 0.000``.  See :func:`_legacy_max_nfev`.
+
     Parameters
     ----------
     eis_result : EISResult
@@ -355,6 +484,9 @@ def fit_circuit(eis_result, model_name: str = "simpleSalt", *,
     min_points : int, optional
         Override the ``[quality] min_points`` floor. For tests that need to pin the
         threshold rather than inherit the operator's configuration.
+    max_nfev : int, optional
+        Override the ``[eis] legacy_max_nfev`` optimiser budget. ``0`` or negative
+        means no cap — impedance.py's ``maxfev = 1e5``, the pre-cap behaviour.
 
     Returns
     -------
@@ -406,6 +538,7 @@ def fit_circuit(eis_result, model_name: str = "simpleSalt", *,
                 z_indices=z_idx,
                 success=False,
                 error_msg=reason,
+                failure_kind=FAILURE_TOO_FEW_POINTS,
                 n_points_used=n_kept,
                 n_points_dropped=n_dropped,
             )
@@ -466,6 +599,18 @@ def fit_circuit(eis_result, model_name: str = "simpleSalt", *,
     freq = fit_freq
     full_freq = np.asarray(eis_result.frequency, dtype=float)
 
+    budget = _legacy_max_nfev(max_nfev)
+    # ``maxfev``, not ``max_nfev``, and the distinction is not cosmetic on either call
+    # site.  ``circuit_fit`` fills ``bounds`` with per-element defaults when the caller
+    # passes none, so **both** branches below reach ``curve_fit`` bounded and therefore
+    # run ``trf``, whose own kwarg is ``max_nfev``.  ``curve_fit`` bridges that itself —
+    # ``if 'max_nfev' not in kwargs: kwargs['max_nfev'] = kwargs.pop('maxfev', None)`` —
+    # so passing ``max_nfev`` would leave impedance.py's unconditional ``maxfev = 1e5``
+    # unpopped beside it and raise ``TypeError: least_squares() got an unexpected
+    # keyword argument 'maxfev'``.  Verified both ways against impedance 1.7.1 /
+    # scipy 1.17.1 before this comment was written.
+    fit_kwargs: dict[str, Any] = {} if budget is None else {"maxfev": budget}
+
     try:
         from impedance.models.circuits import CustomCircuit  # type: ignore
 
@@ -475,9 +620,9 @@ def fit_circuit(eis_result, model_name: str = "simpleSalt", *,
             constants=constants or {},
         )
         if bounds:
-            model.fit(freq, Z, bounds=bounds)
+            model.fit(freq, Z, bounds=bounds, **fit_kwargs)
         else:
-            model.fit(freq, Z)
+            model.fit(freq, Z, **fit_kwargs)
 
         params = model.parameters_
 
@@ -524,6 +669,16 @@ def fit_circuit(eis_result, model_name: str = "simpleSalt", *,
 
     except Exception as exc:
         n_params = len(initial_guess)
+        if _BUDGET_EXHAUSTED_SIGNATURE in str(exc).lower():
+            kind = FAILURE_BUDGET_EXHAUSTED
+            reason = _budget_exhausted_message(budget, model_name, n_dropped)
+            logger.warning(
+                "eis_fit_budget_exhausted", model=model_name, max_nfev=budget,
+                n_used=n_kept, n_dropped=n_dropped, detail=reason,
+            )
+        else:
+            kind = FAILURE_FIT_ERROR
+            reason = str(exc)
         return FitResult(
             model_name=model_name,
             parameters=np.full(n_params, np.nan),
@@ -533,7 +688,8 @@ def fit_circuit(eis_result, model_name: str = "simpleSalt", *,
             R1_guess=r1_guess,
             z_indices=z_idx,
             success=False,
-            error_msg=str(exc),
+            error_msg=reason,
+            failure_kind=kind,
             n_points_used=n_kept,
             n_points_dropped=n_dropped,
         )
