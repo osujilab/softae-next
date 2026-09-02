@@ -68,6 +68,26 @@ def _capacitor(C: float = 1e-9, tand: float = 5e-4) -> tuple[np.ndarray, np.ndar
     return f, (abs(Xc) * tand) + 1j * Xc
 
 
+def _resistor(
+    R: float, C_stray: float = 24.7e-12, n: int = 28
+) -> tuple[np.ndarray, np.ndarray]:
+    """A reference resistor **as this fixture presents it** — ``R`` ‖ ``C_stray``.
+
+    An ideal resistor is flat and on the real axis; the committed mux16 calibration
+    records a 10.2–24.7 pF stray per channel, which shunts a high-value reference into
+    a parallel RC whose top half rolls off at −1. That roll-off is the population the
+    resistive gate exists for, so the fixture is modelled rather than idealised, on the
+    deployed 4 Hz–200 kHz sweep rather than the 45-point one the other helpers use.
+    """
+    f = np.logspace(math.log10(200_000), math.log10(4.0), n)
+    return f, 1.0 / (1.0 / R + 1j * 2 * np.pi * f * C_stray)
+
+
+def _ungated_median_deviation(Z: np.ndarray) -> float:
+    """``median(arctan(|Im Z| / |Re Z|))`` over the whole sweep, gate bypassed."""
+    return float(np.median(np.degrees(np.arctan(np.abs(Z.imag) / np.abs(Z.real)))))
+
+
 class TestRoles:
     def test_sample_is_the_default_so_existing_rows_need_no_backfill(self):
         assert MEASUREMENT_ROLES[0] == "sample"
@@ -230,14 +250,99 @@ class TestReferenceComponents:
         assert err == pytest.approx(0.32, abs=0.01)     # the doc's +0.32%
         assert noise == pytest.approx(0.0, abs=1e-9)
 
-    def test_a_resistors_phase_scatter_is_a_direct_read_of_epsilon(self):
-        # A resistor's phase is 0 by definition, so its scatter IS the phase noise.
+    def test_a_constant_phase_bias_with_no_scatter_is_reported_in_full(self):
+        # THE test this class was missing, and the reason the statistic changed.
+        #
+        # The predecessor asserted that a resistor's phase *scatter* is a direct read
+        # of epsilon, and drew its fixture from rng.normal(0.0, sigma) — zero-mean by
+        # construction, the one population where a scatter and a deviation agree. On a
+        # BIASED instrument they do not agree at all: every point here sits a constant
+        # 5 deg off a resistor's ideal 0 deg, so std(phase) is exactly 0.0 and the old
+        # statistic certified a perfect phase floor from a 5-degree-wrong instrument.
+        f, _z = _resistor(9900.0, C_stray=0.0)
+        Z = 9900.0 * np.exp(1j * np.radians(5.0) * np.ones(f.size))
+        res = derive_reference_r(f, Z, nominal_ohm=9900.0)
+
+        assert float(np.std(np.degrees(np.angle(Z)))) == pytest.approx(0.0, abs=1e-12)
+        assert res.eps_deg == pytest.approx(5.0, abs=1e-9)
+
+    def test_zero_mean_phase_scatter_converges_on_the_half_normal_median(self):
+        # The zero-mean case still says something true — but pinned to the STATISTIC
+        # rather than to the generating sigma. For phase ~ N(0, sigma) the angular
+        # deviation is |phase|, whose median is the half-normal median 0.6745*sigma,
+        # not sigma. The predecessor's 25% window around sigma was doing the work a
+        # statement about the statistic should do, and on its seed it scraped through
+        # at 0.1195 against a 0.1118 lower bound.
+        sigma = 0.149
+        n = 4001                      # large enough that the median has converged
         rng = np.random.default_rng(7)
-        f = _freqs()
-        phase = np.radians(rng.normal(0.0, 0.149, f.size))
+        f = np.logspace(math.log10(200_000), math.log10(1.2), n)
+        phase = np.radians(rng.normal(0.0, sigma, n))
         Z = 9900.0 * np.exp(1j * phase)
-        _R, _err, noise = derive_reference_r(f, Z, nominal_ohm=9900.0)
-        assert noise == pytest.approx(0.149, rel=0.25)
+        res = derive_reference_r(f, Z, nominal_ohm=9900.0)
+
+        assert res.eps_deg == pytest.approx(0.6745 * sigma, rel=0.05)
+        assert res.eps_deg < 0.85 * sigma, "a deviation is not a standard deviation"
+
+    def test_a_flat_reference_is_not_over_dropped_by_the_gate(self):
+        # Below ~10 kOhm the stray is negligible and the gate must be a strict no-op:
+        # over-dropping costs table coverage on the half of the ladder the historical
+        # 9.9 kOhm envelope figure lives on.
+        f, Z = _resistor(9.9e3)
+        res = derive_reference_r(f, Z, nominal_ohm=9.9e3)
+
+        assert res.n_kept == res.n_total
+        assert res.eps_deg == pytest.approx(_ungated_median_deviation(Z), rel=1e-9)
+
+    def test_the_gate_drops_the_stray_shunted_half_of_a_high_value_reference(self):
+        # Positive control: without it, a gate that is never reached and a gate that
+        # finds nothing to drop are indistinguishable, and every gating claim in this
+        # file would score green on a spectrum the gate never touched.
+        #
+        # A 1 MOhm reference shunted by the committed 24.7 pF stray spends its top
+        # decade on a capacitive roll-off. Ungated, epsilon measures the BOARD; gated,
+        # it measures the instrument.
+        f, Z = _resistor(1e6)
+        res = derive_reference_r(f, Z, nominal_ohm=1e6)
+        ungated = _ungated_median_deviation(Z)
+
+        assert res.n_kept < res.n_total, "the gate was never reached"
+        assert res.n_kept >= 12, "the gate over-dropped a usable reference"
+        assert ungated > 5.0, "the fixture model has no roll-off left to catch"
+        assert res.eps_deg < ungated / 3.0
+
+    def test_epsilon_is_anchored_at_the_gated_magnitude_not_at_the_resistance(self):
+        # The second axis of the same defect. z_points used to receive abs(R), i.e.
+        # median(Re Z), which is pulled far below |Z| once the stray shunt turns the
+        # top of the sweep capacitive. Filing epsilon there claims coverage at an
+        # impedance the sweep never characterised.
+        from softae.analysis.eis.calibration import phase_table_gate
+
+        f, Z = _resistor(1e7)
+        res = derive_reference_r(f, Z, nominal_ohm=1e7)
+        gated = phase_table_gate(f, Z, load="resistive")
+        median_re = float(np.median(Z.real))
+
+        assert res.z_at_eps_ohm == pytest.approx(
+            float(np.median(np.abs(Z)[gated])), rel=1e-9)
+        assert res.z_at_eps_ohm == pytest.approx(1e7, rel=0.05)
+        assert res.z_at_eps_ohm > 2.0 * median_re
+
+    def test_the_legacy_triple_unpack_is_unaffected(self):
+        # commissioning's blank_load pass and fixture.validate_load both unpack three
+        # values and discard the third; widening the return must not reach them.
+        #
+        # Imported from calibration_derive rather than from the calibration hub: the
+        # hub's re-export map is an explicit whitelist and ReferenceRResult is not on
+        # it, which is a gap worth closing but not in this change's scope.
+        from softae.analysis.eis.calibration_derive import ReferenceRResult
+
+        f, Z = _resistor(9.9e3)
+        res = derive_reference_r(f, Z, nominal_ohm=9.9e3)
+        R, err, eps = derive_reference_r(f, Z, nominal_ohm=9.9e3)
+
+        assert isinstance(res, ReferenceRResult)
+        assert (R, err, eps) == (res.R_ohm, res.error_pct, res.eps_deg)
 
     def test_a_low_loss_capacitor_yields_its_capacitance_and_loss_floor(self):
         C, tand, _z = derive_reference_cap(*_capacitor(C=1e-9, tand=5e-4))
@@ -439,6 +544,47 @@ class TestStrayReachesTheCapCheck:
                                      electrode_modes=ALL_TWO)
         assert with_open.phase_acc.z_ohm == without.phase_acc.z_ohm
         assert with_open.phase_acc.eps_deg == without.phase_acc.eps_deg
+
+
+class TestResistiveContributionToThePhaseTable:
+    """``derive_calibration``'s ``reference_r`` branch — until now, never exercised.
+
+    The DataStore holds zero ``reference_r`` rows and no test reached this branch
+    either, so both halves of the defect it carried (an ungated scatter statistic,
+    filed at ``|R|``) were invisible: SUBAGENT_RULES.md 3.2's second face, a check
+    nothing ever reaches. These pin what the branch now contributes.
+    """
+
+    def _acq(self, channel: int = 1, R: float = 1e7):
+        from softae.workflows.commissioning import AcquiredSpectrum
+
+        f, Z = _resistor(R)
+        return AcquiredSpectrum(channel, f, Z, nominal=R, electrode_mode="two")
+
+    def test_the_table_point_lands_at_the_gated_magnitude_not_at_the_resistance(self):
+        from softae.workflows.commissioning import derive_calibration
+
+        acq = self._acq()
+        cal = derive_calibration({"reference_r": [acq]})
+        expected = derive_reference_r(acq.freq_hz, acq.Z, nominal_ohm=1e7)
+
+        assert len(cal.phase_acc.z_ohm) == 1
+        assert cal.phase_acc.z_ohm[0] == pytest.approx(expected.z_at_eps_ohm, rel=1e-12)
+        assert cal.phase_acc.z_ohm[0] > 2.0 * float(np.median(acq.Z.real))
+        # z_points is the only source of the measured window, so the anchor moves it too.
+        assert cal.z_min_ohm == cal.phase_acc.z_ohm[0]
+        assert cal.z_max_ohm == cal.phase_acc.z_ohm[0]
+
+    def test_the_tabulated_epsilon_is_a_gated_deviation_not_a_phase_scatter(self):
+        from softae.workflows.commissioning import derive_calibration
+
+        acq = self._acq()
+        cal = derive_calibration({"reference_r": [acq]})
+        scatter = float(np.std(np.degrees(np.angle(acq.Z))))
+
+        assert cal.phase_acc.eps_deg[0] < _ungated_median_deviation(acq.Z) / 3.0
+        assert cal.phase_acc.eps_deg[0] < scatter / 3.0
+        assert cal.phase_acc.load == "resistive"
 
 
 class TestPhaseAccuracyTable:

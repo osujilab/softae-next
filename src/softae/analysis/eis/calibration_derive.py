@@ -473,21 +473,120 @@ def derive_reference_cap(
     return result
 
 
-def derive_reference_r(
-    f: np.ndarray, Z: np.ndarray, *, nominal_ohm: float
-) -> tuple[float, float, float]:
-    """``(R_measured, error_pct, phase_noise_deg)`` from a reference resistor.
+@dataclass(frozen=True)
+class ReferenceRResult:
+    """What one reference-resistor sweep says: a magnitude, and a phase bound.
 
-    A resistor's phase is 0° by definition, so the *scatter* of its measured phase is
-    a direct read of ``ε`` at that impedance — which is what makes a resistor ladder
-    the cheap route to a magnitude window and a phase floor at the same time.
+    Unpacks as the ``(R_measured, error_pct, eps_deg)`` triple
+    :func:`derive_reference_r` has always returned — the same affordance
+    :class:`ReferenceCapResult` uses — so the two call sites that discard the third
+    element (``commissioning``'s ``blank_load`` pass, ``fixture.validate_load``) are
+    unaffected. The extra fields exist because the third element's *meaning* changed:
+    it is now a bound measured at a particular ``|Z|`` over a particular subset of the
+    sweep, and a consumer that files it in a table over ``|Z|`` needs both of those.
     """
+
+    R_ohm: float
+    error_pct: float
+    #: Median angular deviation from a resistor's ideal 0°, over gated points.
+    eps_deg: float
+    #: Gated median ``|Z|`` — the impedance :attr:`eps_deg` was actually measured at,
+    #: which is not ``|R|`` once the fixture's stray shunts the part (see below).
+    z_at_eps_ohm: float = float("nan")
+    #: Gate accounting, so an over-drop is visible rather than inferred.
+    n_kept: int = 0
+    n_total: int = 0
+
+    def __iter__(self) -> Iterator[float]:
+        return iter((self.R_ohm, self.error_pct, self.eps_deg))
+
+
+def derive_reference_r(
+    f: np.ndarray,
+    Z: np.ndarray,
+    *,
+    nominal_ohm: float,
+    per_decade: bool = True,
+    slope_tol: float = PHASE_TABLE_SLOPE_TOL,
+) -> ReferenceRResult:
+    """A reference resistor's measured value, and the phase bound it supports.
+
+    **The phase statistic is an angular deviation, not a scatter.** It is the exact
+    mirror of the loss angle :func:`derive_phase_table` computes for a capacitor —
+    the same question asked about a different ideal, with the numerator and the
+    denominator swapped::
+
+        capacitive   ideal −90°   eps = degrees(arctan(|Re Z| / |Im Z|))
+        resistive    ideal   0°   eps = degrees(arctan(|Im Z| / |Re Z|))
+
+    so both read "median angular deviation from what this part should look like", and
+    both are conservative in the same direction — **upward**, because the measured
+    deviation contains the part's own reactance as well as the instrument's phase
+    error, which is what a floor wants.
+
+    This replaced ``std(phase)``, which was a **scatter** filed in a table of bounds.
+    The two are not the same kind of number and no interpolation between them means
+    anything. A scatter also cannot see a *bias*: an instrument reading every point of
+    a resistor a consistent 5° off ideal has ``std(phase) = 0`` and certifies a perfect
+    phase floor. It is not reliably optimistic either — a frequency-varying systematic
+    enters ``std`` as dispersion, and on a 9.9 kΩ reference shunted by this fixture's
+    own 24.7 pF stray it reports ~4° where the angular deviation reports <0.1°: a ~27×
+    disagreement with ``DEFAULT_PHASE_NOISE_DEG = 0.149`` on the very load that constant
+    was taken on. Its direction of error is undefined, which is worse than wrong.
+
+    **Gated, by the same gate the capacitive branch uses**, with
+    :data:`RESISTIVE_REFERENCE` as the expectation: flat ``|Z|``, ``Re Z > 0``, and
+    ``Im Z`` of *either* sign, since a resistor's ideal reactance is zero and whichever
+    parasitic dominates sets the sign — series lead inductance low on the ladder, the
+    board's stray shunt high on it. The saturation test is not a formality here: above
+    ~10⁵ Ω this fixture's 10–25 pF stray turns a reference resistor into a parallel RC
+    whose top half rolls off at slope −1, so on the deployed 4 Hz–200 kHz sweep an
+    ungated ε at 1 MΩ reads ~8° — the *board* — against ~1.3° once the roll-off is
+    dropped. Below ~10 kΩ the gate keeps every point, so it costs no coverage on the
+    half of the ladder the historical 0.149° figure lives on.
+
+    The **median** is taken for the reason :func:`derive_phase_table` argues at length:
+    the minimum across a sweep is the single luckiest point, not a bound. Per-decade
+    binning comes along for the same reason it exists there, though on this fixture it
+    is a no-op — what survives gating spans a small fraction of a decade, so one part
+    contributes one ``(|Z|, ε)`` point rather than a table. Where a part *did* span two
+    decades the bins are collapsed by a median of the per-decade medians, which is an
+    identity in the single-bin case this hardware actually produces.
+
+    *R_ohm* and *error_pct* are unchanged and deliberately ungated: the magnitude
+    accuracy is a separate concern with its own consumer (``fixture.validate_load``).
+    """
+    freq = np.asarray(f, dtype=float)
     Zc = np.asarray(Z, dtype=complex)
+    n_total = int(Zc.size)
     good = np.isfinite(Zc.real) & np.isfinite(Zc.imag)
     if not np.any(good):
-        return float("nan"), float("nan"), float("nan")
+        return ReferenceRResult(float("nan"), float("nan"), float("nan"),
+                                float("nan"), 0, n_total)
 
     R = float(np.median(Zc.real[good]))
     err = ((R - nominal_ohm) / nominal_ohm * 100.0) if nominal_ohm else float("nan")
-    phase = np.degrees(np.angle(Zc[good]))
-    return R, err, float(np.std(phase))
+
+    mag = np.abs(Zc)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        eps = np.degrees(np.arctan(np.abs(Zc.imag) / np.abs(Zc.real)))
+
+    ok = phase_table_gate(freq, Zc, load=RESISTIVE_REFERENCE,
+                          slope_tol=slope_tol) & np.isfinite(eps)
+    n_kept = int(np.count_nonzero(ok))
+    if not n_kept:
+        return ReferenceRResult(R, err, float("nan"), float("nan"), 0, n_total)
+    if n_kept < n_total:
+        logger.info("eis_reference_r_gated", kept=n_kept, total=n_total)
+
+    mag, eps = mag[ok], eps[ok]
+    if per_decade:
+        decade = np.floor(np.log10(mag)).astype(int)
+        bins = sorted(set(decade.tolist()))
+        z_bins = [float(np.median(mag[decade == d])) for d in bins]
+        e_bins = [float(np.median(eps[decade == d])) for d in bins]
+    else:
+        z_bins, e_bins = [float(np.median(mag))], [float(np.median(eps))]
+
+    return ReferenceRResult(R, err, float(np.median(e_bins)),
+                            float(np.median(z_bins)), n_kept, n_total)

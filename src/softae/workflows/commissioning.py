@@ -374,18 +374,35 @@ def derive_calibration(
     load_kind = "resistive"
     for acq in artifacts.get("reference_r", []):
         nom = _nominal_for("reference_r", acq)
-        R, _err, noise = derive_reference_r(
+        ref = derive_reference_r(
             acq.freq_hz, acq.Z, nominal_ohm=float(nom or 0.0) or 1.0)
-        # Finiteness only, deliberately. A resistor's |Z| is flat by construction, so
-        # the slope-plateau detector that finds a capacitor's rail cannot distinguish
-        # a railed resistor from a working one — and derive_reference_r takes a median
-        # over the whole sweep rather than a per-decade table, so there is no per-point
-        # mask to apply. A reference resistor chosen above the instrument ceiling is
-        # therefore still an operator error this cannot catch; the guard against it is
-        # the ladder (">=1 per decade") plus the load blank's error check, not this.
-        if R == R and noise == noise:
-            z_points.append(abs(R))
-            eps_points.append(noise)
+        # Gated, and anchored where the gate left it. Both halves used to be wrong in
+        # the same way: an ungated scatter statistic, filed at |R| rather than at the
+        # |Z| it was measured at.
+        #
+        # An earlier comment here argued the resistive branch could not be gated,
+        # because "a resistor's |Z| is flat by construction" leaves the slope-plateau
+        # detector nothing to see but the instrument's rail — which it cannot tell from
+        # a working part. The second half of that is true and the first half is false on
+        # this fixture: above ~10^5 Ω the board's own 10-25 pF stray shunts a reference
+        # resistor into a parallel RC, so roughly a third of the sweep on a 1 MΩ part
+        # sits on a capacitive roll-off rather than on the resistor (9 of 28 points on
+        # the deployed 4 Hz-200 kHz grid). What the slope test fires on here is the
+        # STRAY, not the rail — and a railed resistor and a shunt-dominated one are both
+        # non-measurements, so dropping both is the right answer either way. The ladder
+        # (">=1 per decade") and the load blank's error check still guard operator
+        # choice of a bad nominal; this guards a fixture artifact inside one good part's
+        # sweep, which they cannot see.
+        #
+        # Anchoring on ref.z_at_eps_ohm rather than |R| also makes the comment above
+        # z_points true again: median(Re Z) is pulled below |Z| by exactly that
+        # roll-off, by 2.9x on a 10 MΩ reference, so epsilon would be filed at an
+        # impedance the sweep never characterised — and at the top of the ladder that
+        # gap approaches valid_decades, where the table starts claiming coverage it
+        # does not have and refusing coverage it does.
+        if ref.z_at_eps_ohm == ref.z_at_eps_ohm and ref.eps_deg == ref.eps_deg:
+            z_points.append(ref.z_at_eps_ohm)
+            eps_points.append(ref.eps_deg)
         measured.add(int(acq.channel))
 
     for acq in artifacts.get("reference_cap", []):
