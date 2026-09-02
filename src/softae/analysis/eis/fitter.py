@@ -103,6 +103,64 @@ DEFAULT_MAX_NFEV = 20_000
 #: an operational cost: a real 32-channel round pays about 0.3 s a spectrum.
 DEFAULT_FIT_TOL = 1e-10
 
+#: Magnitude at or below which a parameter has **collapsed** onto a lower bound of
+#: exactly zero.
+#:
+#: A zero bound admits no relative tolerance, and that is arithmetic rather than a
+#: preference: ``|v − b| ≤ tol·scale`` at ``b = 0`` reads ``|v| ≤ tol·|v|``, false for
+#: every value that carries a scale of its own. The zero-bound case therefore cannot
+#: borrow the relative rule — it needs a scale, and **there is nowhere left to take one
+#: from**. Not from the value: that is the circularity above. Not from the bound: it is
+#: zero. Not from the box either, because ``set_default_bounds`` pairs every zero lower
+#: bound with ``+inf``, so the constraint has no width to measure against. An absolute
+#: constant is the only thing left, and the only defensible place to put one is where
+#: the quantity stops being a *physical magnitude at all*, rather than where it stops
+#: being a plausible resistance — the latter would be a new gate with its own evidence,
+#: not a reading of the bound the optimiser was actually given.
+#:
+#: ``1e-30`` is that place: below it a fitted resistance is a denormal-to-subnormal
+#: float rather than an ohm, so the rows it catches are certain.
+#:
+#: **The corpus offers no gap to put this in, and the threshold is a judgement, not a
+#: measurement.** Across 3 618 stored ``simpleSalt`` fits, ``R0`` is continuous from
+#: 5e-324 upward: 449 rows below 1e-30, a further 89 in (1e-30, 1e-20], 135 more in
+#: (1e-20, 1e-12] and a mode of 918 in (1e-12, 1e-6] — nothing like the empty band
+#: between 100.03 Ω and 226.9 Ω that made the R₁ floor unambiguous. The 89 rows just
+#: above the floor are equally unphysical as ohms and are deliberately **not** caught.
+#:
+#: It is **not** multiplied by ``tol``. Until 2026-08-31 the effective cut was
+#: ``tol × 1e-30``, because 1e-30 entered as a *scale floor* inside the relative
+#: formula rather than as a threshold — so the zero-bound answer moved with
+#: ``[gates] bound_tol`` and sat three decades below what the legacy path applied.
+#: Near-a-finite-bound and collapsed-onto-zero are two geometries, not two tolerances
+#: on one geometry, and only the first has a tolerance to spend.
+#:
+#: :func:`softae.analysis.eis.models.railed_measurand` re-exports this constant for the
+#: legacy path, which carries no :class:`FitCovariance` and so must do the same test by
+#: hand. One number, one job, two paths that cannot drift apart.
+COLLAPSED_AT_ZERO = 1e-30
+
+
+def _rests_on(value: float, bound: float, tol: float) -> bool:
+    """Whether *value* came to rest on *bound*.
+
+    Three cases, and the middle one is the whole point:
+
+    * an infinite or NaN *bound* is not a constraint the optimiser can stop against;
+    * a *bound* of exactly zero is judged absolutely — see :data:`COLLAPSED_AT_ZERO`;
+    * every other bound is judged relatively, against ``max(|v|, |bound|)`` so the
+      scale comes from the constraint as well as from the value and the test does not
+      depend on which side of the bound the optimiser happened to stop.
+
+    Detection is *near*, not *at*: bounded least squares stops within its own step
+    size of a constraint, so an equality test would miss most railed fits.
+    """
+    if bound != bound or abs(bound) == float("inf"):
+        return False
+    if bound == 0.0:
+        return abs(value) <= COLLAPSED_AT_ZERO
+    return abs(value - bound) <= tol * max(abs(value), abs(bound))
+
 
 @dataclass(frozen=True)
 class FitCovariance:
@@ -182,6 +240,18 @@ class FitCovariance:
         A pegged parameter is unidentified: the data pushed it as far as the optimiser
         allowed, so its value is a property of the bound and its reported uncertainty
         is meaningless.
+
+        *tol* is the **relative** window around a finite, non-zero bound. It does not
+        govern the zero-bound case, which has no scale to be relative to and is
+        decided absolutely by :data:`COLLAPSED_AT_ZERO`; see :func:`_rests_on`.
+
+        This matters because of what ``set_default_bounds`` actually builds for the
+        gated path — ``lo = [0, 0, 0, 0, 0]``, ``hi = [inf, inf, 1, inf, inf]``. Both
+        resistances therefore have a zero lower bound and no finite upper one, so
+        until 2026-08-31 the only bound this method could meaningfully test on a
+        production fit was the CPE exponent's ceiling of 1. An ``R0`` collapsed to
+        4.6e-62 Ω beside a healthy ``R1`` — 449 such rows in the stored corpus —
+        was reported as a measurement.
         """
         if self.bounds is None:
             return ()
@@ -190,11 +260,10 @@ class FitCovariance:
         for i, name in enumerate(self.names):
             if i >= len(lo) or i >= len(hi):
                 break
-            v, low, high = float(self.values[i]), float(lo[i]), float(hi[i])
-            scale = max(abs(v), 1e-30)
-            if np.isfinite(low) and abs(v - low) <= tol * scale:
-                out.append(name)
-            elif np.isfinite(high) and abs(v - high) <= tol * scale:
+            v = float(self.values[i])
+            if v != v:
+                continue
+            if any(_rests_on(v, float(b[i]), tol) for b in (lo, hi)):
                 out.append(name)
         return tuple(out)
 

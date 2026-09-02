@@ -173,8 +173,12 @@ class TestHealthyFitsAreUntouched:
 
 class TestZeroBoundIsAbsoluteNotRelative:
     """A relative tolerance against a bound of exactly 0 reads ``|v| <= tol*|v|``,
-    which is false for every positive value — so it can never fire, which is why the
-    449 collapsed rows were invisible. The rule for a zero bound has to be absolute."""
+    which is false for every value carrying a scale of its own. What survived that
+    was not a threshold but an artefact: ``pegged`` clamped its scale at 1e-30, so
+    its effective cut was ``tol * 1e-30 = 1e-33`` — three decades below the legacy
+    floor and, since it multiplied ``tol``, a function of ``[gates] bound_tol``. The
+    rule for a zero bound has to be absolute, and since 2026-08-31 ``pegged`` is
+    where it is written."""
 
     @pytest.mark.parametrize("value", [0.0, 5e-324, 1e-62, 1e-31, COLLAPSED_AT_ZERO])
     def test_values_at_or_below_the_floor_are_collapsed(self, value):
@@ -188,17 +192,38 @@ class TestZeroBoundIsAbsoluteNotRelative:
         put one in (89 rows in (1e-30, 1e-20], 918 in (1e-12, 1e-6])."""
         assert railed_measurand(_legacy([value, 1e-7, 0.7, 5.0e4, 1e-10])) == ""
 
-    def test_both_paths_agree_about_the_zero_bound(self):
-        """``pegged()``'s own zero-bound cut is ``tol * 1e-30 = 1e-33``, a by-product
-        of a formula written for finite bounds. Left alone, the gated and legacy
-        paths would disagree over three decades — 42 rows of the stored corpus. The
-        gated path is supplied the same absolute floor so they do not."""
-        borderline = [1e-31, 1e-7, 0.7, 5.0e4, 1e-10]
-        assert "R0" in railed_measurand(_legacy(borderline))
+    @pytest.mark.parametrize("value", [0.0, 5e-324, 1e-62, 1e-31, COLLAPSED_AT_ZERO])
+    def test_both_paths_agree_at_the_floor(self, value):
+        """The gated path used to be handed the floor as a *supplement* because
+        ``pegged`` could not express it. The supplement is retired, so this is now the
+        assertion that ``pegged`` carries the whole of it — if it regressed to the
+        relative rule, the 1e-31 and 1e-30 cases would go red here first."""
+        borderline = [value, 1e-7, 0.7, 5.0e4, 1e-10]
         assert "R0" in railed_measurand(_gated(borderline))
-        # ... and `pegged` alone would indeed have missed it, which is why the
-        # supplement is needed rather than merely tidy.
-        assert "R0" not in _cov(borderline).pegged()
+        assert "R0" in _cov(borderline).pegged()
+
+    @pytest.mark.parametrize("value", [1e-29, 1e-12, 50.0])
+    def test_both_paths_agree_above_the_floor(self, value):
+        assert railed_measurand(_gated([value, 1e-7, 0.7, 5.0e4, 1e-10])) == ""
+
+    def test_the_gated_path_agrees_against_the_bounds_it_actually_fits(self):
+        """``_cov`` above hangs the *legacy registry's* bounds on a ``FitCovariance``,
+        which the gated path never does — a fixture from a code state that never
+        existed (``SUBAGENT_RULES`` §3.2). What the gated fitter really carries is
+        ``set_default_bounds``: all-zero below, ``+inf`` above except the CPE
+        exponent. Both resistances therefore have *only* a zero lower bound, so on
+        the real bounds the zero-bound rule is the only rule there is."""
+        from impedance.models.circuits.fitting import set_default_bounds
+
+        production = set_default_bounds(CIRCUIT_MODELS["simpleSalt"]["circuit"])
+        assert list(production[0]) == [0.0] * 5
+
+        collapsed = _fit(TestSeriesResistanceCollapse.COLLAPSED,
+                         covariance=_cov(TestSeriesResistanceCollapse.COLLAPSED,
+                                         bounds=production))
+        assert "R0" in railed_measurand(collapsed)
+        healthy = _fit(HEALTHY, covariance=_cov(HEALTHY, bounds=production))
+        assert railed_measurand(healthy) == ""
 
 
 # ── The widened policy, stated as a test because it costs sigma ──────────────

@@ -31,6 +31,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from softae.analysis.eis.fitter import COLLAPSED_AT_ZERO as _COLLAPSED_AT_ZERO
+
 
 @dataclass(frozen=True)
 class CircuitModel:
@@ -90,34 +92,19 @@ def roles_for(model_name: str) -> dict[str, str]:
 
 
 #: Magnitude at or below which a parameter has **collapsed** onto a lower bound of
-#: exactly zero.
+#: exactly zero — re-exported from :mod:`softae.analysis.eis.fitter`, where the
+#: bounds arithmetic lives and where the number is justified in full.
 #:
-#: A zero bound admits no relative tolerance, and that is arithmetic rather than a
-#: choice: ``RAILED_R1_TOL_REL`` asks whether ``|v − b| ≤ tol·scale``, and at
-#: ``b = 0`` that reads ``|v| ≤ tol·|v|``, which is false for **every** positive
-#: value. So a relative test against a zero bound does not merely lose precision, it
-#: can never fire at all — which is why ``R0 = 4.6e-62`` sat beside a healthy R₁ and
-#: was reported a measurement. The rule for a zero bound therefore has to be
-#: absolute, and the only question is what absolute scale is defensible.
-#:
-#: ``1e-30`` is not invented here: it is the scale floor
-#: :meth:`~softae.analysis.eis.fitter.FitCovariance.pegged` already uses for the case
-#: "this value carries no scale of its own". Its own effective zero-bound cut is
-#: ``tol × 1e-30 = 1e-33``, but that product is a by-product of a formula written for
-#: finite bounds, whereas the floor itself is the constant that was chosen
-#: deliberately. Taking the floor keeps one number doing one job.
-#:
-#: **The corpus offers no gap to put this in, and the threshold is a judgement, not a
-#: measurement.** Across 3 618 stored ``simpleSalt`` fits, ``R0`` is continuous from
-#: 5e-324 upward: 449 rows below 1e-30, a further 89 in (1e-30, 1e-20], 135 more in
-#: (1e-20, 1e-12] and a mode of 918 in (1e-12, 1e-6] — nothing like the empty band
-#: between 100.03 Ω and 226.9 Ω that made the R₁ floor unambiguous. 1e-30 is chosen
-#: because everything below it is a subnormal-to-denormal float rather than a
-#: resistance, so the rows it catches are certain; the 89 rows just above it are
-#: equally unphysical as ohms and are deliberately **not** caught, because catching
-#: them would mean picking a physical floor for a series resistance, which is a new
-#: gate rather than a reading of the bound the optimiser was actually given.
-COLLAPSED_AT_ZERO = 1e-30
+#: It is imported rather than restated because the two paths must not be able to
+#: disagree about what "collapsed" means. The **gated** path asks
+#: :meth:`~softae.analysis.eis.fitter.FitCovariance.pegged`, which owns this test
+#: outright. The **legacy** path carries no ``FitCovariance`` at all — its bounds sit
+#: in :data:`~softae.analysis.circuit_fitting.CIRCUIT_MODELS` and nothing on the fit
+#: itself knows them — so it has to apply the same rule by hand, in
+#: :func:`_collapsed_at_zero` below. One arithmetic per *path*, and one number across
+#: both: until 2026-08-31 the constant was written down here as well, and the two
+#: readings had already drifted three decades apart.
+COLLAPSED_AT_ZERO = _COLLAPSED_AT_ZERO
 
 
 def _finite(value: Any) -> float:
@@ -290,10 +277,14 @@ def railed_measurand(fit: Any) -> str:
 
     * the **gated** path carries the bounds it fitted against on
       :class:`~softae.analysis.eis.fitter.FitCovariance`, whose
-      :meth:`~softae.analysis.eis.fitter.FitCovariance.pegged` already names every
-      parameter resting on one — so that is asked rather than re-derived, and only
-      the zero-bound case it cannot express (:data:`COLLAPSED_AT_ZERO`) is supplied
-      alongside it;
+      :meth:`~softae.analysis.eis.fitter.FitCovariance.pegged` names every parameter
+      resting on one — so that is asked rather than re-derived, and it is asked for
+      the zero-bound case too. Between ``443c948`` and 2026-08-31 a second,
+      absolute test was supplied alongside it, because ``pegged`` was then a purely
+      relative rule and a relative rule cannot express a bound of exactly zero. That
+      supplement is **retired**: ``pegged`` now expresses it, and a second
+      implementation on the same path is how two answers to one question start to
+      disagree;
     * the **legacy** path declares them in
       :data:`~softae.analysis.circuit_fitting.CIRCUIT_MODELS`, read through
       :func:`~softae.analysis.equilibration.r1_lower_bound_ohms` — the one
@@ -323,18 +314,18 @@ def railed_measurand(fit: Any) -> str:
 
     cov = getattr(fit, "covariance", None)
     if cov is not None:
-        collapsed = ()
-        if getattr(cov, "bounds", None) is not None:
-            collapsed = _collapsed_at_zero(cov.names, cov.values, cov.bounds[0])
-        collapsed = tuple(c for c in collapsed if c[0] in watched)
         pegged = tuple(n for n in cov.pegged() if n in watched)
-        if bulk in pegged or any(n == bulk for n, _ in collapsed):
+        if bulk in pegged:
             return f"{bulk} rests on a fitted bound"
-        resting = _nearest_bounds(cov, pegged)
-        resting = tuple(r for r in resting if not any(r[0] == c for c, _ in collapsed))
-        if not collapsed and not resting:
+        if not pegged:
             return ""
-        return _describe(collapsed, resting)
+        # Membership is entirely ``pegged``'s. The bound is recovered here only to
+        # choose which sentence describes it: resting *on zero* is a collapse and
+        # reads as one, which is a different diagnosis from resting on a fitted
+        # floor. Nothing is re-decided, so the two cannot disagree.
+        nearest = _nearest_bounds(cov, pegged)
+        collapsed = tuple((n, v) for n, v, b in nearest if b == 0.0)
+        return _describe(collapsed, tuple(r for r in nearest if r[2] != 0.0))
 
     bound = r1_lower_bound_ohms(model_name)
     if is_railed(getattr(fit, "R1", None), bound):

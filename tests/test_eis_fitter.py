@@ -152,6 +152,85 @@ class TestIdentifiability:
         assert cov.pegged() == ()
 
 
+class TestPeggedAgainstTheBoundsProductionActuallyBuilds:
+    """``pegged`` is tested against ``set_default_bounds``' output, not a fixture.
+
+    The test above it passes ``values = [0.0, ...]``, which a relative rule catches
+    for a reason that has nothing to do with the rule: ``|v - 0| <= tol*max(|v|, 1e-30)``
+    at ``v = 0`` is ``0 <= 1e-33``. That is the whole of what the zero-bound case used
+    to be — an **effective cut of ``tol × 1e-30``**, three decades below the floor the
+    legacy path applies and, worse, a function of the caller's ``[gates] bound_tol``.
+    Not a chosen threshold at all, but a by-product of a formula written for finite
+    bounds, so the fixture passed while the rule underneath it was arithmetic
+    (``SUBAGENT_RULES`` §3.2). The bounds below are read from the library rather than
+    written down, so this fixture cannot drift away from the production path the way
+    the legacy-registry bounds in ``test_eis_railed_parameters`` have.
+    """
+
+    @staticmethod
+    def _bounds():
+        from impedance.models.circuits.fitting import set_default_bounds
+
+        lo, hi = set_default_bounds(CIRCUIT)
+        return np.asarray(lo, dtype=float), np.asarray(hi, dtype=float)
+
+    def _cov(self, values):
+        return FitCovariance(
+            names=("R0", "CPE0_0", "CPE0_1", "R1", "C0"),
+            values=np.asarray(values, dtype=float),
+            pcov=np.eye(5) * 1e-4,
+            bounds=self._bounds(),
+        )
+
+    def test_the_production_bounds_are_zero_below_and_mostly_infinite_above(self):
+        """The premise, pinned: every lower bound is exactly 0, and the only finite
+        upper bound belongs to the CPE exponent. A relative rule therefore has
+        *nothing* to bite on for either resistance."""
+        lo, hi = self._bounds()
+        assert list(lo) == [0.0] * 5
+        assert list(hi) == [np.inf, np.inf, 1.0, np.inf, np.inf]
+
+    @pytest.mark.parametrize("value", [0.0, 5e-324, 4.6e-62, 1e-31, 1e-30])
+    def test_a_resistance_collapsed_onto_a_zero_bound_is_pegged(self, value):
+        """``R0 = 4.6e-62`` Ω is the stored shape: 449 of 3 618 corpus fits carry an
+        ``R0`` below 1e-30 Ω. The last two are the ones the old cut of ``tol × 1e-30``
+        let through, and they are not a rounding difference — they are the band the
+        legacy path has demoted since ``443c948`` while the gated path did not."""
+        assert "R0" in self._cov([value, 1e-7, 0.7, 5.0e4, 1e-10]).pegged()
+
+    @pytest.mark.parametrize("value", [1e-29, 1e-12, 1.0, 50.0])
+    def test_a_resistance_above_the_floor_is_set_by_the_data(self, value):
+        assert "R0" not in self._cov([value, 1e-7, 0.7, 5.0e4, 1e-10]).pegged()
+
+    def test_a_healthy_fit_pegs_nothing_at_all(self):
+        assert self._cov([50.0, 1e-7, 0.7, 5.0e4, 1e-10]).pegged() == ()
+
+    def test_the_finite_upper_bound_still_pegs_relatively(self):
+        """``CPE0_1`` is the one parameter with a finite bound on the gated path, and
+        the relative rule is right for it — a regression pin, not a new catch."""
+        assert self._cov([50.0, 1e-7, 0.9997, 5.0e4, 1e-10]).pegged() == ("CPE0_1",)
+
+    def test_an_infinite_bound_is_never_a_constraint(self):
+        """A huge ``R1`` is a bad fit, not a pegged one: ``+inf`` is not a bound the
+        optimiser can stop against."""
+        assert "R1" not in self._cov([50.0, 1e-7, 0.7, 1e300, 1e-10]).pegged()
+
+    def test_a_nan_parameter_is_not_reported_as_pegged(self):
+        assert self._cov([np.nan, 1e-7, 0.7, 5.0e4, 1e-10]).pegged() == ()
+
+    def test_the_zero_bound_cut_does_not_move_with_tol(self):
+        """The two geometries are not two tolerances on one geometry, and the old
+        code made them one: at ``tol = 1e-3`` the cut was 1e-33 and at ``tol = 0.5``
+        it was 5e-31, so ``[gates] bound_tol`` silently redefined what "collapsed to
+        zero ohms" meant. ``tol`` governs the window around a *finite* bound and
+        nothing else."""
+        collapsed = self._cov([1e-31, 1e-7, 0.7, 5.0e4, 1e-10])
+        healthy = self._cov([1e-20, 1e-7, 0.7, 5.0e4, 1e-10])
+        for tol in (1e-3, 0.5):
+            assert "R0" in collapsed.pegged(tol)
+            assert "R0" not in healthy.pegged(tol)
+
+
 class TestSumVersusSplitIsBehavioural:
     """R2: the pipeline selects, the analyst is never handed the choice."""
 
