@@ -788,7 +788,7 @@ rho_degenerate      = -0.95  # below this, report R_series+R_bulk, not the split
 bound_tol           = 1e-3   # fractional distance to a bound counted as pegged
 plateau_min_decades = 0.5    # narrower than this and R_bulk is extrapolated
 tand_headroom_mult  = 3.0    # tanδ must exceed this × the phase floor for a value
-blank_over_frac     = 0.25   # open blank unusable above this fraction over range
+blank_over_frac     = 0.30   # open blank unusable above this fraction over range
 blank_flip_frac     = 0.30   # ...or this density of Im sign flips
 blank_repro_pct     = 5.0    # blank repeatability tolerance (E2)
 
