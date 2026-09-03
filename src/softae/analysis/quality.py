@@ -40,6 +40,52 @@ DEFAULT_MIN_POINTS = 8
 DEFAULT_MIN_ABS_Z = 1e-3
 #: |Z| at or above this is an implausible open circuit.
 DEFAULT_MAX_ABS_Z = 1e12
+#: Instrument-path stray capacitance, F. **A last-resort fallback, not a second home
+#: for the number** — ``[eis.instrument] stray_C_instrument_F`` is authoritative and
+#: :func:`quality_config` reads it. This constant is reached only when the config
+#: cannot be loaded at all, and it is kept equal to the shipped value so that path is
+#: not silently a different instrument.
+#:
+#: **Two-electrode, and that is the correct basis rather than a limitation.** A
+#: three-electrode figure for a two-terminal load is a floating-divider artefact
+#: (overhaul F17) — the same ch17 blank reads 246 pF that way against 10.2 pF tied.
+#:
+#: It is a **board median** over seven tied open blanks spanning 10.2–24.7 pF, a real
+#: 2.4× per-channel variation repeatable to 1%. Measured across that whole spread the
+#: screen below flags 1–3 of 296 stored spectra, with exactly one stable either way —
+#: so the median's imprecision does not decide the outcome here.
+DEFAULT_STRAY_C_F = 18.5e-12
+
+
+def open_circuit_z_ohm(freq: Any, stray_c_f: float = DEFAULT_STRAY_C_F) -> float:
+    """|Z| an **unbridged** cell presents at this sweep's geometric-mid frequency.
+
+    An open circuit is not "very large |Z|" — it is a specific physical object: the
+    fixture's stray capacitance with nothing across it. So the threshold is *derived*
+    from that capacitance and the band actually swept, rather than chosen::
+
+        Z_open = 1 / (2 pi f_geo C_stray)
+
+    **The band matters, which is why this is a function and not a constant.** Over
+    3.9 Hz – 200 kHz the same 18.5 pF presents 9.7e6 Ω at the geometric mid and 2.2e9 Ω
+    at the bottom of the sweep — so a scalar threshold silently encodes one sweep's
+    geometry as though it were a property of the hardware. Measured on 296 stored
+    spectra, a fixed 9.7e6 flags four and this per-spectrum form flags one: the
+    difference is not cosmetic.
+
+    ``f_geo`` is the geometric mean of the swept extremes because the comparand is a
+    *median* over a logarithmically spaced sweep, and the geometric mean is where that
+    median sits. Returns ``nan`` when the band or the capacitance is unusable, which
+    callers must treat as "no opinion" rather than as a passing threshold.
+    """
+    f = np.asarray(freq, dtype=float)
+    f = f[np.isfinite(f) & (f > 0.0)]
+    if f.size < 2 or not np.isfinite(stray_c_f) or stray_c_f <= 0.0:
+        return float("nan")
+    f_geo = float(np.sqrt(f.min() * f.max()))
+    if not np.isfinite(f_geo) or f_geo <= 0.0:
+        return float("nan")
+    return 1.0 / (2.0 * np.pi * f_geo * float(stray_c_f))
 
 
 class Verdict(str, Enum):
@@ -77,6 +123,7 @@ def validate_eis_trace(
     min_points: int = DEFAULT_MIN_POINTS,
     min_abs_z: float = DEFAULT_MIN_ABS_Z,
     max_abs_z: float = DEFAULT_MAX_ABS_Z,
+    stray_c_f: float = DEFAULT_STRAY_C_F,
 ) -> QualityReport:
     """Check a raw impedance trace before anything is fitted to it.
 
@@ -127,6 +174,29 @@ def validate_eis_trace(
     if z_med >= float(max_abs_z):
         issues.append(f"|Z| median {z_med:.3g} Ω — open circuit")
         return QualityReport(Verdict.REJECT, issues, metrics)
+
+    # The *derived* open-circuit reading, and deliberately a SCREEN rather than a
+    # refusal. `max_abs_z` above is an absolute backstop and on this rig it cannot
+    # fire — the whole stored corpus has a median |Z| below 5.4e7 against its 1e12.
+    # This one is keyed to what an unbridged cell physically presents, so it can.
+    #
+    # It appends an issue and falls through, which this function's own contract turns
+    # into SUSPECT: "Rejects only what is physically impossible or unusable …
+    # everything else that merely looks unusual is reported as SUSPECT". Rejecting
+    # here would be wrong on the measured population — the spectra it flags are
+    # five-week-old dried films, and a film too resistive to measure is an upper
+    # BOUND on sigma, which is a result. It cannot distinguish that from a genuinely
+    # empty well, and no threshold on |Z| can: both read as a near-pure capacitance.
+    # Telling them apart needs provenance, which is the open admissibility question.
+    z_open = open_circuit_z_ohm(freq[:n][finite], stray_c_f)
+    if np.isfinite(z_open):
+        metrics["z_open_circuit"] = z_open
+        if z_med >= z_open:
+            issues.append(
+                f"|Z| median {z_med:.3g} Ω at or above the {float(stray_c_f) * 1e12:.1f} pF "
+                f"open-circuit reading {z_open:.3g} Ω — nothing may be bridging the "
+                "electrodes, or the film is beyond the measurable range"
+            )
 
     if float(np.min(mag)) <= 0.0:
         issues.append("non-positive |Z| present")
@@ -299,7 +369,29 @@ def quality_config(config: dict[str, Any] | None = None) -> dict[str, float]:
         "min_points": _f("min_points", DEFAULT_MIN_POINTS),
         "min_abs_z": _f("min_abs_z", DEFAULT_MIN_ABS_Z),
         "max_abs_z": _f("max_abs_z", DEFAULT_MAX_ABS_Z),
+        # Deliberately NOT read from `[quality]`. The stray capacitance is a fact about
+        # the instrument, it already has a home in `[eis.instrument]`, and copying it
+        # into a second section is how two numbers for one quantity start to drift.
+        "stray_c_f": _stray_c_from_config(),
     }
+
+
+def _stray_c_from_config() -> float:
+    """``[eis.instrument] stray_C_instrument_F``, or the fallback if unreadable.
+
+    Read from the instrument section rather than ``[quality]`` because that is where
+    the measurement lives — the same value the EIS engine uses, with the blank-sweep
+    provenance recorded beside it. A ``[quality]`` copy would be a second number for
+    one physical quantity, free to drift from the one the blanks actually produced.
+    """
+    try:
+        from softae.config import loader
+
+        section = loader.load().get("eis", {}).get("instrument", {}) or {}
+        value = float(section.get("stray_C_instrument_F", DEFAULT_STRAY_C_F))
+    except Exception:
+        return DEFAULT_STRAY_C_F
+    return value if np.isfinite(value) and value > 0.0 else DEFAULT_STRAY_C_F
 
 
 def gate_raw_measurement(
@@ -330,6 +422,7 @@ def gate_raw_measurement(
         min_points=int(cfg["min_points"]),
         min_abs_z=cfg["min_abs_z"],
         max_abs_z=cfg["max_abs_z"],
+        stray_c_f=cfg["stray_c_f"],
     )
 
     if report.verdict is Verdict.REJECT and not enabled:
@@ -368,6 +461,7 @@ def gate_measurement(
         min_points=int(cfg["min_points"]),
         min_abs_z=cfg["min_abs_z"],
         max_abs_z=cfg["max_abs_z"],
+        stray_c_f=cfg["stray_c_f"],
     )
     issues = list(trace.issues)
     metrics = dict(trace.metrics)

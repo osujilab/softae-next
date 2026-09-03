@@ -251,3 +251,99 @@ class _gate_enabled:
     def __exit__(self, *exc):
         self._q.gate_raw_measurement = self._orig
         return False
+
+
+class TestOpenCircuitScreenIsDerivedNotChosen:
+    """The open-circuit threshold comes from the stray capacitance, not a constant.
+
+    ``max_abs_z = 1e12`` is an absolute backstop that on this rig cannot fire — the
+    whole stored corpus has a median |Z| below 5.4e7. A threshold nothing can reach is
+    not a threshold, and the fix is not a smaller magic number: an open circuit is the
+    fixture's stray capacitance with nothing across it, so the value is computable.
+    """
+
+    @staticmethod
+    def _flat_trace(z_ohm, f_lo=3.91, f_hi=2.0e5, n=35):
+        """A trace whose |Z| MEDIAN is exactly ``z_ohm``, over a realistic band.
+
+        |Z| deliberately VARIES by +/-10%: a constant-|Z| trace trips the
+        stuck-instrument check and is rejected before this screen is ever consulted,
+        so a flat fixture would test the wrong branch. ``n`` is odd and the factors
+        are log-symmetric about 1, so the median is exactly ``z_ohm``.
+        """
+        freq = np.geomspace(f_lo, f_hi, n)
+        mag = float(z_ohm) * np.geomspace(1 / 1.1, 1.1, n)
+        return _Trace(freq, mag, np.zeros(n))
+
+    def test_the_threshold_tracks_the_stray_capacitance(self):
+        from softae.analysis.quality import open_circuit_z_ohm
+
+        freq = np.geomspace(3.91, 2.0e5, 34)
+        # Z_open = 1/(2 pi f C): double the capacitance, halve the impedance.
+        assert open_circuit_z_ohm(freq, 18.5e-12) == pytest.approx(
+            2.0 * open_circuit_z_ohm(freq, 37.0e-12), rel=1e-9)
+
+    def test_the_threshold_tracks_the_swept_band(self):
+        # THE REASON THIS IS A FUNCTION AND NOT A CONSTANT. The same fixture presents a
+        # different |Z| over a different sweep, so a scalar encodes one run's geometry
+        # as though it were a property of the hardware.
+        from softae.analysis.quality import open_circuit_z_ohm
+
+        wide = open_circuit_z_ohm(np.geomspace(3.91, 2.0e5, 34))
+        low = open_circuit_z_ohm(np.geomspace(0.016, 1.0e3, 34))
+        assert low > wide * 10.0
+
+    def test_an_unbridged_cell_is_flagged(self):
+        from softae.analysis.quality import open_circuit_z_ohm
+
+        freq = np.geomspace(3.91, 2.0e5, 34)
+        z_open = open_circuit_z_ohm(freq)
+        report = validate_eis_trace(self._flat_trace(z_open * 1.5))
+        assert any("open-circuit" in i for i in report.issues)
+
+    def test_it_screens_rather_than_rejects(self):
+        # The population it flags is five-week-old dried films, and a film too
+        # resistive to measure is an upper BOUND on sigma — a result, not a failure.
+        # Rejecting would discard it. This is the whole posture of the change.
+        from softae.analysis.quality import open_circuit_z_ohm
+
+        freq = np.geomspace(3.91, 2.0e5, 34)
+        report = validate_eis_trace(self._flat_trace(open_circuit_z_ohm(freq) * 1.5))
+        assert report.verdict is Verdict.SUSPECT
+        assert report.verdict is not Verdict.REJECT
+        assert report.ok           # still usable, which is the point
+
+    def test_an_ordinary_film_is_not_flagged(self):
+        # Anti-vacuity: a screen that fires on everything is not a screen. The corpus
+        # median is ~7.6e5, three decades under the open-circuit reading.
+        report = validate_eis_trace(self._flat_trace(7.6e5))
+        assert not any("open-circuit" in i for i in report.issues)
+        assert report.verdict is Verdict.ACCEPT
+
+    def test_the_threshold_is_reported_so_a_reader_can_check_it(self):
+        report = validate_eis_trace(self._flat_trace(7.6e5))
+        assert report.metrics["z_open_circuit"] == pytest.approx(9.73e6, rel=0.02)
+
+    def test_an_unusable_band_yields_no_opinion_rather_than_a_passing_threshold(self):
+        # nan must mean "no opinion". Were it read as a threshold, `z_med >= nan` is
+        # False and the screen would silently never fire — the failure this whole
+        # exercise is about, reintroduced one level down.
+        from softae.analysis.quality import open_circuit_z_ohm
+
+        assert np.isnan(open_circuit_z_ohm([1.0]))
+        assert np.isnan(open_circuit_z_ohm([3.91, 2e5], stray_c_f=0.0))
+        # A degenerate band is NOT a no-opinion case: every point at one frequency
+        # still has a well-defined open-circuit |Z| at that frequency.
+        assert np.isfinite(open_circuit_z_ohm([1.0] * 12))
+        # No usable frequency at all is. The trace is refused for other reasons; what
+        # matters is that no threshold is invented for it.
+        n = 35
+        mag = 7.6e5 * np.geomspace(1 / 1.1, 1.1, n)
+        report = validate_eis_trace(_Trace(np.full(n, -1.0), mag, np.zeros(n)))
+        assert "z_open_circuit" not in report.metrics
+
+    def test_the_stray_comes_from_the_instrument_section_not_a_quality_copy(self):
+        # One physical quantity, one home. A `[quality]` copy would be free to drift
+        # from the blanks that produced it.
+        cfg = quality_config({})
+        assert cfg["stray_c_f"] == pytest.approx(18.5e-12, rel=1e-6)
