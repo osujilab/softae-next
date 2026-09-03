@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import statistics
@@ -40,6 +41,15 @@ DEFAULT_WARMUP = 1
 #: The anchors this feeds are quoted to 0.05 s; a preset swinging wider than this
 #: is not reporting a cost, it is reporting that something else was happening.
 SPREAD_WARN_PCT = 10.0
+
+#: ``<kind>:<name>:<run_id>`` — the grammar ``core.rig_session`` documents, whose
+#: shipped sibling is ``campaign:<name>:<run_id>``. This tool has no DataStore and
+#: no run id at all (it is a pure benchmarking utility), so the third field is a
+#: timestamp stamped at launch rather than a database key -- see ``run_timing``'s
+#: ``stamp`` argument. Filled rather than left trailing, same reasoning as
+#: ``tools/env_hold.py``'s ``CLAIM_KIND``: a bare ``tool:eis-timing:`` in a lock
+#: file asserts "there is an identifier and it is blank".
+CLAIM_KIND = "tool:eis-timing"
 
 
 @dataclass
@@ -171,14 +181,26 @@ async def run_timing(
     repeats: int = DEFAULT_REPEATS,
     warmup: int = DEFAULT_WARMUP,
     mock: bool = False,
+    stamp: str = "",
 ) -> dict[str, PresetTiming]:
-    """Drive every preset ``repeats`` times on one channel, repeat-major."""
+    """Drive every preset ``repeats`` times on one channel, repeat-major.
+
+    ``stamp`` identifies this run inside the rig claim's ``what`` field
+    (``tool:eis-timing:<stamp>``) in place of the run id a DataStore-backed tool
+    would use -- this tool has neither. ``main`` derives it from ``started``
+    before calling in, so a claim taken here and one read back from the lock
+    file agree on when the run began. A caller that omits it (a test, or a
+    script importing ``run_timing`` directly) gets a fresh one instead of a
+    trailing-colon claim.
+    """
     from softae.config.loader import pico_for_channel
     from softae.core.eis_scripts import EISParams
     from softae.core.hardware_safety import assert_hardware_armed
     from softae.core.preflight import estimate_eis_duration
+    from softae.core.rig_session import held_rig_session
     from softae.drivers.factory import create_manager
 
+    stamp = stamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     resolved = {p: EISParams.from_preset(p) for p in presets}
     results = {
         p: PresetTiming(
@@ -194,23 +216,46 @@ async def run_timing(
 
     manager = create_manager(mock=mock)
     assert_hardware_armed(manager, action=f"run EIS timing sweeps on channel {channel}")
-    await manager.connect_all()
-    try:
-        pico = manager.get(pico_for_channel(channel))
-        script_dir = tempfile.gettempdir()
 
-        for pass_index in range(warmup + repeats):
-            is_warmup = pass_index < warmup
-            tag = "warmup" if is_warmup else f"pass {pass_index - warmup + 1}/{repeats}"
-            for preset in presets:
-                elapsed = _time_one_sweep(
-                    pico, channel, resolved[preset], script_dir
-                )
-                bucket = results[preset]
-                (bucket.warmup_s if is_warmup else bucket.samples_s).append(elapsed)
-                print(f"  [{tag}] {preset:<10} {elapsed:8.2f} s", flush=True)
-    finally:
-        await manager.disconnect_all()
+    # `--mock` claims nothing, and the gate is **this tool's own `mock` flag**
+    # rather than `held_rig_session`'s internal `session_is_simulated` exemption
+    # alone. Same shape as `tools/eis_validate.py`'s `_rig_claim` and
+    # `tools/env_hold.py`'s claim gate -- see either docstring for the reasoning
+    # in full; summarised for the two reasons that still apply to a tool this
+    # small: (1) `session_is_simulated` places a driver by checking it against a
+    # hand-maintained registry of shipped mock classes, and every failure mode
+    # there -- a mock added to `softae.drivers` and forgotten in the registry, an
+    # unreadable driver, an enumeration that raises -- answers "real" and claims
+    # the rig anyway; `mock` needs no registry, so it cannot go stale that way.
+    # (2) it is the one flag this tool's own actuation prompt in `main` is
+    # already gated on, so claiming the same flag keeps "this run touches no
+    # hardware" a single fact instead of two that could disagree. Do not
+    # collapse this into an unconditional `held_rig_session` call.
+    claim = (contextlib.nullcontext() if mock
+             else held_rig_session(manager, what=f"{CLAIM_KIND}:{stamp}"))
+    # Claimed before `connect_all`, released after `disconnect_all` --
+    # `core.rig_session`'s rule is "acquire when the ports open, release when
+    # they close" -- so the claim wraps the whole connect/sweep/disconnect
+    # block rather than sitting inside it.
+    with claim:
+        await manager.connect_all()
+        try:
+            pico = manager.get(pico_for_channel(channel))
+            script_dir = tempfile.gettempdir()
+
+            for pass_index in range(warmup + repeats):
+                is_warmup = pass_index < warmup
+                tag = ("warmup" if is_warmup
+                       else f"pass {pass_index - warmup + 1}/{repeats}")
+                for preset in presets:
+                    elapsed = _time_one_sweep(
+                        pico, channel, resolved[preset], script_dir
+                    )
+                    bucket = results[preset]
+                    (bucket.warmup_s if is_warmup else bucket.samples_s).append(elapsed)
+                    print(f"  [{tag}] {preset:<10} {elapsed:8.2f} s", flush=True)
+        finally:
+            await manager.disconnect_all()
 
     return results
 
@@ -304,6 +349,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    from softae.core.run_lock import RunLockHeld
     from softae.tools import use_utf8_console
 
     use_utf8_console()
@@ -335,10 +381,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
 
     started = datetime.now(timezone.utc)
-    results = asyncio.run(run_timing(
-        args.channel, presets,
-        repeats=args.repeats, warmup=args.warmup, mock=args.mock,
-    ))
+    stamp = started.strftime("%Y%m%dT%H%M%SZ")
+    try:
+        results = asyncio.run(run_timing(
+            args.channel, presets,
+            repeats=args.repeats, warmup=args.warmup, mock=args.mock,
+            stamp=stamp,
+        ))
+    except RunLockHeld as held:
+        from softae.core.run_lock import busy_rig_message
+
+        print(f"\nNOT STARTING: "
+              f"{busy_rig_message(held.lock, action='This timing run')}")
+        return 1
     _print_report(results, args.channel, mock=args.mock)
 
     if args.out:
