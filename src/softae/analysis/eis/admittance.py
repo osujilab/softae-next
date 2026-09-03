@@ -38,6 +38,27 @@ import numpy as np
 #: Guard against dividing by an exactly-zero reactance or frequency.
 _EPS = 1e-30
 
+#: Shortest ``tan δ`` falling segment still fitted on its own terms rather than
+#: discarded for the full band — see :func:`parallel_branch_window`, which uses it at
+#: **both** its guards, and :func:`~softae.analysis.eis.gates.gate_tand_slope`, which
+#: passes it to :func:`log_slope` so the fit and the window agree on what is enough.
+#:
+#: Four, because four is what this rig produces. Over the 1440-spectrum
+#: ``20260811T023757Z_equilibration_characterization`` corpus (349 spectra physically
+#: valid by ``min Re Z >= 0``) the loss-tangent gate rejected 203 — and **196 of those
+#: rejections were false**. In every one of the 196 the falling segment held exactly
+#: four points, one short of the threshold of five this constant replaces, so the
+#: full-band fallback fired and substituted a fit over the whole sweep — CPE limb
+#: included — for the segment the window exists to isolate. Measured on that
+#: population: the segment reads a median ``−0.73``, a comfortable pass against
+#: ``tand_slope_max = −0.3``; the full-band substitute reads a median ``+0.28``, a
+#: reject. Nothing that passes today changes.
+#:
+#: **Not lower.** The false-reject population's own p10 is also 4 (median 4, p90 4),
+#: so the corpus says nothing at all about three-point segments. Going below what was
+#: measured would be an untargeted loosening riding on a targeted fix.
+MIN_FALLING_SEGMENT_POINTS = 4
+
 
 def to_admittance(Z: np.ndarray) -> np.ndarray:
     """``Y = 1/Z``, with non-finite results where ``Z`` vanishes."""
@@ -97,7 +118,7 @@ def log_slope(x: np.ndarray, y: np.ndarray, *, min_points: int = 5) -> float:
 
 
 def parallel_branch_window(
-    freq: np.ndarray, Z: np.ndarray, *, min_points: int = 5
+    freq: np.ndarray, Z: np.ndarray, *, min_points: int = MIN_FALLING_SEGMENT_POINTS
 ) -> np.ndarray:
     """The falling segment of ``tan δ`` — the only band where parallel conduction shows.
 
@@ -145,7 +166,11 @@ def parallel_branch_window(
     Falling back to the full band when the falling segment is too short is not a safety
     valve, it is part of the discriminator: a series parasitic has ``tan δ`` rising
     monotonically, so its maximum *is* the top of the band, and the full-band fit then
-    correctly returns ``+1``.
+    correctly returns ``+1``. ``min_points`` sets *how* short is too short, at both
+    guards below — enough usable points to locate a peak at all, and enough segment
+    left afterwards to fit — and :data:`MIN_FALLING_SEGMENT_POINTS` records why it is
+    four rather than five, which is the difference between this fallback firing on a
+    series parasitic and firing on most of the rig's real spectra.
 
     Order-agnostic: the rig sweeps high→low, so the anchors are found on a sorted copy
     and applied as scalar frequency comparisons against the original array.

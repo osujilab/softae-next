@@ -54,6 +54,7 @@ import numpy as np
 import structlog
 
 from softae.analysis.eis.admittance import (
+    MIN_FALLING_SEGMENT_POINTS,
     apparent_capacitance,
     log_slope,
     loss_tangent,
@@ -496,11 +497,18 @@ def gate_tand_slope(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> GateRe
     The slope is fitted over :func:`~softae.analysis.eis.admittance.parallel_branch_window`
     rather than the whole sweep — see that function for why the printed global fit
     rejects well-formed blocking-cell spectra.
+
+    ``min_points`` is passed explicitly to :func:`log_slope` so the fit accepts exactly
+    the windows the window function is willing to return. :func:`log_slope`'s own
+    default of five stands for its other three callers, which are windowed differently
+    or not at all; had this call kept it, a four-point segment would have been selected
+    and then fitted to NaN, which this gate spells as a reject.
     """
     f = np.asarray(f, dtype=float)
     tand = loss_tangent(Z)
     window = parallel_branch_window(f, Z)
-    slope = log_slope(f[window], tand[window])
+    slope = log_slope(f[window], tand[window],
+                      min_points=MIN_FALLING_SEGMENT_POINTS)
     ok = _all_pass(f.size)
     threshold = float(_ctx_get(ctx, "gates", "tand_slope_max", -0.3))
 

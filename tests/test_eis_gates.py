@@ -39,7 +39,11 @@ from softae.analysis.eis.gates import (
     gate_tand_slope,
     run_gates,
 )
-from softae.analysis.eis.admittance import log_slope, parallel_branch_window
+from softae.analysis.eis.admittance import (
+    MIN_FALLING_SEGMENT_POINTS,
+    log_slope,
+    parallel_branch_window,
+)
 from softae.analysis.eis.policy import build_context
 from softae.analysis.eis.settings import GateSettings
 from tests.test_eis_kk import RIG_FREQ
@@ -151,6 +155,33 @@ class TestTandWindowShapes:
         """``tan δ`` computed independently of the module under test."""
         return np.asarray(Z).real / np.abs(np.asarray(Z).imag)
 
+    @staticmethod
+    def _falling_segment_of(*, points: int, rise_above: float):
+        """``(f, Z)`` whose ``tan δ`` falling segment is exactly ``points`` long.
+
+        Built in ``tan δ`` rather than from a circuit, because segment *length* is the
+        quantity under test and no ``R_bulk`` sets it directly — reaching a chosen
+        length through :func:`reference_spectrum` would mean solving for a corner
+        frequency and would tie the fixture to the sweep grid. ``Z = tan δ − 1j``
+        makes ``loss_tangent(Z)`` exactly ``tan δ``: the module note in
+        ``admittance.py`` gives ``tan δ = Z′/(−Z″)``, and here ``−Z″ = 1``.
+
+        The shape is the rig's own three-limb one, per this class's docstring — the
+        CPE limb rising to a peak, the falling parallel-conduction limb, then the
+        high-frequency rise where ``Z → R_series`` and ``tan δ → ∞``. ``rise_above``
+        stays shallow enough that the tail never overtakes the peak, or ``argmax``
+        would move to the top endpoint and the fixture would be the monotone shape.
+        """
+        peak, npts = 4, 12
+        trough = peak + points - 1
+        f_asc = log_frequencies(npts=npts, descending=False)
+        lf = np.log10(f_asc)
+        lt = np.empty(npts)
+        lt[:peak + 1] = 1.0 - 1.3 * (lf[peak] - lf[:peak + 1])          # CPE limb, up
+        lt[peak:trough + 1] = 1.0 - 0.70 * (lf[peak:trough + 1] - lf[peak])
+        lt[trough:] = lt[trough] + rise_above * (lf[trough:] - lf[trough])
+        return f_asc[::-1], (10.0 ** lt)[::-1] - 1j                     # descending
+
     def test_tand_window_with_an_interior_peak_runs_from_the_peak_to_the_top_of_band(self):
         # Regression pin. The default synthetic has its tanδ minimum at the top of the
         # sweep, so "peak → first minimum above it" *is* "at or above the peak" — the
@@ -219,6 +250,85 @@ class TestTandWindowShapes:
 
         window = parallel_branch_window(f, Z)
         assert window.all() and window.size == f.size
+
+    def test_tand_window_with_a_four_point_falling_segment_is_fitted_not_discarded(self):
+        """The false-reject population, reproduced: four points is a window, not a stub.
+
+        196 of 203 rejections on the ``20260811T023757Z_equilibration_characterization``
+        corpus were this shape and every one was false — the segment held exactly four
+        points against a threshold of five, so the full-band fallback fired and fitted
+        the CPE limb the window exists to exclude. The two slopes here (−0.70 segment,
+        +0.31 full band) sit on the measured medians (−0.73 and +0.28), and they land on
+        opposite sides of the −0.3 threshold, which is the whole defect in one fixture.
+        """
+        f, Z = self._falling_segment_of(points=4, rise_above=0.50)
+        tand = self._tand(Z)
+        ascending = np.argsort(f)
+
+        assert int(np.argmax(tand[ascending])) == 4, "interior peak, not an endpoint"
+        assert int((np.isfinite(tand) & (tand > 0)).sum()) == f.size, (
+            "every point usable — so the segment-length guard is the one under test, "
+            "not the data-sufficiency guard that precedes it")
+
+        window = parallel_branch_window(f, Z)
+        assert int(window.sum()) == MIN_FALLING_SEGMENT_POINTS == 4
+        assert not window.all(), "a real selection — the fallback must not have fired"
+        assert log_slope(f[window], tand[window],
+                         min_points=MIN_FALLING_SEGMENT_POINTS) == pytest.approx(-0.70, abs=0.02)
+
+        # The pre-fix answer, reached through the parameter rather than a patched module:
+        # five discards this segment and returns the whole sweep, whose fit is positive.
+        old = parallel_branch_window(f, Z, min_points=5)
+        assert old.all(), "the threshold of five is what produced the false rejects"
+        assert log_slope(f[old], tand[old]) == pytest.approx(+0.31, abs=0.02)
+        assert log_slope(f[old], tand[old]) > GateSettings().tand_slope_max
+
+        r = gate_tand_slope(f, Z, _ctx())
+        assert r.passed and r.checked
+        assert r.metrics["tand_window_pts"] == 4.0
+        assert r.metrics["tand_slope"] == pytest.approx(-0.70, abs=0.02)
+
+    def test_tand_window_with_a_three_point_falling_segment_still_returns_the_full_band(self):
+        """One below the new line, and the corpus says nothing about it.
+
+        Distinct from the too-few-valid-points test above: there the sweep never had
+        enough usable points to locate a peak at all, so the *first* guard returned the
+        full band. Here all twelve points are usable, the peak and trough are both
+        found, and it is the resulting *segment* that is too short — the second guard.
+        The measured false-reject population's p10 is 4, so lowering the threshold past
+        what was measured would be loosening this fix never bought evidence for.
+        """
+        f, Z = self._falling_segment_of(points=3, rise_above=0.20)
+        tand = self._tand(Z)
+        ascending = np.argsort(f)
+        tand_asc = tand[ascending]
+
+        assert int((np.isfinite(tand) & (tand > 0)).sum()) == f.size, (
+            "the data-sufficiency guard must be satisfied, or this tests that instead")
+        i_peak = int(np.argmax(tand_asc))
+        i_trough = i_peak + int(np.argmin(tand_asc[i_peak:]))
+        assert i_trough - i_peak + 1 == 3 < MIN_FALLING_SEGMENT_POINTS
+
+        window = parallel_branch_window(f, Z)
+        assert window.all(), "three is still short enough to fall back to the full band"
+        assert gate_tand_slope(f, Z, _ctx()).metrics["tand_window_pts"] == float(f.size)
+
+    def test_log_slope_still_needs_five_points_so_only_the_tand_gate_relaxed(self):
+        """``log_slope``'s own default did not move, and must not be merged into the new one.
+
+        It has four call sites in ``gates.py``: ``gate_tand_slope`` — windowed by
+        ``parallel_branch_window`` and the only one this fix touches — ``gate_cap_flatness``,
+        windowed by ``top_decade_window``, and two unwindowed calls in ``gate_series_rc``.
+        Collapsing the two constants into one shared default would silently relax the
+        other three, on a corpus that measured nothing about them.
+        """
+        x = np.array([1.0, 2.0, 4.0, 8.0])
+        y = np.array([8.0, 4.0, 2.0, 1.0])
+
+        assert log_slope(x, y) != log_slope(x, y), "four points is still NaN by default"
+        assert log_slope(x, y, min_points=MIN_FALLING_SEGMENT_POINTS) == pytest.approx(-1.0)
+        assert log_slope(np.append(x, 16.0), np.append(y, 0.5)) == pytest.approx(-1.0), (
+            "five is what the untouched default admits")
 
 
 class TestPointGates:
