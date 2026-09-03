@@ -144,6 +144,35 @@ class SpectrumReport:
     #: one, which is a different statement: *considered, and deliberately not applied*.
     correction: Any = None           # fixture.FixtureCorrection
     correction_outcome: Any = None   # fixture.CorrectionOutcome
+    #: **Which fitter actually produced** :attr:`fit`. ``""`` where the question does not
+    #: arise — the legacy engine has exactly one fitter, so ``engine`` already answers it.
+    #:
+    #: On the gated engine it does *not*: four routes can produce ``fit`` and three of
+    #: them are not the gated fitter. ``engine="gated"`` therefore names the **cascade**
+    #: that ran, not the estimator that returned the number, and a report carrying only
+    #: ``engine`` describes a check it may not have performed. That gap is measured, not
+    #: hypothetical: 22 of 54 rows on ``20260825T154521Z_arrhenius_sweep`` — 41 % — fell
+    #: back to :func:`~softae.analysis.circuit_fitting.fit_circuit` while reporting
+    #: themselves as gated output.
+    #:
+    #: ==========================  ================================================
+    #: value                       what returned ``fit``
+    #: ==========================  ================================================
+    #: ``"gated"``                 ``fitter.fit_spectrum`` — the E1 fitter
+    #: ``"two_point"``             the pre-gate open-arc route; **changes R₁**
+    #: ``"legacy_unknown_model"``  ``fit_circuit``, because the model is not in the
+    #:                             gated registry
+    #: ``"legacy_fit_failed"``     ``fit_circuit``, because the gated fit did not
+    #:                             converge — **this is the 41 %**
+    #: ``""``                      not applicable (legacy engine), or a report built
+    #:                             before this field existed
+    #: ==========================  ================================================
+    #:
+    #: The two legacy values are kept apart deliberately: one says the estimator was
+    #: never applicable, the other says it was applied and did not converge. Collapsing
+    #: them to ``"legacy"`` would hide which of those is happening, and on this corpus
+    #: it is entirely the second.
+    fitter: str = ""
 
     @property
     def corrected(self) -> bool:
@@ -166,7 +195,38 @@ class SpectrumReport:
         return int(sum(e.get("n_dropped", 0) for e in self.gate_log))
 
     def gate_summary(self) -> str:
-        """The one-cell rendering for the analysis tab's ``Gate`` column."""
+        """The one-cell rendering for the analysis tab's ``Gate`` column.
+
+        **"pass" means every gate ran and none refused — not merely that none refused.**
+        A gate that cannot evaluate its criterion fails *open*: it returns
+        ``passed=True`` as a placeholder and marks it ``checked=False``
+        (:meth:`~softae.analysis.eis.gates.GateResult.unchecked`, whose own docstring
+        says ``checked=False`` "is what stops that posture from being reported as a clean
+        result"). Reading ``passed`` alone reported it as a clean result anyway, which is
+        the conflation the field was added to remove.
+
+        ``checked`` is read with **no default**, because absent is a third answer:
+
+        =============  ==============================================  ================
+        ``checked``    what the entry is saying                        rendered here
+        =============  ==============================================  ================
+        ``True``       the gate ran and returned a verdict             by ``passed``
+        ``False``      it could not run; ``passed`` is a placeholder   **"unchecked"**
+        absent         the row predates the field                      by ``passed``
+        =============  ==============================================  ================
+
+        **The third row is a judgement, and it is deliberately the permissive one** —
+        ``is not False`` rather than ``is True``. Every ``gate_log_json`` in the DataStore
+        today predates ``checked``, so treating absent as unchecked would mark the entire
+        stored corpus "unchecked" and make the distinction useless on the only data there
+        is. This is the same ruling
+        :meth:`softae.tools.eis_validate_records.FitRecord.passed_gates` makes, adopted
+        here so the two surfaces cannot disagree by one default.
+
+        Drops and unchecked gates are reported *together* rather than one shadowing the
+        other: they are independent facts about the sweep, and a cell that showed only
+        the first would hide the second exactly when both are true.
+        """
         if self.engine != "gated":
             return "—"
         for entry in self.gate_log:
@@ -174,8 +234,26 @@ class SpectrumReport:
                 "block_spectrum", "block_session"
             ):
                 return f"REJECTED: {entry.get('gate', '?')}"
-        dropped = self.n_dropped
-        return f"{dropped} dropped" if dropped else "pass"
+        # A quality rejection NEVER reaches `gate_log`, so rescanning the log alone
+        # cannot see it. `grade_fit` writes its reasons — R², RMS residual, failed
+        # convergence — into `quality.issues`, and the raw-trace checks write theirs
+        # the same way; neither is a gate and neither leaves an entry here.
+        #
+        # Without this branch a spectrum whose gates all passed but whose fit is
+        # unusable renders "pass" while `report.ok` is False and the point is silently
+        # withheld from the campaign objective — the cell says the measurement is fine
+        # at exactly the moment the optimiser is refusing it. The true verdict reached
+        # only the DataStore's `gate_verdict` column, read offline and never live.
+        if not self.ok:
+            issues = list(getattr(self.quality, "issues", ()) or ())
+            return f"REJECTED: {issues[0]}" if issues else "REJECTED: quality"
+        parts = []
+        if self.n_dropped:
+            parts.append(f"{self.n_dropped} dropped")
+        unchecked = sum(1 for e in self.gate_log if e.get("checked") is False)
+        if unchecked:
+            parts.append(f"{unchecked} unchecked")
+        return ", ".join(parts) if parts else "pass"
 
     def describe(self) -> str:
         return f"[{self.engine}] {self.gate_summary()} — {self.sigma.describe()}"
@@ -244,6 +322,21 @@ def decide_report_mode(
     z_med = float(np.median(mag[finite])) if finite.any() else float("nan")
 
     measured = bool(getattr(envelope, "phase_noise_measured", False))
+    # Both fallbacks below are CONSERVATIVE on purpose, and the choice is load-bearing:
+    # an envelope that cannot answer "was the phase floor measured, and does it apply
+    # here?" makes this result **provisional**, never qualified.
+    #
+    # `gates.py:385` takes the opposite default on the same predicate — `lambda _z: True`
+    # — so a missing capability makes the gate assume the floor applies and pass. The
+    # two are not interchangeable and this asymmetry is currently undocumented at the
+    # other site ([p96] §3, parallel's to resolve; `gates.py` is theirs).
+    #
+    # If the two are ever reconciled, reconcile TOWARD THIS ONE. `SUBAGENT_RULES` §3.1(a)
+    # already condemns the permissive direction on this exact subject: the envelope's
+    # `phase_noise_measured` once defaulted True, "so the guard that exists to force a
+    # provisional result when the floor was never measured can never fire". A default
+    # that answers the safe-sounding question when it has no information is the failure
+    # this whole module is written against.
     in_band = bool(
         getattr(envelope, "phase_noise_valid_at", lambda _z: False)(z_med))
     floor = getattr(envelope, "tand_floor", float("nan"))

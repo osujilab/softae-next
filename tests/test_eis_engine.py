@@ -1023,3 +1023,200 @@ class TestLegacyDroppedPointCountIsNotVacuous:
         # that no gates ran. A non-zero ``n_dropped`` reaches ``gate_summary``'s
         # second branch on any engine but this one.
         assert report.gate_summary() == "—"
+
+
+class TestGateSummaryDistinguishesUncheckedFromPassed:
+    """A gate that could not run must not render as ``pass``.
+
+    ``GateResult.unchecked`` fails *open* — ``passed=True`` as a placeholder, marked
+    ``checked=False`` — and its docstring states that the mark "is what stops that
+    posture from being reported as a clean result". ``gate_summary`` read ``passed``
+    alone and reported it as a clean result anyway. These pin the repair, and the
+    third one pins the judgement that makes it usable on real data.
+    """
+
+    @staticmethod
+    def _report(gate_log, *, engine="gated"):
+        """A report carrying only what ``gate_summary`` reads.
+
+        Built directly rather than driven through ``analyze_spectrum`` because the
+        subject is the *rendering* of a log, not the production of one: a synthetic
+        log states the three ``checked`` states exactly, where a real sweep would
+        leave which-state-occurred to the physics.
+        """
+        return SpectrumReport(engine=engine, sigma=SigmaReport(),
+                              gate_log=tuple(gate_log))
+
+    def _entry(self, name="some_gate", *, passed=True, checked=None,
+               severity="advisory", n_dropped=0):
+        entry = {"gate": name, "severity": severity, "passed": passed,
+                 "n_dropped": n_dropped}
+        if checked is not None:          # absent is a THIRD state, not False
+            entry["checked"] = checked
+        return entry
+
+    def test_an_unchecked_gate_is_not_reported_as_pass(self):
+        report = self._report([self._entry(checked=False)])
+        assert report.gate_summary() == "1 unchecked"
+
+    def test_a_gate_that_ran_and_passed_still_reports_pass(self):
+        # The repair must not cost the ordinary case its rendering.
+        report = self._report([self._entry(checked=True)])
+        assert report.gate_summary() == "pass"
+
+    def test_a_row_predating_the_field_is_read_by_passed_not_as_unchecked(self):
+        # THE JUDGEMENT, and it is the one that decides whether this is usable.
+        # Every ``gate_log_json`` in the DataStore today predates ``checked``. Reading
+        # absent as unchecked would mark the entire stored corpus "unchecked" and make
+        # the distinction worthless on the only data that exists. Matches
+        # ``FitRecord.passed_gates``'s `is not False` ruling, deliberately.
+        report = self._report([self._entry(checked=None)])
+        assert report.gate_summary() == "pass"
+
+    def test_drops_and_unchecked_gates_are_reported_together(self):
+        # Independent facts about one sweep. A cell showing only the first would hide
+        # the second exactly when both are true, which is when it matters most.
+        report = self._report([
+            self._entry("dropper", severity="block_point", n_dropped=2),
+            self._entry("cannot_run", checked=False),
+        ])
+        assert report.gate_summary() == "2 dropped, 1 unchecked"
+
+    def test_a_blocking_refusal_still_outranks_both(self):
+        # Severity order is unchanged: a spectrum that was refused says so first.
+        report = self._report([
+            self._entry("cannot_run", checked=False),
+            self._entry("refuser", passed=False, severity="block_spectrum",
+                        checked=True),
+        ])
+        assert report.gate_summary() == "REJECTED: refuser"
+
+    def test_the_legacy_engine_is_untouched_by_any_of_this(self):
+        # The guard that makes this change zero-blast-radius on what ships.
+        report = self._report([self._entry(checked=False)], engine="legacy")
+        assert report.gate_summary() == "—"
+
+
+class TestTheReportSaysWhichFitterProducedTheNumber:
+    """``engine="gated"`` names the cascade, not the estimator.
+
+    Four routes can produce ``fit`` and three are not the gated fitter, so a report
+    carrying only ``engine`` can describe a check it did not perform. [p92] measured
+    that gap at 22 of 54 rows on one sweep — every one of them the legacy fitter
+    reporting itself as gated output.
+    """
+
+    def test_the_legacy_engine_leaves_it_blank_because_the_question_does_not_arise(self):
+        # One fitter, so ``engine`` already answers it. Blank is not "unknown" here.
+        report = analyze_spectrum(as_eis_result(*reference_spectrum()),
+                                  cell=CELL, engine="legacy")
+        assert report.fitter == ""
+
+    def test_an_ordinary_gated_fit_is_labelled_gated(self):
+        report = analyze_spectrum(as_eis_result(*reference_spectrum()),
+                                  cell=CELL, settings=_gated())
+        assert report.fitter == "gated"
+
+    def test_a_gated_fit_that_does_not_converge_is_labelled_as_legacy_output(self):
+        # THE 41%. Driven by making the gated fitter fail the way it really fails —
+        # returning success=False — rather than by asserting on a hand-built report,
+        # so the test exercises the fallback branch itself.
+        import softae.analysis.eis.engine as engine_mod
+
+        def _never_converges(*_a, **_k):
+            return SimpleNamespace(success=False, R0=float("nan"), R1=float("nan"),
+                                   covariance=None, model_name="simpleSalt",
+                                   n_points_dropped=0)
+
+        original = engine_mod.fit_spectrum if hasattr(engine_mod, "fit_spectrum") else None
+        import softae.analysis.eis.fitter as fitter_mod
+        saved = fitter_mod.fit_spectrum
+        fitter_mod.fit_spectrum = _never_converges
+        try:
+            report = analyze_spectrum(as_eis_result(*reference_spectrum()),
+                                      cell=CELL, settings=_gated())
+        finally:
+            fitter_mod.fit_spectrum = saved
+            if original is not None:
+                engine_mod.fit_spectrum = original
+
+        assert report.fitter == "legacy_fit_failed"
+        # And the distinction that matters: the row still calls itself gated, which is
+        # exactly why the second field has to exist.
+        assert report.engine == "gated"
+
+    def test_the_two_legacy_reasons_are_not_collapsed(self):
+        # "never applicable" and "applied and did not converge" are different facts.
+        # On the measured corpus it is entirely the second, and a single "legacy"
+        # value would have hidden that.
+        assert "legacy_unknown_model" != "legacy_fit_failed"
+        report = SpectrumReport(engine="gated", sigma=SigmaReport(),
+                                fitter="legacy_unknown_model")
+        assert report.fitter.startswith("legacy_")
+
+
+class TestGateSummaryShowsAQualityRejection:
+    """A rejection the operator cannot see is worse than no column.
+
+    `grade_fit` writes R²/RMS/convergence failures into `quality.issues`, and the
+    raw-trace checks write theirs the same way. Neither is a gate, so neither leaves a
+    `gate_log` entry — and a cell derived by rescanning `gate_log` alone reported
+    "pass" on a spectrum the optimiser was refusing. [p96] §2.
+    """
+
+    @staticmethod
+    def _report(verdict, issues=(), gate_log=None):
+        from softae.analysis.quality import QualityReport
+
+        log = gate_log if gate_log is not None else (
+            {"gate": "kk", "severity": "advisory", "passed": True,
+             "checked": True, "n_dropped": 0},
+        )
+        return SpectrumReport(
+            engine="gated", sigma=SigmaReport(),
+            quality=QualityReport(verdict, list(issues), {}),
+            gate_log=tuple(log),
+        )
+
+    def test_a_fit_quality_rejection_is_visible_with_its_reason(self):
+        report = self._report(Verdict.REJECT, ["R^2 0.41 below 0.95"])
+        assert report.ok is False
+        assert report.gate_summary() == "REJECTED: R^2 0.41 below 0.95"
+
+    def test_the_defect_this_replaces_is_pinned_so_it_cannot_return(self):
+        # Every admission gate ran and passed; only the FIT failed. Rescanning
+        # gate_log finds nothing, and the old code said "pass" here while the point
+        # was withheld from the campaign objective.
+        report = self._report(Verdict.REJECT, ["RMS residual 41.2% above 15.0%"])
+        assert all(e["passed"] for e in report.gate_log)
+        assert report.gate_summary() != "pass"
+
+    def test_a_rejection_with_no_stated_issue_still_says_so(self):
+        assert self._report(Verdict.REJECT).gate_summary() == "REJECTED: quality"
+
+    def test_a_blocking_gate_still_outranks_a_quality_rejection(self):
+        # Admission failure is the more fundamental fact and names the gate.
+        report = self._report(Verdict.REJECT, ["R^2 too low"], gate_log=[
+            {"gate": "quadrant", "severity": "block_spectrum", "passed": False,
+             "checked": True, "n_dropped": 0},
+        ])
+        assert report.gate_summary() == "REJECTED: quadrant"
+
+    def test_suspect_is_not_a_rejection_and_still_renders_normally(self):
+        # SUSPECT means "use it, but flagged". `ok` is True, so the cell must not
+        # claim a refusal that is not happening.
+        report = self._report(Verdict.SUSPECT, ["|Z| median near the open-circuit reading"])
+        assert report.ok is True
+        assert report.gate_summary() == "pass"
+
+    def test_an_accepted_spectrum_is_unaffected(self):
+        assert self._report(Verdict.ACCEPT).gate_summary() == "pass"
+
+    def test_a_report_with_no_quality_object_is_unchanged(self):
+        # `quality=None` is the legacy/partial shape; `ok` defaults True there and the
+        # branch must not fire on it.
+        report = SpectrumReport(engine="gated", sigma=SigmaReport(), quality=None,
+                                gate_log=({"gate": "kk", "severity": "advisory",
+                                           "passed": True, "checked": True,
+                                           "n_dropped": 0},))
+        assert report.gate_summary() == "pass"

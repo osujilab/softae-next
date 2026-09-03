@@ -576,6 +576,12 @@ def analyze_spectrum(
     pre_cfg = pregate if pregate is not None else pregate_settings()
     fit = None
     budget = None
+    # Precondition #7 ([a134] §4(3)): FOUR routes below can produce `fit` and three of
+    # them are not the gated fitter, so `engine="gated"` names the cascade rather than
+    # the estimator. Recorded at each route as it is taken — never inferred afterwards
+    # from the result, because a legacy `FitResult` and a gated one are the same type
+    # and the fallback is exactly the case where they are indistinguishable.
+    fitter_used = ""
     if pre_cfg.engaged and blocking_open(
         arc_closure(surviving.frequency, surviving.z_imag_neg,
                     getattr(surviving, "phase", None)), pre_cfg
@@ -587,6 +593,8 @@ def analyze_spectrum(
             # fit is the more biased estimator here (175.2 % against 60.9 %). A
             # decline returns None and the ordinary route runs.
             fit = _two_point_fit(surviving, model_name)
+            if fit is not None:
+                fitter_used = "two_point"
         if fit is None and pre_cfg.budget_cap:
             # (A). Same estimator, bounded effort, and it cannot move a number: the
             # unbounded fit was measured to exhaust its 20 000 evaluations and return
@@ -596,12 +604,21 @@ def analyze_spectrum(
             budget = pre_cfg.max_nfev
 
     if fit is None:
+        fitter_used = "gated"
         try:
             fit = fit_spectrum(surviving, model_name, max_nfev=budget)
         except ValueError:
+            # The model is not in the gated registry — the estimator was never
+            # applicable here, which is a different statement from it having failed.
             fit = fit_circuit(surviving, model_name)
+            fitter_used = "legacy_unknown_model"
         if not fit.success:
+            # The gated fitter ran and did not converge. `fit_spectrum` never raises,
+            # so this — not the branch above — is the path [p92] §1 measured at 22 of
+            # 54 rows, every one of them "maximum number of function evaluations
+            # exceeded". The number below it is legacy output.
             fit = fit_circuit(surviving, model_name)
+            fitter_used = "legacy_fit_failed"
     # After the fallback, never before it: demoting a railed fit clears
     # ``success``, and the line above reads that flag as "try the other fitter".
     railed = _demote_if_railed(fit)
@@ -677,4 +694,5 @@ def analyze_spectrum(
         engine="gated", fit=fit, sigma=sigma, quality=quality,
         gate_log=tuple(log), mask=mask, cell=cell, envelope=env,
         correction=corr, correction_outcome=corr_outcome,
+        fitter=fitter_used,
     )
