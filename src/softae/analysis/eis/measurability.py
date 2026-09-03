@@ -99,9 +99,11 @@ from softae.analysis.eis.policy import RE_STATES
 __all__ = [
     "PLATEAU_TOL_PCT",
     "PLATEAU_MIN_DECADES",
+    "PLATEAU_POSITIONS",
     "OUTCOMES",
     "UNJUDGEABLE_OUTCOMES",
     "Plateau",
+    "PlateauPosition",
     "ConductionLift",
     "TandMargin",
     "NegativeConductance",
@@ -109,6 +111,7 @@ __all__ = [
     "capacitance_plateau",
     "conduction_lift",
     "tand_margin",
+    "plateau_position",
     "negative_conductance_count",
     "eps_is_clamped",
 ]
@@ -481,3 +484,97 @@ def negative_conductance_count(
     n_bad = int(np.count_nonzero(Zc.real[finite] < 0))
     frac = n_bad / n_finite if n_finite else float("nan")
     return NegativeConductance(n_bad, frac, re_state)
+
+
+# ── Plateau position — a fourth metric, and not one of S1–S3 ─────────────────
+
+#: Where the resistive plateau sat relative to the swept band.
+PLATEAU_POSITIONS = ("interior", "low_edge", "high_edge", "none")
+
+
+class PlateauPosition(NamedTuple):
+    """Where in the band ``tan δ`` peaked — a measurement, or a bound on one.
+
+    ``tan δ = Z′/(−Z″)`` is maximal where the response is most nearly resistive, so
+    ``argmax(tan δ)`` locates the resistive plateau — the only place a real part may be
+    read *as a resistance*. This says whether that location fell inside the swept window
+    or against one of its edges.
+
+    **The distinction is not cosmetic, and it has cost a bench session.** On the 08/18
+    thickness-calibration board the peak is interior on some wells and pinned to the
+    200 kHz ceiling on others. An edge peak means the resistive region continues past where
+    the sweep stopped, so the resistance read there is an **upper bound**, not a
+    measurement — and the two were indistinguishable downstream. A later session on the
+    same board, by then partly clipped, read as a *contradicting* result for three days
+    rather than an out-of-window one.
+
+    ``decades_to_edge`` is the margin: ``log10`` of the distance from the peak to the
+    nearer band edge, so ``0.0`` is exactly on the edge and larger is safer. It is reported
+    rather than thresholded — see the module note below on why there is no cut here.
+
+    .. note::
+       **Not** :attr:`~softae.analysis.eis.arc.ArcClosure.band_below_apex_decades`, which
+       is a different quantity about a different feature: that one measures band below the
+       ``−Z″`` **apex**, this one measures band around the ``tan δ`` **maximum**. On a
+       blocking-electrode spectrum they are not near each other — on the board above the
+       arc apex sits at 1.7–653 Hz while the plateau sits at 40–64 kHz, three to four
+       decades apart. A spectrum can be ``CLOSED`` by the arc rule and still have its
+       plateau against the ceiling.
+    """
+
+    position: str
+    f_hz: float
+    tand: float
+    decades_to_edge: float
+    n_usable: int
+
+    @property
+    def interior(self) -> bool:
+        """True only when the peak is strictly inside the band."""
+        return self.position == "interior"
+
+
+def plateau_position(freq: np.ndarray, Z: np.ndarray) -> PlateauPosition:
+    """Locate ``argmax(tan δ)`` and say whether the band contained it.
+
+    **Complementary to** :func:`tand_margin`, deliberately: S2 takes the *minimum* of
+    ``tan δ`` to ask "is there any parallel conduction here at all", and this takes the
+    *maximum* to ask "and did the band reach where it is best resolved". Same quantity,
+    opposite ends, different questions — so the two must not be collapsed into one pass
+    over ``tan δ`` that returns both, because a future edit tightening one end's usable
+    mask would silently move the other end's answer.
+
+    Usability is ``tan δ`` finite and positive, matching :func:`tand_margin` exactly rather
+    than restating a mask: a point at ``Re Z < 0, Im Z > 0`` has positive ``tan δ`` and is
+    admitted, an inductive point has ``tan δ < 0`` and is not. Fewer than
+    :data:`~softae.analysis.eis.gates.MIN_PLATEAU_POINTS` usable points returns
+    ``"none"`` — an absence of input, reported as one.
+
+    **No threshold and no verdict.** ``decades_to_edge`` is returned for a reader to judge,
+    because the cut is a campaign-distribution question and this module has no config
+    authority (spec §8). Choosing one now from a sample of one board would be choosing a
+    percentile of our own prior — the same reasoning that keeps S1–S3 unarmed.
+    """
+    f = np.asarray(freq, dtype=float)
+    Zc = np.asarray(Z, dtype=complex)
+    tand = loss_tangent(Zc)
+    nothing = PlateauPosition("none", float("nan"), float("nan"), float("nan"), 0)
+
+    usable = np.isfinite(f) & (f > 0) & np.isfinite(tand) & (tand > 0)
+    n_usable = int(usable.sum())
+    if n_usable < MIN_PLATEAU_POINTS:
+        return PlateauPosition("none", float("nan"), float("nan"), float("nan"), n_usable)
+
+    idx = np.flatnonzero(usable)
+    order = idx[np.argsort(f[idx])]
+    k = int(order[int(np.argmax(tand[order]))])
+    f_peak, tand_peak = float(f[k]), float(tand[k])
+    f_lo, f_hi = float(f[order[0]]), float(f[order[-1]])
+
+    if k == order[0]:
+        return PlateauPosition("low_edge", f_peak, tand_peak, 0.0, n_usable)
+    if k == order[-1]:
+        return PlateauPosition("high_edge", f_peak, tand_peak, 0.0, n_usable)
+
+    margin = min(math.log10(f_peak / f_lo), math.log10(f_hi / f_peak))
+    return PlateauPosition("interior", f_peak, tand_peak, margin, n_usable)

@@ -448,3 +448,101 @@ class TestRealOpenBlanks:
 
         assert M.negative_conductance_count(Z).n == 6
         assert M.tand_margin(f, Z, mux16_table).f_at_min == pytest.approx(expected_f)
+
+
+class TestPlateauPosition:
+    """Where ``tan δ`` peaked, and whether the band actually contained it.
+
+    The metric exists because an edge peak and an interior peak were indistinguishable
+    downstream, and that ambiguity is the difference between a measured resistance and an
+    upper bound on one.
+    """
+
+    #: Where the fixture below puts its resistive plateau, to 5 significant figures.
+    F_PEAK_HZ = 1584.9
+
+    @staticmethod
+    def _cell(freq):
+        """A blocking coplanar cell, in physics convention (Im Z < 0).
+
+        ``R_series + Z_block + (R_bulk ∥ C_par)``, all shunted by a fixture stray.
+        **The two nuisance elements are what make an interior peak possible at all**, so
+        neither may be dropped to simplify the fixture: on a bare ``R_s + (R_b ∥ C)``,
+        ``−Z″ → 0`` at DC and ``tan δ`` therefore diverges at the low edge, putting the
+        maximum on the first point of *every* sweep. Blocking rolls the low end off and the
+        stray rolls the high end off, which is the shape real spectra from this rig have —
+        and the shape the metric was written to describe.
+        """
+        w = 2 * np.pi * np.asarray(freq, dtype=float)
+        core = 50.0 + 1 / (1j * w * 1e-7) + 5e4 / (1 + 1j * w * 5e4 * 3e-11)
+        return 1 / (1 / core + 1j * w * 2e-11)
+
+    def test_an_interior_peak_reports_its_distance_from_both_edges(self):
+        freq = np.logspace(0, 6, 61)
+        got = M.plateau_position(freq, self._cell(freq))
+        assert got.position == "interior"
+        assert got.interior
+        assert got.f_hz == pytest.approx(self.F_PEAK_HZ, rel=1e-3)
+        # The margin is the distance to the NEARER edge, so it cannot exceed half the
+        # swept width, and must be strictly positive for an interior point.
+        assert 0.0 < got.decades_to_edge <= 3.0
+        assert got.n_usable == freq.size
+
+    def test_a_peak_on_the_lowest_swept_point_is_a_low_edge_with_zero_margin(self):
+        # Start the sweep at the plateau, so the maximum lands on the first point.
+        freq = np.logspace(math.log10(self.F_PEAK_HZ), 6, 31)
+        got = M.plateau_position(freq, self._cell(freq))
+        assert got.position == "low_edge"
+        assert got.decades_to_edge == 0.0
+        assert not got.interior
+
+    def test_a_peak_on_the_highest_swept_point_is_a_high_edge_with_zero_margin(self):
+        # Stop the sweep at the plateau: the resistive region continues past the band,
+        # so any resistance read here is an upper bound. This is the 08/21 condition.
+        freq = np.logspace(0, math.log10(self.F_PEAK_HZ), 31)
+        got = M.plateau_position(freq, self._cell(freq))
+        assert got.position == "high_edge"
+        assert got.decades_to_edge == 0.0
+        assert not got.interior
+
+    def test_too_few_usable_points_is_none_rather_than_a_position(self):
+        freq = np.array([10.0, 100.0])
+        got = M.plateau_position(freq, self._cell(freq))
+        assert got.position == "none"
+        assert got.n_usable < M.MIN_PLATEAU_POINTS
+        assert math.isnan(got.f_hz)
+
+    def test_an_all_inductive_spectrum_yields_no_position_because_tand_is_negative(self):
+        # Im Z > 0 with Re Z > 0 gives tan δ < 0, which cannot enter the search —
+        # the same admission rule tand_margin uses, not a restated mask.
+        freq = np.logspace(1, 5, 41)
+        Z = 50.0 + 1j * 2 * np.pi * freq * 1e-3
+        assert (loss_tangent(Z) < 0).all()
+        assert M.plateau_position(freq, Z).position == "none"
+
+    def test_the_peak_is_the_maximum_of_tand_and_the_minimum_of_absolute_phase(self):
+        """Two spellings of one quantity; a future edit must not let them diverge."""
+        freq = np.logspace(0, 6, 61)
+        Z = self._cell(freq)
+        got = M.plateau_position(freq, Z)
+        phase = np.degrees(np.angle(Z))
+        assert freq[int(np.argmin(np.abs(phase)))] == pytest.approx(got.f_hz)
+
+    def test_frequency_order_does_not_change_the_verdict(self):
+        """Sweeps arrive descending as often as ascending; the edges must not swap."""
+        freq = np.logspace(0, 6, 61)
+        Z = self._cell(freq)
+        asc = M.plateau_position(freq, Z)
+        desc = M.plateau_position(freq[::-1], Z[::-1])
+        assert asc.position == desc.position
+        assert asc.f_hz == pytest.approx(desc.f_hz)
+        assert asc.decades_to_edge == pytest.approx(desc.decades_to_edge)
+
+    def test_it_is_a_metric_and_carries_no_verdict_machinery(self):
+        """measurability.py's standing rule: nothing here gates. Held as a test."""
+        freq = np.logspace(0, 6, 61)
+        got = M.plateau_position(freq, self._cell(freq))
+        assert not hasattr(got, "severity")
+        assert not hasattr(got, "passed")
+        assert not hasattr(got, "checked")
+        assert got.position in M.PLATEAU_POSITIONS
