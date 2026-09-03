@@ -1018,7 +1018,31 @@ f_min_hz           = 0.016
 f_max_hz           = 200_000
 f_verified_lo_hz   = 1.2      # no degradation observed down to here at 1e4 Ohm
 z_min_ohm          = 10
-z_max_ohm          = 1e9      # upper decades NOT yet verified
+z_max_ohm          = 144560987.92693862  # PHASE-VERIFIED ceiling (1.4456e8), not the
+                              # datasheet 1e9. Mirrors calibration/eis/mux16.toml, which
+                              # is the derived record; this block is the fallback until
+                              # CalibrationSet.envelope() is wired (spec #17). Keep the
+                              # two in step by hand until then.
+                              #
+                              # The datasheet 1e9 and the MUX leakage equivalent (10 pA/ch
+                              # at 10 mV) agree on a HARD limit near 1e9, which is what
+                              # makes that limit credible -- but a hard limit and a
+                              # VERIFIED RANGE are different things, and only the latter
+                              # belongs here. 1.4456e8 is the highest |Z| at which the
+                              # phase floor was actually measured: 5.26 decades from
+                              # 795.6 Ohm up.
+                              #
+                              # NOT the observed rail, 1.0147e9. During derivation -- before
+                              # this repository existed, so there is NO commit to compare --
+                              # the rail was briefly taken as the ceiling: the artefact that
+                              # should have been gated out was setting the bound. Dropping
+                              # railed and quadrant-violating points gave 1.4456e8 and
+                              # improved the phase floor from median 3.12 to 2.21 deg at the
+                              # same time. calibration/eis/mux16.toml was COMMITTED ALREADY
+                              # CARRYING the corrected value, so `git log` on it shows one
+                              # commit and no diff -- do not go looking for the before-and-
+                              # after, and do not read the single commit as evidence the
+                              # rail was never a candidate. It was.
 phase_noise_deg    = 0.149    # measured, 9.9 kOhm resistive -> tan d floor 0.0026
 phase_noise_at_ohm = 9.9e3    # the impedance it was measured at
 phase_noise_valid_decades = 1.0   # how far it may be trusted either side
