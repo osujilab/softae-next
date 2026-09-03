@@ -457,7 +457,7 @@ def analyze_spectrum(
     if chosen != "gated":
         return _legacy_report(eis_result, cell, model_name)
 
-    from softae.analysis.circuit_fitting import fit_circuit
+    from softae.analysis.circuit_fitting import CIRCUIT_MODELS, fit_circuit
     from softae.analysis.eis.admittance import model_free_r_bulk
     from softae.analysis.eis.envelope import instrument_envelope
     from softae.analysis.eis.gates import (
@@ -605,20 +605,35 @@ def analyze_spectrum(
 
     if fit is None:
         fitter_used = "gated"
-        try:
-            fit = fit_spectrum(surviving, model_name, max_nfev=budget)
-        except ValueError:
-            # The model is not in the gated registry — the estimator was never
-            # applicable here, which is a different statement from it having failed.
-            fit = fit_circuit(surviving, model_name)
-            fitter_used = "legacy_unknown_model"
+        # `fit_spectrum` raises only for a model in NEITHER registry — a caller error
+        # rather than a data condition — and it is left to propagate. It does *not*
+        # raise for a legacy-registry model: it resolves those through `CIRCUIT_MODELS`
+        # itself, which is why the comment below could truthfully say it never raises.
+        #
+        # An `except ValueError -> fit_circuit` used to sit here, labelled
+        # `legacy_unknown_model`. It was unreachable as a fallback and the label was
+        # never assigned: the only way to enter it is a model neither registry knows,
+        # and `fit_circuit` then raises the identical `ValueError` one line later.
+        fit = fit_spectrum(surviving, model_name, max_nfev=budget)
         if not fit.success:
-            # The gated fitter ran and did not converge. `fit_spectrum` never raises,
-            # so this — not the branch above — is the path [p92] §1 measured at 22 of
-            # 54 rows, every one of them "maximum number of function evaluations
-            # exceeded". The number below it is legacy output.
-            fit = fit_circuit(surviving, model_name)
-            fitter_used = "legacy_fit_failed"
+            # The gated fitter ran and did not converge — [p92] §1 measured this at 22
+            # of 54 rows, every one "maximum number of function evaluations exceeded".
+            if model_name in CIRCUIT_MODELS:
+                # A legacy equivalent exists. Its number is legacy output, labelled so.
+                fit = fit_circuit(surviving, model_name)
+                fitter_used = "legacy_fit_failed"
+            else:
+                # A gated-registry model has NO legacy equivalent — the two registries
+                # have an EMPTY intersection — so there is nothing to fall back *to*.
+                # Calling `fit_circuit` here raised `ValueError` straight out of
+                # `analyze_spectrum` on roughly half of real `blocking_coplanar`
+                # spectra ([a162] §3), which is latent only because the shipped default
+                # model is legacy-registry: it detonates on the E6 cutover, not before.
+                #
+                # The failed gated fit is the honest result — `success=False`, NaN
+                # resistances — and the label says a fallback was unavailable rather
+                # than untried.
+                fitter_used = "gated_no_fallback"
     # After the fallback, never before it: demoting a railed fit clears
     # ``success``, and the line above reads that flag as "try the other fitter".
     railed = _demote_if_railed(fit)

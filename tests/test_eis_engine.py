@@ -1145,14 +1145,24 @@ class TestTheReportSaysWhichFitterProducedTheNumber:
         # exactly why the second field has to exist.
         assert report.engine == "gated"
 
-    def test_the_two_legacy_reasons_are_not_collapsed(self):
-        # "never applicable" and "applied and did not converge" are different facts.
-        # On the measured corpus it is entirely the second, and a single "legacy"
-        # value would have hidden that.
-        assert "legacy_unknown_model" != "legacy_fit_failed"
-        report = SpectrumReport(engine="gated", sigma=SigmaReport(),
-                                fitter="legacy_unknown_model")
-        assert report.fitter.startswith("legacy_")
+    def test_a_substituted_number_and_a_missing_one_are_not_collapsed(self):
+        """The distinction that survives, and it is the one that changes a reader's job.
+
+        This test previously pinned ``legacy_unknown_model`` against
+        ``legacy_fit_failed``. That label was removed on 2026-09-03 as unreachable
+        (`[a162]` §3), and the assertion was tautological besides — two different string
+        literals comparing unequal. The real distinction is between a row whose number
+        came from the legacy fitter and a row that has **no number at all**, because
+        only the second leaves the measurand missing.
+        """
+        substituted = SpectrumReport(engine="gated", sigma=SigmaReport(),
+                                     fitter="legacy_fit_failed")
+        missing = SpectrumReport(engine="gated", sigma=SigmaReport(),
+                                 fitter="gated_no_fallback")
+
+        assert substituted.fitter != missing.fitter
+        # Both still call themselves gated -- which is why the second field exists.
+        assert substituted.engine == missing.engine == "gated"
 
 
 class TestGateSummaryShowsAQualityRejection:
@@ -1220,3 +1230,90 @@ class TestGateSummaryShowsAQualityRejection:
                                            "passed": True, "checked": True,
                                            "n_dropped": 0},))
         assert report.gate_summary() == "pass"
+
+
+class TestAGatedModelWithNoLegacyEquivalentDoesNotCrashWhenTheFitFails:
+    """`[a162]` §3: the second fallback called `fit_circuit` unguarded.
+
+    The two circuit registries have an EMPTY intersection, so for any gated-registry
+    model a non-convergent fit reached `fit_circuit` with a name it does not know and
+    raised `ValueError` straight out of `analyze_spectrum`. Latent only because the
+    shipped default model is legacy-registry; it detonates on the E6 cutover.
+    """
+
+    @staticmethod
+    def _failed_fit(*_a, **_k):
+        """What `fit_spectrum` returns when the optimiser exhausts its budget."""
+        from softae.analysis.circuit_fitting import FitResult
+
+        return FitResult(
+            model_name="blocking_coplanar", parameters=np.full(5, np.nan),
+            R0=np.nan, R1=np.nan, R0_guess=1.0, R1_guess=1.0,
+            z_indices=[0, 0], success=False,
+            error_msg="maximum number of function evaluations is exceeded",
+        )
+
+    def test_the_two_registries_have_no_model_in_common(self):
+        """The premise the fix rests on, pinned so it cannot drift silently.
+
+        If a model is ever added to both, the "no legacy equivalent" branch stops
+        being reachable for it and this test is where that surfaces.
+        """
+        from softae.analysis.circuit_fitting import CIRCUIT_MODELS
+        from softae.analysis.eis.models import EIS_CIRCUITS
+
+        assert set(CIRCUIT_MODELS) & set(EIS_CIRCUITS) == set()
+
+    def test_a_non_convergent_gated_model_returns_a_failed_report_instead_of_raising(
+            self, monkeypatch):
+        from softae.analysis.eis import fitter as fitter_mod
+
+        monkeypatch.setattr(fitter_mod, "fit_spectrum", self._failed_fit)
+        spectrum = as_eis_result(*reference_spectrum())
+
+        # Before the fix this raised ValueError("Unknown circuit model
+        # 'blocking_coplanar'") out of analyze_spectrum entirely.
+        report = analyze_spectrum(spectrum, cell=CELL, engine="gated",
+                                  model_name="blocking_coplanar",
+                                  settings=_gated(enabled=False))
+
+        assert report is not None
+        assert report.fitter == "gated_no_fallback"
+
+    def test_the_failed_fit_is_reported_as_failed_rather_than_dressed_as_a_number(
+            self, monkeypatch):
+        """No fallback ran, so there is no resistance — and σ must not claim one."""
+        from softae.analysis.eis import fitter as fitter_mod
+
+        monkeypatch.setattr(fitter_mod, "fit_spectrum", self._failed_fit)
+        report = analyze_spectrum(as_eis_result(*reference_spectrum()), cell=CELL, engine="gated",
+                                  model_name="blocking_coplanar",
+                                  settings=_gated(enabled=False))
+
+        assert not report.sigma.is_value
+        assert not (report.sigma.value == report.sigma.value)  # NaN, not a number
+
+    def test_a_legacy_registry_model_still_falls_back_and_is_labelled_as_legacy(
+            self, monkeypatch):
+        """The working half of the fallback is untouched: a legacy equivalent exists,
+        so it is used, and the label says the number is legacy output."""
+        from softae.analysis.eis import fitter as fitter_mod
+
+        monkeypatch.setattr(fitter_mod, "fit_spectrum", self._failed_fit)
+        report = analyze_spectrum(as_eis_result(*reference_spectrum()), cell=CELL, engine="gated",
+                                  model_name="simpleSalt",
+                                  settings=_gated(enabled=False))
+
+        assert report.fitter == "legacy_fit_failed"
+
+    def test_a_model_in_neither_registry_still_raises_rather_than_failing_quietly(self):
+        """An unknown model name is a caller error, not a data condition.
+
+        The removed `except ValueError` never rescued this — `fit_circuit` raised the
+        identical error one line later — so the observable behaviour is unchanged.
+        What changed is that the code no longer implies a fallback exists.
+        """
+        with pytest.raises(ValueError, match="Unknown circuit model"):
+            analyze_spectrum(as_eis_result(*reference_spectrum()), cell=CELL, engine="gated",
+                             model_name="no_such_model",
+                             settings=_gated(enabled=False))

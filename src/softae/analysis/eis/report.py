@@ -160,18 +160,28 @@ class SpectrumReport:
     #: ==========================  ================================================
     #: ``"gated"``                 ``fitter.fit_spectrum`` — the E1 fitter
     #: ``"two_point"``             the pre-gate open-arc route; **changes R₁**
-    #: ``"legacy_unknown_model"``  ``fit_circuit``, because the model is not in the
-    #:                             gated registry
     #: ``"legacy_fit_failed"``     ``fit_circuit``, because the gated fit did not
     #:                             converge — **this is the 41 %**
+    #: ``"gated_no_fallback"``     the gated fit did not converge and the model has NO
+    #:                             legacy equivalent, so nothing was fallen back *to*;
+    #:                             the failed gated fit stands, ``success=False``
     #: ``""``                      not applicable (legacy engine), or a report built
     #:                             before this field existed
     #: ==========================  ================================================
     #:
-    #: The two legacy values are kept apart deliberately: one says the estimator was
-    #: never applicable, the other says it was applied and did not converge. Collapsing
-    #: them to ``"legacy"`` would hide which of those is happening, and on this corpus
-    #: it is entirely the second.
+    #: ``"legacy_fit_failed"`` and ``"gated_no_fallback"`` are kept apart deliberately:
+    #: one says a legacy number was substituted, the other says none could be and the
+    #: row therefore carries no resistance at all. Collapsing them would hide which,
+    #: and only the second leaves the measurand missing.
+    #:
+    #: .. note::
+    #:    A fourth value, ``"legacy_unknown_model"``, was documented here until
+    #:    2026-09-03 and **was never reachable**. It sat behind an
+    #:    ``except ValueError`` around ``fit_spectrum``, which raises only for a model
+    #:    in *neither* registry — whereupon the handler called ``fit_circuit``, which
+    #:    raises the identical error one line before the label could be assigned. The
+    #:    dead branch is gone; the value never appeared in a stored row, so nothing
+    #:    persisted needs migrating.
     fitter: str = ""
 
     @property
