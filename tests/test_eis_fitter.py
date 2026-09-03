@@ -356,3 +356,86 @@ class TestConvergenceTolerance:
         assert all(c is not None for c in fits)
         loose, tight = fits
         assert loose.value("R_1") == pytest.approx(tight.value("R_1"), rel=1e-3)
+
+
+class TestPerQuestionIdentifiability:
+    """Three consumers ask three questions of one covariance and get three answers.
+
+    ``singular`` is one bool about the whole matrix, and every older accessor
+    short-circuits on it. On the measured corpus that is right about exactly one of
+    the three questions: the R0/R1 split is genuinely dead, while the sum and R1 alone
+    are determined to parts in 10^4. These pin the separation.
+
+    ``rho = -1`` with equal variances is the shape [p91] measured on 30 of 30, so it
+    is the fixture rather than an invented edge case.
+    """
+
+    @staticmethod
+    def _cov(*, saa=1e4, sbb=1e4, rho=-1.0, r0=3.0, r1=1.0e6, singular=False):
+        sab = rho * np.sqrt(saa * sbb)
+        return FitCovariance(
+            names=("R0", "R1"),
+            values=np.array([r0, r1], dtype=float),
+            pcov=np.array([[saa, sab], [sab, sbb]], dtype=float),
+            singular=singular,
+            n_points=30,
+        )
+
+    def test_the_split_is_refused_at_rho_minus_one(self):
+        # The one question the global flag gets right, and it stays right.
+        assert self._cov(rho=-1.0).split_identifiable("R0", "R1") is False
+
+    def test_the_sum_survives_the_dead_split(self):
+        # Complement, not a weaker version: the sum is determined BECAUSE one
+        # parameter carries the whole uncertainty.
+        assert self._cov(rho=-1.0).sum_determined("R0", "R1") is True
+
+    def test_the_sum_also_survives_rho_PLUS_one(self):
+        # [p91] §2's correction, pinned. rho = +1 makes Var(a+b) MAXIMAL, and the sum
+        # is still determined -- so the sign of rho is not the mechanism, and a test
+        # written against the rho=-1 cancellation story would pass for a wrong reason.
+        assert self._cov(rho=+1.0).sum_determined("R0", "R1") is True
+
+    def test_one_parameter_is_supported_while_the_other_is_not(self):
+        # The statement no pair-level bool can make. Same matrix, both answers.
+        cov = self._cov(rho=-1.0)
+        assert cov.supports("R1") is True
+        assert cov.supports("R0") is False
+
+    def test_a_finite_variance_is_not_enough_to_support_a_collapsed_parameter(self):
+        # R0 collapsed onto a zero lower bound has a perfectly finite variance and no
+        # information in it. Judging on variance alone would call that supported.
+        cov = self._cov(saa=1e-20, r0=1e-33)
+        assert np.isfinite(cov.pcov[0, 0])
+        assert cov.supports("R0") is False
+
+    def test_none_of_the_three_read_the_global_singular_flag(self):
+        # THE POINT. A whole-matrix flag must not blank a per-parameter question --
+        # that conflation is what these exist to remove. Same numbers, flag flipped.
+        on = self._cov(rho=-1.0, singular=True)
+        off = self._cov(rho=-1.0, singular=False)
+        assert on.supports("R1") == off.supports("R1") is True
+        assert on.sum_determined("R0", "R1") == off.sum_determined("R0", "R1") is True
+        assert on.split_identifiable("R0", "R1") == off.split_identifiable("R0", "R1")
+        # And the older accessors still DO gate on it, which is the contrast.
+        assert np.isnan(on.se("R1")) and np.isfinite(off.se("R1"))
+
+    def test_an_all_nan_covariance_refuses_every_question_on_its_own_terms(self):
+        cov = FitCovariance(names=("R0", "R1"), values=np.array([3.0, 1e6]),
+                            pcov=np.full((2, 2), np.nan), singular=True, n_points=30)
+        assert cov.supports("R1") is False
+        assert cov.sum_determined("R0", "R1") is False
+        assert cov.split_identifiable("R0", "R1") is False
+
+    def test_a_well_conditioned_pair_passes_all_three(self):
+        # Anti-vacuity: predicates that always refuse would satisfy every test above.
+        cov = self._cov(saa=1e-4, sbb=1e-4, rho=0.1, r0=1.0e3, r1=1.0e6)
+        assert cov.split_identifiable("R0", "R1") is True
+        assert cov.sum_determined("R0", "R1") is True
+        assert cov.supports("R0") is True and cov.supports("R1") is True
+
+    def test_an_unknown_parameter_name_refuses_rather_than_raising(self):
+        cov = self._cov()
+        assert cov.supports("nope") is False
+        assert cov.sum_determined("R0", "nope") is False
+        assert cov.split_identifiable("nope", "R1") is False

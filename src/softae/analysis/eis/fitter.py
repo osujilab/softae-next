@@ -140,6 +140,39 @@ DEFAULT_FIT_TOL = 1e-10
 #: hand. One number, one job, two paths that cannot drift apart.
 COLLAPSED_AT_ZERO = 1e-30
 
+#: Relative standard error at or below which a quantity counts as **determined**, for
+#: :meth:`FitCovariance.supports` and :meth:`FitCovariance.sum_determined`.
+#:
+#: **Chosen, not inherited, and the corpus does not make the choice delicate.** Over the
+#: 30 usable covariances on ``20260825T154521Z_arrhenius_sweep`` ([p91]):
+#:
+#: * ``rel_se`` of the **sum** R0+R1 spans 4.1e-05 … 7.3e-03 — every one of the 30 is
+#:   inside this threshold, and 11 are below 1e-3.
+#: * ``rel_se`` of **R1 alone** spans 5.3e-09 … 4.4e-05 — tighter than one part in 10⁴
+#:   on all 30.
+#: * R0, the parameter actually carrying the degeneracy, sits orders above it.
+#:
+#: So on the measured population **nothing lies near 0.10**: the two groups are
+#: separated by many decades and any threshold between ~1e-2 and ~1 gives the identical
+#: partition. 10 % is the conventional reading of "determined" and is stated here so a
+#: later corpus can move it deliberately rather than by accident.
+MAX_REL_SE_DETERMINED = 0.10
+
+#: Condition number of the **correlation** 2×2 above which a pair's SPLIT counts as
+#: unidentifiable, for :meth:`FitCovariance.split_identifiable`.
+#:
+#: For a symmetric 2×2 this is exactly ``(1+|rho|)/(1-|rho|)``, so 1e14 corresponds to
+#: ``|rho| >= 1 - 2e-14`` — that is, **only a correlation numerically indistinguishable
+#: from ±1 fails.** Deliberately permissive: the question is "is the split beyond what
+#: float64 can represent", not "is it poorly determined", and the measured population
+#: answers it unambiguously — ``rho`` is ``-1.000000`` or ``+1.000000`` on 30 of 30,
+#: with a median whole-matrix condition number of 6.0e25.
+#:
+#: **A pair that merely correlates strongly still passes**, and that is intended: a
+#: threshold that refused ``|rho| = 0.99`` would be making a judgement about experiment
+#: design, which is not this predicate's job.
+SPLIT_MAX_COND = 1e14
+
 
 def _rests_on(value: float, bound: float, tol: float) -> bool:
     """Whether *value* came to rest on *bound*.
@@ -266,6 +299,108 @@ class FitCovariance:
             if any(_rests_on(v, float(b[i]), tol) for b in (lo, hi)):
                 out.append(name)
         return tuple(out)
+
+    # ── Per-question identifiability ─────────────────────────────────────────
+    #
+    # ``singular`` is ONE bool about the WHOLE matrix, and every accessor above
+    # short-circuits on it. But the three consumers ask three different questions of
+    # the same covariance, and on the measured corpus they get three different
+    # answers:
+    #
+    #   gate_degeneracy        is the R0/R1 SPLIT identifiable?      -> the 2x2
+    #   rel_se, degenerate     how well is the SUM R0+R1 determined? -> Var(a+b)
+    #   rel_se, non-degenerate how well is R1 ALONE determined?      -> a 1x1
+    #
+    # [p91], 54 arrhenius spectra, 30 with a usable covariance: **the split is dead on
+    # 30 of 30, while the sum is determined to <=1% on 30 of 30 and R1 alone to better
+    # than one part in 10^4 on 30 of 30.** A single bool cannot carry that, and
+    # ``supports("R0") is False`` beside ``supports("R1") is True`` is the statement no
+    # pair-level answer can make.
+    #
+    # **None of these read ``self.singular``, deliberately.** A whole-matrix flag
+    # blanking a per-parameter question is the defect they exist to remove; they read
+    # the covariance directly, so an all-NaN ``pcov`` makes each of them False on its
+    # own terms rather than by proxy.
+    #
+    # **They do not make any conductivity number better** ([p92] §2). Thickness
+    # dominates sigma's error budget, and ``rel_se`` is a PRECISION statement while
+    # this rig's problem is ACCURACY -- R1 itself has measured 53x-224x low against the
+    # numpy anchor. These make the RECORD honest: saying "could not check" about a
+    # quantity determined to 1 part in 10^4 is false. That is the whole claim.
+
+    def supports(self, name: str) -> bool:
+        """Is *name*'s own value usable — its 1×1, judged on its own scale?
+
+        Finite positive variance is necessary and not sufficient: a parameter that
+        collapsed to 1e-33 against a zero lower bound has a perfectly finite variance
+        and no information in it. The test is therefore on ``rel_se``, which is what
+        the non-degenerate branch of ``relative_standard_error`` actually reports.
+        """
+        i = self.index(name)
+        if i is None:
+            return False
+        var = float(self.pcov[i, i])
+        if not (np.isfinite(var) and var > 0.0):
+            return False
+        v = float(self.values[i])
+        if not np.isfinite(v) or v == 0.0:
+            return False
+        return bool(np.sqrt(var) / abs(v) <= MAX_REL_SE_DETERMINED)
+
+    def split_identifiable(self, a: str, b: str,
+                           max_cond: float = SPLIT_MAX_COND) -> bool:
+        """Can *a* and *b* be told APART — is the 2×2 sub-block conditioned?
+
+        Judged on the **correlation** 2×2, not the raw one, so the answer is invariant
+        to the parameters' units. For a symmetric 2×2 that reduces exactly to::
+
+            cond = (1 + |rho|) / (1 - |rho|)
+
+        so this is a threshold on ``|rho|`` wearing its numerical meaning. At
+        ``rho = ±1`` — which is 30 of 30 on the measured corpus — it is infinite and the
+        split is genuinely unidentifiable. **That is the one question the global flag
+        gets right**, and it stays right here.
+        """
+        ia, ib = self.index(a), self.index(b)
+        if ia is None or ib is None:
+            return False
+        saa, sbb = float(self.pcov[ia, ia]), float(self.pcov[ib, ib])
+        sab = float(self.pcov[ia, ib])
+        if not all(np.isfinite(x) for x in (saa, sbb, sab)):
+            return False
+        if saa <= 0.0 or sbb <= 0.0:
+            return False
+        r = abs(sab / np.sqrt(saa * sbb))
+        if not np.isfinite(r) or r >= 1.0:
+            return False
+        return bool((1.0 + r) / (1.0 - r) <= float(max_cond))
+
+    def sum_determined(self, a: str, b: str,
+                       max_rel_se: float = MAX_REL_SE_DETERMINED) -> bool:
+        """Is ``a + b`` determined, whatever the split does?
+
+        ``Var(a+b) = Saa + Sbb + 2Sab``. **This is not a weaker version of
+        :meth:`split_identifiable` — it is its complement**, and the two disagree on
+        every spectrum measured so far: the sum is excellent *because* one parameter
+        carries the whole uncertainty and the other does not.
+
+        [p91] corrected the mechanism and it is worth stating rather than assuming:
+        this is **not** the ``rho = -1`` cancellation. ``rho`` is ``+1`` on 9 of 30 —
+        where ``Var(a+b)`` is MAXIMAL — and the sum is still determined to 6.3e-05.
+        The weak eigenvector lies along ONE PARAMETER (``|cos|`` with the sum direction
+        is 1/sqrt(2) on essentially all 30), and that parameter is R0.
+        """
+        ia, ib = self.index(a), self.index(b)
+        if ia is None or ib is None:
+            return False
+        var = (float(self.pcov[ia, ia]) + float(self.pcov[ib, ib])
+               + 2.0 * float(self.pcov[ia, ib]))
+        if not (np.isfinite(var) and var >= 0.0):
+            return False
+        total = float(self.values[ia]) + float(self.values[ib])
+        if not np.isfinite(total) or total == 0.0:
+            return False
+        return bool(np.sqrt(var) / abs(total) <= float(max_rel_se))
 
     def describe(self) -> str:
         if self.singular:
