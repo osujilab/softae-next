@@ -158,7 +158,16 @@ class GateSettings:
     geom_slope_exponent_tol: float = DEFAULT_GEOM_SLOPE_EXPONENT_TOL
 
     def describe(self) -> str:
-        """One line an operator can sanity-check the settings against."""
+        """One line an operator can sanity-check the settings against.
+
+        ``rho_degenerate`` drives two different tests and the line says both, because
+        naming only one would misdescribe whichever is omitted. ``gate_degeneracy`` is
+        **two-sided on the magnitude** (``|ρ| ≥ |rho_degenerate|`` is degenerate), while
+        ``engine_support._resolve_reported_resistance`` keeps the **one-sided** rule that
+        chooses the reported resistance — a deliberate divergence documented in
+        ``gate_degeneracy``. The gate's half reads ``abs()`` so the string cannot disagree
+        with the gate if an operator writes the threshold positive.
+        """
         if not self.enabled:
             return (
                 "EIS gates observe only — every check runs and logs, nothing is "
@@ -167,7 +176,8 @@ class GateSettings:
         return (
             f"EIS gates enforcing: tanδ slope ≤ {self.tand_slope_max:+.2f}, "
             f"≥ {self.min_fit_pts} surviving points, "
-            f"sum-only below ρ = {self.rho_degenerate:+.2f}."
+            f"degenerate at |ρ| ≥ {abs(self.rho_degenerate):.2f} "
+            f"(engine reports sum-only below ρ = {self.rho_degenerate:+.2f})."
         )
 
 

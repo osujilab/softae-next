@@ -1073,3 +1073,183 @@ class TestCouldNotCheckCensus:
         assert source.count("GateResult.unchecked(") == 19, (
             "the §3.5 census moved — update this count and the tests above "
             "together, and say which site changed")
+
+
+def _cov_with_rho(rho: float, *, singular: bool = False):
+    """A ``FitCovariance`` whose ``R0``/``R1`` correlation is exactly *rho*.
+
+    Unit diagonal, so ``pcov`` *is* the correlation matrix and
+    ``split_identifiable``'s ``(1+|ρ|)/(1−|ρ|)`` is readable by eye: ρ = 0.99 is a
+    condition number of 199, twelve decades under ``SPLIT_MAX_COND``.
+    """
+    from softae.analysis.eis.fitter import FitCovariance
+
+    return FitCovariance(
+        names=("R0", "R1"), values=np.array([50.0, 2000.0]),
+        pcov=np.array([[1.0, float(rho)], [float(rho), 1.0]]), singular=singular,
+    )
+
+
+class TestDegeneracyIsTwoSided:
+    """ρ = +1 is the same rank deficiency as ρ = −1, and used to pass.
+
+    The gate's threshold is now applied to ``|ρ|``. On the 30 covariance-bearing
+    spectra of ``20260825T154521Z_arrhenius_sweep`` this is strictly a tightening —
+    9 PASS→FAIL, 0 FAIL→PASS — because ρ is ``+1.000000`` on 9 of them.
+
+    These tests pin the *contract* (two-sided, on the configured magnitude, with the
+    numerical predicate recorded and inert), not the arithmetic that implements it.
+    """
+
+    def _gate(self, cov, **overrides):
+        from softae.analysis.eis.gates import gate_degeneracy
+
+        f, Z = reference_spectrum()
+        ctx = _ctx(**overrides)
+        ctx["fit"] = _fit_with(cov)
+        return gate_degeneracy(f, Z, ctx)
+
+    def test_degeneracy_positive_unit_correlation_fails(self):
+        # The documented bug: `rho > -0.95` passed this cleanly, and the split it
+        # endorsed is as invented as the one at ρ = −1.
+        r = self._gate(_cov_with_rho(1.0))
+        assert not r.passed and r.checked is True
+        assert r.metrics["rho"] == pytest.approx(1.0)
+        assert "positive degeneracy" in r.detail
+
+    def test_degeneracy_negative_unit_correlation_still_fails(self):
+        # Pre-existing verdict, unmoved — the change adds a side, it does not swap one.
+        r = self._gate(_cov_with_rho(-1.0))
+        assert not r.passed and r.checked is True
+        assert "sum" in r.detail
+
+    @pytest.mark.parametrize("rho", [0.5, -0.5, 0.0])
+    def test_degeneracy_moderate_correlation_still_passes(self, rho):
+        # A tightening at the extremes only. A gate that refused every correlated pair
+        # would be making a different claim than "the split is unidentifiable".
+        r = self._gate(_cov_with_rho(rho))
+        assert r.passed and r.checked is True
+
+    @pytest.mark.parametrize("rho, expected_pass",
+                             [(0.94, True), (-0.94, True),
+                              (0.96, False), (-0.96, False)])
+    def test_degeneracy_default_threshold_is_symmetric_about_zero(self, rho,
+                                                                  expected_pass):
+        # The shipped `rho_degenerate = -0.95` read as a magnitude: the two sides sit
+        # at the same distance from zero, which is the whole content of the change.
+        assert self._gate(_cov_with_rho(rho)).passed is expected_pass
+
+    @pytest.mark.parametrize("rho, expected_pass",
+                             [(0.97, True), (-0.97, True),
+                              (0.995, False), (-0.995, False)])
+    def test_degeneracy_configured_threshold_is_honoured_on_both_sides(
+            self, rho, expected_pass):
+        # `rho_degenerate` is a config key and stays one. Written negative, as the
+        # shipped value is, and read as |−0.99| so its sign cannot invert the test.
+        r = self._gate(_cov_with_rho(rho), rho_degenerate=-0.99)
+        assert r.passed is expected_pass
+
+    def test_degeneracy_positive_threshold_configured_reads_the_same(self):
+        # An operator who drops the minus sign gets the same gate, not its inverse.
+        assert not self._gate(_cov_with_rho(0.99), rho_degenerate=0.95).passed
+        assert self._gate(_cov_with_rho(0.5), rho_degenerate=0.95).passed
+
+    def test_degeneracy_singular_covariance_is_still_a_checked_refusal(self):
+        # KEEP: a singular covariance is the answer to this gate's question, not a
+        # missing input to it. Two-sidedness must not have turned it into an absence.
+        r = self._gate(_cov_with_rho(float("nan"), singular=True))
+        assert not r.passed and r.checked is True
+        assert "unidentifiable" in r.detail
+
+    def test_degeneracy_unformable_correlation_is_unchecked_not_a_verdict(self):
+        # Zero variance on R0 — finite `pcov`, so `singular` is False — makes ρ's
+        # denominator zero. `abs(nan) >= t` is False, so a naive two-sided test would
+        # report a clean PASS here; the NaN branch must still take precedence.
+        from softae.analysis.eis.fitter import FitCovariance
+
+        cov = FitCovariance(names=("R0", "R1"), values=np.array([50.0, 2000.0]),
+                            pcov=np.array([[0.0, 0.0], [0.0, 100.0]]))
+        assert not cov.singular and np.isnan(cov.rho("R0", "R1"))
+
+        r = self._gate(cov)
+        assert r.passed and r.checked is False and "unavailable" in r.detail
+
+    def test_degeneracy_split_identifiable_is_recorded_but_does_not_gate(self):
+        """The test that would have caught the rejected proposal.
+
+        ``split_identifiable`` is a float64-representability test —
+        ``SPLIT_MAX_COND = 1e14`` is ``|ρ| ≥ 1 − 2e-14`` — so ρ = 0.99 (condition
+        number 199) passes it comfortably while being far past any threshold about
+        experiment design. Substituting it for the comparison was measured on the
+        arrhenius corpus and *regressed* 4 spectra against 1 fixed.
+        """
+        cov = _cov_with_rho(0.99)
+        assert cov.split_identifiable("R0", "R1") is True, (
+            "premise: the numerical predicate must disagree with the gate here")
+
+        r = self._gate(cov)
+        assert not r.passed, "the gate's own threshold decides, not the 1e14 one"
+        assert r.metrics["split_identifiable"] == 1.0
+
+    def test_degeneracy_split_identifiable_records_zero_at_unit_correlation(self):
+        # Where the two predicates agree, the metric says so — which is what makes the
+        # 18-of-30 versus 30-of-30 split legible in the log.
+        r = self._gate(_cov_with_rho(1.0))
+        assert r.metrics["split_identifiable"] == 0.0
+
+    def test_degeneracy_covariance_without_the_predicate_records_nan(self):
+        """A covariance object that predates the method must degrade, not explode.
+
+        ``split_identifiable`` is newer than ``FitCovariance`` itself and the metric is
+        advisory, so a stand-in without it reports NaN — "not asked" — rather than
+        taking down a gate whose verdict does not depend on it.
+        """
+        class _CovWithoutSplitTest:
+            singular = False
+
+            def rho(self, a, b):
+                return -0.99
+
+        r = self._gate(_CovWithoutSplitTest())
+        assert not r.passed, "the verdict comes from ρ alone and is unaffected"
+        assert np.isnan(r.metrics["split_identifiable"])
+
+
+class TestPhaseNoiseFallbackIsConservative:
+    def test_phase_noise_envelope_without_the_predicate_is_not_assumed_in_band(self):
+        """SYNTHETIC-ONLY, and reconciliation rather than repair.
+
+        No production path reaches this fallback: ``policy.build_context`` substitutes
+        ``instrument_envelope()`` when none is passed, ``engine.analyze_spectrum`` does
+        the same, and the one hand-built stand-in in the tree supplies the method. The
+        test pins the *direction* of the default — matching ``report.py``'s
+        ``_reporting_mode`` on the same predicate — so the permissive reading cannot
+        drift back in. ``SUBAGENT_RULES`` §3.1(a): "unknown" must not be spelled with
+        the same token as "checked and clean".
+        """
+        from types import SimpleNamespace
+
+        from softae.analysis.eis.gates import gate_phase_noise_extrapolated
+
+        env = SimpleNamespace()
+        assert not hasattr(env, "phase_noise_valid_at"), "premise of this test"
+
+        f, Z = reference_spectrum()
+        ctx = _ctx()
+        ctx["envelope"] = env
+
+        r = gate_phase_noise_extrapolated(f, Z, ctx)
+        assert not r.passed
+        assert r.metrics["phase_noise_valid"] == 0.0
+
+    def test_phase_noise_real_envelope_still_judges_by_band(self):
+        # Positive control for the test above: with a real envelope the gate still
+        # answers from the measurement, so the fallback is what changed and nothing
+        # else.
+        from softae.analysis.eis.envelope import instrument_envelope
+        from softae.analysis.eis.gates import gate_phase_noise_extrapolated
+
+        f, Z = reference_spectrum(R_bulk=1.0e4, noise_pct=0.0)
+        ctx = _ctx()
+        ctx["envelope"] = instrument_envelope()
+        assert gate_phase_noise_extrapolated(f, Z, ctx).passed

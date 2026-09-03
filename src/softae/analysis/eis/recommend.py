@@ -62,8 +62,15 @@ DEFAULT_MIN_EVIDENCE = 20
 #: and enforcing regimes the enforcing spectra are a *strict sample of the admitted
 #: population* — R18 skips the fit for anything it rejected — so their Front-2 values
 #: are excluded rather than pooled (§6.2).
+#:
+#: ``split_identifiable`` qualifies by the same definition — ``gate_degeneracy`` reads it
+#: off the covariance, so it cannot exist without a fit — and is listed **latently**: no
+#: :class:`_Key` targets it today, so nothing pools it and no recommendation is currently
+#: wrong. Membership is here so the §6.2 exclusion is already in force on the day a fence
+#: is placed against it, rather than being remembered then.
 FRONT2_METRICS = frozenset({
-    "rel_se_measurand", "rho", "residual_rms_pct", "r_squared", "residual_max_pct",
+    "rel_se_measurand", "rho", "split_identifiable",
+    "residual_rms_pct", "r_squared", "residual_max_pct",
     "chi2", "chi2_reduced", "n_pegged", "runs_z", "cross_check_pct",
 })
 

@@ -154,11 +154,6 @@ class GateResult:
             "n_dropped": self.n_dropped,
         }
 
-    def describe(self) -> str:
-        mark = "pass" if self.passed else "FAIL"
-        drop = f" (−{self.n_dropped} pts)" if self.n_dropped else ""
-        return f"[{mark}] {self.name}{drop}: {self.detail}"
-
 
 def _all_pass(n: int) -> np.ndarray:
     return np.ones(int(n), dtype=bool)
@@ -387,7 +382,17 @@ def gate_phase_noise_extrapolated(
 
     env = ctx.get("envelope")
     z_med = float(np.median(mag[finite]))
-    valid = bool(getattr(env, "phase_noise_valid_at", lambda _z: True)(z_med))
+    # Deliberately CONSERVATIVE, and matching `report.py`'s `_reporting_mode` on the
+    # same predicate: an envelope that cannot say whether the phase floor applies here
+    # must not be read as saying it does (`SUBAGENT_RULES` §3.1(a) condemns exactly this
+    # direction, on exactly this subject). The two sites previously disagreed.
+    #
+    # This is a RECONCILIATION, not a repair: the branch has no known caller. Every path
+    # into this gate builds `ctx` through `policy.build_context`, which substitutes
+    # `instrument_envelope()` when none is passed, and the only hand-built envelope
+    # stand-in in the tree (`tests/test_eis_engine.py`) supplies the method. Nothing in
+    # `src/` or `tests/` reaches this fallback, so the behaviour change is zero.
+    valid = bool(getattr(env, "phase_noise_valid_at", lambda _z: False)(z_med))
     at = float(getattr(env, "phase_noise_at_ohm", float("nan")))
 
     return GateResult(
@@ -850,19 +855,52 @@ def gate_degeneracy(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> GateRe
     selects sum-vs-split from ``ρ`` before this runs, so the gate's job is to record
     that the choice was made and why, not to ask anyone to make it.
 
+    **The test is two-sided**, on the magnitude of the configured threshold:
+    ``|ρ| >= |rho_degenerate|`` is degenerate. Positive degeneracy is the same rank
+    deficiency with the ridge running the other way and the reported split is just as
+    invented, yet ``ρ = +1.000000`` passed the old ``rho > −0.95`` cleanly. The variance
+    argument the threshold rests on inverts with the sign — at ρ = +1 it is the
+    *difference* whose variance collapses, so ``Σ₀₀ + Σ₁₁ + 2Σ₀₁`` is largest exactly
+    where the split is worst — so one comparison cannot serve both signs. ``abs()`` is
+    applied to the configured value as well, so an operator who writes
+    ``rho_degenerate = -0.99`` gets ``|ρ| < 0.99`` and the sign of a config key cannot
+    silently invert the test.
+
     .. warning::
-       **The test is one-sided and half the degeneracy on this rig is on the other side.**
-       ``ρ`` is exactly ±1.000000 on all 28 fits of the 40-spectrum corpus that returned a
-       covariance, and **eight of them are ρ = +1.000000**, which passes ``rho > −0.95``
-       cleanly. Positive degeneracy is the same rank deficiency with the ridge running the
-       other way and the reported split is just as invented. Note also that the variance
-       argument the threshold rests on inverts with the sign: at ρ = +1 it is the
-       *difference* whose variance collapses, so ``Σ₀₀ + Σ₁₁ + 2Σ₀₁`` is largest exactly
-       where the split is worst. Combined with the ``cov is None`` fail-open above — which
-       returns the shape of a pass for a spectrum never checked — this is what produces the
-       measured sep of −0.65. The threshold and the comparison are left exactly as they are:
-       ``rho_degenerate`` is a config key and the engine reads ``ρ`` for its own sum-vs-split
-       decision, so changing either here would move behaviour, not documentation.
+       **What the two-sided test moved, measured.** Over the 30 spectra of
+       ``20260825T154521Z_arrhenius_sweep`` that returned an R0/R1 covariance (54
+       spectra run; ``engine="gated"``, ``gates.enabled=False``, ``budget_cap=true`` —
+       none of them the shipped defaults), it is **strictly a tightening**: 9 PASS→FAIL
+       and 0 FAIL→PASS. ``ρ`` is ``+1.000000`` on 9 of the 30 and ``−1.000000`` on 21,
+       which is where the 9 come from. An earlier and **independent** sample agrees —
+       8 of the 28 covariance-bearing fits of the 40-spectrum corpus were
+       ``ρ = +1.000000``, likewise all ±1.000000 — so two populations put roughly 30 %
+       of covariance-bearing fits on the side the old test passed. The ``cov is None``
+       fail-open above is untouched and still contributes to the measured sep of −0.65.
+
+       **``split_identifiable`` was measured as a replacement predicate and REJECTED.**
+       Substituting :meth:`~softae.analysis.eis.fitter.FitCovariance.split_identifiable`
+       for the comparison fixes 1 spectrum (shipped PASS → FAIL) and regresses 4
+       (shipped FAIL → PASS) — a net loss on the same corpus. The reason is scale:
+       :data:`~softae.analysis.eis.fitter.SPLIT_MAX_COND` of 1e14 is ``|ρ| >= 1 − 2e-14``,
+       some 1e12 times more permissive than 0.95, and it holds on only 18 of the 30 where
+       ``|ρ| >= 0.95`` holds on all 30. That predicate asks, deliberately, "is the split
+       beyond what float64 can represent"; this gate asks the experiment-design question.
+       It is therefore **recorded as a metric and does not enter ``passed``** — kept
+       because separating "numerically dead" from "correlated past the design threshold"
+       is information this gate did not previously carry.
+
+       **``engine_support.py`` still applies the ONE-SIDED rule, and that is deliberate.**
+       :func:`~softae.analysis.eis.engine_support._resolve_reported_resistance` chooses
+       the *reported resistance* with
+       ``degenerate = cov.singular or (rho == rho and rho <= float(rho_degenerate))``,
+       so on the 9 positive-ρ spectra the engine returns the split (``R_bulk`` alone)
+       while this gate now says the split is degenerate. The divergence is intentional
+       and the engine's rule lives in another session's file: this gate is advisory and
+       records a fact about identifiability, whereas moving the engine's rule would move
+       all 9 reported numbers. **Do not "reconcile" it by reverting this gate.** The
+       detail string names which side the degeneracy is on precisely so the two records
+       can be read against each other.
     """
     ok = _all_pass(np.asarray(f).size)
     fit = ctx.get("fit")
@@ -876,7 +914,7 @@ def gate_degeneracy(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> GateRe
     roles = roles_for(getattr(fit, "model_name", "")) or {}
     a, b = roles.get("R_series", "R0"), roles.get("R_bulk", "R1")
     rho = cov.rho(a, b)
-    threshold = float(_ctx_get(ctx, "gates", "rho_degenerate", -0.95))
+    threshold = abs(float(_ctx_get(ctx, "gates", "rho_degenerate", -0.95)))
 
     if cov.singular:
         # KEEP `passed=False, checked=True`. This gate asks whether the series/bulk
@@ -891,13 +929,30 @@ def gate_degeneracy(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> GateRe
     if not (rho == rho):
         return GateResult.unchecked("degeneracy", FLAG, "ρ unavailable", ok)
 
-    passed = rho > threshold
+    # RECORDED, NEVER GATING — see the warning above for the measurement that decided
+    # it. `getattr` rather than a direct call because a covariance object predating the
+    # method (or a duck-typed stand-in) must degrade to a NaN metric, not raise inside
+    # an advisory gate.
+    split_test = getattr(cov, "split_identifiable", None)
+    identifiable = (float(bool(split_test(a, b))) if callable(split_test)
+                    else float("nan"))
+
+    passed = abs(rho) < threshold
+    if passed:
+        suffix = ""
+    elif rho < 0:
+        suffix = " — relaxation corner out of band; reporting the sum, not the split"
+    else:
+        # The other side of the same rank deficiency. Worth its own words because the
+        # engine's one-sided rule does NOT treat it as degenerate, so the record must
+        # not read as though the sum was reported here.
+        suffix = (" — positive degeneracy: the same rank deficiency with the ridge "
+                  "running the other way, so the split is invented; the engine's "
+                  "one-sided rule still reports the split")
     return GateResult(
         "degeneracy", FLAG, passed,
-        f"ρ(R_series, R_bulk) = {rho:+.3f}"
-        + ("" if passed else
-           " — relaxation corner out of band; reporting the sum, not the split"),
-        ok, {"rho": rho},
+        f"ρ(R_series, R_bulk) = {rho:+.3f}" + suffix,
+        ok, {"rho": rho, "split_identifiable": identifiable},
     )
 
 

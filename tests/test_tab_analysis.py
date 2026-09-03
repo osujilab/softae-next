@@ -7,13 +7,17 @@ Confirms:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 from PySide6.QtCore import Qt, QThread
 from PySide6.QtWidgets import QApplication
 
+from softae.analysis.eis.gates import BLOCK_POINT, BLOCK_SPECTRUM, FLAG, GateResult
 from softae.drivers.mock_factory import create_mock_manager
+from softae.gui.tabs import tab_analysis as ta_mod
 from softae.gui.tabs.tab_analysis import AnalysisTab, _ArrhFitWorker, _FitAllWorker
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -719,3 +723,129 @@ class TestRecordedThicknessAreaGuard:
         """
         self._prepare(tab, self._record_store(um=150.0, area=18.7038))
         assert tab._recorded_thickness_cm(99) is None
+
+
+# ── The Gate cell: three states, not two ───────────────────────────────
+
+
+_MASK_OK = np.ones(5, dtype=bool)
+
+
+def _entry_passed(name="kk_residual", severity=FLAG):
+    """A gate that ran and was satisfied."""
+    return GateResult(name, severity, True, "within tolerance", _MASK_OK).as_log_entry()
+
+
+def _entry_unchecked(name, reason="no covariance available"):
+    """A gate that could not evaluate: ``passed=True`` is a placeholder, not a verdict."""
+    return GateResult.unchecked(name, FLAG, reason, _MASK_OK).as_log_entry()
+
+
+def _entry_dropped(name, n):
+    """A ``block_point`` gate that removed *n* points (``n_dropped`` counts the mask)."""
+    mask = np.array([True] * 5 + [False] * n, dtype=bool)
+    return GateResult(name, BLOCK_POINT, True, f"{n} points removed", mask).as_log_entry()
+
+
+def _entry_rejected(name="stuck_instrument"):
+    """A ``block_spectrum`` refusal — the whole spectrum is out."""
+    return GateResult(name, BLOCK_SPECTRUM, False, "identical readings", _MASK_OK).as_log_entry()
+
+
+def _fit(log):
+    """The only attribute ``_gate_item`` reads off a FitResult."""
+    return SimpleNamespace(gate_log=log)
+
+
+class TestGateItemRendersThreeStates:
+    """``_gate_item`` renders pass / dropped / unchecked / REJECTED.
+
+    Its semantics are :meth:`QualityReport.gate_summary`'s, adopted token-for-token
+    so the two surfaces cannot disagree by one default. Untested they can drift
+    apart in silence, which is the one failure the adoption exists to prevent —
+    hence this class. The reduction that shipped before ``checked`` existed was
+    ``"N dropped" if dropped else "pass"``; every assertion here is chosen to be
+    red against it.
+    """
+
+    def test_gate_item_empty_log_renders_em_dash(self, qapp):
+        assert ta_mod._gate_item(_fit([])).text() == "—"
+
+    def test_gate_item_missing_gate_log_attribute_renders_em_dash(self, qapp):
+        """The legacy engine's FitResult carries no ``gate_log`` at all."""
+        assert ta_mod._gate_item(SimpleNamespace()).text() == "—"
+
+    def test_gate_item_all_gates_checked_and_passed_renders_pass(self, qapp):
+        log = [_entry_passed("kk_residual"), _entry_passed("phase_floor")]
+        assert ta_mod._gate_item(_fit(log)).text() == "pass"
+
+    def test_gate_item_one_unchecked_gate_renders_one_unchecked(self, qapp):
+        log = [_entry_passed("kk_residual"), _entry_unchecked("pegged_parameters")]
+        assert ta_mod._gate_item(_fit(log)).text() == "1 unchecked"
+
+    def test_gate_item_two_unchecked_gates_render_two_unchecked(self, qapp):
+        log = [_entry_unchecked("pegged_parameters"),
+               _entry_unchecked("phase_floor"),
+               _entry_passed("kk_residual")]
+        assert ta_mod._gate_item(_fit(log)).text() == "2 unchecked"
+
+    def test_gate_item_dropped_points_render_the_summed_count(self, qapp):
+        log = [_entry_dropped("outlier", 2), _entry_dropped("negative_real", 1)]
+        assert ta_mod._gate_item(_fit(log)).text() == "3 dropped"
+
+    def test_gate_item_dropped_and_unchecked_render_together_dropped_first(self, qapp):
+        """Neither may shadow the other: they are independent facts about one spectrum.
+
+        A spectrum that lost three points *and* left a gate unevaluated has two
+        things wrong with it, and a cell reporting only one of them is the same
+        conflation ``checked`` was added to remove.
+        """
+        log = [_entry_dropped("outlier", 2),
+               _entry_dropped("negative_real", 1),
+               _entry_unchecked("pegged_parameters")]
+        assert ta_mod._gate_item(_fit(log)).text() == "3 dropped, 1 unchecked"
+
+    def test_gate_item_entry_without_a_checked_key_renders_by_passed(self, qapp):
+        """The permissive branch, and the reason ``checked`` is read with no default.
+
+        Hand-typed rather than built from ``as_log_entry()`` **deliberately**: this
+        is a *pre-field* row, and ``as_log_entry`` can no longer produce one — it
+        always writes ``checked``. Every ``gate_log_json`` in the DataStore today
+        has this shape, so rendering it as anything but ``pass`` would blank the
+        entire stored corpus. It is the same ruling ``eis_validate_records
+        .passed_gates()`` makes.
+        """
+        log = [{"gate": "kk_residual", "severity": FLAG, "passed": True,
+                "detail": "within tolerance", "n_dropped": 0}]
+        assert ta_mod._gate_item(_fit(log)).text() == "pass"
+
+    def test_gate_item_a_blocked_spectrum_renders_rejected_over_dropped_and_unchecked(
+            self, qapp):
+        """A refusal outranks both counters — nothing else about the row matters."""
+        log = [_entry_dropped("outlier", 3),
+               _entry_unchecked("pegged_parameters"),
+               _entry_rejected("stuck_instrument")]
+        assert ta_mod._gate_item(_fit(log)).text() == "REJECTED: stuck_instrument"
+
+
+class TestGateItemTooltipIsThreeState:
+    """``_gate_mark`` distinguishes *could not check* from *checked and clean*."""
+
+    def _marks(self, log):
+        return [line.split("  ", 1)[0]
+                for line in ta_mod._gate_item(_fit(log)).toolTip().splitlines()]
+
+    def test_gate_item_tooltip_marks_an_unchecked_entry_unchecked(self, qapp):
+        assert self._marks([_entry_unchecked("pegged_parameters")]) == ["unchecked"]
+
+    def test_gate_item_tooltip_marks_a_failed_entry_fail(self, qapp):
+        assert self._marks([_entry_rejected("stuck_instrument")]) == ["FAIL"]
+
+    def test_gate_item_tooltip_marks_a_passed_entry_pass(self, qapp):
+        assert self._marks([_entry_passed("kk_residual")]) == ["pass"]
+
+    def test_gate_item_tooltip_carries_one_mark_per_entry_in_log_order(self, qapp):
+        log = [_entry_passed("kk_residual"),
+               _entry_unchecked("pegged_parameters"),
+               _entry_rejected("stuck_instrument")]
+        assert self._marks(log) == ["pass", "unchecked", "FAIL"]

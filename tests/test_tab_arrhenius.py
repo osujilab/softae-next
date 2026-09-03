@@ -35,16 +35,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import structlog
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtWidgets import QVBoxLayout, QWidget
+from PySide6.QtWidgets import QComboBox, QVBoxLayout, QWidget
 
 from softae.core.rig_activity import PURGE_INSTRUMENTS, RigActivity
 from softae.core.run_lock import RunLock, read_run_lock
 from softae.drivers.mock_factory import create_mock_manager
 from softae.gui.main_window import MainWindow
-from softae.gui.tabs.tab_arrhenius import ArrheniusTab
+from softae.gui.tabs.tab_arrhenius import ArrheniusTab, _restore_combo
 
 
 @pytest.fixture
@@ -571,3 +572,64 @@ class TestExportPaths:
         out = tmp_path / "store" / "runs" / "R1" / "images" / "rh_3d_ch1_R1.png"
         assert out.exists()
         assert list(cwd.iterdir()) == []
+
+
+class TestRestoreComboLogsAMiss:
+    """A saved config naming a model the combo does not offer must not miss silently.
+
+    ``findText`` returns -1, the combo keeps whatever was already selected, and the
+    sweep then fits a *different* model than the config on disk records. Falling back
+    is right — a restore path must not crash on a stale config — but the
+    substitution has to name what will actually run, or the operator cannot tell
+    which model the data came from.
+    """
+
+    def _combo(self, items, current):
+        combo = QComboBox()
+        combo.addItems(items)
+        combo.setCurrentIndex(items.index(current))
+        return combo
+
+    def test_restore_combo_hit_selects_the_requested_model(self, qapp):
+        combo = self._combo(["randles", "series_rc", "warburg"], "warburg")
+
+        _restore_combo(combo, "randles", "eis_model")
+
+        assert combo.currentText() == "randles"
+
+    def test_restore_combo_hit_logs_nothing(self, qapp):
+        """The quiet path stays quiet — a warning per restore would train it away."""
+        combo = self._combo(["arrhenius", "vft"], "vft")
+
+        with structlog.testing.capture_logs() as logs:
+            _restore_combo(combo, "arrhenius", "thermal_model")
+
+        assert logs == []
+
+    def test_restore_combo_miss_leaves_the_selection_unchanged(self, qapp):
+        combo = self._combo(["randles", "series_rc"], "series_rc")
+
+        _restore_combo(combo, "retired_circuit", "eis_model")
+
+        assert combo.currentText() == "series_rc"
+
+    def test_restore_combo_miss_does_not_raise(self, qapp):
+        """An empty combo is the degenerate miss: ``currentText()`` is ``''``."""
+        combo = QComboBox()
+
+        _restore_combo(combo, "randles", "eis_model")
+
+        assert combo.currentText() == ""
+
+    def test_restore_combo_miss_logs_requested_using_and_available(self, qapp):
+        combo = self._combo(["randles", "series_rc"], "series_rc")
+
+        with structlog.testing.capture_logs() as logs:
+            _restore_combo(combo, "retired_circuit", "eis_model")
+
+        entry = next(e for e in logs
+                     if e["event"] == "arrhenius_config_model_not_offered")
+        assert entry["field"] == "eis_model"
+        assert entry["requested"] == "retired_circuit"
+        assert entry["using"] == "series_rc"          # what will actually run
+        assert entry["available"] == ["randles", "series_rc"]

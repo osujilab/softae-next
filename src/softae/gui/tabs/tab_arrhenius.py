@@ -55,6 +55,30 @@ def _widget_alive(w: "QWidget") -> bool:
         return False
 
 
+def _restore_combo(combo: "QComboBox", wanted: str, field: str) -> None:
+    """Select *wanted* in *combo*, and say so in the log when it is not offered.
+
+    A saved config naming a model that no longer exists (a retired circuit, a
+    renamed thermal law) used to miss in silence: ``findText`` returned -1, the
+    combo kept whatever was already selected, and the sweep then fitted a
+    *different* model than the config on disk records. Falling back is still the
+    right behaviour — a restore path must not crash on a stale config — but the
+    substitution has to be visible, and it has to name what will actually run so
+    the operator can tell which model the data came from.
+    """
+    idx = combo.findText(wanted)
+    if idx >= 0:
+        combo.setCurrentIndex(idx)
+        return
+    logger.warning(
+        "arrhenius_config_model_not_offered",
+        field=field,
+        requested=wanted,
+        using=combo.currentText(),
+        available=[combo.itemText(i) for i in range(combo.count())],
+    )
+
+
 class ArrheniusTab(DaemonRunnerMixin, QWidget):
     """Temperature-stepped EIS sweep control panel.
 
@@ -636,12 +660,12 @@ class ArrheniusTab(DaemonRunnerMixin, QWidget):
             self._spin_eis_npts.setValue(int(config.eis_params.get("npts", 50)))
             self._spin_eis_mv_ac.setValue(int(config.eis_params.get("mv_ac", 10)))
             self._spin_eis_mv_dc.setValue(int(config.eis_params.get("mv_dc", 0)))
-        idx = self._combo_fit_model.findText(config.eis_model)
-        if idx >= 0:
-            self._combo_fit_model.setCurrentIndex(idx)
-        tidx = self._combo_thermal_model.findText(getattr(config, "thermal_model", "arrhenius"))
-        if tidx >= 0:
-            self._combo_thermal_model.setCurrentIndex(tidx)
+        _restore_combo(self._combo_fit_model, config.eis_model, "eis_model")
+        _restore_combo(
+            self._combo_thermal_model,
+            getattr(config, "thermal_model", "arrhenius"),
+            "thermal_model",
+        )
 
         # RH sweep
         if config.rh_setpoints:

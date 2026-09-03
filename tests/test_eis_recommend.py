@@ -309,6 +309,28 @@ class TestEnforcingRegimes:
                                          enforced=True)), "min_r_squared")
         assert rec.n == N
 
+    def test_split_identifiable_is_excluded_from_a_mixed_log_like_any_front2_metric(
+            self):
+        # `gate_degeneracy` reads `split_identifiable` off the covariance, so it cannot
+        # exist without a fit — Front-2 by the set's own definition.
+        #
+        # LATENT, NOT LIVE: no METRIC_KEYS entry targets it today, so nothing pools it
+        # and no recommendation is currently wrong. The membership is what makes the
+        # §6.2 exclusion already true on the day a fence IS placed against it, so this
+        # test places one rather than asserting set contents and calling that a reason.
+        from softae.analysis.eis.recommend import FRONT2_METRICS, _Key, _observations
+
+        assert not [k for k in METRIC_KEYS if k.metric == "split_identifiable"], (
+            "a real key now targets split_identifiable — this test's premise is stale")
+        assert "split_identifiable" in FRONT2_METRICS
+
+        spec = _Key("eis.gates", "hypothetical_fence", "split_identifiable", "gap",
+                    "lower_eq")
+        observing = records("split_identifiable", [1.0] * 10, enforced=False)
+        enforcing = records("split_identifiable", [0.0] * 10, enforced=True)
+        assert _observations(spec, observing + enforcing, True) == [1.0] * 10
+        assert len(_observations(spec, observing + enforcing, False)) == 20
+
 
 # ── The emitted TOML block ───────────────────────────────────────────────────
 

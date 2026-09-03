@@ -271,9 +271,28 @@ def _gate_item(fit_result: Any) -> "QTableWidgetItem":
     """The Gate cell: what the admission gates did to this spectrum.
 
     ``—`` on the legacy engine, which runs no gates. Otherwise ``pass``,
-    ``N dropped``, or ``REJECTED: <gate>``, with the full per-gate log in the
-    tooltip — R17's "no point removed without a named gate and a reason", carried
-    all the way to where someone actually looks.
+    ``N dropped``, ``N unchecked``, or ``REJECTED: <gate>``, with the full
+    per-gate log in the tooltip — R17's "no point removed without a named gate
+    and a reason", carried all the way to where someone actually looks.
+
+    The rendering is
+    :meth:`softae.analysis.eis.report.QualityReport.gate_summary`'s, adopted
+    token-for-token so the two surfaces cannot disagree. In particular
+    ``checked`` is read with **no default**: ``e.get("checked") is False`` only.
+    An absent ``checked`` means the entry predates the field and is rendered by
+    ``passed`` — deliberately the permissive branch, because every stored
+    ``gate_log_json`` predates ``checked``, and it is the same ruling
+    ``eis_validate_records.passed_gates()`` makes. Drops and unchecked gates are
+    reported *together*: they are independent facts, and neither shadows the
+    other.
+
+    **The empty-log guard differs from ``gate_summary``'s by necessity, not by
+    choice.** That method returns ``—`` on ``self.engine != "gated"``;
+    :class:`~softae.analysis.eis.circuit_fitting.FitResult` carries no ``engine``
+    field, so the same guard is not available here. The two are equivalent today
+    only because ``engine.py`` hardcodes ``gate_log=()`` on the legacy path —
+    an upstream guarantee, not a local one. If the legacy path ever starts
+    emitting a log, this cell renders it and ``gate_summary`` still would not.
     """
     log = list(getattr(fit_result, "gate_log", None) or [])
     if not log:
@@ -286,20 +305,37 @@ def _gate_item(fit_result: Any) -> "QTableWidgetItem":
         None,
     )
     dropped = sum(int(e.get("n_dropped", 0) or 0) for e in log)
+    unchecked = sum(1 for e in log if e.get("checked") is False)
 
     if rejected is not None:
         item = _ro_item(f"REJECTED: {rejected.get('gate', '?')}")
         item.setForeground(Qt.GlobalColor.red)
-    elif dropped:
-        item = _ro_item(f"{dropped} dropped")
     else:
-        item = _ro_item("pass")
+        parts = []
+        if dropped:
+            parts.append(f"{dropped} dropped")
+        if unchecked:
+            parts.append(f"{unchecked} unchecked")
+        item = _ro_item(", ".join(parts) if parts else "pass")
 
     item.setToolTip("\n".join(
-        f"{'pass' if e.get('passed', True) else 'FAIL'}  {e.get('gate', '?')}: "
-        f"{e.get('detail', '')}" for e in log
+        f"{_gate_mark(e)}  {e.get('gate', '?')}: {e.get('detail', '')}"
+        for e in log
     ))
     return item
+
+
+def _gate_mark(entry: dict) -> str:
+    """One gate entry's tooltip mark — three states, not two.
+
+    ``unchecked`` exists because ``passed=True`` on an entry that could not
+    evaluate its criterion is a *placeholder*, not a verdict, and rendering it
+    ``pass`` is the exact conflation ``checked`` was added to remove. Absent
+    ``checked`` still renders by ``passed`` — see :func:`_gate_item`.
+    """
+    if entry.get("checked") is False:
+        return "unchecked"
+    return "pass" if entry.get("passed", True) else "FAIL"
 
 
 def _editable_item(text: str) -> "QTableWidgetItem":
