@@ -1957,8 +1957,8 @@ class TestModelFlagVocabularies:
     def test_circuit_model_and_the_model_alias_reach_the_same_destination(self):
         for flag in ("--circuit-model", "--model"):
             args = build_parser().parse_args(
-                ["plan", "--channels", "1-4", flag, "simpleSaltMembrane"])
-            assert args.model == "simpleSaltMembrane"
+                ["plan", "--channels", "1-4", flag, "flexSalt"])
+            assert args.model == "flexSalt"
 
     def test_relaxation_model_and_the_model_alias_reach_the_same_destination(self):
         for flag in ("--relaxation-model", "--model"):

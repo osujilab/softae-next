@@ -428,7 +428,10 @@ The tab has two sub-tabs: **Fit & Export** (existing workflow) and **EIS Browser
 |---|---|---|
 | `simpleSalt` | R₀-CPE₀-p(R₁,C₀) | Simple ionic conductors |
 | `flexSalt` | R₀-CPE₀-p(R₁,C₀) with fixed C₀ | Salt solutions with known stray capacitance |
-| `simpleSaltMembrane` | R₀-CPE₀-p(R₁-Wo₁,C₀) | Membranes / diffusion-limited systems |
+
+`simpleSaltMembrane` was **retired on 2026-09-02** — it never returned a usable fit
+(one attempt in the entire fit history, and that one failed), and selecting it now
+raises an unknown-model error. Use `simpleSalt` for membrane samples.
 
 #### Sub-tab: EIS Browser
 
@@ -867,7 +870,10 @@ else:                                  # "unavailable"
 |---|---|---|---|
 | `simpleSalt` | R₀-CPE₀-p(R₁,C₀) | 5 free | General ionic conductors |
 | `flexSalt` | R₀-CPE₀-p(R₁,C₀) | 4 free + fixed C₀ | Known stray capacitance |
-| `simpleSaltMembrane` | R₀-CPE₀-p(R₁-Wo₁,C₀) | 7 free | Membrane / diffusion systems |
+
+`simpleSaltMembrane` was **retired on 2026-09-02** — its 7-element initial guess never
+reconciled against its constants, so the circuit raised before the optimiser was reached
+and it produced no usable fit in its lifetime. `fit_circuit` now rejects the name.
 
 ---
 

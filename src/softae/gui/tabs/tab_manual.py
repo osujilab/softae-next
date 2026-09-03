@@ -961,7 +961,9 @@ class ManualControlTab(QWidget):
         fit_row.addWidget(self._chk_autofit)
         fit_row.addWidget(QLabel("Model:"))
         self._combo_fit_model = QComboBox()
-        self._combo_fit_model.addItems(["simpleSalt", "flexSalt", "simpleSaltMembrane"])
+        from softae.analysis.circuit_fitting import CIRCUIT_MODELS
+        for m in CIRCUIT_MODELS:
+            self._combo_fit_model.addItem(m)
         fit_row.addWidget(self._combo_fit_model)
         # Off by default and deliberately so: this tab is where non-standard
         # samples get measured — two arcs, a stack, something nobody has

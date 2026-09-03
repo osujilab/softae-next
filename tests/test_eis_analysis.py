@@ -115,7 +115,15 @@ class TestCircuitFitting:
     def test_circuit_models_registry(self):
         assert "simpleSalt" in CIRCUIT_MODELS
         assert "flexSalt" in CIRCUIT_MODELS
-        assert "simpleSaltMembrane" in CIRCUIT_MODELS
+
+    def test_the_retired_membrane_model_stays_out_of_the_registry(self):
+        """Retired 2026-09-02: one fit-history row ever, ``success=0``, ``R1`` NULL.
+
+        A registry entry is cheap to re-add and expensive to notice, so the absence is
+        asserted rather than merely left. ``fit_circuit`` refuses an unknown model by
+        name, which is the behaviour a re-add would silently remove.
+        """
+        assert "simpleSaltMembrane" not in CIRCUIT_MODELS
 
     def test_circuit_model_has_required_keys(self):
         for name, model in CIRCUIT_MODELS.items():
@@ -589,7 +597,7 @@ class TestFitCircuitOptimiserBudget:
         assert _legacy_max_nfev() is None
         assert fit_circuit(clean, "simpleSalt").success
 
-    # -- the two refusals must not read alike ------------------------------
+    # -- the three refusals must not read alike ----------------------------
 
     def test_budget_and_dropped_point_refusals_are_distinct(self, clean):
         """The operator read one of these as "the EIS gates are enabled".
@@ -628,17 +636,75 @@ class TestFitCircuitOptimiserBudget:
         assert got.success
         assert got.failure_kind == ""
 
-    def test_an_unrelated_fit_error_is_not_labelled_a_budget_failure(self, clean):
-        """The classifier keys on ``curve_fit``'s wording, so prove it discriminates.
+    def test_an_unrelated_fit_error_is_not_labelled_a_budget_failure(self):
+        """The third refusal, and the one the other two must not absorb.
 
-        ``simpleSaltMembrane`` raises from ``CustomCircuit.__init__`` — before the
-        optimiser is reached at all — which is precisely the shape that must *not* be
-        reported as an exhausted budget.
+        This test was briefly retired with ``simpleSaltMembrane`` on 2026-09-02, on the
+        belief that no surviving model produces a natural fit error and that re-vehicling
+        it would mean patching ``CustomCircuit`` to raise.  That belief was wrong, and
+        the vehicle below is why: ``simpleSalt`` carries its own ``bounds``, whose ``R1``
+        floor is 100 Ω, while ``extract_features`` takes ``R1``'s initial guess *from the
+        spectrum*.  A cell conductive enough to put the bulk arc under 100 Ω therefore
+        hands ``curve_fit`` an ``x0`` outside its own bounds, and scipy raises
+        ``ValueError("Initial guess is outside of provided bounds")`` from
+        ``_lsq/least_squares.py`` before the optimiser spends a single evaluation.
+        Nothing is patched, monkeypatched or injected here — the model's shipped bounds
+        meet a spectrum, which is a reachable contract and not a fabricated input.
+
+        What is under test is the ``else`` of the classifier in ``fit_circuit``'s
+        ``except``: a non-budget exception must be labelled ``fit_error``.  Both
+        alternatives are excluded by construction rather than by assumption — the budget
+        is generous (so ``budget_exhausted`` cannot be right) and the spectrum is
+        all-finite (so ``too_few_points`` cannot be either) — and both are asserted, so
+        a classifier that stopped discriminating cannot pass this quietly.
         """
-        got = fit_circuit(clean, "simpleSaltMembrane", max_nfev=2)
+        lower_bound_R1 = CIRCUIT_MODELS["simpleSalt"]["bounds"][0][3]
+        assert lower_bound_R1 == 100.0, (
+            "premise: simpleSalt's own R1 floor is what this spectrum falls under"
+        )
+
+        # The reference topology with every impedance 1000x lower — the same cell, 1000x
+        # more conductive. Physical, and not a scaling trick applied to Z after the fact.
+        f, Z = reference_spectrum(
+            R_series=0.05, R_bulk=50.0, C_par=3.5e-7, Q=1.0e-4
+        )
+        conductive = as_eis_result(f, Z, channel=22)
+
+        assert usable_points(
+            conductive.frequency, conductive.z_real, conductive.z_imag_neg
+        ).all(), "premise: all-finite, so the too_few_points refusal cannot be the path"
+        guess = extract_features(
+            conductive.frequency, conductive.z_real, conductive.z_imag_neg
+        )["r1_guess"]
+        assert guess < lower_bound_R1, (
+            f"premise: the extracted R1 guess ({guess:.4g}) must fall under the model's "
+            "own floor, or scipy has nothing to object to"
+        )
+
+        got = fit_circuit(conductive, "simpleSalt", max_nfev=5000)
+
         assert not got.success
         assert got.failure_kind == "fit_error"
+        assert got.failure_kind != "budget_exhausted", (
+            "an exception that is not budget exhaustion must not be filed as one"
+        )
+        assert got.failure_kind != "too_few_points"
+        assert got.n_points_dropped == 0
+        assert np.isnan(got.R1)
+
+        # The refusals are pinned apart in wording as well as in token, because the GUI
+        # shows only the wording. A fit error must not borrow the budget refusal's prose.
+        assert "Initial guess is outside of provided bounds" in got.error_msg
         assert "budget" not in got.error_msg
+        assert "NOT a gate" not in got.error_msg
+
+        # And the same fitter on the ordinary spectrum succeeds, so this is the data
+        # meeting the bounds and not the machinery being broken.
+        assert fit_circuit(
+            as_eis_result(*reference_spectrum(), channel=22),
+            "simpleSalt",
+            max_nfev=5000,
+        ).success
 
     # -- the real manifold, not a fixture of it ----------------------------
 

@@ -69,15 +69,14 @@ CIRCUIT_MODELS: dict[str, dict[str, Any]] = {
         "z_indices": [0, 3],
         "description": "Flexible salt model with fixed stray capacitance",
     },
-    "simpleSaltMembrane": {
-        "circuit": "R0-CPE0-p(R1-Wo1,C0)",
-        "initial_guess": [None, 1e-7, 0.83, None, 1e-2, 1e2, None],
-        "bounds": None,
-        "constants": None,
-        "z_indices": [0, 3],
-        "description": "Salt + membrane diffusion (Warburg open)",
-    },
 }
+# ``simpleSaltMembrane`` (``R0-CPE0-p(R1-Wo1,C0)``, Warburg-open) was retired here on
+# 2026-09-02.  It produced exactly one row in the entire fit history — ``fit_id`` 3,
+# 2026-03-07, ``success=0``, ``R1`` NULL — and never a usable fit: its 7-element
+# ``initial_guess`` was reconciled against a 3-constant ``constants`` dict below, so
+# ``CustomCircuit.__init__`` raised on circuit length before the optimiser was reached
+# (53 of 54 spectra on the arrhenius sweep).  Selecting it now raises the unknown-model
+# ``ValueError`` from :func:`fit_circuit`, which names the models that do work.
 
 
 # ---------------------------------------------------------------------------
@@ -583,9 +582,6 @@ def fit_circuit(eis_result, model_name: str = "simpleSalt", *,
         else:
             initial_guess = [r0_guess, 1e-7, 0.83, r1_guess, None]
             constants = {"C0": 2e-10}
-    elif model_name == "simpleSaltMembrane":
-        initial_guess = [r0_guess, 1e-7, 0.83, r1_guess, 1e-2, 1e2, None]
-        constants = {"R0": r0_guess, "R1": r1_guess, "C0": 2e-10}
 
     # Build complex impedance: Z = Z' + jZ'' (note Z'' stored as -Z'')
     #

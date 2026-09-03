@@ -1340,7 +1340,7 @@ class TestFitAllEIS:
         in the header that the numbers below it were not produced with.
         """
         tab._eis_results = [_eis(1)]
-        idx = tab._combo_fit_model.findData("simpleSaltMembrane")
+        idx = tab._combo_fit_model.findData("flexSalt")
         assert idx >= 0
         tab._combo_fit_model.setCurrentIndex(idx)
 
@@ -1348,8 +1348,8 @@ class TestFitAllEIS:
                    return_value=_fit()) as fake:
             tab._on_fit_all_eis()
 
-        assert fake.call_args.args[1] == "simpleSaltMembrane"
-        assert "simpleSaltMembrane" in tab._txt_fit_output.toPlainText()
+        assert fake.call_args.args[1] == "flexSalt"
+        assert "flexSalt" in tab._txt_fit_output.toPlainText()
 
     def test_sigma_is_dashed_when_no_thickness_was_recorded_rather_than_computed_from_a_placeholder(
         self, tab: ExperimentBuilderTab, tmp_path

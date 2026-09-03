@@ -390,8 +390,8 @@ def test_a_migrated_fit_site_still_honours_a_module_scope_patch_of_fit_circuit(
     from softae.analysis.eis.engine import analyze_spectrum
 
     report = analyze_spectrum(_eis(), cell=CellConstant.from_legacy(0.2, 0.015, 0.2),
-                              model_name="simpleSaltMembrane")
-    assert calls == ["simpleSaltMembrane"]
+                              model_name="flexSalt")
+    assert calls == ["flexSalt"]
     assert report.fit.R1 == 5.0e4
 
 

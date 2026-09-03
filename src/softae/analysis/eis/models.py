@@ -2,9 +2,16 @@
 
 The legacy registry identifies the two resistances positionally, via ``z_indices =
 [0, 3]``. That is fragile in a way that has already bitten: ``simpleSaltMembrane``
-carries seven parameters and pins ``R0``/``R1`` as constants, so ``[0, 3]`` indexes
+carried seven parameters and pinned ``R0``/``R1`` as constants, so ``[0, 3]`` indexed
 the wrong slots for it, and ``eis_visualizer_widget`` rebuilds fits with ``[0, 1]``
 which matches nothing in the registry at all.
+
+**``simpleSaltMembrane`` was retired on 2026-09-02** and no longer exists in either
+registry — it never produced a usable fit in the whole stored history, and it raised
+before the optimiser on 53 of 54 spectra in the most recent sweep. It is named here
+anyway because it is *why this module exists*: retiring the model does not unmake the
+defect that role-addressing was built to prevent, and a reader who greps for the name
+should find that reason rather than a dangling reference.
 
 Here a model declares which *element names* play ``R_series`` and ``R_bulk``, and the
 parameter vector is addressed through those names. Renaming or reordering a circuit
@@ -79,8 +86,12 @@ EIS_CIRCUITS: dict[str, CircuitModel] = {
 LEGACY_ROLE_MAP: dict[str, dict[str, str]] = {
     "simpleSalt": {"R_series": "R0", "R_bulk": "R1"},
     "flexSalt": {"R_series": "R0", "R_bulk": "R1"},
-    "simpleSaltMembrane": {"R_series": "R0", "R_bulk": "R1"},
 }
+# ``simpleSaltMembrane`` was removed here on 2026-09-02 with the model itself. Its entry
+# named the same roles this map defaults to (``R_series``/``R0``, ``R_bulk``/``R1``), and
+# :func:`fitter.fit_spectrum` rejects an unknown model before it ever reaches
+# :func:`roles_for` — so the one stored row from 2026-03-07 (a failed fit, ``R1`` NULL)
+# resolves exactly as it did. The deletion is a no-op, which is why it is safe to make.
 
 
 def roles_for(model_name: str) -> dict[str, str]:
