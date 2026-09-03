@@ -9,7 +9,7 @@ nothing, so the arithmetic that will judge the rig sits in one file, is pinned b
 its own tests against hand-built records, and cannot be reached through a
 rendering change.
 
-Three rules govern everything below:
+Four rules govern everything below:
 
 1. **Offset and scatter are never combined into an RMS.** The failure mode under
    test is *biased, not scattered*. A median near zero with wide scatter means
@@ -36,6 +36,20 @@ Three rules govern everything below:
    ``[PASS] T1 ... observed n/a`` off two zero sums; rounding it to FAIL, as D1,
    D2 and D4 did, is the same error pointed the other way. Neither is a verdict,
    so neither is printed as one.
+4. **The hold certification marks rows and selects none of them.** D1-D4 pick
+   their populations by *band*, never by
+   :attr:`~softae.tools.eis_validate_records.Cell.stillness_certified`, and a
+   cell the settle gate could not speak for contributes its numbers exactly as
+   it always did. That is the operator's decision and it has a reason: those
+   numbers are the metrology the production limits will later be calibrated
+   from, and a row dropped here is a row that has to be re-earned on the rig.
+   The certification therefore reaches this file **only as a note**
+   (:func:`_retained_uncertified`), appended to D1-D4 when the count is non-zero
+   so that "median over 11 cells, 3 of them uncertified" cannot be read as
+   "median over 11 certified cells". A criterion whose note grew is still the
+   same criterion: no ``*_ok`` boolean, no population and no threshold reads the
+   stamp. H1 already withholds the verdict on any certification but ``settled``,
+   which is what makes keeping the rows safe.
 
 Rendered by :mod:`softae.tools.eis_validate_report`, which is also the single
 import surface these names are re-exported through.
@@ -164,6 +178,48 @@ def _status(ok: bool, evaluable: bool) -> str:
     return PASS if ok else FAIL
 
 
+def _retained_uncertified(contributors: Sequence[Cell]) -> str:
+    """How many cells *inside one statistic* were retained uncertified, or ``""``.
+
+    A note, never a filter. *contributors* is the exact set of cells whose
+    numbers entered the median being reported, so the sentence describes the
+    statistic that is printed beside it rather than the run as a whole -- a
+    median over eleven cells of which three were uncertified is a different
+    claim from one over eleven certified cells, and only the count makes the two
+    distinguishable.
+
+    Empty when every contributing cell was certified, which is what keeps a
+    fully certified run's report exactly what it was.
+    """
+    uncertified = [c for c in contributors if not c.stillness_certified]
+    if not uncertified:
+        return ""
+    words = ", ".join(sorted({c.certification for c in uncertified}))
+    return (
+        f"RETAINED UNCERTIFIED: {len(uncertified)} of {len(contributors)} "
+        f"cell(s) in this statistic were not certified still ({words}). Their "
+        "numbers are counted here ON PURPOSE and this is not a failure -- "
+        "metrology on more channels is what production limits get calibrated "
+        "from, and a row dropped here would have to be re-earned on the rig. "
+        "H1 withholds the verdict regardless, so nothing is licensed by them."
+    )
+
+
+def _note(*parts: str) -> str:
+    """Join a criterion's standing note to a conditional one, as sentences.
+
+    Every part but the last is terminated so the two cannot run together in the
+    wrapped block. The last is passed through **byte for byte**, so a criterion
+    with nothing to add renders exactly the characters it always did -- which is
+    what keeps a fully certified run's report unchanged.
+    """
+    kept = [part.strip() for part in parts if part and part.strip()]
+    if not kept:
+        return ""
+    lead = [p if p.endswith(".") else f"{p}." for p in kept[:-1]]
+    return " ".join(lead + kept[-1:])
+
+
 @dataclass
 class Verdict:
     outcome: str
@@ -232,6 +288,14 @@ def evaluate(
         [abs(v) for v in (c.delta_hold() for c in usable) if v is not None]
     )
 
+    # Exactly the cells whose numbers entered each median above -- not the
+    # populations, which are larger wherever a cell yielded no deviation. Used
+    # for the RETAINED UNCERTIFIED note and for nothing else; no threshold, no
+    # population and no `*_ok` boolean below reads these lists.
+    improving = [c for c in treatment if c.improvement() is not None]
+    deviating = [c for c in treatment if c.delta_scout() is not None]
+    control_deviating = [c for c in control if c.delta_scout() is not None]
+
     criteria: list[Criterion] = []
 
     # H1 first: if the hold did not hold, nothing below means anything.
@@ -288,7 +352,8 @@ def evaluate(
         _fmt(d_scout_control_abs.median, "dec") + f" (n={d_scout_control_abs.n})"
         if d_scout_control_abs.n else "no CONTROL cells (n=0)",
         _status(d3_ok, bool(d_scout_control_abs.n)),
-        "no improvement below this floor can be believed",
+        _note("no improvement below this floor can be believed",
+              _retained_uncertified(control_deviating)),
     ))
 
     d1_ok = (
@@ -301,6 +366,7 @@ def evaluate(
         _fmt(improvement.median, "dec") + f" (n={improvement.n})"
         if improvement.n else "no TREATMENT cell yielded an improvement (n=0)",
         _status(d1_ok, bool(improvement.n)),
+        _retained_uncertified(improving),
     ))
 
     frac = improvement.positive_fraction
@@ -311,7 +377,8 @@ def evaluate(
         f"{frac:.3f} ({improvement.n_positive}/{improvement.n})"
         if frac is not None else "no TREATMENT cell yielded an improvement (0/0)",
         _status(d2_ok, frac is not None),
-        "separates a real shift from a tail",
+        _note("separates a real shift from a tail",
+              _retained_uncertified(improving)),
     ))
 
     d4_negative = d_scout_treat.median is not None and d_scout_treat.median < 0
@@ -321,10 +388,12 @@ def evaluate(
         _fmt(d_scout_treat.median, "dec") if d_scout_treat.n
         else "no TREATMENT deviation (n=0)",
         _status(d4_negative, bool(d_scout_treat.n)),
-        "PRE-REGISTERED SIGN: R1 extrapolated past the apex is OVERestimated "
-        "(x1.598), and sigma = K/R, so the plain preset must read sigma LOW "
-        "against the reference (-0.204 dec). Reported as a FLAG, not a hard "
-        "fail -- but a GO with this inverted must be argued in prose.",
+        _note(
+            "PRE-REGISTERED SIGN: R1 extrapolated past the apex is OVERestimated "
+            "(x1.598), and sigma = K/R, so the plain preset must read sigma LOW "
+            "against the reference (-0.204 dec). Reported as a FLAG, not a hard "
+            "fail -- but a GO with this inverted must be argued in prose.",
+            _retained_uncertified(deviating)),
     ))
 
     ratio_cells = [c for c in usable if c.population in (CONTROL, TREATMENT)]

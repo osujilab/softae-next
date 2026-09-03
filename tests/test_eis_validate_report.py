@@ -271,6 +271,108 @@ def test_segmented_follow_up_failing_a_gate_the_scout_passed_vetoes():
     assert any(v.startswith("V2") and "hf_inductive" in v for v in vetoes)
 
 
+# ── Gate log: "passed" is not the whole story ────────────────────────────────
+#
+# `GateResult.checked` (analysis/eis/gates.py) splits a fail-open placeholder
+# from a verdict: a gate that could not evaluate its criterion serialises as
+# `passed=True, checked=False`. Reading `passed` alone counts it as a pass.
+
+def _log(gate: str, **fields) -> list[dict]:
+    return [{"gate": gate, "severity": "flag", "detail": "", "n_dropped": 0,
+             **fields}]
+
+
+def test_passed_gates_excludes_a_gate_that_could_not_check():
+    """The defect itself: fail-open is not a pass."""
+    row = _record(gate_log=_log("cap_flatness", passed=True, checked=False))
+    assert "cap_flatness" not in row.passed_gates()
+    assert row.unchecked_gates() == {"cap_flatness"}
+    assert row.failed_gates() == set()
+
+
+def test_passed_gates_keeps_a_checked_pass():
+    row = _record(gate_log=_log("cap_flatness", passed=True, checked=True))
+    assert row.passed_gates() == {"cap_flatness"}
+    assert row.unchecked_gates() == set()
+
+
+def test_passed_gates_keeps_a_row_written_before_the_checked_field_existed():
+    """The third state, decided rather than defaulted.
+
+    An absent ``checked`` is not ``checked=True``; it is a row whose writer had
+    no such concept. Its ``passed=True`` keeps its historical meaning here --
+    dropping it would empty the set for the whole stored corpus -- and the
+    absence stays visible instead of being folded into the pass.
+    """
+    row = _record(gate_log=_log("cap_flatness", passed=True))
+    assert row.passed_gates() == {"cap_flatness"}
+    assert row.unchecked_gates() == set()
+    assert not row.gate_log_distinguishes_unchecked
+
+
+def test_gate_log_distinguishes_unchecked_only_when_every_entry_records_it():
+    checked_era = _record(gate_log=_log("a", passed=True, checked=True)
+                          + _log("b", passed=False, checked=True))
+    mixed = _record(gate_log=_log("a", passed=True, checked=True)
+                    + _log("b", passed=True))
+    assert checked_era.gate_log_distinguishes_unchecked
+    assert not mixed.gate_log_distinguishes_unchecked
+    # An empty log reports no unchecked gates because nothing was RECORDED,
+    # which must not read like "nothing was unchecked".
+    assert not _record(gate_log=[]).gate_log_distinguishes_unchecked
+
+
+def test_the_three_gate_sets_partition_a_checked_era_log():
+    row = _record(gate_log=_log("ran_and_passed", passed=True, checked=True)
+                  + _log("ran_and_failed", passed=False, checked=True)
+                  + _log("could_not_check", passed=True, checked=False))
+    passed, failed, unchecked = (
+        row.passed_gates(), row.failed_gates(), row.unchecked_gates())
+    assert passed == {"ran_and_passed"}
+    assert failed == {"ran_and_failed"}
+    assert unchecked == {"could_not_check"}
+    assert not (passed & failed) and not (passed & unchecked)
+    assert not (failed & unchecked)
+    assert passed | failed | unchecked == {
+        "ran_and_passed", "ran_and_failed", "could_not_check"}
+
+
+def test_the_reader_matches_what_the_gate_module_actually_writes():
+    """Read the writer's own shape, not a hand-typed guess at it.
+
+    A fixture invented here would test this reader against a dict production
+    never emits. ``GateResult.unchecked(...).as_log_entry()`` is the exact
+    payload that reaches ``gate_log_json``.
+    """
+    import numpy as np
+
+    from softae.analysis.eis.gates import FLAG, GateResult
+
+    entry = GateResult.unchecked(
+        "relative_standard_error", FLAG, "covariance degenerate",
+        np.ones(4, dtype=bool)).as_log_entry()
+    assert entry["passed"] is True and entry["checked"] is False
+
+    row = _record(gate_log=[entry])
+    assert row.passed_gates() == set()
+    assert row.unchecked_gates() == {"relative_standard_error"}
+
+
+def test_a_gate_the_scout_could_not_check_does_not_veto_the_follow_up():
+    """V2's consumer end: a baseline never established cannot be regressed from.
+
+    The mirror of ``test_segmented_follow_up_failing_a_gate_the_scout_passed``:
+    same log, same failure downstream, but the scout's entry is a fail-open
+    placeholder rather than a verdict, so there is no pass to regress from.
+    """
+    records = _treatment_cell(1, d_scout=-0.3, d_adaptive=-0.1)
+    records[1].gate_log = _log("hf_inductive", passed=True, checked=False)
+    records[2].gate_log = _log("hf_inductive", passed=False, checked=True)
+    records[2].params["eis_sweep"] = "segmented"
+    vetoes = R.evaluate_vetoes(_cells(records))
+    assert not any(v.startswith("V2") for v in vetoes)
+
+
 def test_a_narrower_follow_up_vetoes():
     records = _treatment_cell(1, d_scout=-0.3, d_adaptive=-0.1)
     records[2].params["eis_validation_f_lo_hz"] = 20.0   # ABOVE the scout's 6.475
@@ -345,6 +447,211 @@ def test_excursion_cells_are_excluded_and_the_count_is_printed():
     assert payload["completeness"]["n_excluded_excursion_cells"] == 1
     assert payload["deviation"]["improvement"]["n"] == 5
     assert "EXCLUDED" in R.render(payload)
+
+
+# ── Hold certification: marking rows without selecting any ───────────────────
+#
+# Survivor mode drops cells whose stillness could not be established, but D1-D4
+# pick their populations by BAND, so a dropped cell's numbers still enter every
+# accuracy table. That is the operator's decision and not an oversight: those
+# numbers are what the production thresholds will later be calibrated from, and
+# a row dropped here is a row that has to be re-earned on the rig. What was
+# missing is that a reader could not tell which rows they were. Every test below
+# pins a MARK and never a filter -- the anti-regression one pins that most
+# directly, by comparing criterion for criterion against the same run certified.
+
+
+def _stamp(records, word, channels=None):
+    """Stamp *word* as the hold certification on every row, or only *channels*'."""
+    for row in records:
+        if channels is None or row.channel in channels:
+            row.params["eis_validation_hold_certified"] = word
+    return records
+
+
+def test_cell_certification_is_read_from_the_rows_it_already_holds():
+    """No second query and no new column: `SweepRecord.hold_certified` has always
+    read the stamp out of `eis_params_json`; it simply never reached the cell."""
+    cell = _cells(_stamp(_treatment_cell(1, d_scout=-0.3, d_adaptive=-0.1),
+                         "dropped_unevaluable"))[0]
+    assert cell.certifications == ("dropped_unevaluable",)
+    assert cell.certification == "dropped_unevaluable"
+    assert cell.stillness_certified is False
+
+
+def test_cell_survivor_stamp_counts_as_certified_and_the_drop_words_do_not():
+    """A survivor is a cell the gate COULD speak for; the dropped ones are the
+    cells it could not. Folding the two together would mark every row of a
+    survivor run and erase the only distinction the mark exists to draw."""
+    for word in ("settled", "survivors"):
+        cell = _cells(_stamp(_treatment_cell(1, d_scout=-0.3, d_adaptive=-0.1),
+                             word))[0]
+        assert cell.stillness_certified is True, word
+    for word in ("ceiling", "not_evaluable", "disabled", "dropped_moving",
+                 "dropped_unevaluable"):
+        cell = _cells(_stamp(_treatment_cell(1, d_scout=-0.3, d_adaptive=-0.1),
+                             word))[0]
+        assert cell.stillness_certified is False, word
+
+
+def test_cell_with_no_stamp_at_all_is_unstamped_not_certified():
+    """`undeclared is unknown, never empty` -- the house rule, applied here."""
+    cell = _cells(_stamp(_treatment_cell(1, d_scout=-0.3, d_adaptive=-0.1),
+                         ""))[0]
+    assert cell.certifications == ()
+    assert cell.certification == R.UNSTAMPED
+    assert cell.stillness_certified is False
+
+
+def test_cell_mixed_certifications_within_one_cell_are_not_certified():
+    """The stamp is per measurement, so one cell's rows can disagree.
+
+    Every statistic a cell yields is a within-cell ratio ACROSS those rows, so
+    one uncertified row is enough to make the ratio a comparison against a hold
+    that was not certified: the weaker claim wins. Both words are kept, so the
+    report can say which two disagreed rather than only that they did.
+    """
+    # `_treatment_cell` forwards **kwargs to the SCOUT row alone, so here the
+    # reference and the follow-up stay `settled` and the scout does not.
+    cell = _cells(_treatment_cell(1, d_scout=-0.3, d_adaptive=-0.1,
+                                  hold_certified="dropped_moving"))[0]
+    assert cell.certifications == ("settled", "dropped_moving")
+    assert cell.certification == "settled + dropped_moving"
+    assert cell.stillness_certified is False
+
+
+def test_uncertified_cells_enter_d1_to_d4_exactly_as_certified_ones_do():
+    """**The anti-regression test.** A marker may not move a pre-registered
+    verdict, so every criterion's threshold, observed value and status is
+    identical with three TREATMENT cells uncertified -- and only H1, which read
+    the stamp long before any of this marking existed, differs at all."""
+    settled = _passing_run()
+    marked = _stamp(_passing_run(), "dropped_unevaluable",
+                    channels={10, 11, 12})
+    a = R.evaluate(_cells(settled), min_treatment=6)
+    b = R.evaluate(_cells(marked), min_treatment=6)
+    assert [c.name for c in a.criteria] == [c.name for c in b.criteria]
+    for x, y in zip(a.criteria, b.criteria):
+        if x.name.startswith("H1"):
+            continue
+        assert (x.threshold, x.observed, x.status) == (
+            y.threshold, y.observed, y.status), x.name
+    assert a.vetoes == b.vetoes
+    # ...and the numbers themselves: every cell still counted, both populations.
+    certified = R.build_payload(settled, _cells(settled), {}, a)
+    payload = R.build_payload(marked, _cells(marked), {}, b)
+    assert payload["deviation"] == certified["deviation"]
+    assert payload["noise_floor"] == certified["noise_floor"]
+    assert payload["populations"] == certified["populations"]
+    assert payload["deviation"]["improvement"]["n"] == 6
+    # H1's withhold is untouched: no false GO off the marked run, and no new
+    # refusal on the certified one either.
+    assert a.outcome == R.OUTCOME_GO
+    assert b.outcome == R.OUTCOME_INSUFFICIENT
+
+
+def test_survivor_run_marks_only_the_cells_the_gate_dropped():
+    """The case the mark exists for: inside ONE run, survivors and dropped cells
+    sit side by side in the same D tables and were indistinguishable."""
+    records = _stamp(_passing_run(), "survivors")
+    _stamp(records, "dropped_unevaluable", channels={10, 11})
+    cells = _cells(records)
+    assert [c.key for c in cells if not c.stillness_certified] == [
+        "10:30:25:1", "11:30:25:1"]
+    verdict = R.evaluate(cells, min_treatment=6)
+    # H1 is untouched: `survivors` is not `settled`, so the verdict withholds
+    # exactly as it did before any of this existed.
+    assert _status(verdict, "H1") == R.FAIL
+    assert verdict.outcome == R.OUTCOME_INSUFFICIENT
+    payload = R.build_payload(records, cells, {}, verdict)
+    assert payload["certification"]["n_uncertified_cells"] == 2
+
+
+def test_uncertified_rows_are_marked_in_the_report_as_retained_not_failed():
+    records = _stamp(_passing_run(), "dropped_unevaluable",
+                     channels={10, 11, 12})
+    cells = _cells(records)
+    report = R.render(R.build_payload(records, cells, {},
+                                      R.evaluate(cells, min_treatment=6)))
+    assert "3 of 26 cell(s) RETAINED UNCERTIFIED" in report
+    assert "ch10   10:30:25:1" in report
+    assert "TREATMENT   dropped_unevaluable" in report
+    assert "RETAINED UNCERTIFIED: 3 of 6 TREATMENT cell(s) below" in report
+    # The vocabulary says retained evidence, never an error or an exclusion.
+    # Flattened, because the roster prose is wrapped to the block width.
+    prose = " ".join(report.split())
+    assert "numbers are KEPT in sections 4-8 ON PURPOSE" in prose
+    assert "NOT a failure and NOT an exclusion" in prose
+    # ...and the tag rides the printed rows themselves: three rescue-depth rows
+    # in section 6 and the one drift-check row in section 2.
+    assert report.count(R.UNCERTIFIED_MARK) == 4
+
+
+def test_uncertified_count_is_stated_next_to_each_d_criterion():
+    """`median over 11 cells, 3 of them uncertified` is a different claim from
+    `median over 11 certified cells`, and only the count distinguishes them."""
+    records = _stamp(_passing_run(), "dropped_unevaluable",
+                     channels={10, 11, 12})
+    verdict = R.evaluate(_cells(records), min_treatment=6)
+    for name in ("D1", "D2", "D4"):
+        note = next(c.note for c in verdict.criteria if c.name.startswith(name))
+        assert "RETAINED UNCERTIFIED: 3 of 6 cell(s)" in note, name
+        assert "dropped_unevaluable" in note, name
+    # D3 is the CONTROL noise floor, and none of ITS cells were uncertified.
+    d3 = next(c for c in verdict.criteria if c.name.startswith("D3"))
+    assert d3.note == "no improvement below this floor can be believed"
+    # The count survives the wrap into the rendered criteria block.
+    payload = R.build_payload(records, _cells(records), {}, verdict)
+    assert "RETAINED UNCERTIFIED: 3 of 6" in _criteria_block(R.render(payload))
+
+
+def test_uncertified_partition_reaches_the_structured_output():
+    """The stated purpose is later threshold calibration, so the partition must
+    be recoverable from the JSON artifact without parsing console text."""
+    records = _stamp(_passing_run(), "dropped_unevaluable",
+                     channels={10, 11, 12})
+    cells = _cells(records)
+    payload = R.build_payload(records, cells, {},
+                              R.evaluate(cells, min_treatment=6))
+    block = payload["certification"]
+    assert block["n_uncertified_cells"] == 3
+    assert block["n_cells"] == 26
+    assert block["by_certification"] == {"dropped_unevaluable": 3}
+    assert block["uncertified_by_population"] == {R.CONTROL: 0, R.TREATMENT: 3}
+    assert [e["channel"] for e in block["uncertified_cells"]] == [10, 11, 12]
+    assert block["certified_still"] == ["settled", "survivors"]
+    assert "RETAINED, NOT DROPPED" in block["policy"]
+    # One bool per cell: what an offline analysis actually filters on.
+    assert [c["cell"] for c in payload["cells"]
+            if not c["stillness_certified"]] == [
+        "10:30:25:1", "11:30:25:1", "12:30:25:1"]
+    assert all(c["hold_certification"] == "dropped_unevaluable"
+               for c in payload["cells"] if not c["stillness_certified"])
+    assert payload["hold"]["uncertified_channels"] == ["10"]
+    assert [e["cell"] for e in payload["mechanism"]["rescue_depth"]
+            if not e["stillness_certified"]] == [
+        "10:30:25:1", "11:30:25:1", "12:30:25:1"]
+    # The whole block is JSON, not repr: `--out` writes it verbatim.
+    assert json.loads(json.dumps(payload))["certification"] == block
+
+
+def test_a_fully_certified_run_report_is_unchanged():
+    """No marker anywhere, no note grew, and the outcome is the same GO."""
+    records = _passing_run()
+    cells = _cells(records)
+    verdict = R.evaluate(cells, min_treatment=6)
+    payload = R.build_payload(records, cells, {}, verdict)
+    report = R.render(payload)
+    assert "RETAINED UNCERTIFIED" not in report
+    assert R.UNCERTIFIED_MARK not in report
+    assert payload["certification"]["n_uncertified_cells"] == 0
+    assert payload["certification"]["uncertified_cells"] == []
+    notes = {c.name[:2]: c.note for c in verdict.criteria}
+    assert notes["D1"] == ""
+    assert notes["D2"] == "separates a real shift from a tail"
+    assert notes["D3"] == "no improvement below this floor can be believed"
+    assert notes["D4"].endswith("must be argued in prose.")
+    assert verdict.outcome == R.OUTCOME_GO
 
 
 # ── Mechanism ────────────────────────────────────────────────────────────────

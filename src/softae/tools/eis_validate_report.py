@@ -45,6 +45,17 @@ the one that would matter:
    verdict. The arithmetic that would produce one is still exercised in full --
    that is what the grid-aware backend in :mod:`softae.tools.eis_validate_mock`
    is for -- but the outcome line says WITHHELD.
+
+4. **It never lets an uncertified row pass for a certified one -- and never
+   drops it either.** A cell the settle gate could not speak for keeps its
+   numbers in every accuracy table, because that metrology is what production
+   limits get calibrated from and a row dropped here has to be re-earned on the
+   rig (:attr:`~softae.tools.eis_validate_records.Cell.stillness_certified`).
+   What it does not keep is its anonymity: the cell is listed in section 3 with
+   the certification it carries, marked ``(uncertified)`` wherever its row is
+   printed, counted beside every criterion computed over it, and partitionable
+   offline off ``payload["cells"][*]["stillness_certified"]`` without parsing a
+   line of this text.
 """
 
 from __future__ import annotations
@@ -59,10 +70,12 @@ from softae.tools.eis_validate_records import (
     ARM_REFERENCE,
     ARM_REFERENCE_END,
     ARM_SCOUT,
+    CERTIFIED_STILL,
     CONTROL,
     EXCLUDED,
     TREATMENT,
     UNRESOLVED,
+    UNSTAMPED,  # noqa: F401  -- re-export; the word an unstamped cell carries
     Cell,
     SweepRecord,
     _as_float,
@@ -116,6 +129,14 @@ STATUS_WIDTH = max(len(s) for s in (PASS, FAIL, INSUFFICIENT, "VETO"))
 #: Column the criterion's own detail lines hang from: ``"  ["`` + status + ``"] "``.
 _DETAIL_INDENT = " " * (STATUS_WIDTH + 5)
 
+#: What a printed row of an uncertified cell is tagged with. One neutral word,
+#: because the row is **retained evidence and not an error**: it is not spelled
+#: ``FAIL``, ``!`` or ``EXCLUDED``, all three of which already mean something
+#: else in this report and none of which is what happened here. Section 3 states
+#: the policy in full once, so the per-row tag stays short enough to sit at the
+#: end of the widest line it marks.
+UNCERTIFIED_MARK = "(uncertified)"
+
 
 # ── The machine-readable report ──────────────────────────────────────────────
 
@@ -151,6 +172,7 @@ def build_payload(
         "populations": {
             pop: [c.key for c in group] for pop, group in sorted(by_pop.items())
         },
+        "certification": _certification_block(cells, by_pop),
         "apex_histogram": _apex_histogram(cells),
         "noise_floor": describe(
             [abs(v) for v in (c.delta_scout() for c in control) if v is not None]
@@ -167,11 +189,16 @@ def build_payload(
                 str(c.channel): c.delta_hold()
                 for c in usable if c.delta_hold() is not None
             },
+            "uncertified_channels": sorted(
+                str(c.channel) for c in usable
+                if c.delta_hold() is not None and not c.stillness_certified
+            ),
         },
         "mechanism": {
             "closure_discordance": _closure_discordance(treatment),
             "rescue_depth": [
-                {"cell": c.key, "required_dec": d[0], "delivered_dec": d[1]}
+                {"cell": c.key, "required_dec": d[0], "delivered_dec": d[1],
+                 "stillness_certified": c.stillness_certified}
                 for c, d in ((c, c.rescue_depth()) for c in treatment)
                 if d is not None
             ],
@@ -198,6 +225,12 @@ def build_payload(
             {
                 "cell": c.key, "channel": c.channel, "population": c.population,
                 "complete": c.complete, "excursion": c.excursion,
+                # The offline partition, one bool per cell. `hold_certification`
+                # is the word for a human; this is the thing a threshold-
+                # calibration script filters on without reading the text report.
+                "stillness_certified": c.stillness_certified,
+                "hold_certification": c.certification,
+                "hold_certifications": list(c.certifications),
                 "scout_verdict": c.scout.scout_verdict if c.scout else "",
                 "reference_arc_closed": bool(
                     c.reference.arc_closed) if c.reference else None,
@@ -213,6 +246,51 @@ def build_payload(
             for c in cells
         ],
         "caveats": CAVEATS,
+    }
+
+
+def _certification_block(
+    cells: Sequence[Cell], by_pop: dict[str, list[Cell]]
+) -> dict[str, Any]:
+    """Who was retained uncertified, how many, and in which population.
+
+    The **roster** is over every cell recorded, excursion-excluded ones
+    included: a cell that was measured is a cell whose provenance a reader can
+    ask about. The **per-population counts** are over ``by_pop``, which the
+    caller built from the usable cells, so they line up with the population
+    sizes printed beside them and with the medians the criteria quote.
+
+    ``policy`` travels in the payload rather than only in this file's docstring
+    because the offline analysis that partitions on ``stillness_certified``
+    months from now is the reader most likely to mistake a marked row for a
+    rejected one, and it will be holding the JSON and not the source.
+    """
+    uncertified = [c for c in cells if not c.stillness_certified]
+    by_word: dict[str, int] = {}
+    for cell in uncertified:
+        by_word[cell.certification] = by_word.get(cell.certification, 0) + 1
+    return {
+        "certified_still": sorted(CERTIFIED_STILL),
+        "n_cells": len(cells),
+        "n_uncertified_cells": len(uncertified),
+        "by_certification": dict(sorted(by_word.items())),
+        "uncertified_by_population": {
+            pop: sum(1 for c in group if not c.stillness_certified)
+            for pop, group in sorted(by_pop.items())
+        },
+        "uncertified_cells": [
+            {"cell": c.key, "channel": c.channel, "population": c.population,
+             "certification": c.certification}
+            for c in uncertified
+        ],
+        "policy": (
+            "RETAINED, NOT DROPPED. These cells keep their numbers in every "
+            "accuracy table and in D1-D4, unchanged: that metrology is what "
+            "production limits get calibrated from, and a row dropped here "
+            "would have to be re-earned on the rig. The mark is provenance, "
+            "not a failure. H1 withholds the verdict on any certification "
+            "other than `settled`, so no GO can be emitted off them."
+        ),
     }
 
 
@@ -262,8 +340,10 @@ def render(payload: dict[str, Any]) -> str:
     hold = payload["hold"]["delta_hold"]
     add(f"  median |Delta_hold| {_fmt(hold['median'], 'dec')}  "
         f"MAD {_fmt(hold['mad'], 'dec')}  n={hold['n']}")
+    uncertified_channels = set(payload["hold"].get("uncertified_channels", []))
     for ch, value in sorted(payload["hold"]["per_channel"].items()):
-        add(f"    ch{ch:<4} Delta_hold = {value:+.4f} dec")
+        add(f"    ch{ch:<4} Delta_hold = {value:+.4f} dec"
+            + (f"   {UNCERTIFIED_MARK}" if ch in uncertified_channels else ""))
 
     add("")
     add("-- 3. POPULATIONS " + "-" * 56)
@@ -281,13 +361,16 @@ def render(payload: dict[str, Any]) -> str:
     if excluded:
         add(f"  {excluded} cell(s) EXCLUDED above: taken inside a warn-grade "
             "hold excursion.")
+    _add_certification_roster(add, payload)
 
     add("")
     add("-- 4. NOISE FLOOR (CONTROL) " + "-" * 46)
+    _add_uncertified_count(add, payload, CONTROL)
     _add_spread(add, payload["noise_floor"], "|Delta_scout|")
 
     add("")
     add("-- 5. DEVIATION (TREATMENT) " + "-" * 46)
+    _add_uncertified_count(add, payload, TREATMENT)
     for label, key in (("Delta_scout", "delta_scout"),
                        ("Delta_adaptive", "delta_adaptive"),
                        ("improvement", "improvement")):
@@ -306,7 +389,9 @@ def render(payload: dict[str, Any]) -> str:
         add("  rescue depth (required vs delivered, decades):")
         for entry in depths:
             add(f"    {entry['cell']:<28} required {entry['required_dec']:+.3f}  "
-                f"delivered {entry['delivered_dec']:+.3f}")
+                f"delivered {entry['delivered_dec']:+.3f}"
+                + ("" if entry.get("stillness_certified", True)
+                   else f"  {UNCERTIFIED_MARK}"))
     add(f"  UNRESOLVED verdicts: {payload['mechanism']['unresolved_verdicts'] or '{}'}")
 
     add("")
@@ -388,6 +473,57 @@ def _soak_line(spec: dict[str, Any]) -> str:
         return "none -- the first spectrum followed the settle gate directly"
     return (f"{seconds / 3600:.2f} h held at condition before the first "
             "spectrum")
+
+
+def _add_certification_roster(add: Any, payload: dict[str, Any]) -> None:
+    """Name every cell the settle gate could not speak for, once, in section 3.
+
+    Nothing is printed when every cell was certified, so a fully certified run's
+    report is what it always was -- and the absence of this block is itself the
+    statement that there was nothing to say.
+
+    It sits in POPULATIONS rather than beside the criteria because a reader
+    scanning the accuracy tables needs the roster *before* the medians, and
+    because the per-row tag further down has to stay short: the policy is
+    explained here once and abbreviated to :data:`UNCERTIFIED_MARK` everywhere
+    else.
+    """
+    block = payload.get("certification", {})
+    count = block.get("n_uncertified_cells", 0)
+    if not count:
+        return
+    for line in _wrap(
+        f"{count} of {block['n_cells']} cell(s) RETAINED UNCERTIFIED: the "
+        "settle gate could not certify these cells still. Their numbers are "
+        "KEPT in sections 4-8 ON PURPOSE -- that metrology is what production "
+        "limits get calibrated from, and a row dropped here would have to be "
+        "re-earned on the rig. NOT a failure and NOT an exclusion; H1 "
+        "withholds the verdict on any certification but 'settled', so nothing "
+        "is licensed by them.", 70
+    ):
+        add(f"  {line}")
+    for entry in block.get("uncertified_cells", []):
+        add(f"    ch{entry['channel']:<4} {entry['cell']:<20} "
+            f"{entry['population']:<11} {entry['certification']}")
+
+
+def _add_uncertified_count(
+    add: Any, payload: dict[str, Any], population: str
+) -> None:
+    """``k of n`` for the population whose table follows, or nothing.
+
+    Stated at the head of the table as well as beside each criterion, because a
+    median over eleven cells of which three were uncertified is a different
+    claim from one over eleven certified cells, and the spreads in sections 4
+    and 5 carry no criterion of their own to hang the count off.
+    """
+    count = payload.get("certification", {}).get(
+        "uncertified_by_population", {}).get(population, 0)
+    if not count:
+        return
+    total = len(payload["populations"].get(population, []))
+    add(f"  RETAINED UNCERTIFIED: {count} of {total} {population} cell(s) below "
+        "-- counted, by design")
 
 
 def _add_spread(add: Any, spread: dict[str, Any], label: str) -> None:
@@ -532,12 +668,14 @@ def _wrap(text: str, width: int) -> list[str]:
 
 __all__ = [
     "ARM_FOLLOW_UP", "ARM_REFERENCE", "ARM_REFERENCE_END", "ARM_SCOUT",
-    "CONTROL", "D1_MIN_MEDIAN_IMPROVEMENT_DEC", "D2_MIN_POSITIVE_FRACTION",
+    "CERTIFIED_STILL", "CONTROL", "D1_MIN_MEDIAN_IMPROVEMENT_DEC",
+    "D2_MIN_POSITIVE_FRACTION",
     "D3_MAX_CONTROL_DEVIATION_DEC", "EXCLUDED", "FAIL",
     "H3_MAX_HOLD_DRIFT_DEC", "INSUFFICIENT", "OUTCOME_CONDITIONAL_GO",
     "OUTCOME_GO", "OUTCOME_INSUFFICIENT", "OUTCOME_MECHANISM_LIMITED",
     "OUTCOME_NO_GO", "OUTCOME_WITHHELD", "PASS", "REPORT_SCHEMA",
-    "STATUS_WIDTH", "T1_MAX_TIME_RATIO", "TREATMENT", "UNRESOLVED",
+    "STATUS_WIDTH", "T1_MAX_TIME_RATIO", "TREATMENT", "UNCERTIFIED_MARK",
+    "UNRESOLVED", "UNSTAMPED",
     "Cell", "Criterion", "Spread", "SweepRecord", "Verdict",
     "assemble_cells", "build_payload", "checkpoint_campaign", "cmd_report",
     "describe", "evaluate", "evaluate_vetoes", "generate", "load_checkpoint",

@@ -14,14 +14,18 @@ Nothing in this module knows a threshold. It answers three questions and stops:
    decades of log10, all within-cell so the cell constant ``K`` in ``sigma = K/R``
    cancels exactly (spec 3.4).
 
-The one judgement that does live here is :attr:`Cell.population`, and it lives
-here because it is a statement about *the sweep that was taken* rather than about
-a criterion: whether a cell is CONTROL, TREATMENT or UNRESOLVED is decided by two
-frequencies -- the scout's verdict and the reference's own validity -- both of
-which are properties of the rows. That partition is what keeps a deviation
-between two extrapolations out of every accuracy table
-(:attr:`SweepRecord.reference_valid`), and it must be computable without the rule
-module ever being imported.
+The judgements that do live here are statements about *the sweeps that were
+taken* rather than about a criterion, which is why they can be computed without
+the rule module ever being imported:
+
+* :attr:`Cell.population` -- whether a cell is CONTROL, TREATMENT or UNRESOLVED
+  is decided by two frequencies, the scout's verdict and the reference's own
+  validity, both properties of the rows. That partition is what keeps a deviation
+  between two extrapolations out of every accuracy table
+  (:attr:`SweepRecord.reference_valid`).
+* :attr:`Cell.stillness_certified` -- whether the hold gate could speak for this
+  cell, read off the per-measurement ``hold_certified`` stamp. It **marks** rows
+  and selects nothing: the populations above are unchanged by it, deliberately.
 
 The rule that judges these numbers is :mod:`softae.tools.eis_validate_rule`; the
 report that renders them is :mod:`softae.tools.eis_validate_report`, which is
@@ -46,6 +50,35 @@ CONTROL = "CONTROL"
 TREATMENT = "TREATMENT"
 UNRESOLVED = "UNRESOLVED"
 EXCLUDED = "EXCLUDED"
+
+#: The hold certifications under which a **cell's** stillness was established.
+#:
+#: Two words, not one. ``settled`` is the whole board certified quiet;
+#: ``survivors`` is a *partitioned* settle phase in which these cells were
+#: certified quiet and others were dropped
+#: (:data:`softae.analysis.equilibration.SETTLE_SURVIVORS`, whose own docstring
+#: says it: "these cells were certified quiet, those cells could not be judged
+#: and were dropped"). A survivor is a cell the gate **could** speak for, so
+#: folding it in with the dropped cells would mark every row of a survivor run
+#: and erase the one distinction this vocabulary exists to draw.
+#:
+#: This is a **cell**-level predicate and deliberately not the board-level
+#: :attr:`softae.tools.eis_validate_hold.SettleOutcome.certified`, which is
+#: ``verdict == "settled"`` and stays ``False`` for a survivor run. H1 keeps the
+#: board-level rule and withholds the verdict on anything but ``settled``;
+#: nothing here weakens it.
+#:
+#: Spelled as literals rather than imported from
+#: :mod:`softae.analysis.equilibration`, for the same reason
+#: :mod:`softae.tools.eis_validate_rule` spells ``"settled"`` as one: the reading
+#: half imports nothing from ``softae``, and pulling numpy in through a shared
+#: analysis module to read two strings is not a trade worth making.
+CERTIFIED_STILL: frozenset[str] = frozenset({"settled", "survivors"})
+
+#: What a cell whose rows carry no certification at all is called in a table.
+#: Named rather than left blank because "undeclared is unknown, never empty" is
+#: the house rule, and an empty column reads as an oversight.
+UNSTAMPED = "unstamped"
 
 
 # ── Reading ──────────────────────────────────────────────────────────────────
@@ -183,13 +216,82 @@ class SweepRecord:
         return str(self.params.get("eis_sweep", "")) == "segmented"
 
     def passed_gates(self) -> set[str]:
+        """Gates that **ran and passed** -- never one that could not check.
+
+        ``GateResult.checked`` exists because a gate unable to evaluate its
+        criterion must fail *open*: it returns ``passed=True`` as a placeholder
+        and marks the placeholder with ``checked=False``
+        (:meth:`softae.analysis.eis.gates.GateResult.unchecked`). Reading
+        ``passed`` alone therefore counts "could not check" as "checked and
+        clean", which is the conflation the field was added to remove.
+
+        Three states, read via :func:`_gate_checked` with **no default**,
+        because ``None`` is a third answer and not a synonym for ``True``:
+
+        =============  ===========================================  ===========
+        ``checked``    what the entry is saying                     in this set?
+        =============  ===========================================  ===========
+        ``True``       the gate ran and returned a verdict          if ``passed``
+        ``False``      it could not run; ``passed`` is a            **never**
+                       fail-open placeholder, not a verdict
+        absent         the row predates the field                   if ``passed``
+        =============  ===========================================  ===========
+
+        **The third row is a judgement, not a default.** For a row written
+        before the field existed, ``passed=True`` means exactly what it has
+        always meant here -- "this gate did not refuse the spectrum" -- and no
+        better information is recoverable from it, so this method reports it
+        unchanged. Excluding it instead would empty this set for the *entire*
+        stored corpus (every ``gate_log_json`` in the DataStore today predates
+        ``checked``), silently retiring
+        :func:`softae.tools.eis_validate_rule.evaluate_vetoes`'s V2 rather than
+        repairing it. The absence is not swept under the pass either: it is
+        readable at :attr:`gate_log_distinguishes_unchecked`, so a caller that
+        needs the stronger claim can ask whether this row can support it.
+        """
         return {
             str(entry.get("gate", ""))
             for entry in self.gate_log
-            if entry.get("passed")
+            if entry.get("passed") and _gate_checked(entry) is not False
         }
 
+    def unchecked_gates(self) -> set[str]:
+        """Gates that could not evaluate their criterion on this sweep.
+
+        Disjoint from :meth:`passed_gates` by construction and from
+        :meth:`failed_gates` by ``GateResult.__post_init__``'s invariant, so
+        the three sets partition a ``checked``-era log. A non-empty result
+        means this spectrum's record has holes in it -- a different statement
+        from either a pass or a refusal, and the one that used to be
+        unavailable.
+        """
+        return {
+            str(entry.get("gate", ""))
+            for entry in self.gate_log
+            if _gate_checked(entry) is False
+        }
+
+    @property
+    def gate_log_distinguishes_unchecked(self) -> bool:
+        """Can this row tell "checked and clean" from "could not check"?
+
+        ``False`` for a log written before ``GateResult.checked`` existed and
+        ``False`` for an empty log. In both cases :meth:`unchecked_gates` is
+        empty because nothing was *recorded*, never because nothing was
+        unchecked -- and the two must not read alike.
+        """
+        return bool(self.gate_log) and all(
+            _gate_checked(entry) is not None for entry in self.gate_log
+        )
+
     def failed_gates(self) -> set[str]:
+        """Gates that ran and refused. Deliberately unchanged by ``checked``.
+
+        ``GateResult.__post_init__`` forbids ``checked=False, passed=False``,
+        so ``passed is False`` already implies the gate ran; an unchecked entry
+        cannot reach this set. The identity test -- not truthiness -- is also
+        what keeps an entry with no ``passed`` key out of it.
+        """
         return {
             str(entry.get("gate", ""))
             for entry in self.gate_log
@@ -286,6 +388,73 @@ class Cell:
             for row in (self.reference, self.scout, self.follow_up)
             if row is not None
         )
+
+    @property
+    def rows(self) -> tuple[SweepRecord, ...]:
+        """Every sweep this cell actually holds, in arm order."""
+        return tuple(
+            row for row in
+            (self.reference, self.scout, self.follow_up, self.reference_end)
+            if row is not None
+        )
+
+    @property
+    def certifications(self) -> tuple[str, ...]:
+        """Every distinct ``hold_certified`` this cell's rows carry, first seen first.
+
+        Derived from the rows rather than stored, and that is the whole of the
+        plumbing: :attr:`SweepRecord.hold_certified` has always read the stamp
+        out of ``eis_params_json``, so no second query, no new column and no
+        field that can go stale against the rows it summarises. A hand-built
+        :class:`Cell` -- there are some, in tests -- reports its rows' real
+        certification instead of a constructor default nobody passed.
+
+        **All four arms, including ``reference_end``.** The stamp is written per
+        measurement, so it is a fact about the row; a cell that quoted only three
+        of its four rows would under-report, and ``delta_hold`` -- the one
+        statistic ``reference_end`` feeds -- is a number a reader sees.
+        """
+        seen: list[str] = []
+        for row in self.rows:
+            if row.hold_certified and row.hold_certified not in seen:
+                seen.append(row.hold_certified)
+        return tuple(seen)
+
+    @property
+    def certification(self) -> str:
+        """One word for a table cell; ``a + b`` when the cell's rows disagree."""
+        return " + ".join(self.certifications) or UNSTAMPED
+
+    @property
+    def stillness_certified(self) -> bool:
+        """Was this cell's stillness established? **Marks the row; keeps the number.**
+
+        A cell this returns ``False`` for is *retained evidence*, never an error
+        and never a dropped row. Its numbers stay in D1-D4 exactly as they were,
+        because the operator's reason for keeping them is that they are the data
+        the production limits will be calibrated from: *"having metrology on more
+        channels before having valid criteria avoids downstream confusion and
+        allows refinement on criteria for production limits."* A dropped row is
+        data that would otherwise have to be re-earned on the rig, and keeping it
+        costs nothing as long as its provenance is visible -- which is what this
+        flag is for, and the whole of what it is for.
+
+        So the obvious-looking "fix" -- filtering these cells out of the accuracy
+        tables -- is wrong twice over: it discards the calibration evidence, and
+        it edits a pre-registered criterion after the data arrived, which
+        :mod:`softae.tools.eis_validate_rule` exists to forbid. Nothing routes on
+        this property. H1 already withholds the verdict on any certification
+        other than ``settled``, so no false ``GO`` can be emitted either way.
+
+        **A cell whose rows disagree is not certified.** The stamp is per
+        measurement, so disagreement inside one cell is a real possibility, and
+        every statistic a cell produces is a within-cell ratio *across* those
+        rows -- one uncertified row is enough to make the ratio a comparison
+        against a hold that was not certified. The weaker claim therefore wins,
+        and :attr:`certification` keeps both words so the report can say which
+        two disagreed.
+        """
+        return bool(self.certifications) and set(self.certifications) <= CERTIFIED_STILL
 
     @property
     def population(self) -> str:
@@ -433,6 +602,21 @@ def _delta(numerator: SweepRecord | None, denominator: SweepRecord | None) -> fl
     return None
 
 
+def _gate_checked(entry: dict[str, Any]) -> bool | None:
+    """``entry["checked"]`` as a tri-state: ``True``, ``False``, or *unrecorded*.
+
+    ``.get("checked")`` with **no default**, deliberately. A default of ``True``
+    would spell "this writer had no such concept" with the same token as "the
+    gate ran and found nothing wrong", and a default of ``False`` would call
+    every historical row unchecked; both are claims the record does not make.
+    ``None`` is returned for an explicit JSON ``null`` too -- nothing writes one
+    (``GateResult.as_log_entry`` emits ``bool(self.checked)``), and if something
+    ever did, "unrecorded" is the honest reading of it.
+    """
+    value = entry.get("checked")
+    return None if value is None else bool(value)
+
+
 def _as_float(value: Any) -> float:
     try:
         return float(value)
@@ -451,7 +635,8 @@ def _loads(text: Any, default: Any) -> Any:
 
 __all__ = [
     "ARM_FOLLOW_UP", "ARM_REFERENCE", "ARM_REFERENCE_END", "ARM_SCOUT",
-    "CONTROL", "EXCLUDED", "TREATMENT", "UNRESOLVED",
+    "CERTIFIED_STILL", "CONTROL", "EXCLUDED", "TREATMENT", "UNRESOLVED",
+    "UNSTAMPED",
     "Cell", "SweepRecord", "assemble_cells", "checkpoint_campaign",
     "load_checkpoint", "load_records",
 ]
