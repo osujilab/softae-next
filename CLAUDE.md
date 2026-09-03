@@ -142,6 +142,38 @@ edit cannot reach. Three tiers, each with its own owner and its own gate:
   the next edit; a green tier-3 run is what licenses a commit. Tier 3 is the tier that actually
   catches cross-cutting regressions, so it is never traded away before a commit — it is backgrounded
   so it does not block.
+- **A green suite on the working tree is not transitive to HEAD, and the check is by symbol.** The
+  gate certifies the *tree*; the commit captures the *index*. A file in `MM` state — staged and
+  unstaged edits both — commits only its staged half, and nothing fails locally because the working
+  tree always had both. Only a fresh checkout would show it, and no session here does one. This is
+  not hypothetical: it is how `36d574a` landed a set of tests without the source they exercise.
+  **Run the symbol check BEFORE the commit, across every coupled dirty pair, and again afterwards as
+  confirmation.** Detection after the fact was always the weaker half of this rule: one pre-commit
+  sweep across the long-standing dirty set found a `36d574a` loaded and waiting ten days — a test
+  file asserting on a symbol HEAD's source defines zero times, both halves dirty, and nothing
+  anywhere recording that the two had to move together. `git show HEAD:<path> | grep <symbol>` on
+  both halves. A clean `git status` proves only that nothing was left behind.
+- **Choose the symbol from the TEST half, never from the source half.** The check exists to catch
+  tests committed without their source, so the probe must be a symbol **the tests actually reference
+  by name**; then confirm the source defines it. Choosing from the source side — the newest, most
+  defect-adjacent name just added — reliably picks a private helper the tests exercise only through
+  its public surface, and the check then reports a **false failure on correct work**. That is the
+  worse of the two directions: a check that cries wolf on good commits teaches everyone to override
+  it, and then it is not there on the day it is right. And when **no** symbol crosses the boundary by
+  name, the check is **inapplicable, not passed** — `0 / 0` is indistinguishable from a genuine
+  `36d574a` and equally indistinguishable from perfect safety. Record which one it is.
+- **The freeze lifts per file, not per tree: inventory files stay frozen until they commit.** Once
+  the post-bracket is taken the run is spent, and files *not* on the commit list are free
+  immediately. Files *on* it are not. A commit list outlives the bracket that licensed it, so a file
+  edited after the gate **forfeits its gate cover while still sitting on a list that says a gate
+  covered it** — the same non-transitivity as above, running forward in time instead of backward.
+- **Check the seam the commit will create, not only the halves it commits.** When a gate runs on a
+  tree where some files are held back, the commit produces a pairing the gate never certified — new
+  source against old callers — and it is a pairing **no session's working tree reproduces**, because
+  every tree still carries the held-back edits. Only a fresh checkout has it, and no session here
+  does one. One grep per held-back file, before the commit: does it reference any symbol this commit
+  changes? An empty seam is the common case and costs nothing to confirm; the point is that it is
+  not guaranteed.
 - **Test time is a budgeted resource, and the budget is planned before the work starts.** Tier 3 now
   costs ~28 min. On a multi-step arc, one tier-3 run per step is the default that quietly turns a
   day of work into three: eleven steps is over five hours of gating, most of it re-proving the same
