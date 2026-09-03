@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -118,6 +119,35 @@ SETTLE_TOL_REL_LOOSE = 0.20
 #: ``--yes-i-really-mean-it`` escape would restore exactly the value it exists to
 #: refuse.
 SETTLE_TOL_REL_MAX = 0.50
+
+#: Which criterion the settle gate routes on. Restated here rather than imported
+#: for the reason :data:`DEFAULT_SETTLE_TOL_REL` is, and pinned to
+#: :data:`softae.analysis.equilibration.SETTLE_CRITERION_DEVIATION` by a test.
+DEFAULT_SETTLE_CRITERION = "deviation"
+#: **Unset**, not "no drift permitted". A rate criterion with no tolerance has
+#: nothing to compare against, so 0 is refused at :func:`validate_plan` rather
+#: than taken literally -- a literal zero would make every cell moving and the
+#: run would blame the film for the flag.
+DEFAULT_SETTLE_RATE_TOL_DEC_PER_H = 0.0
+
+#: Above this rate band the run refuses to start, on exactly
+#: :data:`SETTLE_TOL_REL_MAX`'s argument and for exactly its reason. At 0.5 dec/h
+#: a cell whose conductivity changes by a factor of **3.16 every hour** still
+#: certifies as having stopped moving; there is no film state that reading
+#: describes. The two directions are again not symmetric: a band set too TIGHT is
+#: self-correcting -- :data:`~softae.analysis.equilibration.RATE_SPAN_TOO_SHORT`
+#: and :data:`~softae.analysis.equilibration.RATE_UNDETECTABLE` are both
+#: non-evaluable, so the phase runs to its ceiling and refuses -- while a band set
+#: too LOOSE certifies, and the run it produces is indistinguishable from a
+#: correct one.
+#:
+#: The number is calibrated against what the shipped deviation band already
+#: amounts to: ``--settle-tol-rel 0.10`` over the measured 562.5 s round is
+#: 0.610 ln/h = **0.265 dec/h**, so nothing presently defensible is refused here.
+#: For scale in the other direction, H3 asks the whole hold to stay inside 0.05
+#: dec. Deliberately **not** overridable, for the reason
+#: :data:`SETTLE_TOL_REL_MAX` is not.
+SETTLE_RATE_TOL_DEC_PER_H_MAX = 0.5
 
 #: No soak unless one is asked for. Every invocation and every test written
 #: before the soak existed must behave exactly as it did, and 0 is the only
@@ -265,6 +295,27 @@ class ValidationPlan:
     #: **In** :meth:`fingerprint`, unlike ``circuit_model`` and unlike every
     #: other duration on this plan -- see that method for why.
     settle_tol_rel: float = DEFAULT_SETTLE_TOL_REL
+    #: Which of the two sibling criteria the settle gate ROUTES on --
+    #: ``deviation`` (shipped), ``rate``, or ``both`` (deviation routes, the rate
+    #: is reported). **In** :meth:`fingerprint` when it is not the default, on
+    #: ``settle_tol_rel``'s argument: this is the criterion, not a ceiling on
+    #: waiting for one.
+    settle_criterion: str = DEFAULT_SETTLE_CRITERION
+    #: The rate band, in **decades per hour** -- the operator's unit, converted
+    #: to the gate's ln-units at the one boundary that needs it
+    #: (:func:`~softae.analysis.equilibration.rate_tol_ln_per_hour`). Decades
+    #: because H3 is in decades and the spec derives this number from it as
+    #: ``H3_MAX_HOLD_DRIFT_DEC / T_meas``; an operator who computes it computes
+    #: decades. 0 means unset and is refused for the criteria that need it.
+    settle_rate_tol_dec_per_h: float = DEFAULT_SETTLE_RATE_TOL_DEC_PER_H
+    #: At the ceiling, partition rather than fail: proceed on the cells the
+    #: criterion certified quiet and record the rest with their reasons.
+    #: **Off by default**, so every existing verdict is byte-identical, and
+    #: available only here -- the campaign path does not get it, because
+    #: conditioning a BO objective on settling biases it toward materials that
+    #: equilibrate fast, which is a material property correlated with the thing
+    #: being optimised.
+    survivors: bool = False
 
     def cell_key(self, channel: int) -> str:
         return (f"{int(channel)}:{self.rh_setpoint_pct:g}:"
@@ -316,6 +367,19 @@ class ValidationPlan:
         before this field existed keeps its fingerprint, so introducing an
         operator knob does not invalidate an in-flight run's ``--resume`` --
         including the run whose unsatisfiable band is why the knob exists.
+
+        **The criterion selector and the survivor flag join it, on the same
+        argument and by the same conditional mechanism.** The spec that proposed
+        them argued they were *out* -- ceilings on waiting for a criterion -- and
+        that argument does not survive contact with the paragraph above: they are
+        not ceilings on waiting for the criterion, they ARE the criterion, and
+        ``survivors`` decides which cells are admitted to the population at all,
+        which is ``settle_tol_rel``'s side of the ceiling-versus-floor line
+        rather than ``settle_max_hold_s``'s. A ``--resume`` that switched
+        ``--settle-criterion`` mid-run would be exactly the after-the-fact
+        criterion choice :mod:`softae.tools.eis_validate_rule` opens by
+        forbidding. Each enters only when it is not the default, so every
+        checkpoint written before these fields existed keeps its fingerprint.
         """
         import hashlib
 
@@ -328,6 +392,15 @@ class ValidationPlan:
             # Labelled, not bare: a self-describing token cannot be confused
             # with a future appended field, and reads in a debugger.
             parts.append(f"settle_tol_rel={float(self.settle_tol_rel)!r}")
+        if str(self.settle_criterion) != DEFAULT_SETTLE_CRITERION:
+            parts.append(f"settle_criterion={str(self.settle_criterion)!r}")
+            # Only under a criterion that reads it: a rate band typed beside
+            # `deviation` changes nothing about what was measured, and hashing
+            # it would refuse a resume over a number the run never used.
+            parts.append("settle_rate_tol_dec_per_h="
+                         f"{float(self.settle_rate_tol_dec_per_h)!r}")
+        if bool(self.survivors):
+            parts.append("survivors=True")
         return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
     def as_dict(self) -> dict[str, Any]:
@@ -410,6 +483,83 @@ def validate_plan(plan: ValidationPlan) -> None:
             f"whose conductivity doubled between rounds. If the gate cannot be "
             f"cleared at a defensible band, the cells are the problem and a "
             f"wider band only hides it."
+        )
+    _validate_criterion(plan)
+
+
+def _validate_criterion(plan: ValidationPlan) -> None:
+    """The criterion selector and the survivor flag, refused before any heat.
+
+    Four refusals, and every one of them is a run that would otherwise spend its
+    whole ceiling at temperature before failing for a reason the operator could
+    have been told at the prompt.
+    """
+    from softae.analysis.equilibration import (
+        DEFAULT_SETTLE_MIN_CHANNELS,
+        SETTLE_CRITERIA,
+        SETTLE_CRITERION_DEVIATION,
+    )
+
+    criterion = str(plan.settle_criterion)
+    if criterion not in SETTLE_CRITERIA:
+        raise RefuseToStart(
+            f"--settle-criterion {criterion!r} is not one of "
+            f"{', '.join(SETTLE_CRITERIA)}.")
+    rate_tol = float(plan.settle_rate_tol_dec_per_h)
+    if criterion != SETTLE_CRITERION_DEVIATION:
+        if not math.isfinite(rate_tol) or rate_tol <= 0:
+            raise RefuseToStart(
+                f"--settle-criterion {criterion} needs "
+                f"--settle-rate-tol-dec-per-h, and {rate_tol:g} is not a usable "
+                "band. It is a DRIFT RATE in decades per hour, not a relative "
+                "deviation and not %RH: 0.025 means a cell whose conductivity "
+                "moves by 0.025 decades in an hour is still called still. The "
+                "spec derives it from H3 as 0.05 dec / (measurement block "
+                "hours), so a 2 h block wants 0.025. A zero or negative band "
+                "would make every cell moving and the run would blame the film."
+            )
+        if rate_tol > SETTLE_RATE_TOL_DEC_PER_H_MAX:
+            raise RefuseToStart(
+                f"--settle-rate-tol-dec-per-h {rate_tol:g} is above the maximum "
+                f"{SETTLE_RATE_TOL_DEC_PER_H_MAX:g}. This number is DECADES PER "
+                f"HOUR: {rate_tol:g} certifies a cell whose conductivity changes "
+                f"by a factor of {10.0 ** rate_tol:.3g} every hour as having "
+                f"stopped moving. For scale, the shipped --settle-tol-rel 0.10 "
+                f"over a 562.5 s round is 0.265 dec/h, and H3 asks the whole "
+                f"hold to stay inside 0.05 dec. If the gate cannot be cleared at "
+                f"a defensible band, the cells are the problem."
+            )
+    if not plan.survivors:
+        return
+    if criterion == SETTLE_CRITERION_DEVIATION:
+        # The partition rests on telling "this cell is MOVING" from "this cell
+        # cannot be judged", and the deviation criterion is precisely the one
+        # that cannot: for a 3-round window its statistic IS the window noise
+        # floor to within 13 %. Partitioning on it would drop the moving cells
+        # along with the noisy ones -- the exact failure the criterion exists to
+        # prevent, wearing the feature's name.
+        raise RefuseToStart(
+            "--survivors on needs --settle-criterion rate or both. The "
+            "partition drops cells the gate could not JUDGE and keeps refusing "
+            "on cells it proved were MOVING, and the deviation criterion cannot "
+            "tell those apart -- its statistic is a scatter estimate compared "
+            "against a drift tolerance. Dropping on it would drop the moving "
+            "cells too."
+        )
+    # A survivor set must clear `min_channels` AND carry `min_treatment`
+    # TREATMENT cells AND at least one CONTROL. TREATMENT survivors are
+    # survivors, so the binding floor is the larger of the two and not their
+    # sum, plus the one CONTROL that keeps D3 computable.
+    floor = max(DEFAULT_SETTLE_MIN_CHANNELS, int(plan.min_treatment) + 1)
+    if len(plan.channels) < floor:
+        raise RefuseToStart(
+            f"--survivors on with {len(plan.channels)} channel(s): a survivor "
+            f"set must carry at least {int(plan.min_treatment)} TREATMENT "
+            f"cell(s), at least one CONTROL, and at least "
+            f"{DEFAULT_SETTLE_MIN_CHANNELS} cells in total -- {floor} channels "
+            "before a single one is dropped. Partitioning a board with no "
+            "headroom refuses at the same ceiling it would have refused at, "
+            "having spent the whole hold to get there."
         )
 
 
@@ -933,6 +1083,26 @@ class SettleOutcome:
     #: Median relative scatter across the participating channels of the last
     #: judged window -- the number the endorsement was decided against.
     noise_floor_rel: float | None = None
+    #: The cells the rate criterion certified quiet at the last judged window.
+    #: Populated whenever a rate was computed, under ``--survivors`` on OR off:
+    #: recording is not routing, and the denominator is worth having either way.
+    survivors: list[int] = field(default_factory=list)
+    #: ``{channel: why}`` for every cell that did not survive, in the criterion's
+    #: own refusal vocabulary. **This is the denominator.** Without it "11 of 13
+    #: settled" is unrecoverable after the fact, which is exactly what made
+    #: 20260821T173111Z and 20260821T192508Z impossible to diagnose.
+    dropped: dict[int, str] = field(default_factory=dict)
+    #: The band census recomputed over :attr:`survivors` -- what
+    #: ``--min-treatment`` must be judged against once cells have been dropped.
+    #: Empty when nothing was partitioned.
+    survivor_projected: dict[str, int] = field(default_factory=dict)
+    #: Which post-drop floor broke, in words, or ``""``. Non-empty means the
+    #: partition was attempted and refused, and the verdict stayed a refusal.
+    survivor_refusal: str = ""
+    #: Mean rate across the cells that produced a fit, ln-units per hour.
+    #: Reported and never routed on -- pooling certifies the population and this
+    #: gate's endpoints are per cell.
+    pooled_rate_per_hour: float | None = None
 
     @property
     def certified(self) -> bool:
@@ -974,9 +1144,11 @@ def settle_phase(
     from softae.analysis.equilibration import (
         DEFAULT_MIN_HOLD_FIRST_S,
         DEFAULT_RH_STABILITY_PCT,
+        SETTLE_CRITERION_DEVIATION,
         SETTLE_DISABLED,
         SettleTracker,
         r1_lower_bound_ohms,
+        rate_tol_ln_per_hour,
     )
     from softae.workflows.equilibration import default_round_period_s
 
@@ -1003,10 +1175,20 @@ def settle_phase(
     # shipped 0.10 silently -- correct for the board it was measured on and
     # arithmetically unsatisfiable on 20260821T173111Z_eis_validate, whose own
     # median scatter was 12.5-14 %.
+    #
+    # `criterion` selects which of the two sibling gates routes; `deviation` is
+    # the shipped default and `both` routes on it while reporting the rate, so
+    # the only configuration that changes a verdict is the one an operator asked
+    # for by name. The rate band arrives in DECADES per hour -- the unit H3 is in
+    # and the unit the spec derives it in -- and is converted once, here.
+    criterion = str(plan.settle_criterion)
+    rate_tol = (None if criterion == SETTLE_CRITERION_DEVIATION
+                else rate_tol_ln_per_hour(plan.settle_rate_tol_dec_per_h))
     tracker = SettleTracker(
         enabled=True, tol_rel=plan.settle_tol_rel,
         rh_stability_pct=DEFAULT_RH_STABILITY_PCT,
-        r1_bound_ohms=r1_lower_bound_ohms(plan.circuit_model))
+        r1_bound_ohms=r1_lower_bound_ohms(plan.circuit_model),
+        criterion=criterion, rate_tol_per_hour=rate_tol)
     if (wide := loose_band_notice(plan.settle_tol_rel)):
         print(wide, flush=True)
     rh = manager.get(RH_CONTROLLER)
@@ -1071,6 +1253,7 @@ def settle_phase(
               f"-> {state}", flush=True)
         if check is not None and not check.evaluable:
             print(f"         not evaluable: {check.reason}", flush=True)
+        _announce_rate(tracker, plan)
         _announce_endorsement(tracker, endorsed, endorsement, announced,
                               floor_rel=floor_rel)
         _announce_basis(fits, check, tracker.min_channels, plan.circuit_model,
@@ -1111,6 +1294,10 @@ def settle_phase(
             # that survives, from a run that stalled because the film moved.
             "n_modelled": _n_modelled(fits),
             "excluded_by_channel": _narrated_exclusions(check),
+            # The criterion that ROUTED this round. One word, and without it a
+            # reader of a `settled` cannot tell which of two gates said so.
+            "settle_criterion": criterion,
+            **_rate_payload(tracker),
         })
 
         if tracker.settled and elapsed >= floor_s:
@@ -1122,13 +1309,67 @@ def settle_phase(
 
     verdict = tracker.outcome(stopped_early=stopped_early)
     projected = _project_populations(apexes, plan)
-    return SettleOutcome(
+    outcome = SettleOutcome(
         verdict=verdict, n_rounds=rounds, elapsed_s=float(now()) - start,
         apex_by_channel=apexes, projected=projected,
         rh_median_pct=_read_rh(rh) if rh is not None else float("nan"),
         tolerance_achievable=endorsed, endorsement=endorsement,
         noise_floor_rel=floor_rel,
     )
+    _apply_survivors(outcome, tracker, plan)
+    return outcome
+
+
+def _apply_survivors(
+    outcome: SettleOutcome, tracker: Any, plan: ValidationPlan
+) -> None:
+    """Record the partition always; let it change the verdict only if asked.
+
+    Two separable things, and collapsing them is how a feature that is "off by
+    default" ends up changing a default. **Recording** the survivor set and the
+    per-cell reason happens whenever a rate was computed at all, because the
+    denominator costs nothing and its absence is what made both of the 2026-08-21
+    runs undiagnosable. **Routing** on it happens only under ``--survivors on``.
+
+    A cell proven MOVING keeps the run refusing, whatever the flag says. That is
+    the locked distinction the whole criterion exists to draw: "this cell is
+    moving" is evidence about the sample and blocks; "this cell cannot be judged"
+    is an absence and may be dropped, recorded, and swept anyway.
+    """
+    from softae.analysis.equilibration import (
+        SETTLE_CEILING,
+        SETTLE_NOT_EVALUABLE,
+        SETTLE_SURVIVORS,
+    )
+
+    rate = tracker.last_rate
+    if rate is None:
+        return
+    outcome.pooled_rate_per_hour = rate.pooled_rate_per_hour
+    outcome.survivors, outcome.dropped = survivor_partition(rate, plan.channels)
+    if not plan.survivors:
+        return
+    bands = band_by_channel(outcome.apex_by_channel, plan)
+    outcome.survivor_projected = {
+        band: sum(1 for ch in outcome.survivors if bands.get(ch) == band)
+        for band in set(bands.values())
+    }
+    _announce_survivors(outcome, tracker.min_channels)
+    if outcome.verdict not in (SETTLE_CEILING, SETTLE_NOT_EVALUABLE):
+        return
+    if rate.moving:
+        outcome.survivor_refusal = (
+            f"{len(rate.moving)} cell(s) were PROVEN to be still moving, which "
+            f"no partition may drop: "
+            + " ".join(f"ch{ch}" for ch in rate.moving)
+            + ". A moving cell invalidates the paired difference the run exists "
+              "to make, so this is evidence about the sample and not an absence "
+              "of it.")
+        return
+    outcome.survivor_refusal = survivor_floors(
+        outcome.survivors, bands, min_channels=tracker.min_channels)
+    if not outcome.survivor_refusal:
+        outcome.verdict = SETTLE_SURVIVORS
 
 
 def _announce_endorsement(
@@ -1191,6 +1432,103 @@ def _announce_endorsement(
                   f"{floor * 100:.1f}% exceeds the tolerance "
                   f"{tracker.tol_rel * 100:.2f}% -- no hold length can satisfy "
                   f"it, so waiting is not the fix", flush=True)
+
+
+def _announce_rate(tracker: Any, plan: ValidationPlan) -> None:
+    """The rate line, under the round's ``[settle]`` line. Silent by default.
+
+    Printed on every round that produced a rate, unlike the endorsement lines
+    above, because under ``both`` this IS the shadow measurement -- the two
+    criteria read the same window and the operator is being asked to compare
+    them, which cannot be done from a line that prints once.
+
+    The tolerance is quoted in the unit the operator typed it in, and the rate
+    beside it in the same one, because the gate's own arithmetic is in ln-units
+    and a number printed in one unit next to a threshold in another is exactly
+    the trap ``spread 0.130`` was.
+    """
+    from softae.analysis.equilibration import (
+        LN_PER_DECADE,
+        SETTLE_CRITERION_BOTH,
+    )
+
+    rate = tracker.last_rate
+    if rate is None:
+        return
+    worst = rate.max_upper_bound_per_hour
+    worst_text = "  n/a" if worst is None else f"{worst / LN_PER_DECADE:+7.4f}"
+    pooled = rate.pooled_rate_per_hour
+    pooled_text = ("  n/a" if pooled is None
+                   else f"{pooled / LN_PER_DECADE:+7.4f}")
+    shadow = (" (SHADOW -- deviation is what routed this round)"
+              if tracker.criterion == SETTLE_CRITERION_BOTH else "")
+    print(f"         rate: worst 95% bound {worst_text} dec/h  pooled "
+          f"{pooled_text} dec/h  (tol "
+          f"{plan.settle_rate_tol_dec_per_h:g} dec/h)  quiet "
+          f"{len(rate.quiet)} moving {len(rate.moving)} unjudgeable "
+          f"{len(rate.undetectable) + len(rate.unsettleable)}{shadow}",
+          flush=True)
+    if rate.moving:
+        print("         still MOVING: "
+              + " ".join(f"ch{ch}" for ch in rate.moving)
+              + " -- a proven slope, which no partition may drop", flush=True)
+
+
+def _rate_payload(tracker: Any) -> dict[str, Any]:
+    """The rate's share of the ``on_round`` record -- **empty by default**.
+
+    Absent rather than null under ``deviation``, so a reader of the stream can
+    tell "this run did not compute a rate" from "this round's rate was
+    unavailable", and so the shipped payload is byte-identical to today's.
+
+    Every value here is a rate or a count -- dimensionless per hour, or a channel
+    number -- which is the same line the deviations already sit on: gate state,
+    never the observable behind it.
+    """
+    from softae.analysis.equilibration import LN_PER_DECADE
+
+    rate = tracker.last_rate
+    if rate is None:
+        return {}
+    per_channel = {
+        str(ch): round(judged.rate_per_hour / LN_PER_DECADE, 6)
+        for ch, judged in sorted(rate.by_channel.items())
+        if judged.rate_per_hour is not None
+    }
+    return {
+        "rate_evaluable": bool(rate.evaluable),
+        "rate_settled": bool(rate.settled),
+        "rate_dec_per_h_by_channel": per_channel,
+        "pooled_rate_dec_per_h": (
+            None if rate.pooled_rate_per_hour is None
+            else round(rate.pooled_rate_per_hour / LN_PER_DECADE, 6)),
+        "rate_quiet": list(rate.quiet),
+        "rate_moving": list(rate.moving),
+        "rate_unjudgeable": sorted(rate.undetectable + rate.unsettleable),
+        "rate_span_s": round(rate.span_s, 1),
+        "rate_reason": rate.reason,
+    }
+
+
+def _announce_survivors(outcome: SettleOutcome, min_channels: int) -> None:
+    """The partition, at the drop, with the bias it introduces named out loud."""
+    from softae.tools.eis_validate_report import CONTROL, TREATMENT, UNRESOLVED
+
+    total = len(outcome.survivors) + len(outcome.dropped)
+    census = outcome.survivor_projected
+    detail = ", ".join(f"ch{ch} ({why})"
+                       for ch, why in sorted(outcome.dropped.items()))
+    print(f"[settle] SURVIVORS {len(outcome.survivors)}/{total}"
+          + (f" -- dropped {detail}" if detail else " -- nothing dropped")
+          + f". {CONTROL} {census.get(CONTROL, 0)} {TREATMENT} "
+            f"{census.get(TREATMENT, 0)} {UNRESOLVED} "
+            f"{census.get(UNRESOLVED, 0)}; the gate's minimum is "
+            f"{int(min_channels)}.", flush=True)
+    print("         Every number this run reports is now CONDITIONAL ON "
+          "SETTLING. Dropped cells are still swept and are stamped so the "
+          "population filter excludes them, and the reason for each is in the "
+          "run's event stream -- read the survivor set as a subset, never as "
+          "the board.", flush=True)
 
 
 def _announce_basis(
@@ -1271,6 +1609,14 @@ def _narrated_exclusions(check: Any) -> dict[str, str]:
     console line beside it carries the number, and the constants stay unchanged
     for every caller that is not a stream.
     """
+    if check is None:
+        return {}
+    return {str(ch): _exclusion_word(why)
+            for ch, why in sorted(check.excluded.items())}
+
+
+def _exclusion_word(why: str) -> str:
+    """One ``EXCLUDED_*`` constant, in the vocabulary a stream may carry."""
     from softae.analysis.equilibration import (
         EXCLUDED_ABSENT,
         EXCLUDED_RAILED,
@@ -1278,12 +1624,107 @@ def _narrated_exclusions(check: Any) -> dict[str, str]:
         EXCLUDED_ZERO_MEAN,
     )
 
-    words = {EXCLUDED_ABSENT: "absent", EXCLUDED_SIGMA_NULL: "no_value",
-             EXCLUDED_RAILED: "railed", EXCLUDED_ZERO_MEAN: "zero_mean"}
-    if check is None:
-        return {}
-    return {str(ch): words.get(why, "excluded")
-            for ch, why in sorted(check.excluded.items())}
+    return {EXCLUDED_ABSENT: "absent", EXCLUDED_SIGMA_NULL: "no_value",
+            EXCLUDED_RAILED: "railed",
+            EXCLUDED_ZERO_MEAN: "zero_mean"}.get(why, "excluded")
+
+
+# ── Surviving-channel mode ───────────────────────────────────────────────────
+
+def survivor_partition(
+    rate: Any, channels: Sequence[int]
+) -> tuple[list[int], dict[int, str]]:
+    """``(survivors, {channel: why})`` -- who the rate criterion can speak for.
+
+    **Survivorship bias lives here, and a reader meets it at this function.**
+    Selecting cells *for having settled* conditions every number downstream on
+    settling. For THIS harness that is defensible and arguably desirable: the
+    question is whether an acquisition strategy resolves the arc, and comparing
+    two arms on a cell that is still drying is precisely what H3 exists to
+    forbid, so restricting to quiet cells removes a confound rather than adding
+    one. For a campaign objective it is **not** defensible -- dropping cells that
+    never settle biases the objective toward materials that equilibrate fast,
+    which is a material property correlated with the thing being optimised --
+    which is why ``--survivors`` exists only in this tool. For equilibration
+    characterization it is worse still: the dropped cells are the ones whose hold
+    time such a run exists to measure. Anyone reading a survivor set as a board
+    is reading a conditional distribution as a marginal one.
+
+    Every channel is accounted for, including the ones that never reached the
+    window: an unexplained absence from both lists is how a denominator goes
+    missing.
+    """
+    if rate is None:
+        return [], {}
+    quiet = {int(ch) for ch in rate.quiet}
+    survivors = sorted(ch for ch in map(int, channels) if ch in quiet)
+    dropped: dict[int, str] = {}
+    for channel in sorted(map(int, channels)):
+        if channel in quiet:
+            continue
+        judged = rate.by_channel.get(channel)
+        if judged is not None and judged.refusal:
+            dropped[channel] = str(judged.refusal)
+        elif channel in rate.excluded:
+            dropped[channel] = _exclusion_word(rate.excluded[channel])
+        else:
+            dropped[channel] = "absent"
+    return survivors, dropped
+
+
+def survivor_row_stamp(why: str) -> str:
+    """The per-row ``hold_certified`` word for one drop reason.
+
+    Coarse where :func:`survivor_partition` is fine-grained, because a row stamp
+    is read by a population filter and the artifact is read by a person. The
+    filter needs one bit -- was this cell certified -- and the person needs the
+    refusal.
+    """
+    from softae.analysis.equilibration import (
+        DROPPED_STILL_MOVING,
+        DROPPED_UNEVALUABLE,
+        RATE_MOVING,
+    )
+
+    return DROPPED_STILL_MOVING if why == RATE_MOVING else DROPPED_UNEVALUABLE
+
+
+def survivor_floors(
+    survivors: Sequence[int], bands: dict[int, str], *, min_channels: int
+) -> str:
+    """Why this survivor set is not evidence, or ``""`` if it is.
+
+    **Checked AFTER the drop, never before**, which is the whole discipline of
+    the feature: a floor cleared by the board says nothing about the set that
+    remains, and a run whose survivors are all CONTROL has proven nothing at all.
+    Two floors here; ``--min-treatment`` is the third and stays with its owner in
+    :mod:`softae.tools.eis_validate`, recomputed there against
+    :attr:`SettleOutcome.survivor_projected` rather than restated here.
+
+    Returns a sentence rather than raising, on
+    :func:`~softae.analysis.equilibration.settle_tol_rel_refusal`'s precedent:
+    the caller decides that a broken floor means the verdict stays a refusal, and
+    the refusal it raises is its own.
+    """
+    from softae.tools.eis_validate_report import CONTROL, TREATMENT
+
+    kept = sorted(int(ch) for ch in survivors)
+    needed = max(1, int(min_channels))
+    if len(kept) < needed:
+        return (f"{len(kept)} channel(s) survived the drop, below the settle "
+                f"gate's minimum of {needed}. A survivor set that small is not "
+                f"evidence, and falling back to the whole board would be "
+                f"treating an absence of evidence as evidence.")
+    census = {band: sum(1 for ch in kept if bands.get(ch) == band)
+              for band in (CONTROL, TREATMENT)}
+    if not census[CONTROL] or not census[TREATMENT]:
+        empty = CONTROL if not census[CONTROL] else TREATMENT
+        return (f"the survivors carry no {empty} cell "
+                f"({CONTROL} {census[CONTROL]}, {TREATMENT} "
+                f"{census[TREATMENT]}). D1, D2 and D4 are {TREATMENT} "
+                f"statistics and D3 is the {CONTROL} noise floor, so a run with "
+                f"one arm missing cannot evaluate its own decision rule.")
+    return ""
 
 
 def settle_deviations(window: Any, participating: Any) -> dict[int, float]:
@@ -1463,16 +1904,33 @@ def assert_settle_licensed(outcome: SettleOutcome) -> None:
         SETTLE_CEILING,
         SETTLE_DISABLED,
         SETTLE_NOT_EVALUABLE,
+        SETTLE_SURVIVORS,
     )
 
     if outcome.verdict in (SETTLE_CEILING, SETTLE_NOT_EVALUABLE):
+        # `survivor_refusal` names the floor the partition broke, and it is
+        # appended rather than substituted: the ceiling is still WHY the run is
+        # stopping, and the broken floor is why the escape hatch did not save it.
+        survivors = (f" --survivors was on and did not rescue it: "
+                     f"{outcome.survivor_refusal}"
+                     if outcome.survivor_refusal else "")
         raise RefuseToStart(
             f"the settle gate returned `{outcome.verdict}` after "
             f"{outcome.n_rounds} rounds ({outcome.elapsed_s / 60:.1f} min). "
             "The material was never shown to have stopped moving, and "
             "'undeclared is unknown, never empty' -- refusing to start."
-            + _tolerance_clause(outcome)
+            + _tolerance_clause(outcome) + survivors
         )
+    if outcome.verdict == SETTLE_SURVIVORS:
+        # Allowed through, and never silently: this is a weaker claim about a
+        # smaller board, every row it produces is stamped with which side of the
+        # partition its cell landed on, and the outcome is conditional on
+        # settling. `certified` stays False, so nothing downstream reads it as a
+        # clean hold.
+        print(f"  ! --survivors: proceeding on {len(outcome.survivors)} of "
+              f"{len(outcome.survivors) + len(outcome.dropped)} cells. Every "
+              f"row is stamped hold_certified=survivors or dropped_*, and every "
+              f"result is CONDITIONAL ON SETTLING.")
     if outcome.verdict == SETTLE_DISABLED:
         print("  ! --settle off: every row is stamped hold_certified=disabled "
               "and the decision-rule outcome will be WITHHELD.")

@@ -1117,6 +1117,82 @@ SETTLE_MIN_FIT_POINTS = 4
 #: and this is a floor rather than a target.
 DEFAULT_SETTLE_MIN_FIT_POINTS = 6
 
+# ── Which criterion a tracker gates on ───────────────────────────────────────
+#
+# :func:`rate_check` is a **sibling** of :func:`settle_check` and never a mode of
+# it — the two estimate different things and neither is expressible as an option
+# on the other. What is selectable is which of them a :class:`SettleTracker`
+# *routes on*, and the middle word exists because a criterion that has never been
+# measured against a real board must not be given routing power on the strength
+# of an argument. Under ``"both"`` the deviation criterion decides, exactly as it
+# does today, and the rate is computed and reported beside it: a shadow run then
+# compares the two on identical windows before anything is trusted.
+
+#: Today's criterion, and the default: `max|σ − mean| / |mean|` against a
+#: relative tolerance. Every existing verdict is this branch.
+SETTLE_CRITERION_DEVIATION = "deviation"
+#: :func:`rate_check` routes. Per cell, on a confidence bound of the slope.
+SETTLE_CRITERION_RATE = "rate"
+#: Deviation routes; the rate is computed and reported and routes on nothing.
+#: The shadow mode, and the only honest way to acquire the comparison the
+#: cutover needs.
+SETTLE_CRITERION_BOTH = "both"
+SETTLE_CRITERIA = (SETTLE_CRITERION_DEVIATION, SETTLE_CRITERION_RATE,
+                   SETTLE_CRITERION_BOTH)
+
+#: `ln(10)` — the one place decades and ln-units meet. The criterion's own
+#: arithmetic is in ln-units, because `d ln σ/dt` is what an OLS on `ln σ`
+#: returns; the operator's arithmetic is in **decades**, because
+#: :data:`~softae.tools.eis_validate_rule.H3_MAX_HOLD_DRIFT_DEC` is, and §3.6 of
+#: the spec derives the settle tolerance from it as `0.05 dec / T_meas`. Two
+#: units for one quantity is a slip waiting to happen, so the conversion lives
+#: here rather than at each boundary that needs it.
+LN_PER_DECADE = float(np.log(10.0))
+
+#: The setpoint ran out of rounds, and rather than refusing outright the phase
+#: **partitioned**: these cells were certified quiet, those cells could not be
+#: judged and were dropped. Spelled apart from :data:`SETTLE_SETTLED` because it
+#: is a weaker claim about a smaller board, and every row it stamps must carry
+#: that difference — see :data:`DROPPED_UNEVALUABLE`.
+SETTLE_SURVIVORS = "survivors"
+
+#: Why a cell was dropped from a survivor set, as a **row stamp**. Coarse on
+#: purpose: the fine-grained refusal (`rate_undetectable`, `rate_span_too_short`,
+#: `unsettleable`, an absent fit) goes in the run artifact, where a reader can
+#: reconstruct the denominator, while the stamp says only which of the two things
+#: happened that a downstream population filter cares about.
+#:
+#: :data:`DROPPED_STILL_MOVING` is recorded but never proceeds: a cell proven
+#: moving blocks the run, so a row can only ever be stamped with it if a later
+#: edit lets one through, and then the stamp is the evidence.
+#:
+#: **The stamp is recorded and nothing downstream acts on it yet.** The spec that
+#: asked for this said a dropped row would be "excluded from the statistics by
+#: machinery that already exists"; it is not. The only reader of
+#: ``hold_certified`` in :mod:`softae.tools.eis_validate_rule` builds the SET of
+#: certifications for H1, and D1--D4 are partitioned by *band*, so a dropped row
+#: still enters the accuracy tables. What H1 does do is **withhold** on any
+#: certification other than ``settled``, which is the conservative direction and
+#: is why a survivor run cannot silently produce a GO. Pinned by
+#: ``test_a_survivor_stamp_withholds_h1_and_does_not_yet_exclude_the_dropped_row``.
+DROPPED_STILL_MOVING = "dropped_moving"
+#: The cell was measured and swept, and the gate could not speak for it. **Not**
+#: spelled ``dropped_unsettleable``: :data:`EXCLUDED_UNSETTLEABLE` names one
+#: specific refusal — the cell's own floor exceeds the tolerance — and using that
+#: word for the other three would make the stamp say which refusal fired when it
+#: does not know.
+DROPPED_UNEVALUABLE = "dropped_unevaluable"
+
+
+def rate_tol_ln_per_hour(dec_per_hour: float) -> float:
+    """Decades per hour → ln-units per hour. The operator's unit → the gate's.
+
+    A one-line function rather than a bare multiplication at three call sites,
+    because the direction of a unit conversion is the thing that gets inverted
+    and a named function cannot be applied backwards by accident.
+    """
+    return float(dec_per_hour) * LN_PER_DECADE
+
 
 #: How a :class:`RoundFit`'s σ was arrived at. Recorded rather than inferred,
 #: because every candidate is `1/R` for *some* R and the numbers are therefore
@@ -1738,6 +1814,26 @@ def rate_check(
         **common)
 
 
+def as_settle_check(rate: RateCheck) -> SettleCheck:
+    """A :class:`RateCheck` in :class:`SettleCheck`'s clothes, for the callers.
+
+    Not a conversion between criteria — the two measure different things and one
+    cannot be recovered from the other. It is the **verdict surface** the phase,
+    the RH clause and the console already speak: ``evaluable`` / ``settled`` /
+    ``participating`` / ``excluded`` / ``reason``, which the rate criterion fills
+    with exactly the same meanings.
+
+    ``max_deviation_rel`` is left ``None``, and that is the honest value: under
+    the rate criterion no window deviation was computed, so a number there would
+    be one nobody measured. Every consumer already handles the absence, because a
+    window judged before it is full has always produced it.
+    """
+    return SettleCheck(
+        evaluable=rate.evaluable, settled=rate.settled,
+        participating=list(rate.participating), excluded=dict(rate.excluded),
+        max_deviation_rel=None, n_rounds=rate.n_rounds, reason=rate.reason)
+
+
 def round_rh_median(samples: Sequence[Any] | None) -> float | None:
     """The %RH this round stood at — median over its samples, or ``None``.
 
@@ -1792,6 +1888,13 @@ class SettleTracker:
     Deliberately holds no clock and no store: the caller owns the floor and the
     ceiling, because those are time and this is evidence. Testable end-to-end by
     feeding it lists of :class:`RoundFit`.
+
+    *criterion* selects which of the two sibling gates **routes** —
+    :data:`SETTLE_CRITERION_DEVIATION` (the default, and today's behaviour
+    unchanged), :data:`SETTLE_CRITERION_RATE`, or :data:`SETTLE_CRITERION_BOTH`,
+    which routes on deviation while computing and reporting the rate. The last
+    exists so a bench run can compare the two on identical windows before either
+    is trusted; it is a shadow, and :attr:`last_rate` is where it lands.
     """
 
     def __init__(
@@ -1803,12 +1906,30 @@ class SettleTracker:
         min_channels: int = DEFAULT_SETTLE_MIN_CHANNELS,
         r1_bound_ohms: float | None = None,
         rh_stability_pct: float | None = None,
+        criterion: str = SETTLE_CRITERION_DEVIATION,
+        rate_tol_per_hour: float | None = None,
+        min_fit_points: int = DEFAULT_SETTLE_MIN_FIT_POINTS,
     ) -> None:
         self.enabled = bool(enabled)
         self.tol_rel = float(tol_rel)
         self.n_rounds = max(2, int(n_rounds))
         self.min_channels = max(1, int(min_channels))
         self.r1_bound_ohms = r1_bound_ohms
+        #: Which criterion **routes**. Defaults to today's, so every existing
+        #: construction keeps every existing verdict. Refused at construction
+        #: rather than silently falling back, because the fallback would be the
+        #: criterion the caller was trying to leave and the run would look
+        #: exactly like a correct one.
+        if str(criterion) not in SETTLE_CRITERIA:
+            raise ValueError(
+                f"criterion {criterion!r} is not one of {SETTLE_CRITERIA}")
+        self.criterion = str(criterion)
+        #: The rate tolerance in **ln-units per hour**, or ``None``. Required by
+        #: the two branches that compute a rate and read by nothing else, so the
+        #: default cannot change a deviation verdict.
+        self.rate_tol_per_hour = (None if rate_tol_per_hour is None
+                                  else float(rate_tol_per_hour))
+        self.min_fit_points = max(SETTLE_MIN_FIT_POINTS, int(min_fit_points))
         #: How far the room may move across the judged window and still count as
         #: still. ``None`` — the default — is the gate off, so every existing
         #: caller keeps today's verdicts exactly.
@@ -1825,6 +1946,12 @@ class SettleTracker:
         #: the setpoint prohibition above applies to this axis unchanged.
         self.times_s: list[float | None] = []
         self.last: SettleCheck | None = None
+        #: The rate verdict on the last judged window, under either criterion
+        #: that computes one, and ``None`` under ``"deviation"``. Under
+        #: ``"both"`` it is **reported and never routed on** — the pair
+        #: :attr:`last` / :attr:`last_rate` is then the shadow comparison, the
+        #: same window read two ways.
+        self.last_rate: RateCheck | None = None
         #: Achieved spread of the **last** judged window, for the record. It is
         #: deliberately not the discriminator below: the binding window may have
         #: been an earlier one.
@@ -1864,22 +1991,94 @@ class SettleTracker:
         and :func:`rate_check` refuses a window containing one rather than
         guessing at the spacing. Nothing reads it under the deviation criterion,
         so every existing verdict is unchanged.
+
+        Under :data:`SETTLE_CRITERION_RATE` the first verdict arrives later than
+        it does under the default -- :attr:`rate_window_rounds` rather than
+        :attr:`n_rounds` -- and ``None`` until then, which is the same "no window
+        yet" every caller already handles.
         """
         self.rounds.append(list(fits))
         self.rh_medians.append(
             None if rh_median_pct is None else float(rh_median_pct))
         self.times_s.append(None if t_s is None else float(t_s))
         self.last = None
-        if not self.enabled or len(self.rounds) < self.n_rounds:
+        self.last_rate = None
+        if not self.enabled:
             return None
-        self.last = settle_check(
-            self.rounds[-self.n_rounds:], tol_rel=self.tol_rel,
-            min_channels=self.min_channels, r1_bound_ohms=self.r1_bound_ohms)
+        if self.criterion != SETTLE_CRITERION_DEVIATION:
+            self.last_rate = self._rate_verdict()
+        if self.criterion == SETTLE_CRITERION_RATE:
+            if self.last_rate is None:
+                return None
+            self.last = as_settle_check(self.last_rate)
+        else:
+            if len(self.rounds) < self.n_rounds:
+                return None
+            self.last = settle_check(
+                self.rounds[-self.n_rounds:], tol_rel=self.tol_rel,
+                min_channels=self.min_channels, r1_bound_ohms=self.r1_bound_ohms)
         self._apply_rh_clause(self.last)
         # After the clause, never before: a window the room made non-evaluable
         # must not be counted as evidence that the criterion was ever evaluable.
         self.ever_evaluable = self.ever_evaluable or self.last.evaluable
         return self.last
+
+    @property
+    def rate_window_rounds(self) -> int:
+        """How many trailing rounds the **rate** criterion reads.
+
+        Longer than the deviation criterion's window, and that difference is the
+        point rather than an implementation detail. Three rounds is `df = 1` and
+        `t(0.975, 1) = 12.706`, so a 3-round rate interval is ~6.5× wider than a
+        reader assumes and :data:`RATE_UNDETECTABLE` becomes the universal
+        verdict; :data:`DEFAULT_SETTLE_MIN_FIT_POINTS` is the length at which an
+        interval is worth quoting, so it is also the window.
+
+        It is what makes a *transient* fit excursion visible at all. On
+        ``20260821T173111Z_eis_validate`` ch18 ran 13, 11, **164**, 90, 7 % — one
+        bad fitted R₁ entering and leaving a trailing 3-round window, which the
+        deviation criterion then certified as settled the moment the excursion
+        aged out of it. Over six rounds the same excursion is a residual, and a
+        residual is what the rate criterion refuses on.
+
+        **A count, where the spec asks for a trailing span.** Selecting by span
+        would need a duration knob that nothing on this rig derives, and over a
+        uniformly paced hold the two windows are the same window; the achieved
+        span is reported on every :class:`RateCheck` so a reader can see which
+        one they got.
+        """
+        return max(self.n_rounds, self.min_fit_points)
+
+    @property
+    def judged_rounds(self) -> int:
+        """Length of the window the **routing** criterion actually judged.
+
+        One property rather than three copies of the same conditional, because
+        the RH clause and both endorsements have to be measured over the same
+        window the σ verdict was, or they answer a question about a window
+        nobody was judging. Equal to :attr:`n_rounds` under ``"deviation"`` and
+        under ``"both"``, where deviation routes.
+        """
+        return (self.rate_window_rounds
+                if self.criterion == SETTLE_CRITERION_RATE else self.n_rounds)
+
+    def _rate_verdict(self) -> RateCheck | None:
+        """:func:`rate_check` over the trailing rate window, or ``None``.
+
+        ``None`` before the window is full, and ``None`` — never a verdict — when
+        no rate tolerance was configured: a gate given no tolerance has nothing
+        to compare against, and inventing one would invent the answer.
+        """
+        if self.rate_tol_per_hour is None:
+            return None
+        window = self.rate_window_rounds
+        if len(self.rounds) < window:
+            return None
+        return rate_check(
+            self.rounds[-window:], self.times_s[-window:],
+            tol_per_hour=self.rate_tol_per_hour, tol_rel=self.tol_rel,
+            min_fit_points=self.min_fit_points,
+            min_channels=self.min_channels, r1_bound_ohms=self.r1_bound_ohms)
 
     def _apply_rh_clause(self, check: SettleCheck) -> None:
         """Was the room still across this window? Mutates *check* in place.
@@ -1902,7 +2101,14 @@ class SettleTracker:
         """
         if self.rh_stability_pct is None:
             return
-        spread = rh_window_spread(self.rh_medians[-self.n_rounds:])
+        # The window the SIGMA verdict was taken over, which under the rate
+        # criterion is longer than `n_rounds`. Judging the room over a shorter
+        # window than the sample would leave part of the sample's window
+        # unwatched, and "sigma flat under a moving room is not evidence" is a
+        # statement about the same window or it is not a statement at all.
+        # Identical to `n_rounds` under `deviation` and under `both`.
+        judged = self.judged_rounds
+        spread = rh_window_spread(self.rh_medians[-judged:])
         self.rh_spread_pct = spread
         if not check.evaluable:
             return
@@ -1911,7 +2117,7 @@ class SettleTracker:
             check.evaluable = False
             check.settled = False
             check.reason = (f"{EXCLUDED_RH_UNREADABLE}: no RH reading for at "
-                            f"least one of the last {self.n_rounds} round(s); "
+                            f"least one of the last {judged} round(s); "
                             f"the room was not observed, so it cannot be called "
                             f"still")
             return
@@ -1952,7 +2158,7 @@ class SettleTracker:
         """
         if not self.enabled or self.last is None or not self.last.participating:
             return None, "not evaluated: no participating channels", None
-        floor = window_noise_floor(self.rounds[-self.n_rounds:],
+        floor = window_noise_floor(self.rounds[-self.judged_rounds:],
                                    self.last.participating)
         ok, why = endorse_tolerance(self.tol_rel, floor)
         return ok, why, floor
@@ -1975,7 +2181,7 @@ class SettleTracker:
         """
         if not self.enabled or self.last is None or not self.last.participating:
             return {}
-        floors = channel_noise_floors(self.rounds[-self.n_rounds:],
+        floors = channel_noise_floors(self.rounds[-self.judged_rounds:],
                                       self.last.participating)
         judged: dict[int, tuple[bool | None, str, float | None]] = {}
         for channel, floor in floors.items():

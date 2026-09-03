@@ -555,3 +555,218 @@ class TestTrackerPerChannelEndorsement:
             tracker.observe([RoundFit(9, 0.5, 100.0)])
 
         assert tracker.per_channel_endorsement() == {}
+
+
+# ── The criterion selector, and the window the two criteria disagree about ───
+
+#: The tolerance the tracker tests judge a rate against, ln-units per hour. Well
+#: above every quiet fixture's own bound and well below the decaying one's, so a
+#: verdict that flips is the criterion and not the number.
+RATE_TOL_LN_PER_H = 0.30
+
+
+def _feed(tracker: SettleTracker, series: dict[int, list[float]],
+          *, period_s: float = ROUND_PERIOD_S, with_time: bool = True):
+    """Replay ``{channel: [R1 per round]}`` through a tracker, one round at a
+    time, and hand back every verdict it produced."""
+    rounds = max(len(values) for values in series.values())
+    seen = []
+    for index in range(rounds):
+        fits = [RoundFit(channel=ch, sigma=1.0 / values[index],
+                         r1_ohms=values[index])
+                for ch, values in sorted(series.items())]
+        seen.append(tracker.observe(
+            fits, t_s=index * period_s if with_time else None))
+    return seen
+
+
+@pytest.fixture
+def ch18_one_fit_excursion_r1() -> list[float]:
+    """Flat R1 with **one** round at 4x -- a fitted R1 that went wrong once.
+
+    Seeded from ``20260821T173111Z_eis_validate`` ch18, whose relative deviations
+    ran 13, 11, **164, 90**, 7 %. No film moves 164 % and back to 7 % in three
+    rounds; that is one bad fit entering and leaving a trailing 3-round window.
+    The excursion is the case the two criteria disagree about most sharply.
+    """
+    return [1.0e4, 1.0e4, 4.0e4, 1.0e4, 1.0e4, 1.0e4]
+
+
+class TestCriterionSelector:
+    def test_tracker_default_criterion_gives_byte_identical_verdicts(
+            self, ch30_decaying_transient_r1, quiet_r1):
+        """The selector defaults to today's branch, and "identical" means every
+        field of every round's verdict -- not merely the same `settled`."""
+        series = {30: ch30_decaying_transient_r1,
+                  18: quiet_r1, 19: quiet_r1, 20: quiet_r1}
+        shipped = SettleTracker(n_rounds=3, min_channels=3, r1_bound_ohms=100.0)
+        named = SettleTracker(n_rounds=3, min_channels=3, r1_bound_ohms=100.0,
+                              criterion="deviation")
+
+        assert _feed(shipped, series) == _feed(named, series)
+        assert shipped.criterion == "deviation" and shipped.last_rate is None
+
+    def test_tracker_both_mode_gates_on_deviation_and_reports_the_rate(
+            self, ch30_decaying_transient_r1, quiet_r1):
+        """Shadow mode: the verdict is the shipped one, byte for byte, and the
+        rate rides beside it with no routing power at all.
+
+        This is the configuration a bench run uses to compare the two criteria on
+        one board before either is trusted, so the *pair* is the deliverable --
+        an identical verdict is not enough if no rate came back with it.
+        """
+        series = {30: ch30_decaying_transient_r1,
+                  18: quiet_r1, 19: quiet_r1, 20: quiet_r1}
+        shipped = SettleTracker(n_rounds=3, min_channels=3, r1_bound_ohms=100.0)
+        shadow = SettleTracker(n_rounds=3, min_channels=3, r1_bound_ohms=100.0,
+                               criterion="both",
+                               rate_tol_per_hour=RATE_TOL_LN_PER_H)
+
+        assert _feed(shipped, series) == _feed(shadow, series)
+        assert shadow.judged_rounds == shadow.n_rounds == 3
+        # ...and the rate was computed anyway, over its own longer window.
+        assert shadow.last_rate is not None
+        assert shadow.last_rate.moving == [30]
+        assert shadow.last_rate.pooled_rate_per_hour is not None
+
+    def test_tracker_rate_criterion_routes_on_the_rate_not_on_the_deviation(
+            self, ch30_decaying_transient_r1, quiet_r1):
+        series = {30: ch30_decaying_transient_r1,
+                  18: quiet_r1, 19: quiet_r1, 20: quiet_r1}
+        tracker = SettleTracker(n_rounds=3, min_channels=3, r1_bound_ohms=100.0,
+                                criterion="rate",
+                                rate_tol_per_hour=RATE_TOL_LN_PER_H)
+        seen = _feed(tracker, series)
+
+        # No verdict until the RATE window is full -- longer than n_rounds,
+        # because df = 1 at k = 3 makes an interval meaningless.
+        assert tracker.judged_rounds == 6
+        assert seen[:5] == [None] * 5
+        assert seen[5] is not None and not seen[5].settled
+        # A deviation number would be a number nobody measured.
+        assert seen[5].max_deviation_rel is None
+        assert "still moving" in seen[5].reason
+
+    def test_tracker_rate_criterion_without_a_time_axis_refuses_rather_than_guessing(
+            self, quiet_r1):
+        tracker = SettleTracker(n_rounds=3, min_channels=1, r1_bound_ohms=100.0,
+                                criterion="rate",
+                                rate_tol_per_hour=RATE_TOL_LN_PER_H)
+        seen = _feed(tracker, {18: quiet_r1}, with_time=False)
+
+        assert seen[-1] is not None
+        assert not seen[-1].evaluable and not seen[-1].settled
+        assert "will not assume even spacing" in seen[-1].reason
+        assert tracker.outcome(stopped_early=False) == "not_evaluable"
+
+    def test_tracker_rate_criterion_without_a_tolerance_never_certifies(
+            self, quiet_r1):
+        """A gate handed no tolerance has nothing to compare against, so it
+        returns no verdict rather than inventing one. The tool refuses this
+        combination at `validate_plan`; the tracker refuses it in arithmetic."""
+        tracker = SettleTracker(n_rounds=3, min_channels=1, r1_bound_ohms=100.0,
+                                criterion="rate")
+
+        assert _feed(tracker, {18: quiet_r1}) == [None] * 6
+        assert tracker.last_rate is None and not tracker.settled
+
+    def test_tracker_an_unknown_criterion_is_refused_at_construction(self):
+        """Falling back would fall back to the criterion the caller was trying
+        to leave, and the run would look exactly like a correct one."""
+        with pytest.raises(ValueError, match="not one of"):
+            SettleTracker(criterion="deviaton")
+
+    def test_tracker_rate_criterion_judges_the_room_over_the_window_it_judged_sigma(
+            self, quiet_r1):
+        """The RH clause spans the SIGMA window, which under the rate criterion
+        is six rounds and not three. A room judged over half the window leaves
+        the other half unwatched, and "sigma flat under a moving room is not
+        evidence" is a claim about one window or it is not a claim."""
+        tracker = SettleTracker(n_rounds=3, min_channels=1, r1_bound_ohms=100.0,
+                                rh_stability_pct=1.5, criterion="rate",
+                                rate_tol_per_hour=RATE_TOL_LN_PER_H)
+        # RH walks 4 %RH across six rounds and 0.6 %RH across the last three, so
+        # only the longer window can see it.
+        for index, r1 in enumerate(quiet_r1):
+            tracker.observe([RoundFit(18, 1.0 / r1, r1)],
+                            rh_median_pct=10.0 + 0.8 * index,
+                            t_s=index * ROUND_PERIOD_S)
+
+        assert tracker.rh_spread_pct == pytest.approx(4.0)
+        assert tracker.rh_blocked_settle is True
+        assert not tracker.settled
+
+
+class TestTheFitExcursion:
+    """The window the whole build exists to keep refusing.
+
+    ``20260821T173111Z_eis_validate`` and ``20260821T192508Z_eis_validate`` both
+    ran 11 rounds to `ceiling` with `n_recorded: 0`, and the failure is not
+    drift: ch18 went 13, 11, **164, 90**, 7 % and ch28 was 14 % in one run and
+    94 % in the other. A film cannot do that. It is a fitted R1 excursion moving
+    through a trailing 3-round window -- so selecting "stable" channels from a
+    prior run selects noise, and the gate that certifies once the excursion ages
+    out certifies a board carrying it.
+    """
+
+    def _board(self, excursion, quiet):
+        return {18: excursion, 19: quiet, 20: quiet, 21: quiet}
+
+    def test_rate_check_a_fit_excursion_is_droppable_and_never_moving(
+            self, ch18_one_fit_excursion_r1, quiet_r1):
+        """The separation, on the real failure rather than on a synthetic one.
+
+        `rate_moving` BLOCKS and the other refusals may be dropped, so a cell
+        classified moving on the strength of one bad fit would hold a board
+        forever -- and one classified quiet would let a wild cell into the
+        dataset. It must be neither.
+        """
+        window = _window(self._board(ch18_one_fit_excursion_r1, quiet_r1))
+        check = rate_check(window, _times(6), tol_per_hour=RATE_TOL_LN_PER_H,
+                           tol_rel=0.10, min_channels=3)
+        judged = check.by_channel[18]
+
+        assert judged.refusal != RATE_MOVING
+        assert judged.refusal in (RATE_UNDETECTABLE, EXCLUDED_UNSETTLEABLE,
+                                  RATE_SPAN_TOO_SHORT)
+        assert judged.evaluable is False and judged.settled is False
+        assert 18 not in check.moving and 18 not in check.quiet
+
+    def test_rate_check_a_genuine_decay_still_blocks_beside_the_excursion(
+            self, ch18_one_fit_excursion_r1, ch30_decaying_transient_r1,
+            quiet_r1):
+        """The other half of the separation, asserted on ONE board so the two
+        classifications are made by the same call over the same window."""
+        window = _window({18: ch18_one_fit_excursion_r1,
+                          30: ch30_decaying_transient_r1,
+                          19: quiet_r1, 20: quiet_r1, 21: quiet_r1})
+        check = rate_check(window, _times(6), tol_per_hour=RATE_TOL_LN_PER_H,
+                           tol_rel=0.10, min_channels=3)
+
+        assert check.moving == [30]
+        assert check.by_channel[30].rate_per_hour < 0     # a drying film
+        assert check.evaluable and not check.settled
+        assert "ch30" in check.reason and "ch18" not in check.reason
+
+    def test_settle_check_certifies_the_excursion_window_the_rate_refuses(
+            self, ch18_one_fit_excursion_r1, quiet_r1):
+        """**The behaviour this build exists to preserve, pinned.**
+
+        The deviation criterion reads a trailing THREE rounds, so once the
+        excursion has aged out of it the same board certifies -- today's gate
+        would license a run on a board carrying a 4x fit excursion two rounds
+        earlier. The rate criterion reads the longer window and does not.
+
+        If this test ever goes green in both directions, the two criteria have
+        stopped disagreeing and the selector has stopped being worth having.
+        """
+        window = _window(self._board(ch18_one_fit_excursion_r1, quiet_r1))
+
+        deviation = settle_check(window[-3:], tol_rel=0.10, min_channels=3)
+        rate = rate_check(window, _times(6), tol_per_hour=RATE_TOL_LN_PER_H,
+                          tol_rel=0.10, min_channels=3)
+
+        assert deviation.settled is True                  # ...and it is wrong
+        assert deviation.max_deviation_rel < 0.10
+        assert 18 in rate.unsettleable or 18 in rate.undetectable
+        assert rate.by_channel[18].settled is False
