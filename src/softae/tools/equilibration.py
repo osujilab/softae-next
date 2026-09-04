@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import math
 import sys
 import time
@@ -147,6 +148,13 @@ logger = structlog.get_logger(__name__)
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_DECLINED = 2
+#: Nobody decided anything — the rig was simply occupied. **4, not 3**, and the
+#: value is copied from ``tools/env_hold.py`` rather than taken as the next free
+#: integer here: that tool ships the identical ``0/1/2`` ladder and skipped 3 to
+#: land on ``tools/campaign.py``'s value, so all three tools that can refuse a
+#: busy rig refuse it with one number. A wrapper reading exit codes across them
+#: must not have to know which tool it invoked to know what "busy" looks like.
+EXIT_BUSY = 4
 
 
 #: The typed word that starts a nine-hour thermal run. Not "y".
@@ -164,6 +172,15 @@ CONSOLE_SCRIPT = "softae-equilibration"
 MODULE = "softae.tools.equilibration"
 #: How this tool refers to itself in anything an operator is meant to type.
 CLI = f"python -m {MODULE}"
+
+#: ``<kind>:<name>:<run_id>`` — the grammar ``core.rig_session`` documents, whose
+#: shipped siblings are ``campaign:<name>:<run_id>`` and ``tool:env-hold:<run_id>``.
+#: The third field is filled rather than left trailing: a bare
+#: ``tool:equilibration:`` in a lock file asserts "there is a run id and it is
+#: blank", which is what a campaign that failed to stamp its run looks like, and
+#: the two must not be indistinguishable to a human reading that file at 3 a.m. to
+#: decide whether to take the rig.
+CLAIM_KIND = "tool:equilibration"
 
 #: Status-line budget. Deliberately narrow: the rig console is whatever window
 #: happens to be open, and a line that wraps defeats an in-place redraw entirely.
@@ -1758,6 +1775,40 @@ def _cmd_run(args) -> int:
                            plan_overrides=overrides):
         return EXIT_DECLINED
 
+    from softae.core.rig_session import held_rig_session
+    from softae.core.run_lock import RunLockHeld, busy_rig_message, foreign_run_lock
+
+    # Ask who holds the rig **before** `_open_store`, which is the ordering
+    # `assert_hardware_armed` above already keeps and for the same reason it
+    # states: a refusal must leave no orphan `experiments` row. Here the point is
+    # sharper than an orphan — a refusal over hardware this run never touched
+    # would leave an `aborted` row, and that row is byte-for-byte what a run that
+    # started and failed looks like. `tools/env_hold.py` and `tools/campaign.py`
+    # both order it this way, for this.
+    #
+    # And as LATE as that ordering allows: after `confirm_thermal`, which stays
+    # the last thing a human reads before the chamber is driven. This peek is a
+    # machine fact rather than a decision, so it does not displace the barrier —
+    # and the two remaining invariants above are untouched, because it opens no
+    # instrument (the rig stays untouched by a declined run) and no store.
+    #
+    # Gated on `args.mock`, the same flag the claim below is gated on and for the
+    # same reason: a mock run that takes no lock must not be *refused* over one it
+    # never wanted.
+    #
+    # The residual race is deliberately accepted: a holder arriving between this
+    # peek and the claim below still raises `RunLockHeld` after the row exists,
+    # and that path keeps its `aborted` finalization. The peek does not close the
+    # window — `acquire_run_lock`'s exclusive create is what makes the claim
+    # itself safe — it only makes the stray `aborted` row rare instead of the
+    # routine outcome of starting this run while the rig is busy.
+    if not args.mock:
+        holder = foreign_run_lock()
+        if holder is not None:
+            print(f"\n!! NOT STARTING THIS RUN\n\n"
+                  f"{busy_rig_message(holder, action='This run')}", flush=True)
+            return EXIT_BUSY
+
     store, _project = _open_store(args)
     print(f"  recording to: {store.project_dir}")
     if args.mock:
@@ -1782,7 +1833,24 @@ def _cmd_run(args) -> int:
             await manager.disconnect_all()
 
     try:
-        asyncio.run(_go())
+        # `--mock` claims nothing, and the gate is **this tool's own flag** rather
+        # than `held_rig_session`'s `session_is_simulated` exemption, which would
+        # otherwise reach the same answer here today. `tools/env_hold.py` carries
+        # the argument in full and it is not restated; its two live halves are that
+        # the `foreign_run_lock` peek above consults no predicate at all, so only
+        # this flag stops a run claiming nothing from being refused over a lock it
+        # never wanted, and that `_mock_driver_classes` is a hand-maintained
+        # registry whose own documented failure direction is "a mock forgotten
+        # there reads as real".
+        claim = (contextlib.nullcontext() if args.mock
+                 else held_rig_session(manager, what=f"{CLAIM_KIND}:{run_id}"))
+        # Around the WHOLE of `_go`, not around `connect_all`. `_go` connects,
+        # runs for nine to fifteen hours and disconnects, and the thing being
+        # excluded is a second process driving the same heater for those hours —
+        # not a collision at the moment the ports open. A claim released anywhere
+        # inside that span is a rig two processes may share for the rest of it.
+        with claim:
+            asyncio.run(_go())
     except EquilibrationAbort as exc:
         finalize("aborted")
         print(f"\nABORTED ({exc.kind}): {exc}", file=sys.stderr)
@@ -1793,6 +1861,17 @@ def _cmd_run(args) -> int:
         print("\nInterrupted.", file=sys.stderr)
         _print_teardown(runner)
         return EXIT_FAILED
+    except RunLockHeld as held:
+        # The race the peek above leaves open, arriving with the row already
+        # started. `aborted` rather than `error`, and no `_print_teardown`: the
+        # runner never ran, so there is no ambient restore and no sidecar to
+        # report on, and printing the teardown lines here would assert a chamber
+        # was brought down that was never driven. `store.close()` is left to the
+        # `finally` below, which already does it in the right order.
+        finalize("aborted")
+        print(f"\n!! NOT STARTING THIS RUN\n\n"
+              f"{busy_rig_message(held.lock, action='This run')}", flush=True)
+        return EXIT_BUSY
     else:
         finalize("done")
     finally:

@@ -10,6 +10,7 @@ builds is therefore the only barrier, and these tests are what keep it one.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
@@ -20,7 +21,10 @@ import structlog
 
 from softae.analysis.equilibration import MIN_POINTS_FOR_TAU
 from softae.core.hardware_safety import HardwareNotArmedError
+from softae.core.run_lock import RunLock, RunLockHeld
 from softae.tools.equilibration import (
+    CLAIM_KIND,
+    EXIT_BUSY,
     EXIT_DECLINED,
     EXIT_FAILED,
     EXIT_OK,
@@ -70,6 +74,38 @@ def project(monkeypatch, tmp_path):
 
     monkeypatch.setattr(loader, "data_project_dir", lambda: str(tmp_path / "real"))
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def rig_lock_is_never_the_real_one(monkeypatch):
+    """No test in this file may read a verdict from, or write to, ``~/.softae/rig.lock``.
+
+    ``run --execute`` now peeks at the rig lock and then claims the rig for the
+    duration of the run, and the lock's scope is **this machine** — not the
+    ``tmp_path`` project every test here is otherwise sandboxed into. Without this
+    fixture the non-``--mock`` runs in :class:`TestRunRowFinalization` would do two
+    unacceptable things: read whatever really holds the rig right now (very
+    possibly the operator's live GUI, which would turn seven passing tests red on
+    a fact about the room), and then take the machine-scope lock themselves for a
+    manager that owns no port — ``session_is_simulated`` cannot recognise their
+    hand-rolled ``_Manager`` as a mock, so it answers "real" and claims. That is
+    the [e6] defect exactly: a test run refusing the operator's GUI.
+
+    So the default here is **rig free, claim recorded and not taken**. Both halves
+    are patched at their definition sites, which is where ``_cmd_run``'s
+    function-local imports resolve them at call time.
+
+    :func:`~softae.core.rig_session.held_rig_session` is deliberately left REAL, so
+    the ``with claim:`` block is genuinely entered and exited; only
+    :func:`~softae.core.rig_session.claim_rig_session`, the half that writes a
+    file, is stubbed. Tests that are *about* the claim re-patch either half after
+    this fixture has run and win — see :class:`TestRigClaim`, which is what stops
+    this convenience from becoming a suite-wide blindfold over the guard.
+    """
+    monkeypatch.setattr("softae.core.run_lock.foreign_run_lock",
+                        lambda *_a, **_kw: None)
+    monkeypatch.setattr("softae.core.rig_session.claim_rig_session",
+                        lambda *_a, **_kw: None)
 
 
 def _args(*argv):
@@ -2078,15 +2114,26 @@ def _arrange_outcome(monkeypatch, outcome: BaseException | None = None):
     monkeypatch.setattr(tool, "EquilibrationRun", _Runner)
 
 
-def _the_only_outcome(project: Path) -> dict:
-    """``run_outcome`` for the single run the command wrote."""
+def _the_only_run_id(project: Path) -> str:
+    """The id of the single run the command wrote — the id the claim must name."""
     from softae.core.data_store import DataStore
 
     with DataStore(project) as ds:
         run_ids = [r[0] for r in ds._conn.execute(
             "SELECT run_id FROM experiments ORDER BY started_at")]
-        assert len(run_ids) == 1, run_ids
-        return ds.run_outcome(run_ids[0])
+    assert len(run_ids) == 1, run_ids
+    return run_ids[0]
+
+
+def _the_only_outcome(project: Path) -> dict:
+    """``run_outcome`` for the single run the command wrote."""
+    from softae.core.data_store import DataStore
+
+    # Sequentially, not nested: two live connections to one SQLite file to answer
+    # one question is a lock contention nobody needs.
+    run_id = _the_only_run_id(project)
+    with DataStore(project) as ds:
+        return ds.run_outcome(run_id)
 
 
 class TestRunRowFinalization:
@@ -2170,3 +2217,246 @@ class TestRunRowFinalization:
 
         self._run(monkeypatch, tmp_path / "proj", KeyboardInterrupt())
         assert events[:2] == ["finish", "close"]
+
+
+# ── The rig claim ────────────────────────────────────────────────────────────
+#
+# `run --execute` drives the stage heater and the humidifier for nine to fifteen
+# hours and, until this landed, took no claim, lock or rig-state check of any
+# kind: `create_manager` then `manager.connect_all()` inside `_go`, with nothing
+# anywhere in the path asking whether somebody else already had the ports open.
+# Two invocations against one rig both proceeded.
+#
+# The mechanism is `core.rig_session.held_rig_session`, which is what
+# `tools/env_hold.py` uses for the same shape of problem — one long real-hardware
+# hold launched from a CLI — and these tests are shaped after that tool's own.
+
+#: A live, foreign holder. `RunLock` rather than a stub so `busy_rig_message`
+#: renders it exactly as the operator will read it.
+HOLDER = RunLock(pid=99999, what="gui:desktop", started_at="2026-08-19T00:00:00Z")
+
+
+def _arrange_claimable_run(monkeypatch, outcome: BaseException | None = None,
+                           log: list[str] | None = None):
+    """``_arrange_outcome``, but the manager is identifiable and the run announces itself.
+
+    The claim's two properties under test are *which manager* it was taken over
+    and *when* it was held relative to the run, and neither is observable through
+    the existing helper: it builds a fresh `_Manager` inside a lambda and the
+    runner records nothing about its own timing.
+
+    Returns the one manager `create_manager` will hand back.
+    """
+    import softae.core.hardware_safety as safety
+    import softae.drivers.factory as factory
+    import softae.tools.equilibration as tool
+
+    class _Manager:
+        async def connect_all(self):
+            if log is not None:
+                log.append("connect")
+            return None
+
+        async def disconnect_all(self):
+            if log is not None:
+                log.append("disconnect")
+            return None
+
+    manager = _Manager()
+    monkeypatch.setattr(factory, "create_manager", lambda **_kw: manager)
+    monkeypatch.setattr(safety, "assert_hardware_armed", lambda *_a, **_kw: None)
+    monkeypatch.setattr(tool, "confirm_thermal", lambda *_a, **_kw: True)
+
+    class _Runner(_InterruptedRunner):
+        async def run(self):
+            if log is not None:
+                log.append("run")
+            if outcome is not None:
+                raise outcome
+            return None
+
+    monkeypatch.setattr(tool, "EquilibrationRun", _Runner)
+    return manager
+
+
+def _run_argv(project: Path, *extra: str) -> list[str]:
+    return ["run", "--channels", "1-2", *GEOMETRY, "--execute",
+            "--project", str(project), *extra]
+
+
+class TestRigClaim:
+    """Who may drive the chamber, and for how long.
+
+    Every test here re-patches over the module-wide
+    ``rig_lock_is_never_the_real_one`` fixture, which is the point: that fixture
+    exists so the *other* tests cannot touch the machine-scope lock, and these
+    are the ones that would otherwise let it quietly disable the guard for
+    everybody.
+    """
+
+    def test_a_run_on_a_busy_rig_is_refused_before_a_store_is_ever_opened(
+            self, monkeypatch, tmp_path, capsys):
+        """EXIT_BUSY, and **no run row at all** — not even an `aborted` one.
+
+        An `aborted` row is byte-for-byte what a run that started and failed
+        leaves behind, so a run refused before it touched anything must leave
+        none: the peek sits above `_open_store` precisely to buy this, which is
+        the same ordering `assert_hardware_armed` already keeps a few lines up.
+        """
+        import softae.tools.equilibration as tool
+
+        _arrange_claimable_run(monkeypatch)
+        monkeypatch.setattr(tool, "_open_store", _never("_open_store"))
+        monkeypatch.setattr("softae.core.run_lock.foreign_run_lock",
+                            lambda *_a, **_kw: HOLDER)
+
+        assert _cmd_run(_args(*_run_argv(tmp_path / "proj"))) == EXIT_BUSY
+        out = capsys.readouterr().out
+        assert "NOT STARTING THIS RUN" in out
+        # Named, never a bare "busy": the operator's only recourse against an
+        # anonymous refusal is to start deleting lock files.
+        assert "would drive the same rig" in out
+        assert "99999" in out
+
+    def test_a_run_on_a_free_rig_claims_it_naming_the_run_id_and_the_manager(
+            self, monkeypatch, tmp_path):
+        project = tmp_path / "proj"
+        manager = _arrange_claimable_run(monkeypatch)
+        seen: dict = {}
+
+        def _claim(claimed, *, what, **_kw):
+            seen["manager"] = claimed
+            seen["what"] = what
+            return None
+
+        monkeypatch.setattr("softae.core.rig_session.claim_rig_session", _claim)
+
+        assert _cmd_run(_args(*_run_argv(project))) == EXIT_OK
+
+        # The manager whose ports are at stake, not some other one.
+        assert seen["manager"] is manager
+        # `<kind>:<name>:<run_id>`, with the run id filled: a trailing empty field
+        # in a lock file asserts "there is a run id and it is blank".
+        assert seen["what"] == f"{CLAIM_KIND}:{_the_only_run_id(project)}"
+        assert seen["what"].count(":") == 2
+
+    def test_the_claim_is_held_across_the_whole_run_not_merely_the_connect(
+            self, monkeypatch, tmp_path):
+        """The property the wrapping exists for, and the one a narrower fix loses.
+
+        What is excluded is a second process driving the same heater for nine to
+        fifteen hours — not a collision at the instant the ports open. A claim
+        released anywhere inside that span is a rig two processes may share for
+        the rest of it, so the ordering, not merely the call, is what is pinned.
+        """
+        log: list[str] = []
+
+        @contextlib.contextmanager
+        def _held(_manager, **_kw):
+            log.append("claim")
+            try:
+                yield None
+            finally:
+                log.append("release")
+
+        monkeypatch.setattr("softae.core.rig_session.held_rig_session", _held)
+        _arrange_claimable_run(monkeypatch, log=log)
+
+        assert _cmd_run(_args(*_run_argv(tmp_path / "proj"))) == EXIT_OK
+        assert log == ["claim", "connect", "run", "disconnect", "release"]
+
+    def test_a_mock_run_neither_consults_the_lock_nor_claims_the_rig(
+            self, monkeypatch, tmp_path):
+        """``--mock`` is gated on **this tool's own flag**, and the gate is differential.
+
+        `held_rig_session` has its own `session_is_simulated` exemption and would
+        reach the same answer for a real mock manager today, which is exactly what
+        makes this gate look removable. It is not: the `foreign_run_lock` peek
+        consults no predicate at all, so only `args.mock` can stop a run that
+        claims nothing from being *refused* over a lock it never wanted.
+
+        The second half is the whole reason this is one test rather than an
+        assertion that nothing happened. A test that only pins *absence* is green
+        against a tool with no guard at all — SUBAGENT_RULES §3.1(e) — so the same
+        invocation is run again with the flag dropped, and the emptiness above is
+        thereby shown to be the flag's doing rather than the guard's.
+        """
+        reached: list[str] = []
+        monkeypatch.setattr("softae.core.run_lock.foreign_run_lock",
+                            lambda *_a, **_kw: reached.append("peek"))
+        monkeypatch.setattr("softae.core.rig_session.claim_rig_session",
+                            lambda *_a, **_kw: reached.append("claim"))
+        _arrange_claimable_run(monkeypatch)
+
+        assert _cmd_run(_args(*_run_argv(tmp_path / "mock", "--mock"))) == EXIT_OK
+        assert reached == [], "a --mock run consulted or took the machine-scope lock"
+
+        assert _cmd_run(_args(*_run_argv(tmp_path / "real"))) == EXIT_OK
+        assert reached == ["peek", "claim"]
+
+    def test_a_mock_run_is_not_refused_over_a_lock_it_never_wanted(
+            self, monkeypatch, tmp_path):
+        """The half only `args.mock` can supply: the peek consults no predicate.
+
+        `held_rig_session`'s `session_is_simulated` exemption could excuse the
+        *claim* on its own. Nothing excuses the *refusal*, so a live foreign
+        holder must not stop a run that was never going to take the lock.
+        """
+        def _boom(*_a, **_kw):
+            raise AssertionError("a --mock run must not take the rig claim")
+
+        monkeypatch.setattr("softae.core.rig_session.held_rig_session", _boom)
+        monkeypatch.setattr("softae.core.rig_session.claim_rig_session", _boom)
+        monkeypatch.setattr("softae.core.run_lock.foreign_run_lock",
+                            lambda *_a, **_kw: HOLDER)
+        _arrange_claimable_run(monkeypatch)
+
+        assert _cmd_run(_args(*_run_argv(tmp_path / "proj", "--mock"))) == EXIT_OK
+
+    def test_a_holder_arriving_after_the_peek_aborts_the_row_and_closes_the_store(
+            self, monkeypatch, tmp_path, capsys):
+        """The residual race the peek deliberately does not close.
+
+        A holder appearing between the peek and the claim raises `RunLockHeld`
+        with the row already open. `acquire_run_lock`'s exclusive create is what
+        keeps the claim itself correct; the peek only makes this outcome rare
+        instead of routine, so the path has to keep its `aborted` finalization
+        rather than leaving `finished_at` NULL — which is what a killed process
+        leaves, and what the GUI reads as an unclean shutdown.
+        """
+        from softae.core.data_store import DataStore
+
+        project = tmp_path / "proj"
+        closed: list[str] = []
+        real_close = DataStore.close
+        monkeypatch.setattr(
+            DataStore, "close",
+            lambda self, *a, **k: closed.append("close") or real_close(self, *a, **k))
+
+        _arrange_claimable_run(monkeypatch)
+        monkeypatch.setattr("softae.core.run_lock.foreign_run_lock",
+                            lambda *_a, **_kw: None)       # free at the peek …
+
+        def _held(*_a, **_kw):
+            raise RunLockHeld(HOLDER)                      # … and taken by the claim
+
+        monkeypatch.setattr("softae.core.rig_session.claim_rig_session", _held)
+
+        assert _cmd_run(_args(*_run_argv(project))) == EXIT_BUSY
+        assert "would drive the same rig" in capsys.readouterr().out
+        assert _the_only_outcome(project) == {"status": "aborted", "finished": True}
+        assert closed, "the store was left open on the refused path"
+
+    def test_the_busy_exit_code_is_the_one_the_other_rig_tools_use(self):
+        """One number for "the rig was occupied", across every tool that can say it.
+
+        Not the next free integer here (3). `tools/env_hold.py` ships the identical
+        0/1/2 ladder and skipped 3 to land on `tools/campaign.py`'s value, so a
+        wrapper reading exit codes does not have to know which tool it invoked to
+        know what busy looks like.
+        """
+        from softae.tools.campaign import EXIT_BUSY as CAMPAIGN_BUSY
+        from softae.tools.env_hold import EXIT_BUSY as ENV_HOLD_BUSY
+
+        assert EXIT_BUSY == ENV_HOLD_BUSY == CAMPAIGN_BUSY == 4
+        assert EXIT_BUSY not in (EXIT_OK, EXIT_FAILED, EXIT_DECLINED)
