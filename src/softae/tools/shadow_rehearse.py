@@ -65,11 +65,15 @@ DEFAULT_ROUNDS = 2
 
 @dataclass(frozen=True)
 class CorpusRow:
-    """One measurement, joined to its latest fit.  Everything a replay needs."""
+    """One measurement, joined to its latest fit.  Everything a replay needs —
+    ``role`` included, because it decides whether the gated engine judges the
+    spectrum against the commissioned ``|Z|`` window at all.
+    """
 
     measurement_id: int
     channel: int
     eis_file_path: str
+    role: str = "sample"
     model_name: str = "simpleSalt"
     L_cm: float | None = None
     t_cm: float | None = None
@@ -136,6 +140,11 @@ def _read_corpus(db_path: Path, run_id: str | None = None
     The fit join is a ``LEFT JOIN`` on purpose: a measurement with no fit row is
     replayable, it simply has no geometry, and the timing record says so
     (``cell_source="absent"``) rather than the spectrum vanishing from the population.
+
+    ``m.role`` is selected rather than left to ``analyze_spectrum``'s own
+    ``role="sample"`` default, because a commissioning run keeps its blanks and
+    reference parts in the same table as its samples: the default judges every one of
+    them as a sample, and the verdict that comes back looks entirely ordinary.
     """
     conn = _connect_ro(db_path)
     try:
@@ -144,8 +153,8 @@ def _read_corpus(db_path: Path, run_id: str | None = None
             return None, []
         rows: list[CorpusRow] = []
         seen: set[int] = set()
-        for (mid, channel, path, model, L, t, w) in conn.execute(
-            "SELECT m.measurement_id, m.channel, m.eis_file_path, "
+        for (mid, channel, path, role, model, L, t, w) in conn.execute(
+            "SELECT m.measurement_id, m.channel, m.eis_file_path, m.role, "
             "       f.model_name, f.electrode_L_cm, f.electrode_t_cm, f.electrode_w_cm "
             "FROM measurements m "
             "LEFT JOIN fit_results f ON f.measurement_id = m.measurement_id "
@@ -159,7 +168,7 @@ def _read_corpus(db_path: Path, run_id: str | None = None
             leg, setpoint, rnd = _grid_fields(str(path))
             rows.append(CorpusRow(
                 measurement_id=int(mid), channel=int(channel or -1),
-                eis_file_path=str(path),
+                eis_file_path=str(path), role=str(role or "sample"),
                 model_name=str(model or "simpleSalt"),
                 L_cm=None if L is None else float(L),
                 t_cm=None if t is None else float(t),
@@ -432,7 +441,7 @@ def _replay_one(row: CorpusRow, project: Path, settings: Any, result: RehearsalR
     t0 = time.perf_counter()
     try:
         report = eis_engine.analyze_spectrum(
-            eis, cell=cell, model_name=model, settings=settings)
+            eis, cell=cell, model_name=model, settings=settings, role=row.role)
     except Exception as exc:      # noqa: BLE001 - see run_rehearsal's docstring
         _skip(result, "raised", row, path, exc)
         return None

@@ -38,7 +38,11 @@ CREATE TABLE experiments (
 CREATE TABLE measurements (
     measurement_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL,
     channel INTEGER NOT NULL, timestamp TEXT NOT NULL DEFAULT '',
-    eis_file_path TEXT);
+    eis_file_path TEXT,
+    -- Mirrors the DataStore migration exactly, default included. A fixture schema
+    -- missing this column is what let the rehearsal judge every blank as a sample
+    -- for a whole release without a single red test.
+    role TEXT NOT NULL DEFAULT 'sample');
 CREATE TABLE fit_results (
     fit_id INTEGER PRIMARY KEY AUTOINCREMENT, measurement_id INTEGER NOT NULL,
     run_id TEXT NOT NULL, model_name TEXT NOT NULL,
@@ -49,7 +53,7 @@ CREATE TABLE fit_results (
 # ── Fixture corpora ──────────────────────────────────────────────────────────
 
 def rows(legs=("Lup", "Ldown"), setpoints=(0, 1, 2, 3), channels=(1, 2),
-         rounds=15, model="simpleSalt", geometry=True):
+         rounds=15, model="simpleSalt", geometry=True, role="sample"):
     """A synthetic corpus with no database and no files — enough for selection."""
     out, mid = [], 0
     for leg in legs:
@@ -61,7 +65,7 @@ def rows(legs=("Lup", "Ldown"), setpoints=(0, 1, 2, 3), channels=(1, 2),
                         measurement_id=mid, channel=ch,
                         eis_file_path=f"runs\\{RUN_ID}\\eis\\"
                                       f"eq_ch{ch}_{leg}_S{sp}_R{rnd}_ch{ch}.txt",
-                        model_name=model,
+                        role=role, model_name=model,
                         L_cm=0.2 if geometry else None,
                         t_cm=0.02 if geometry else None,
                         w_cm=0.2 if geometry else None,
@@ -71,7 +75,8 @@ def rows(legs=("Lup", "Ldown"), setpoints=(0, 1, 2, 3), channels=(1, 2),
 
 def make_project(tmp_path: Path, *, legs=("Lup",), setpoints=(0,), channels=(1, 2),
                  rounds=2, run_id=RUN_ID, with_fits=True, write_files=True,
-                 model="simpleSalt", geometry=True, extra_runs=()) -> Path:
+                 model="simpleSalt", geometry=True, extra_runs=(),
+                 role="sample") -> Path:
     """A tmp_path project: ``db/softae.db`` plus spectra under ``runs/<id>/eis/``."""
     project = tmp_path / "project"
     (project / "db").mkdir(parents=True, exist_ok=True)
@@ -84,11 +89,13 @@ def make_project(tmp_path: Path, *, legs=("Lup",), setpoints=(0,), channels=(1, 
                  (run_id, "2026-08-11T02:37:57+00:00"))
 
     f, Z = reference_spectrum()
-    for row in rows(legs, setpoints, channels, rounds, model=model, geometry=geometry):
+    for row in rows(legs, setpoints, channels, rounds, model=model, geometry=geometry,
+                    role=role):
         rel = row.eis_file_path.replace(f"runs\\{RUN_ID}\\", f"runs\\{run_id}\\")
         cur = conn.execute(
-            "INSERT INTO measurements (run_id, channel, eis_file_path) VALUES (?,?,?)",
-            (run_id, row.channel, rel))
+            "INSERT INTO measurements (run_id, channel, eis_file_path, role) "
+            "VALUES (?,?,?,?)",
+            (run_id, row.channel, rel, row.role))
         if with_fits:
             conn.execute(
                 "INSERT INTO fit_results (measurement_id, run_id, model_name, "
@@ -247,6 +254,20 @@ class TestCorpus:
         _, corpus = R._read_corpus(project / "db" / "softae.db")
         assert {r.model_name for r in corpus} == {"randles"}
 
+    def test_a_non_sample_role_is_read_from_the_column_not_left_at_its_default(
+            self, tmp_path):
+        # A commissioning run keeps its blanks and reference parts in ``measurements``
+        # beside its samples, so the corpus has to carry the distinction: a row that
+        # reads back as "sample" is indistinguishable from one whose role was dropped.
+        project = make_project(tmp_path, role="blank_open")
+        _, corpus = R._read_corpus(project / "db" / "softae.db")
+        assert corpus and {r.role for r in corpus} == {"blank_open"}
+
+    def test_an_ordinary_measurement_reads_back_as_role_sample(self, tmp_path):
+        project = make_project(tmp_path)
+        _, corpus = R._read_corpus(project / "db" / "softae.db")
+        assert corpus and {r.role for r in corpus} == {"sample"}
+
     def test_the_cell_is_reconstructed_from_the_fit_rows_electrode_columns(
             self, tmp_path, stub_engine):
         project = make_project(tmp_path)
@@ -312,6 +333,24 @@ class TestInvocation:
         R.run_rehearsal(R.select_spectra(corpus), project)
         settings = stub_engine[0]["settings"]
         assert settings.engine == "gated" and settings.gates.enabled is False
+
+    def test_a_non_sample_role_reaches_analyze_spectrum_rather_than_its_default(
+            self, tmp_path, stub_engine):
+        # ``analyze_spectrum``'s own default is role="sample", and only a sample is
+        # judged against the commissioned |Z| window. Passing no role at all therefore
+        # measures a reference resistor against a window commissioned for films — and
+        # the verdict that comes back looks entirely ordinary.
+        project = make_project(tmp_path, channels=(1,), rounds=1, role="reference_r")
+        _, corpus = R._read_corpus(project / "db" / "softae.db")
+        R.run_rehearsal(R.select_spectra(corpus), project)
+        assert [call.get("role") for call in stub_engine] == ["reference_r"]
+
+    def test_an_ordinary_sample_still_arrives_at_the_engine_as_role_sample(
+            self, tmp_path, stub_engine):
+        project = make_project(tmp_path, channels=(1,), rounds=1)
+        _, corpus = R._read_corpus(project / "db" / "softae.db")
+        R.run_rehearsal(R.select_spectra(corpus), project)
+        assert [call.get("role") for call in stub_engine] == ["sample"]
 
     def test_a_rejected_spectrum_is_still_analysed_because_gates_only_observe(
             self, tmp_path):
