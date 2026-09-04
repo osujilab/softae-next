@@ -239,6 +239,35 @@ def _as_eis(eis_result: Any, freq: np.ndarray, Z: np.ndarray, mask: np.ndarray) 
     )
 
 
+#: :attr:`~softae.analysis.eis.report.SigmaReport.R_basis` for a sum reported because
+#: **no covariance existed at all**, as distinct from ``"sum"`` — reported because ρ was
+#: computed and said the split is unidentifiable.
+#:
+#: They are different claims and the vocabulary has to say so. ``"sum"`` carries a
+#: propagated ``sum_se`` and a real ρ; this one carries NaN for both, and a consumer that
+#: cannot tell them apart reads *"nothing was measured"* as *"measured and degenerate"* —
+#: the shape ``SUBAGENT_RULES`` §3.1(a) is about. The ``_unqualified`` suffix is
+#: :attr:`SigmaReport.mode`'s own idiom (``"bound_unqualified"``): the claim, standing
+#: without the evidence that would qualify it.
+#:
+#: .. warning::
+#:    **Two consumers outside this module test the basis with ``== "sum"`` exactly and
+#:    do not yet know this value.** Both were left alone deliberately — they are held
+#:    under other claims — and both are one line:
+#:
+#:    * ``report.py:121`` (:meth:`SigmaReport.describe`) renders any unrecognised basis
+#:      as ``"R_bulk"``, so an operator-facing string would name the split for a sum;
+#:    * ``data_store.py:751`` populates ``fit_results.R_sum_ohm`` only for ``"sum"``, so
+#:      a row reported on this basis stores ``NULL`` there.
+#:
+#:    Blast radius today is **zero on the shipped engine**: ``[eis] engine = "legacy"``
+#:    and ``_legacy_report`` never calls this function. Both sites must move before
+#:    ``engine = "gated"``, and before any shadow-rehearsal output is cited on the basis
+#:    column — a stored ``NULL`` ``R_sum_ohm`` beside a sum-reported σ is the harder of
+#:    the two to notice later, because nothing marks it as absent rather than as split.
+BASIS_SUM_UNQUALIFIED = "sum_unqualified"
+
+
 def _resolve_reported_resistance(
     fit: Any, *, rho_degenerate: float
 ) -> tuple[float, float, str, float]:
@@ -296,11 +325,65 @@ def _resolve_reported_resistance(
     ``|ρ| >= 1 − 2e-14``, some 1e12 times more permissive than 0.95. That predicate asks
     whether the split is beyond what float64 can represent; this one asks the
     experiment-design question.
+
+    **No covariance at all is not "the split is fine"** — it is the absence of the
+    only evidence that could have licensed one, and until 2026-09-04 it returned
+    ``R_bulk`` under the ``"split_bulk"`` basis, which is that absence spelled with the
+    token for *checked and identifiable* (``SUBAGENT_RULES`` §3.1(a)). It now returns
+    ``R_series + R_bulk`` under :data:`BASIS_SUM_UNQUALIFIED`.
+
+    **The branch is reached, and by a measured population rather than by fixtures.**
+    ``fit_spectrum`` returns a covariance whenever it converges, so the way here on the
+    gated engine is the ``legacy_fit_failed`` fallback — ``fit_circuit`` fits through
+    ``impedance``'s ``CustomCircuit``, which discards ``pcov`` and returns only
+    ``sqrt(diag(pcov))``, so no off-diagonal ρ exists to decide with. [p92] §1 measured
+    that fallback at 22 of 54 rows (41 %) on ``20260825T154521Z_arrhenius_sweep``. The
+    ``two_point`` route lands here too and ships disabled (``[eis.pregate]
+    two_point_open = false``).
+
+    **What licenses the sum here is arithmetic plus a reference resistor, not ρ.**
+    ``R_series`` and ``R_bulk`` are in series, so their sum is the DC resistance of the
+    chain whatever the correlation; the split is the *additional* claim, and it is the
+    one with no evidence behind it on this branch. Measured against the three known
+    resistors (``simpleSalt``, legacy fitter — the same estimator this branch reports
+    for):
+
+    ==========  ==============  ==============  ==============  ==============
+    nominal     ``R_bulk``      err             ``R₀+R₁``       err
+    ==========  ==============  ==============  ==============  ==============
+    10 kΩ       8 889 Ω         −11.11 %        9 547 Ω         −4.53 %
+    220 kΩ      2.123e5 Ω        −3.49 %        2.145e5 Ω       −2.52 %
+    10 MΩ       9.803e6 Ω        −1.97 %        9.803e6 Ω       −1.97 %
+    **mean**                    **5.52 %**                      **3.01 %**
+    ==========  ==============  ==============  ==============  ==============
+
+    The 10 MΩ rung moves by nothing at all, and that is the *other* defect showing
+    through rather than a counter-example: its ``R₀`` fitted to 1e-10 Ω, so there is no
+    series term left to add. That value is twenty decades above
+    :data:`~softae.analysis.eis.fitter.COLLAPSED_AT_ZERO`, so
+    :func:`~softae.analysis.eis.models.railed_measurand` does not — and by its own
+    documented threshold should not — call it a collapse.
+
+    **The SE stays NaN and ρ stays NaN.** There is no covariance from which to
+    propagate either, and inventing a zero would be the same substitution this branch
+    exists to stop. A non-finite ``R_series`` or ``R_bulk`` falls back to the old return
+    unchanged: a sum that is not a number is not a sum, and a demoted railed fit
+    (``R1 = NaN``) must not acquire a basis claiming one was reported.
     """
     cov = getattr(fit, "covariance", None)
     R_split = float(getattr(fit, "R1", float("nan")))
     if cov is None:
-        return R_split, float("nan"), "split_bulk", float("nan")
+        R_series = float(getattr(fit, "R0", float("nan")))
+        if not (R_series == R_series and R_split == R_split):
+            return R_split, float("nan"), "split_bulk", float("nan")
+        R_sum = R_series + R_split
+        logger.info(
+            "eis_split_unqualified", r_series_ohm=R_series, r_bulk_ohm=R_split,
+            r_sum_ohm=R_sum,
+            msg=("no covariance — no rho with which to judge the split; "
+                 "reporting R_series+R_bulk"),
+        )
+        return R_sum, float("nan"), BASIS_SUM_UNQUALIFIED, float("nan")
 
     from softae.analysis.eis.models import roles_for
 

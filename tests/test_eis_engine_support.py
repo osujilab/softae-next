@@ -29,7 +29,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from softae.analysis.eis.engine_support import _resolve_reported_resistance
+from softae.analysis.circuit_fitting import FitResult
+from softae.analysis.eis.engine_support import (
+    BASIS_SUM_UNQUALIFIED,
+    _resolve_reported_resistance,
+)
 from softae.analysis.eis.fitter import FitCovariance
 
 RHO_DEGENERATE = -0.95
@@ -158,7 +162,11 @@ class TestTheFailClosedAndUnknownPaths:
         assert basis == "split_bulk"
         assert R == pytest.approx(R_BULK)
 
-    def test_a_fit_without_covariance_falls_back_to_the_split_as_the_legacy_path_does(self):
+    def test_a_fit_carrying_no_r_series_at_all_still_falls_back_to_the_split(self):
+        # There is nothing to add, so there is no sum to report. Kept as the fallback
+        # pin rather than as the no-covariance pin: since 2026-09-04 a fit that DOES
+        # carry both terms reports their sum, and `TestNoCovarianceReportsTheSum`
+        # below is where that lives.
         class _Fit:
             model_name = "simpleSalt"
             R1 = 1234.0
@@ -197,3 +205,95 @@ class TestTheRecordNamesWhichSideItWas:
             self, monkeypatch):
         seen = self._msg(_fit_with_rho(0.0, singular=True), monkeypatch)
         assert "singular" in seen["msg"]
+
+
+class TestNoCovarianceReportsTheSum:
+    """No ρ at all is not evidence that the split is fine.
+
+    Until 2026-09-04 this branch returned ``R_bulk`` under the ``"split_bulk"`` basis —
+    the absence of the deciding evidence spelled with the token for *checked and
+    identifiable*. It now returns ``R_series + R_bulk`` under a basis of its own.
+
+    Measured against the three known reference resistors on the legacy fitter — the
+    estimator this branch actually reports for — the sum is closer on every rung that
+    has an ``R_series`` left to add: 10 kΩ −11.11 % → −4.53 %, 220 kΩ −3.49 % → −2.52 %,
+    10 MΩ unchanged at −1.97 % because its ``R₀`` fitted to 1e-10 Ω. Mean 5.52 % → 3.01 %.
+    """
+
+    #: A production ``FitResult`` rather than a duck-typed stand-in: ``covariance=None``
+    #: is what ``fit_circuit`` really returns, and ``SUBAGENT_RULES`` §3.1(e) asks
+    #: whether production can produce the shape a test injects.
+    @staticmethod
+    def _legacy_fit(R0: float = 658.0, R1: float = 8889.0) -> FitResult:
+        return FitResult(
+            model_name="simpleSalt",
+            parameters=np.array([R0, 1e-7, 0.7, R1, 1e-10]),
+            R0=R0, R1=R1, R0_guess=100.0, R1_guess=1.0e4,
+            z_indices=[0, 3], success=True, covariance=None,
+        )
+
+    def test_the_sum_is_reported_and_it_is_the_series_chain(self):
+        R, se, basis, rho = _resolve(self._legacy_fit())
+        assert R == pytest.approx(658.0 + 8889.0)
+        assert basis == BASIS_SUM_UNQUALIFIED
+
+    def test_the_basis_is_distinct_from_the_rho_decided_sum(self):
+        # The whole point of a second token. A sum with a propagated SE and a real ρ is
+        # a different claim from a sum with neither, and a consumer that cannot tell
+        # them apart reads "nothing was measured" as "measured and degenerate".
+        assert BASIS_SUM_UNQUALIFIED != "sum"
+        # Both concrete values, not merely their inequality: `!=` alone also holds when
+        # the no-covariance branch returns "split_bulk", so an inequality assertion
+        # passes just as happily on the defect it was written to pin.
+        assert _resolve(self._legacy_fit())[2] == BASIS_SUM_UNQUALIFIED
+        assert _resolve(_fit_with_rho(-1.0))[2] == "sum"
+
+    def test_the_standard_error_and_rho_stay_nan_because_neither_was_computed(self):
+        _, se, basis, rho = _resolve(self._legacy_fit())
+        assert basis == BASIS_SUM_UNQUALIFIED, "otherwise this asserts NaN on the old branch"
+        assert np.isnan(se) and np.isnan(rho)
+
+    def test_a_covariance_bearing_fit_is_untouched_by_this_branch(self):
+        # The control: the new token must not leak onto the path that has evidence.
+        assert _resolve(_fit_with_rho(-1.0))[2] == "sum"
+        assert _resolve(_fit_with_rho(0.0))[2] == "split_bulk"
+
+    @pytest.mark.parametrize("R0,R1", [(float("nan"), 8889.0), (658.0, float("nan"))],
+                             ids=["no_series", "demoted_railed_fit"])
+    def test_a_non_finite_term_falls_back_to_the_old_return_unchanged(self, R0, R1):
+        # `_demote_if_railed` sets `R1 = NaN` on a railed fit. A sum that is not a
+        # number is not a sum, and such a row must not acquire a basis claiming one was
+        # reported — `mode` is "unavailable" there and the basis has to agree.
+        R, se, basis, rho = _resolve(self._legacy_fit(R0, R1))
+        assert basis == "split_bulk"
+        # Exactly the old return: R_bulk itself, whatever it is — 8889 when only the
+        # series term is missing, NaN when the fit was demoted.
+        assert (R == R1 if R1 == R1 else np.isnan(R))
+        assert np.isnan(se) and np.isnan(rho)
+
+    def test_the_branch_is_one_real_data_reaches(self):
+        """``SUBAGENT_RULES`` §3.2 — a sound rule on a branch nothing visits is not a fix.
+
+        ``fit_circuit`` fits through ``impedance``'s ``CustomCircuit``, which discards
+        ``pcov``, so every fit it returns lands here. On the gated engine that is the
+        ``legacy_fit_failed`` fallback, measured by [p92] §1 at 22 of 54 rows (41 %) on
+        ``20260825T154521Z_arrhenius_sweep``.
+        """
+        from softae.analysis.circuit_fitting import fit_circuit
+        from tests.eis_synthetic import as_eis_result, reference_spectrum
+
+        fit = fit_circuit(as_eis_result(*reference_spectrum()), "simpleSalt")
+        assert fit.covariance is None, "the premise of this whole branch"
+        assert _resolve(fit)[2] == BASIS_SUM_UNQUALIFIED
+
+    def test_the_logged_record_says_no_covariance_rather_than_a_correlation(
+            self, monkeypatch):
+        seen: dict = {}
+        import softae.analysis.eis.engine_support as mod
+
+        monkeypatch.setattr(mod.logger, "info",
+                            lambda event, **kw: seen.update(kw, event=event))
+        _resolve(self._legacy_fit())
+        assert seen["event"] == "eis_split_unqualified"
+        assert "no covariance" in seen["msg"]
+        assert seen["r_sum_ohm"] == pytest.approx(658.0 + 8889.0)
