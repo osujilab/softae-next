@@ -128,6 +128,40 @@ DEFAULT_C_CELL_F = 1.0e-9
 #: acquisition is not at risk — this value exists to catch a future change to it.
 DEFAULT_MAX_AMPLITUDE_MV = 25.0
 
+#: Measurement roles judged against the commissioned **sample** ``|Z|`` window.
+#:
+#: An allow-list rather than a list of exemptions, because an undeclared or unrecognised
+#: role must not be spelled the same way as "this is a sample" (``SUBAGENT_RULES`` §3.1(a)).
+#: The DataStore already carries a role outside :data:`MEASUREMENT_ROLES` —
+#: ``reference_r_misplaced_lead``, four rows — and an exemption list would have narrowed
+#: those reference resistors against a window derived from their own siblings.
+SAMPLE_ROLES = frozenset({"sample", "drift_repeat"})
+
+
+def magnitude_window_applies(role: str | None) -> bool:
+    """Whether the commissioned sample ``|Z|`` window may judge a *role*'s spectrum.
+
+    **A blank is not a sample.** The commissioned window on this fixture is
+    795.6 Ω–1.4456×10⁸ Ω, derived from **reference resistors**; a short blank sits near
+    7.7 Ω, four decades below its floor, so the window genuinely does not certify it —
+    and judging a commissioning artifact by a window its own siblings produced is
+    circular whatever the numbers say.
+
+    Measured: ``measurement_id = 3490`` is ``mux16.toml``'s own ``sources.blank_short``,
+    and under the sample window it keeps **2 of 10** surviving points against a
+    ``min_fit_pts`` of 8. It is not only the ``blank_short`` — all 25 commissioning rows
+    in the corpus are judged this way by anything that replays stored spectra through
+    ``analyze_spectrum``, ``shadow_rehearse`` included.
+
+    Commissioning **re-derivation** is not among them, and the spec that proposed this
+    carve-out was wrong about that: ``workflows/commissioning.py`` runs no gate stack at
+    all, calling :mod:`softae.analysis.eis.calibration_derive` directly on raw
+    ``(f, Z)``. So the carve-out protects the replay paths, not the derivation — and a
+    blank is judged instead by ``derive_short``'s own plausibility check, which is the
+    check that actually knows what a short looks like.
+    """
+    return str(role or "").strip().lower() in SAMPLE_ROLES
+
 
 @dataclass(frozen=True)
 class InstrumentEnvelope:

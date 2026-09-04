@@ -412,6 +412,52 @@ def _log_spectrum_metrics(
             pass
 
 
+def _resolved_calibration(fixture_cfg: Any) -> Any:
+    """This fixture's calibration, from the cache ``resolve_correction`` already keeps.
+
+    Deliberately **the same dict** rather than a second cache of our own. ``fixture.py``
+    is another concern's file, so a public accessor cannot be added there; a private
+    cache here would not be emptied by
+    :func:`~softae.analysis.eis.fixture.clear_calibration_cache`, and an envelope
+    surviving a cache clear is a stale measurement wearing a fresh one's clothes.
+
+    ``resolve_calibration`` — never ``load_calibration`` — because it is the one that
+    drops the constants when the hardware hash has moved. A stale set then returns an
+    empty ``phase_acc`` and a NaN window, ``CalibrationSet.envelope``'s two guards leave
+    the base envelope untouched, and the degradation to the configured estimate *with
+    its ``measured = False`` flags intact* comes for free.
+    """
+    from softae.analysis.eis import fixture as fixture_mod
+    from softae.analysis.eis.calibration import hardware_hash, resolve_calibration
+
+    key = (str(getattr(fixture_cfg, "fixture_id", "default") or "default"),
+           hardware_hash())
+    if key not in fixture_mod._CAL_CACHE:
+        fixture_mod._CAL_CACHE[key] = resolve_calibration(key[0])
+    return fixture_mod._CAL_CACHE[key]
+
+
+def _resolved_envelope(fixture_cfg: Any, *, role: str, calibration: Any = None) -> Any:
+    """The commissioned envelope where one exists, the configured estimate otherwise.
+
+    ``CalibrationSet.envelope()`` had **zero call sites in production** until this one:
+    the fixture was commissioned, the numbers were on disk and version-controlled, and
+    every gate went on reading the configured fallback. This is the wiring.
+
+    An explicit ``envelope=`` argument still wins at the call site above — that is what
+    keeps every test injecting its own envelope working, and it is the override a
+    caller needs to ask "what would the uncalibrated rig have said?".
+    """
+    from softae.analysis.eis.envelope import instrument_envelope
+
+    base = instrument_envelope()
+    cal = (calibration if calibration is not None
+           else _resolved_calibration(fixture_cfg))
+    if cal is None:
+        return base
+    return cal.envelope(base, role=role)
+
+
 def analyze_spectrum(
     eis_result: Any,
     *,
@@ -426,6 +472,7 @@ def analyze_spectrum(
     correction: Any = None,
     calibration: Any = None,
     pregate: Any = None,
+    role: str = "sample",
 ) -> SpectrumReport:
     """Analyse one spectrum through whichever engine is selected.
 
@@ -450,6 +497,12 @@ def analyze_spectrum(
         ``[eis.pregate]``, whose two flags both ship false. An override in the same shape
         as ``gates`` and ``envelope``, and for the same reason — it does not choose an
         *engine*, so it is not a second answer to the question ``engine`` asks.
+    role
+        The measurement's ``measurements.role``. Only a sample is judged against the
+        commissioned ``|Z|`` window — see
+        :func:`~softae.analysis.eis.envelope.magnitude_window_applies`. The default
+        matches the DataStore column's own default, so no existing caller changes
+        meaning; a caller replaying a commissioning artifact must say so.
     """
     cfg = settings if settings is not None else eis_settings()
     chosen = (engine or cfg.engine or "legacy").strip().lower()
@@ -459,7 +512,6 @@ def analyze_spectrum(
 
     from softae.analysis.circuit_fitting import CIRCUIT_MODELS, fit_circuit
     from softae.analysis.eis.admittance import model_free_r_bulk
-    from softae.analysis.eis.envelope import instrument_envelope
     from softae.analysis.eis.gates import (
         FRONT1_POST_CORRECTION,
         FRONT1_PRE_CORRECTION,
@@ -469,7 +521,8 @@ def analyze_spectrum(
     from softae.analysis.quality import Verdict, grade_fit, quality_config
 
     gate_cfg = gates if gates is not None else cfg.gates
-    env = envelope if envelope is not None else instrument_envelope()
+    env = (envelope if envelope is not None
+           else _resolved_envelope(cfg.fixture, role=role, calibration=calibration))
     freq, Z = _physics_complex(eis_result)
 
     # RE contact is read off the cell rather than accepted as a second parameter here.

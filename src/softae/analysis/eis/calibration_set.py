@@ -192,31 +192,91 @@ class CalibrationSet:
             "C_stray_F": float(self.C_stray_F.get(ch, float("nan"))),
         }
 
-    def envelope(self, base: Any = None) -> Any:
+    def _headline_phase_row(self) -> int | None:
+        """Which row of :attr:`phase_acc` becomes the envelope's headline ε and anchor.
+
+        **The largest characterised ε, and its own |Z| as the anchor for it** — not the
+        lowest-|Z| row. That was the shipped rule, justified in a comment as *"the
+        lowest characterised impedance is the conservative headline value"*, and it is
+        wrong on its own terms: on the committed 19-point table the lowest-|Z| row gives
+        tan ε = 0.0761 while the largest-ε row gives 0.1072, so ``argmin(|Z|)`` was the
+        *less* conservative of the two. ε is non-monotonic in |Z| and varies 29× across
+        that table, so a rule that sorts on |Z| optimises neither field.
+
+        The **anchor** is the larger consequence, and it is not about conservatism at
+        all. ``phase_noise_at_ohm`` is what
+        :meth:`~softae.analysis.eis.envelope.InstrumentEnvelope.phase_noise_valid_at`
+        measures decades from, so this one index decides which spectra may quote the
+        floor. ``argmin(|Z|)`` put it at 795.6 Ω — *further* from where films sit than
+        the 9.9 kΩ guess it replaces, making the trust radius worse in the act of
+        replacing an assumption with a measurement. ``argmax(ε)`` puts it at 10.1 MΩ — the commissioned 10 MΩ reference resistor —
+        which brings 10⁶–10⁸ Ω films inside the radius for the first time (measured on
+        the corpus: 896 spectra in band against 320 for the shipped default and 94 for
+        ``argmin(|Z|)``).
+
+        Selecting both fields from the *same* row is the property that matters:
+        whatever else it is, the pair is then coherent.
+
+        ``None`` when no row is usable. A NaN ε must not be selected and must not claim
+        ``phase_noise_measured``, which would be "unknown" spelled as "checked and
+        clean" — the envelope's own ``phase_noise_measured = True`` default is the
+        original of exactly that mistake.
+        """
+        z = np.asarray(self.phase_acc.z_ohm, dtype=float)
+        eps = np.asarray(self.phase_acc.eps_deg, dtype=float)
+        n = int(min(z.size, eps.size))
+        if n == 0:
+            return None
+        usable = np.isfinite(eps[:n]) & np.isfinite(z[:n]) & (z[:n] > 0)
+        if not usable.any():
+            return None
+        rows = np.flatnonzero(usable)
+        return int(rows[int(np.argmax(eps[:n][usable]))])
+
+    def envelope(self, base: Any = None, *, role: str = "sample") -> Any:
         """An :class:`InstrumentEnvelope` with whatever this set actually measured.
 
         Unmeasured quantities keep the configured estimate *and its
         ``*_measured = False`` flag*, so a partial calibration never silently
         promotes a guess to a measurement.
+
+        *role* names what was measured. The magnitude window is promoted **only for a
+        sample** — see
+        :func:`~softae.analysis.eis.envelope.magnitude_window_applies` for why, and for
+        the commissioning artifact that stops being admissible under its own window if
+        this carve-out is skipped. The gate lives here rather than at the call sites so
+        it cannot be forgotten by one of them.
         """
-        from softae.analysis.eis.envelope import InstrumentEnvelope, instrument_envelope
+        from softae.analysis.eis.envelope import (
+            InstrumentEnvelope,
+            instrument_envelope,
+            magnitude_window_applies,
+        )
 
         env = base if base is not None else instrument_envelope()
         updates: dict[str, Any] = {}
 
-        if not self.phase_acc.is_empty:
-            # The lowest characterised impedance is the conservative headline value.
-            idx = int(np.argmin(np.asarray(self.phase_acc.z_ohm, dtype=float)))
+        idx = self._headline_phase_row()
+        if idx is not None:
             updates["phase_noise_deg"] = float(self.phase_acc.eps_deg[idx])
             updates["phase_noise_at_ohm"] = float(self.phase_acc.z_ohm[idx])
             updates["phase_noise_load"] = self.phase_acc.load
             updates["phase_noise_valid_decades"] = float(self.phase_acc.valid_decades)
             updates["phase_noise_measured"] = True
 
-        if self.z_min_ohm == self.z_min_ohm and self.z_max_ohm == self.z_max_ohm:
+        window_measured = (self.z_min_ohm == self.z_min_ohm
+                           and self.z_max_ohm == self.z_max_ohm)
+        if window_measured and magnitude_window_applies(role):
             updates["z_min_ohm"] = float(self.z_min_ohm)
             updates["z_max_ohm"] = float(self.z_max_ohm)
             updates["magnitude_window_measured"] = True
+        elif window_measured:
+            logger.info(
+                "eis_magnitude_window_not_applied", role=role,
+                z_min_ohm=float(self.z_min_ohm), z_max_ohm=float(self.z_max_ohm),
+                msg="commissioning artifact judged against the configured window — a "
+                    "window derived from reference resistors does not certify a blank",
+            )
 
         if self.created_at:
             updates["measured_at"] = self.created_at

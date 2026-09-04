@@ -73,6 +73,16 @@ def derive_open(
     verdict here is still meaningful (an unusable open selects series-only, which is
     the right answer either way), but ``usable = False`` on this hardware should be
     read as "not yet attempted properly" rather than "the fixture has no open".
+
+    .. warning::
+       The default envelope here is the **configured** one, deliberately, and it must
+       stay that way. ``env.z_max_ohm`` is the only envelope field this function reads,
+       and a blank judged against a window derived from reference *resistors* is a
+       blank judged against itself — see
+       :func:`~softae.analysis.eis.envelope.magnitude_window_applies`, which carves
+       commissioning roles out of the commissioned window for exactly this reason.
+       Passing ``CalibrationSet.envelope()`` in here would reintroduce the circularity
+       one level down.
     """
     from softae.analysis.eis.envelope import instrument_envelope
     from softae.analysis.eis.settings import eis_settings

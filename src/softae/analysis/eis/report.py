@@ -23,13 +23,25 @@ So conductivity is reported through a small vocabulary rather than as a bare flo
    **withdrawn** (it was a floating-reference-electrode artefact), and nothing here
    uses it.
 
-   What replaces it is narrower and defensible. Phase noise *has* now been measured —
-   0.149° on a 9.9 kΩ resistive load, giving a ``tan δ`` floor of 0.0026 — so a
-   genuine headroom comparison is possible. But films sit at 10⁶–10⁸ Ω and are
-   capacitive, three decades from where that number was taken. Inside the calibrated
-   band a bound is **qualified**; outside it the same bound is **provisional**, because
-   extrapolating an instrument constant across three decades without saying so is
-   exactly how the withdrawn ceiling came to be believed in the first place.
+   What replaces it is narrower and defensible. Phase noise *has* now been measured, so
+   a genuine headroom comparison is possible. Inside the calibrated band a bound is
+   **qualified**; outside it the same bound is **provisional**, because extrapolating
+   an instrument constant across three decades without saying so is exactly how the
+   withdrawn ceiling came to be believed in the first place.
+
+.. note::
+   **Which floor this function divides by changed on 2026-09-04**, and the numbers in
+   older prose are the old one. Until then the envelope was always
+   ``[eis.instrument]``'s configured estimate — 0.149° on a 9.9 kΩ **resistive** load,
+   ``tan δ`` floor 0.0026 — because ``CalibrationSet.envelope()`` had no call site in
+   ``src/``. It has one now, so on the gated engine the floor is the commissioned one:
+   on ``mux16`` that is 6.12° at 10.1 MΩ **capacitive**, a ``tan δ`` floor of 0.1072 —
+   **41× larger**. Every headroom is 41× smaller, and on the stored corpus 90 % of
+   spectra reporting a value falls to 19 %.
+
+   The shipped configuration is unaffected: ``[eis] engine = "legacy"`` and
+   ``_legacy_report`` never calls this function. **Shadow-rehearsal output from before
+   and after that wiring is not comparable and must not be pooled.**
 """
 
 from __future__ import annotations
