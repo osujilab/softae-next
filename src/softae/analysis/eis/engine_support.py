@@ -257,6 +257,45 @@ def _resolve_reported_resistance(
     variance. Reporting ``R_bulk`` alone there silently drops a σ-dependent fraction of
     the true resistance — overhaul §3.1 identifies exactly that as the origin of the
     apparent "non-constant cell constant".
+
+    **The test is two-sided**, on the magnitude of the configured threshold:
+    ``|ρ| >= |rho_degenerate|`` is degenerate. ``abs()`` is applied to the configured
+    value as well, so an operator who writes ``rho_degenerate = -0.99`` gets
+    ``|ρ| < 0.99`` and the sign of a config key cannot silently invert the test. This
+    mirrors :func:`~softae.analysis.eis.gates.gate_degeneracy`, which took the same
+    shape in ``3e51ac0``; before 2026-09-03 this function kept a one-sided
+    ``ρ <= rho_degenerate`` and the two records deliberately disagreed.
+
+    **Positive ρ is the same rank deficiency with the ridge running the other way, and
+    the split there is *invented* rather than merely imprecise.** At ρ → −1 the
+    optimiser trades resistance between the terms along ``R_series + R_bulk`` held
+    fixed, so the sum survives as a determined quantity and only its partition is lost.
+    At ρ → +1 the two move *together*: what the data pins is the **difference**, and
+    ``Var(R_series + R_bulk) = Σ₀₀ + Σ₁₁ + 2Σ₀₁`` is therefore *largest* exactly where
+    the split is worst. One signed comparison cannot serve both signs, and reporting
+    ``R_bulk`` alone on a ρ = +1 fit reports a number the likelihood surface never
+    constrained. Note the consequence for the sum: on the positive side the sum is the
+    *less* well determined of the two, so the ``se`` returned with it is honestly large
+    — that is the point, not a defect.
+
+    **What licensed the change: a known reference resistor.** Measured against a 10 MΩ
+    metal-film reference (``measurement_id`` 3897, run
+    ``20260903T213729Z_commission_reference_r``, channel 25 — the first absolute answer
+    key this project has had), the gated engine logged ``ρ(R_series, R_bulk) = +1.000``
+    with ``split_identifiable = 0.0`` and, under the one-sided rule, still reported the
+    split. **The reported value is not what the change fixes.** ``R_series`` there is
+    289 Ω against an ``R_bulk`` of 9.02 MΩ, so the sum and the split agree to 3e-5 and
+    the −9.8 % error against nominal survives the switch intact — the accuracy gap
+    versus the legacy fitter's −2.0 % lives in the *fit*, not in the reporting basis.
+    What changes is that the row stops claiming a partition the data did not determine,
+    and stops disagreeing with the gate record beside it.
+
+    **``split_identifiable`` is deliberately not substituted for this comparison.** It
+    was measured as a replacement predicate and is a net loss — fixes 1 spectrum,
+    regresses 4 — because :data:`~softae.analysis.eis.fitter.SPLIT_MAX_COND` of 1e14 is
+    ``|ρ| >= 1 − 2e-14``, some 1e12 times more permissive than 0.95. That predicate asks
+    whether the split is beyond what float64 can represent; this one asks the
+    experiment-design question.
     """
     cov = getattr(fit, "covariance", None)
     R_split = float(getattr(fit, "R1", float("nan")))
@@ -270,13 +309,24 @@ def _resolve_reported_resistance(
     b = roles.get("R_bulk", "R1")
 
     rho = cov.rho(a, b)
-    degenerate = cov.singular or (rho == rho and rho <= float(rho_degenerate))
+    threshold = abs(float(rho_degenerate))
+    degenerate = cov.singular or (rho == rho and abs(rho) >= threshold)
 
     if degenerate:
+        # The two sides are the same rank deficiency and get the same basis, but they
+        # are not the same finding, so the record names which one it was — the gate's
+        # detail string draws the same distinction for the same reason.
+        if cov.singular:
+            why = "covariance singular — the split is unidentifiable"
+        elif rho < 0:
+            why = "relaxation corner out of band — reporting R_series+R_bulk only"
+        else:
+            why = ("positive degeneracy — the data pin the difference, not the split; "
+                   "reporting R_series+R_bulk only")
         logger.info(
             "eis_split_degenerate", rho=rho,
             r_sum_ohm=cov.sum_value(a, b), r_sum_se_ohm=cov.sum_se(a, b),
-            msg="relaxation corner out of band — reporting R_series+R_bulk only",
+            msg=why,
         )
         return cov.sum_value(a, b), cov.sum_se(a, b), "sum", rho
 
