@@ -24,6 +24,7 @@ from softae.core.run_lock import (
     lock_path,
     read_run_lock,
     release_run_lock,
+    retitle_run_lock,
 )
 
 
@@ -67,6 +68,92 @@ class TestReentrancy:
         with held_run_lock(tmp_path, "outer"):
             pass
         assert read_run_lock(tmp_path) is None
+
+
+class TestRetitlingAClaimAlreadyHeld:
+    """The other half of re-entrancy: the same claim, better described.
+
+    ``TestReentrancy`` above pins that a second acquire keeps the *first* claim,
+    which is right when the inner call is narrower than the outer one (a trial
+    inside a campaign). It is wrong when the second call is the same claim with
+    the identity finally known: ``tools/campaign.py`` claims the rig before the
+    run id exists, so its ``what`` has no run id and its ``log_path`` is empty,
+    and ``find_running_campaign`` refuses a campaign that published no run
+    directory. This is the narrow tool for that, and it must be incapable of
+    doing anything else.
+    """
+
+    def test_it_rewrites_what_and_the_log_path_of_our_own_claim(self, tmp_path):
+        acquire_run_lock(tmp_path, "campaign:phase_map")
+        assert retitle_run_lock(
+            tmp_path, what="campaign:phase_map:run-1",
+            log_path=str(tmp_path / "runs" / "run-1")) is True
+
+        # Asserted through the reader, not the return value: the point is what a
+        # *second* process finds on disk, and the return value cannot say that.
+        lock = read_run_lock(tmp_path)
+        assert lock.what == "campaign:phase_map:run-1"
+        assert lock.log_path == str(tmp_path / "runs" / "run-1")
+
+    def test_it_keeps_the_identity_and_the_start_time_of_the_original_claim(
+            self, tmp_path):
+        """A refined label is not a new run.
+
+        ``describe()`` is what an operator reads when deciding whether a holder is
+        wedged, so a ``started_at`` that reset every time the claim was renamed
+        would report a six-hour anneal as having just begun.
+        """
+        before = acquire_run_lock(tmp_path, "campaign:phase_map")
+        retitle_run_lock(tmp_path, what="campaign:phase_map:run-1",
+                         log_path=str(tmp_path / "runs" / "run-1"))
+
+        after = read_run_lock(tmp_path)
+        assert (after.pid, after.started_at, after.host) == (
+            before.pid, before.started_at, before.host)
+
+    def test_it_refuses_when_nobody_holds_the_rig_and_creates_nothing(self, tmp_path):
+        """Never a first-claim backdoor.
+
+        Writing here would skip ``acquire_run_lock``'s exclusive create and reopen
+        exactly the race that file exists to close, so "no lock" has to mean
+        "nothing to rename", not "make one".
+        """
+        assert retitle_run_lock(tmp_path, what="campaign:x:run-1",
+                                log_path="/runs/x") is False
+        assert not lock_path(tmp_path).exists()
+
+    def test_it_leaves_another_processes_claim_completely_untouched(self, tmp_path):
+        """The safety property that matters most: it cannot clobber a foreign lock.
+
+        Same reasoning as ``release_run_lock``'s ownership check — a run has no
+        business rewriting another run's account of itself — and asserted on the
+        raw bytes rather than on a field, because "unchanged" is the claim.
+        """
+        _write_foreign(tmp_path, what="campaign:overnight:run-7")
+        raw_before = lock_path(tmp_path).read_text(encoding="utf-8")
+
+        assert retitle_run_lock(tmp_path, what="campaign:mine:run-1",
+                                log_path=str(tmp_path / "runs" / "mine")) is False
+        assert lock_path(tmp_path).read_text(encoding="utf-8") == raw_before
+
+    def test_it_is_what_a_re_entrant_acquire_cannot_do(self, tmp_path):
+        """The two side by side, on the case that motivated this.
+
+        Deliberately additive rather than a change to
+        ``test_the_same_process_re_acquiring_is_idempotent``: that behaviour is
+        still correct for the nesting it protects, and this is the case it does
+        not cover.
+        """
+        acquire_run_lock(tmp_path, "campaign:phase_map")
+
+        acquire_run_lock(tmp_path, "campaign:phase_map:run-1",
+                         log_path=str(tmp_path / "runs" / "run-1"))
+        assert read_run_lock(tmp_path).log_path == "", (
+            "a re-entrant acquire is supposed to discard the second call's fields")
+
+        retitle_run_lock(tmp_path, what="campaign:phase_map:run-1",
+                         log_path=str(tmp_path / "runs" / "run-1"))
+        assert read_run_lock(tmp_path).log_path == str(tmp_path / "runs" / "run-1")
 
 
 class TestScopeIsTheMachineNotTheProject:

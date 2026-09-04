@@ -249,6 +249,67 @@ def acquire_run_lock(
     return lock
 
 
+def retitle_run_lock(
+    scope: str | Path | None = None, *, what: str, log_path: str = "",
+) -> bool:
+    """Say what **our own** claim is, now that we know. Returns whether it changed.
+
+    The companion to :func:`acquire_run_lock`'s re-entrancy, and it exists because
+    that re-entrancy is right for one case and wrong for another. Re-acquiring
+    returns the *existing* claim unchanged, which is correct when the second call
+    is **narrower** than the first — a per-trial workflow lock nested inside a
+    campaign-length one must not overwrite the campaign's identity with a trial's.
+    It is wrong when the second call is the **same** claim, better described.
+
+    That second case is now the ordinary path. ``tools/campaign.py`` claims the rig
+    before it builds a DataStore, because the store, the ledgers, the head gate and
+    ``connect_all`` used to run unclaimed — but at that point the run id does not
+    exist, so it can only say ``campaign:<name>`` with no run directory.
+    :func:`~softae.core.autonomous_wiring.run_autonomous_campaign` learns both a
+    few hundred milliseconds later, and its re-entrant acquire silently discards
+    them. The cost is not cosmetic: :func:`softae.core.campaign_discovery.find_running_campaign`
+    reads ``log_path`` to decide where a pause or abort request goes, and an empty
+    one is a refusal — every headless campaign would report as uncontrollable for
+    its whole length.
+
+    So: **a rename of a claim already held, never an acquisition.** It refuses a
+    lock nobody holds (returning ``False`` rather than creating one — a
+    first-claim backdoor that skipped the exclusive create would reopen the race
+    :func:`acquire_run_lock` exists to close) and refuses a lock belonging to
+    anyone else, on the same reasoning as :func:`release_run_lock`: this process
+    has no business rewriting another run's story about itself.
+
+    ``pid``, ``started_at`` and ``host`` are carried over from the claim as it
+    already stands. Only the *label* is being corrected, and a claim whose start
+    time reset every time its description was refined would tell an operator
+    reading :meth:`RunLock.describe` that a six-hour anneal had just begun.
+    """
+    existing = read_run_lock(scope)              # also clears a stale one
+    if existing is None or not existing.is_mine():
+        return False
+
+    renamed = RunLock(
+        pid=existing.pid, what=str(what), started_at=existing.started_at,
+        host=existing.host, log_path=str(log_path),
+    )
+    path = lock_path(scope)
+    try:
+        # A plain overwrite, not `open(..., "x")`: the file legitimately exists
+        # and this process owns it, so an exclusive create would raise on every
+        # call it is meant to serve.
+        path.write_text(json.dumps(renamed.to_dict(), indent=2), encoding="utf-8")
+    except OSError:
+        # The claim itself is intact — only its description is stale. Refusing
+        # loudly and carrying on beats unwinding a run over a label.
+        logger.warning("run_lock_retitle_failed", path=str(path), what=what,
+                       exc_info=True)
+        return False
+
+    logger.info("run_lock_retitled", pid=renamed.pid, was=existing.what,
+                what=renamed.what, log_path=renamed.log_path)
+    return True
+
+
 def release_run_lock(scope: str | Path | None = None, *, force: bool = False) -> bool:
     """Give the rig back. Returns whether a lock was removed.
 

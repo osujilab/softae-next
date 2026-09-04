@@ -18,10 +18,23 @@ That second guarantee is about **this lock**, not about every refusal. A run
 started from the same GUI takes a scoped rig claim (``ff27bc1``) and does hold
 back the controls it is driving, until it is paused; ``busy_rig_message`` states
 the difference and ``TestBusyMessage`` pins that wording.
+
+Asking is not taking, and the second half of the fix is the taking. The peek
+above claims nothing, and ``run_autonomous_campaign``'s own claim cannot happen
+until ``start_run`` has minted a run id — so the store, the ledgers, the head
+gate and ``connect_all`` all sat in an unclaimed window that a second launcher
+could walk straight into. ``TestHeadlessClaimsTheRigBeforeItTouchesAnything``
+pins that window closed. The *mechanism's* re-entrancy, which is what lets the
+CLI's early claim and the campaign's later one be the same lock rather than a
+deadlock, is pinned where the mechanism lives (``test_run_lock.py``'s
+``test_the_same_process_re_acquiring_is_idempotent`` and
+``test_a_nested_block_does_not_free_the_outer_ones_lock``) and is deliberately
+not restated here.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import socket
 from pathlib import Path
@@ -31,6 +44,8 @@ import pytest
 from softae.core import run_lock as rl
 from softae.core.data_store import DataStore
 from softae.core.run_lock import (
+    RunLock,
+    RunLockHeld,
     acquire_run_lock,
     busy_rig_message,
     foreign_run_lock,
@@ -309,6 +324,162 @@ class TestHeadlessRefusesToJoinALiveRun:
 
         assert rc == cli.EXIT_OK
         assert "NOT STARTING" not in capsys.readouterr().out
+
+
+class TestHeadlessClaimsTheRigBeforeItTouchesAnything:
+    """The peek asks who holds the rig. It does not take it.
+
+    `run_autonomous_campaign` cannot claim until `start_run` has minted a run id,
+    and everything before that — the store, the ledgers, the head gate, and
+    `connect_all`, which opens the real ports — used to run with **nothing
+    claimed**. A second launcher started inside that window passed its own peek
+    for exactly the reason the first one did (nobody had claimed anything yet)
+    and both reached the hardware. These tests pin that the window is claimed at
+    the end it opens.
+
+    `held_run_lock` is patched on :mod:`softae.core.run_lock` throughout, which
+    reaches ``campaign.py``'s *local* import and deliberately does **not** reach
+    :mod:`~softae.core.autonomous_wiring`'s module-level one — the asymmetry the
+    `_real_rig` docstring describes. So a spy counted here counts the CLI's own
+    claim and nothing else, which is the distinction between "claimed before it
+    touched anything" and "claimed eventually, by someone".
+    """
+
+    @staticmethod
+    def _mock_manager_recording_connect(monkeypatch, order):
+        """The real-branch manager, minus real drivers, noting when ports open."""
+        from softae.drivers import factory
+        from softae.drivers.mock_factory import create_mock_manager
+
+        manager = create_mock_manager(config={})
+        real_connect = manager.connect_all
+
+        async def _connect(*a, **k):
+            order.append(("connect", lock_path().exists()))
+            return await real_connect(*a, **k)
+
+        manager.connect_all = _connect
+        monkeypatch.setattr(factory, "create_manager", lambda *a, **k: manager)
+        return manager
+
+    @staticmethod
+    def _spy_on_held_run_lock(monkeypatch, seen):
+        """Record every claim ``campaign.py`` takes, then take it for real."""
+        real_held = rl.held_run_lock
+
+        @contextlib.contextmanager
+        def _spy(scope=None, what="", *, log_path=""):
+            seen.append(what)
+            with real_held(scope, what, log_path=log_path) as lock:
+                yield lock
+
+        monkeypatch.setattr(rl, "held_run_lock", _spy)
+
+    def test_a_real_run_holds_the_claim_before_the_store_and_the_ports(
+            self, tmp_path, capsys, monkeypatch, _isolated_scope, _real_rig):
+        """The gap, closed: claimed first, and still held at every step after.
+
+        Ordering is asserted against the two things in the window that matter —
+        the DataStore the run records into and the `connect_all` that opens the
+        ports — rather than against the claim merely existing by the end.
+        """
+        import softae.core.data_store as ds_mod
+
+        order: list = []
+        claims: list = []
+        self._spy_on_held_run_lock(monkeypatch, claims)
+
+        real_store = ds_mod.DataStore
+
+        def _spy_store(*a, **k):
+            order.append(("store", lock_path().exists()))
+            return real_store(*a, **k)
+
+        monkeypatch.setattr(ds_mod, "DataStore", _spy_store)
+        self._mock_manager_recording_connect(monkeypatch, order)
+
+        rc = cli.main(["run", _spec_file(tmp_path), "--yes", "--head-up",
+                       "--project", str(tmp_path / "proj")])
+        capsys.readouterr()
+
+        assert rc == cli.EXIT_OK
+        assert claims == ["campaign:liveness_test"], (
+            "the CLI took no claim of its own — the window is still open")
+        stages = [name for name, _ in order]
+        assert "store" in stages and "connect" in stages
+        assert all(held for _, held in order), (
+            f"the rig was unclaimed while the run used it: {order}")
+        # And given back: a claim that outlives the run is an outage, not a guard.
+        assert not lock_path().exists()
+
+    def test_a_claim_lost_to_a_race_refuses_exactly_like_the_peek(
+            self, tmp_path, capsys, monkeypatch, _isolated_scope, _real_rig):
+        """The peek narrows the race; only the exclusive create closes it.
+
+        A second launcher can win between "nobody holds it" and this one's own
+        `acquire_run_lock`. The operator must not be able to tell which of the
+        two refusals they got, so the assertion is on the whole transcript, not
+        merely on the exit code: two wordings for one situation is how a cron
+        wrapper ends up parsing stdout.
+        """
+        self._mock_manager_recording_connect(monkeypatch, [])
+        # The manager is built once and reused by both calls, so its registration
+        # logging belongs to neither transcript. Drained here rather than
+        # filtered later: the comparison below is only worth making if it is over
+        # the whole of what each run said.
+        capsys.readouterr()
+        argv = ["run", _spec_file(tmp_path), "--yes", "--head-up",
+                "--project", str(tmp_path / "proj")]
+
+        # (a) The holder is there when the peek looks.
+        _write_foreign(_isolated_scope, what="campaign:overnight:run-7")
+        peek_rc = cli.main(argv)
+        peek_out = capsys.readouterr().out
+
+        # (b) The same holder arrives a moment later, between the peek and the
+        # claim. Identical owner, so an identical message — or they have drifted.
+        lock_path(_isolated_scope).unlink()
+        stolen = RunLock(pid=4321, what="campaign:overnight:run-7",
+                         started_at="2026-08-12T14:02:00+00:00",
+                         host="some-other-machine", log_path="")
+
+        def _lost_the_race(*_a, **_k):
+            raise RunLockHeld(stolen)
+
+        monkeypatch.setattr(rl, "held_run_lock", _lost_the_race)
+        race_rc = cli.main(argv)
+        race_out = capsys.readouterr().out
+
+        assert peek_rc == cli.EXIT_BUSY
+        assert race_rc == cli.EXIT_BUSY
+        assert race_out == peek_out
+        assert "NOT STARTING" in race_out
+        assert "campaign:overnight:run-7" in race_out
+
+    def test_a_simulated_run_still_takes_no_claim_at_all(
+            self, tmp_path, capsys, monkeypatch, _isolated_scope):
+        """Claiming earlier must not cost `--mock` its exemption.
+
+        A mock run collides with nothing and moves nothing, so a claim from one
+        turns a dry run into an outage for a real campaign. The predicate is the
+        same `rig_is_simulated` that governs the refusal above and
+        `autonomous_wiring`'s own claim, so the three cannot come to disagree.
+        """
+        # The `_real_rig` landmine, from the other side: bind the real
+        # `held_run_lock` into `autonomous_wiring` before the patch, or the spy
+        # below becomes that module's permanent copy and leaks into later tests.
+        import softae.core.autonomous_wiring  # noqa: F401
+
+        claims: list = []
+        self._spy_on_held_run_lock(monkeypatch, claims)
+
+        rc = cli.main(["run", _spec_file(tmp_path), "--mock", "--yes",
+                       "--head-up", "--project", str(tmp_path / "proj")])
+        capsys.readouterr()
+
+        assert rc == cli.EXIT_OK
+        assert claims == [], "a simulated run claimed hardware it never touches"
+        assert not lock_path().exists()
 
 
 class TestHeadlessRecoveryOrdering:

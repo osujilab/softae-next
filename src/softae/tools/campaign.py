@@ -62,6 +62,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from contextlib import ExitStack
 from typing import Any
 
 from softae.core.campaign_events import EVENTS_FILENAME
@@ -364,9 +365,17 @@ def _cmd_run(args) -> int:
     from softae.core.autonomous_wiring import run_autonomous_campaign
     from softae.core.data_store import DataStore
     from softae.core.reservoir import attach_reservoir_ledger
+    # Local, not module-level, and that is load-bearing rather than style.
+    # `autonomous_wiring` binds these at *import* time, so a monkeypatch applied
+    # afterwards never reaches its copies; a local import re-resolves the name on
+    # every call and does see one. That asymmetry is what makes this file's
+    # liveness behaviour testable without real drivers — see the `_real_rig`
+    # fixture in `tests/test_campaign_liveness_guard.py`.
     from softae.core.run_lock import (
+        RunLockHeld,
         busy_rig_message,
         foreign_run_lock,
+        held_run_lock,
         rig_is_simulated,
     )
 
@@ -411,17 +420,59 @@ def _cmd_run(args) -> int:
         # overriding them; one that gives up on a collision loses the night.
         return EXIT_BUSY
 
-    # `--project` is required by the parser for `run`/`resume`, so the store is
-    # never None here — the campaign always has somewhere to record what it did.
-    store = DataStore(args.project)
-    attach_reservoir_ledger(manager, store)
+    # ── The peek was a question. This is the answer being written down. ──────
+    #
+    # `foreign_run_lock` above takes nothing: it reads who holds the rig and
+    # returns. So everything from here to `run_autonomous_campaign`'s own claim
+    # — the store, the ledgers, the head gate, and `connect_all`, which opens the
+    # real ports — used to run **unclaimed**. A second launcher started inside
+    # that window passed its own peek for the same reason this one did (nobody
+    # had claimed anything yet) and both reached the hardware. Claiming here
+    # closes the window at the end it opens.
+    #
+    # Deliberately the *same* mechanism `autonomous_wiring` takes later, not a
+    # second one beside it. `acquire_run_lock` is re-entrant for the process that
+    # already holds the lock (`tests/test_run_lock.py`) and neither call passes a
+    # scope, so both resolve to `DEFAULT_SCOPE` and the later claim is a harmless
+    # no-op rather than a deadlock. The price is that `autonomous_wiring`'s
+    # richer `campaign:<name>:<run_id>` never reaches the file — a re-entrant
+    # acquire keeps the first claim's `what` — and that is accepted: the run id
+    # does not exist yet here (`start_run` mints it), and holding the rig from
+    # the start of the window is worth more than a better string describing a
+    # claim taken too late.
+    rig_claim = ExitStack()
+    if not rig_is_simulated(manager):
+        try:
+            rig_claim.enter_context(held_run_lock(what=f"campaign:{spec.name}"))
+        except RunLockHeld as busy:
+            # The peek narrows this race; only the exclusive create closes it.
+            # Same message, same exit code: from the operator's side this is the
+            # peek's refusal reached a few milliseconds later, and two wordings
+            # for one situation is how a wrapper learns to parse stdout.
+            print(f"\n!! NOT STARTING '{spec.name}'\n\n"
+                  f"{busy_rig_message(busy.lock, action='This campaign')}",
+                  flush=True)
+            return EXIT_BUSY
 
-    # Same choke point as the stock ledger, for the same reason: every dispense
-    # the campaign makes must reset that line's purge timer, or the harness pays
-    # the full idle rate for lines the run had just used itself.
-    _attach_purge(manager, store)
+    try:
+        # `--project` is required by the parser for `run`/`resume`, so the store is
+        # never None here — the campaign always has somewhere to record what it did.
+        store = DataStore(args.project)
+        attach_reservoir_ledger(manager, store)
 
-    guard = ParkGuard(manager, on_park=_report_park)
+        # Same choke point as the stock ledger, for the same reason: every dispense
+        # the campaign makes must reset that line's purge timer, or the harness pays
+        # the full idle rate for lines the run had just used itself.
+        _attach_purge(manager, store)
+
+        guard = ParkGuard(manager, on_park=_report_park)
+    except BaseException:
+        # Nothing below has started, so there is nothing else to unwind — but the
+        # claim is already held, and `_cmd_run` is called in-process (every test
+        # here does), where a leaked lock outlives the failure and refuses the
+        # next caller for the life of the interpreter.
+        rig_claim.close()
+        raise
 
     try:
         if not _register_head_state(manager, args):
@@ -512,6 +563,11 @@ def _cmd_run(args) -> int:
         return EXIT_FAILED
     finally:
         store.close()
+        # Last of all, after the store: the claim has to outlive every path that
+        # can still touch the rig or the run's record, and `_go`'s own teardown
+        # (`disconnect_all`) is inside it. Handing the rig to the next process
+        # before that finishes is the window the lock exists to close.
+        rig_claim.close()
 
     print()
     print(f"{result.final_state}: {result.n_trials} trial(s)")

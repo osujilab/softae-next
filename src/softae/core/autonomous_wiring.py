@@ -92,7 +92,7 @@ from softae.core.measurement_spec import (
 # module exclusively inside functions, so its module body never reaches back
 # here. Keep it that way — see `modality_registry`'s "Import discipline".
 from softae.core.modality_registry import ObjectiveSpec, get_modality
-from softae.core.run_lock import held_run_lock, rig_is_simulated
+from softae.core.run_lock import held_run_lock, retitle_run_lock, rig_is_simulated
 from softae.core.run_plan import RunPlan, SettlePlan
 from softae.core.alerts import CRITICAL, Alert, raise_alert
 from softae.core.safe_park import safe_park
@@ -2944,6 +2944,26 @@ async def run_autonomous_campaign(
                 what=f"campaign:{spec.name}:{run_id}",
                 log_path=str(data_store.run_dir(run_id)),
             ))
+            # And say so on disk even when the claim above was re-entrant.
+            # `tools/campaign.py` now claims the rig *before* it builds the store,
+            # to close the unclaimed window around `connect_all` — but it has no
+            # run id yet, so it writes `campaign:<name>` with no run directory.
+            # `acquire_run_lock` hands an existing claim back unchanged (which is
+            # right for the per-trial lock nested *inside* this one), so the
+            # identity assembled here never reached the file, and
+            # `campaign_discovery.find_running_campaign` refuses a campaign that
+            # published no run directory — every headless run would have read as
+            # uncontrollable for its whole length.
+            #
+            # Unconditional, because it does not need to know which case it is in:
+            # with no outer claim the acquire above already wrote exactly these two
+            # values and this rewrites them with themselves; with one, this is the
+            # correction. `retitle_run_lock` touches nothing it does not already
+            # own, so the branch that would distinguish them would buy nothing.
+            retitle_run_lock(
+                what=f"campaign:{spec.name}:{run_id}",
+                log_path=str(data_store.run_dir(run_id)),
+            )
 
         # ── The narration stream (stage 3) ──────────────────────────────────
         # `emit` is in-memory dispatch and dies with the process, which is why

@@ -215,6 +215,141 @@ class TestWhyTheChildIsADifferentProcess:
             release_run_lock(tmp_path)
 
 
+class TestAHeadlessCampaignIsDiscoverableDespiteTheCLIsEarlyClaim:
+    """The same defect as the class above, arriving from the other direction.
+
+    ``TestWhyTheChildIsADifferentProcess`` covers the *unfixable* case: the GUI's
+    ``gui:desktop`` session claim is a genuinely different owner, so a campaign
+    running inside it cannot publish its own identity and the answer is a child
+    process. This is the case that is not that. ``tools/campaign.py`` now claims
+    the rig itself before it builds a DataStore — closing the unclaimed window
+    around ``connect_all`` — and that claim is the **same** campaign, taken a few
+    hundred milliseconds early, when the run id does not exist yet. Handing it
+    back unchanged is what ``acquire_run_lock``'s re-entrancy does, and it would
+    have made every headless run undiscoverable to ``softae-campaign control``
+    for its whole length.
+
+    So this drives the real machinery end to end — placeholder claim, then
+    ``run_autonomous_campaign`` — and asks the production discovery path, with no
+    injected ``lock_reader``, what a controller would find.
+    """
+
+    @staticmethod
+    def _campaign_spec():
+        # Board-shaped, unlike the launch-mechanics `_spec` above: this one is
+        # actually run, so it needs channels a real PCB has.
+        return CampaignSpec(
+            name="early_claim",
+            channels=(21, 22),
+            pcb_name="SoftAE_EIS_4Stripe",
+            parameter_space={
+                "vol_p0": {"type": "float", "low": 5.0, "high": 30.0},
+                "vol_p1": {"type": "float", "low": 5.0, "high": 30.0},
+            },
+            vol_params=("vol_p0", "vol_p1"),
+            pump_ids=(0, 1),
+            deadvols=(10.0, 30.0),
+            time_scale=0.0,
+            budget=1,
+            seed=7,
+        )
+
+    @pytest.fixture
+    def _real_rig_on_a_temp_scope(self, tmp_path, monkeypatch):
+        """A mock rig that reads as real, on a lock nobody else can see.
+
+        Both halves are needed and for opposite reasons: without the scope
+        redirect this test would take the operator's actual ``~/.softae/rig.lock``
+        mid-experiment, and without the simulation override no claim is taken at
+        all, since a mock run must never lock out a real one. Patched on **both**
+        modules — ``autonomous_wiring`` binds the predicate at import time — or
+        the campaign's own claim silently never happens and the test passes by
+        never reaching the code it is about.
+        """
+        from softae.core import autonomous_wiring as aw
+        from softae.core import run_lock as rl
+
+        scope = tmp_path / "lockscope"
+        scope.mkdir()
+        monkeypatch.setattr(rl, "DEFAULT_SCOPE", scope)
+        monkeypatch.setattr(rl, "rig_is_simulated", lambda _m: False)
+        monkeypatch.setattr(aw, "rig_is_simulated", lambda _m: False)
+        return scope
+
+    async def test_a_run_under_the_clis_early_claim_still_publishes_its_run_dir(
+        self, tmp_path, _real_rig_on_a_temp_scope
+    ):
+        """What ``softae-campaign control`` finds while the campaign is running."""
+        from softae.core.autonomous_wiring import run_autonomous_campaign
+        from softae.core.campaign_discovery import find_running_campaign
+        from softae.core.data_store import DataStore
+        from softae.core.run_lock import held_run_lock
+        from softae.drivers.mock_factory import create_mock_manager
+
+        spec = self._campaign_spec()
+        seen: list = []
+
+        def watch(event: dict) -> None:
+            if event.get("type") == "suggestion" and not seen:
+                # No `lock_reader`: the production path, reading the same file a
+                # separate controller process would open.
+                seen.append(find_running_campaign())
+
+        manager = create_mock_manager(config={})
+        await manager.connect_all()
+        store = DataStore(tmp_path / "proj")
+        try:
+            # Exactly what `tools/campaign.py` takes before it has a run id: the
+            # campaign's name, and nothing else it does not know yet.
+            with held_run_lock(what=f"campaign:{spec.name}"):
+                result = await run_autonomous_campaign(
+                    spec, manager=manager, data_store=store, on_event=watch)
+        finally:
+            store.close()
+            await manager.disconnect_all()
+
+        target = seen[0]
+        assert target.controllable, (
+            "a controller would have refused a live campaign: "
+            f"{target.refusal}")
+        assert target.run_dir == str(store.run_dir(result.run_id))
+        assert target.detail == f"campaign:{spec.name}:{result.run_id}"
+
+    async def test_the_early_claim_is_still_the_same_claim_afterwards(
+        self, tmp_path, _real_rig_on_a_temp_scope
+    ):
+        """Renaming a claim must not silently release or re-take it.
+
+        The outer ``with`` is what owns the rig for the CLI's whole window, so if
+        refining the label handed the lock away — or replaced it with a claim the
+        outer block does not think it made — the window this all exists to close
+        would reopen at the far end.
+        """
+        from softae.core.autonomous_wiring import run_autonomous_campaign
+        from softae.core.data_store import DataStore
+        from softae.core.run_lock import held_run_lock, read_run_lock
+        from softae.drivers.mock_factory import create_mock_manager
+
+        spec = self._campaign_spec()
+        manager = create_mock_manager(config={})
+        await manager.connect_all()
+        store = DataStore(tmp_path / "proj")
+        try:
+            with held_run_lock(what=f"campaign:{spec.name}") as outer:
+                await run_autonomous_campaign(
+                    spec, manager=manager, data_store=store)
+                still = read_run_lock()
+                assert still is not None, "the campaign gave the rig away on exit"
+                assert (still.pid, still.started_at) == (
+                    outer.pid, outer.started_at), (
+                    "the claim was re-taken rather than renamed")
+        finally:
+            store.close()
+            await manager.disconnect_all()
+
+        assert read_run_lock() is None, "the CLI's own claim outlived its block"
+
+
 class TestDetachedCampaignHandle:
     def test_the_handle_offers_no_abort_so_closing_the_window_cannot_stop_the_run(
         self, tmp_path
