@@ -29,16 +29,22 @@ from softae.analysis.eis.constrained_fit import (
     BOUNDS,
     CONSENSUS_COST_FACTOR,
     CONSTRAINED_FIT_TOL,
+    HOLDOUT_REFUSE_PCT,
+    MIN_ARC_RESOLVED,
     ORDER_SPREAD_REFUSE_PCT,
     PARAM_NAMES,
     PER_SPECTRUM_PARAMS,
+    QG_PLAUSIBLE_MAX,
     R_SOL_SEED_MULTIPLIERS,
     SHARED_PARAMS,
     SHARED_SEED_GRID,
     Admissibility,
     ConstrainedSpectrum,
+    HoldoutReport,
     HoldoutResult,
+    ImplausibleArtifact,
     InadmissibleFitSet,
+    PoorGeneralisation,
     SharedArtifact,
     ShuntTable,
     UnstableFitSurface,
@@ -49,7 +55,9 @@ from softae.analysis.eis.constrained_fit import (
     fit_shared,
     fixture_admittance,
     holdout_report,
+    implausible_shared,
     model_impedance,
+    refuse_unless_generalises,
 )
 
 #: Arguments for the tests whose subject is something *other* than the multi-start —
@@ -305,10 +313,16 @@ def test_fit_shared_refuses_when_only_one_start_reached_the_minimum(ladder) -> N
 
 
 def test_unstable_fit_surface_is_recorded_as_a_refused_fold(ladder) -> None:
-    """It subclasses InadmissibleFitSet so ``holdout_report`` records it, not crashes."""
+    """It subclasses InadmissibleFitSet so ``holdout_report`` records it, not crashes.
+
+    The generalisation gate has to be lifted to *see* the record: with every fold
+    refused there is nothing scored, the mean is NaN, and NaN refuses — which is the
+    subject of its own test below.
+    """
     assert issubclass(UnstableFitSurface, InadmissibleFitSet)
     report = holdout_report(ladder, kind="leave_one_out",
-                            seed_grid=(SHARED_SEED_GRID[0],))
+                            seed_grid=(SHARED_SEED_GRID[0],),
+                            max_mean_abs_error_pct=math.inf)
     assert len(report.refused) == len(ladder)
     assert report.results == ()
     assert all("order spread" in reason for _, reason in report.refused)
@@ -333,6 +347,68 @@ def test_consensus_window_is_relative_with_an_absolute_floor() -> None:
     # The floor must be far below any measured spectrum's cost per residual: the four
     # NIST standards fit at ~0.25 over ~320 residuals, i.e. ~8e-4 per residual.
     assert module.EXACT_COST_PER_RESIDUAL < 1e-6
+
+
+# ── The plausibility band on Qg ──────────────────────────────────────────────
+
+def test_qg_ceiling_sits_between_the_two_measured_populations() -> None:
+    """The constant is a position in a gap, so the test is that it is still in it.
+
+    Widest ``Qg`` ever *returned* by a good fit across eleven subsets of the four NIST
+    standards on two preparations: 1.048e-9. Lowest ``Qg`` from the poisoned basin
+    across four routes and three preparations: 8.418e-8. An edit that moves the ceiling
+    out of that window changes what the refusal means, and should have to say so here.
+    """
+    assert 1.048e-9 < QG_PLAUSIBLE_MAX < 8.418e-8
+
+
+def test_implausible_shared_passes_a_good_artifact(artifact) -> None:
+    assert implausible_shared(artifact) == ""
+    assert artifact.Qg < QG_PLAUSIBLE_MAX
+
+
+def test_implausible_shared_names_the_ceiling_it_refused_on(artifact) -> None:
+    reason = implausible_shared(artifact, max_qg=artifact.Qg / 2.0)
+    assert "plausible ceiling" in reason
+    assert f"{artifact.Qg:.4g}" in reason
+
+
+def test_implausible_shared_treats_a_nan_qg_as_a_failure_not_a_pass() -> None:
+    """NaN fails every comparison, so ``Qg > ceiling`` alone would let it through."""
+    assert implausible_shared(
+        SharedArtifact(Qg=float("nan"), ng=0.95, nd=0.76)) .startswith("Qg is NaN")
+
+
+def test_implausible_shared_can_be_switched_off_only_explicitly(artifact) -> None:
+    assert implausible_shared(artifact, max_qg=math.inf) == ""
+    assert implausible_shared(SharedArtifact(Qg=1.0, ng=0.95, nd=0.76),
+                              max_qg=math.inf) == ""
+
+
+def test_fit_shared_refuses_an_artifact_above_the_qg_ceiling(ladder) -> None:
+    """End to end, and the control is the same call with the ceiling lifted.
+
+    The synthetic ladder's true ``Qg`` is 1.2e-9, so the band is exercised by moving the
+    ceiling under it rather than by manufacturing a bad fit — the real poisoned basin is
+    not reachable from spectra the forward model generated exactly, which is why the
+    discriminating version of this test is the answer-key one.
+    """
+    permitted = fit_shared(ladder, max_qg=math.inf, **FAST)
+    assert permitted.Qg == pytest.approx(TRUE_SHARED["Qg"], rel=1e-3)
+
+    with pytest.raises(ImplausibleArtifact, match="plausible ceiling") as exc:
+        fit_shared(ladder, max_qg=permitted.Qg / 2.0, **FAST)
+    # The artifact travels in the message; a refusal that says nothing about what it saw
+    # is a dead end for whoever reads the log.
+    assert "artifact from" in str(exc.value)
+
+
+def test_implausible_artifact_is_recorded_as_a_refused_fold(ladder) -> None:
+    assert issubclass(ImplausibleArtifact, InadmissibleFitSet)
+    report = holdout_report(ladder, kind="leave_one_out", max_qg=1e-12,
+                            max_mean_abs_error_pct=math.inf, **FAST)
+    assert len(report.refused) == len(ladder)
+    assert all("plausible ceiling" in reason for _, reason in report.refused)
 
 
 # ── R_sol = R0 + R1, unconditionally ─────────────────────────────────────────
@@ -500,25 +576,42 @@ def test_arc_is_resolved_is_false_for_too_few_points() -> None:
     assert not arc_is_resolved(np.array([1.0, 2.0]), np.array([1 - 1j, 1 - 2j]))
 
 
-def test_check_admissible_refuses_a_set_with_too_few_arc_resolved_spectra() -> None:
-    good = synth("wide", 70_000.0, band=(4.0, 2.0e5))
+def test_check_admissible_refuses_a_set_with_no_arc_resolved_spectrum() -> None:
     blind = [synth(f"high_only_{i}", r, band=(2.0e4, 2.0e5))
              for i, r in enumerate((38_000.0, 2_400.0))]
-    verdict = check_admissible([good, *blind])
+    verdict = check_admissible(blind)
     assert isinstance(verdict, Admissibility)
     assert not verdict.admissible
-    assert verdict.n_arc_resolved == 1
-    assert verdict.arc_resolved == ("wide",)
+    assert verdict.n_arc_resolved == 0
+    assert verdict.arc_resolved == ()
     assert "resolve the geometric arc" in verdict.reason
+
+
+def test_check_admissible_accepts_a_set_with_one_arc_resolved_spectrum() -> None:
+    """The recalibration from 2 to 1, asserted as behaviour rather than as a constant.
+
+    Measured on the four NIST standards with this gate bypassed: sets with **one**
+    arc-resolved member score ``R_sol`` MAE 3.06–4.39 % against 3.00–4.28 % for sets
+    with two — interleaved, not merely close — while the one set with **none** scores
+    2338 %. See :func:`~softae.analysis.eis.constrained_fit.check_admissible`.
+    """
+    assert MIN_ARC_RESOLVED == 1
+    one = [synth("wide", 70_000.0, band=(4.0, 2.0e5)),
+           *(synth(f"high_only_{i}", r, band=(2.0e4, 2.0e5))
+             for i, r in enumerate((38_000.0, 2_400.0)))]
+    verdict = check_admissible(one)
+    assert verdict.n_arc_resolved == 1
+    assert verdict.admissible, verdict.describe()
+    # And the threshold is still a threshold: ask for two and the same set is refused.
+    assert not check_admissible(one, min_arc_resolved=2).admissible
 
 
 def test_fit_shared_raises_rather_than_returning_a_bad_artifact() -> None:
     """Blocker 2. The refusal is the deliverable, not a degraded number."""
-    good = synth("wide", 70_000.0, band=(4.0, 2.0e5))
     blind = [synth(f"high_only_{i}", r, band=(2.0e4, 2.0e5))
              for i, r in enumerate((38_000.0, 2_400.0))]
     with pytest.raises(InadmissibleFitSet, match="INADMISSIBLE"):
-        fit_shared([good, *blind])
+        fit_shared(blind)
 
 
 def test_check_admissible_refuses_a_single_spectrum() -> None:
@@ -654,18 +747,79 @@ def test_holdout_report_leave_one_out_scores_only_held_out_spectra(ladder) -> No
 
 def test_holdout_report_records_refused_folds_rather_than_skipping_them() -> None:
     """A fold dropped for inadmissibility must be visible, not averaged away."""
-    good = [synth("wide_a", 70_000.0), synth("wide_b", 38_000.0)]
-    blind = synth("high_only", 2_400.0, band=(2.0e4, 2.0e5))
-    report = holdout_report([*good, blind], kind="leave_one_out", **FAST)
+    good = synth("wide", 70_000.0)
+    blind = [synth(f"high_only_{i}", r, band=(2.0e4, 2.0e5))
+             for i, r in enumerate((38_000.0, 2_400.0))]
+    report = holdout_report([good, *blind], kind="leave_one_out", **FAST)
     refused = {label for label, _ in report.refused}
-    assert refused == {"wide_a", "wide_b"}
-    assert "INADMISSIBLE" in dict(report.refused)["wide_a"]
+    # Holding out the only arc-resolved spectrum leaves a set that resolves none.
+    assert refused == {"wide"}
+    assert "INADMISSIBLE" in dict(report.refused)["wide"]
     assert "refused" in report.describe()
 
 
 def test_holdout_report_rejects_an_unknown_kind(ladder) -> None:
     with pytest.raises(ValueError, match="unknown holdout kind"):
         holdout_report(ladder, kind="optimistic", **FAST)
+
+
+# ── The generalisation gate ──────────────────────────────────────────────────
+
+def _report(kind: str, *errors_pct: float) -> HoldoutReport:
+    """A report with known errors, so the gate can be tested without running a fit."""
+    return HoldoutReport(kind, tuple(HoldoutResult(f"s{i}", 100.0, 100.0 + e)
+                                     for i, e in enumerate(errors_pct)))
+
+
+def test_refuse_unless_generalises_returns_a_report_that_passes() -> None:
+    good = _report("leave_one_out", 3.0, -6.0, 1.0)
+    assert refuse_unless_generalises(good) is good
+
+
+def test_refuse_unless_generalises_raises_above_the_threshold() -> None:
+    with pytest.raises(PoorGeneralisation, match="mean .error.") as exc:
+        refuse_unless_generalises(_report("leave_one_out", 40.0, -60.0))
+    assert "generalisation" in str(exc.value)
+    assert issubclass(PoorGeneralisation, InadmissibleFitSet)
+
+
+def test_refuse_unless_generalises_says_when_the_number_is_only_in_sample() -> None:
+    """``kind`` is load-bearing and the refusal message is where it is spent."""
+    with pytest.raises(PoorGeneralisation, match="weaker claim"):
+        refuse_unless_generalises(_report("in_sample", 40.0, -60.0))
+
+
+def test_refuse_unless_generalises_refuses_when_nothing_could_be_scored() -> None:
+    """SUBAGENT_RULES §3.1(a): "could not judge" must not be spelled "clean"."""
+    nothing = HoldoutReport("leave_one_out", (), (("a", "refused"),))
+    assert math.isnan(nothing.mean_abs_error_pct)
+    with pytest.raises(PoorGeneralisation, match="unjudged rather than acceptable"):
+        refuse_unless_generalises(nothing)
+
+
+def test_generalisation_threshold_is_between_the_measured_populations() -> None:
+    """Good leave-one-out 3.04 %, poisoned-basin leave-one-out 39.97 %, on the four
+    NIST standards. The threshold has to sit between them or it is not a threshold."""
+    assert 6.4 < HOLDOUT_REFUSE_PCT < 39.9
+
+
+def test_holdout_report_applies_the_gate_by_default(ladder) -> None:
+    """The wiring, with a control that proves the gate is what changed the outcome.
+
+    The fit is unchanged; only the answer key is moved. Declaring each spectrum's
+    reference to be twice its true ``R_sol`` makes every holdout error ~50 %, which is
+    above the shipped threshold and nowhere near it with the threshold lifted — so a
+    green result here cannot come from the fit having failed.
+    """
+    lying = [ConstrainedSpectrum(s.label, s.freq_hz, s.z, s.y_shunt,
+                                 reference_ohm=2.0 * s.reference_ohm) for s in ladder]
+
+    permitted = holdout_report(lying, kind="in_sample",
+                               max_mean_abs_error_pct=math.inf, **FAST)
+    assert permitted.mean_abs_error_pct == pytest.approx(50.0, abs=1.0)
+
+    with pytest.raises(PoorGeneralisation, match="exceeds 25%"):
+        holdout_report(lying, kind="in_sample", **FAST)
 
 
 # ── Housekeeping ─────────────────────────────────────────────────────────────
@@ -735,14 +889,21 @@ AMP_R_SOL = {"kcl_45uS": 71007.64, "kcl_84uS": 37933.07,
 def _truncate_hf_inductive(f: np.ndarray, z: np.ndarray) -> np.ndarray:
     """``gate_hf_inductive``'s rule, applied here: drop the contiguous ``Im Z > 0`` run.
 
-    **This is the one preparation step the constrained fit cannot do without**, measured
-    on the four NIST standards: with it the in-sample ``R_sol`` error is 2.9 %, without
-    it 6295 %. The short-blank correction, the |Z| window and the linear-KK truncation
-    each move the number by little or nothing on this set. A blocking cell has no
-    inductance of its own, so an ``Im Z > 0`` point at the top of the band is the
-    fixture's lead — and left in, the optimiser absorbs it into ``Qg``, which is a
-    shared parameter, so a handful of points at one end of one spectrum corrupts the
-    artifact for the whole set.
+    **Worth having, and NOT a precondition — this docstring said otherwise until
+    2026-09-08 and the figure it quoted was retracted.** It claimed 2.9 % with the
+    truncation against 6295 % without, on the four NIST standards. That 6295 % was a
+    cell of an *ordering* table: it was produced by the order-dependent seeding
+    :data:`SHARED_SEED_GRID` replaced, not by the inductive points. Re-measured on the
+    multi-start, same preparation both ways: ``R_sol`` **3.544 %** truncated against
+    **3.501 %** untruncated, and σ against NIST **0.98 %** against **2.41 %**. So the
+    step is worth about 2.5× on σ and nothing at all on ``R_sol`` — a refinement, kept
+    on its own merits. See mail ``[a184]`` §2 and the module docstring.
+
+    The *mechanism* still holds directionally: a blocking cell has no inductance of its
+    own, so an ``Im Z > 0`` point at the top of the band is the fixture's lead — and
+    left in, the optimiser absorbs it into ``Qg``, which is a shared parameter, so a
+    handful of points at one end of one spectrum degrades the artifact for the whole
+    set. What did not survive is the claim that the consequence is catastrophic.
 
     The rule lives in :func:`~softae.analysis.eis.gates.gate_hf_inductive` and already
     ships in the gated engine; it is restated here rather than imported so this test
@@ -802,16 +963,17 @@ POISONED_STARTS = (SHARED_SEED_GRID[8], SHARED_SEED_GRID[9])
 
 @pytest.mark.skipif(not AMP_KCL.is_dir(), reason="AMP_v1 NIST standards not present")
 def test_answer_key_nist_standards_split_admissible_from_inadmissible_folds() -> None:
-    """The gate fires on exactly the two folds that drop an arc-resolved standard.
+    """The gate fires on the set that resolves **no** arc, and on nothing else here.
 
-    This pins the *verdict*, which is unchanged, and it is worth being explicit that the
-    verdict is no longer the same claim it was. Measured with the gate bypassed, the two
-    refused folds gave −84.1 % / −74.4 % against the retired continuation seeding and
-    give **−6.4 % / −2.5 %** against the multi-start, while the two passed folds give
-    +2.8 % / −0.1 %. The partition is the same and the justification for it has thinned
-    to almost nothing — see :func:`check_admissible`'s docstring and Wave 2A. The
-    assertion here is deliberately on the partition and not on the errors, so it says
-    what it still knows.
+    This is the recalibrated partition and it is the reason the recalibration was worth
+    doing. At ``MIN_ARC_RESOLVED = 2`` every leave-one-out fold that dropped
+    ``kcl_45uS`` or ``kcl_84uS`` was refused, so the module's only generalisation number
+    was computed on **two of four folds** while the other two were recorded as
+    unjudgeable — and re-measurement put those two at −6.4 % / −2.5 %, no worse than the
+    folds it kept. At 1 all four folds are scored. The refusal has not been given up:
+    ``kcl_1413uS + kcl_4500uS``, the one subset of this corpus with no arc-resolved
+    member, is still refused, and its artifact is the reason — ``Qg`` 1.3e-07 and
+    ``R_sol`` wrong by 2338 %.
     """
     specs = _amp_standards()
 
@@ -819,9 +981,17 @@ def test_answer_key_nist_standards_split_admissible_from_inadmissible_folds() ->
     assert verdict == {"kcl_45uS": True, "kcl_84uS": True,
                        "kcl_1413uS": False, "kcl_4500uS": False}
 
-    refused = {label for label, _ in
-               holdout_report(specs, kind="leave_one_out", **FAST).refused}
-    assert refused == {"kcl_45uS", "kcl_84uS"}
+    report = holdout_report(specs, kind="leave_one_out", **FAST)
+    assert report.refused == (), report.describe()
+    assert {r.label for r in report.results} == set(verdict)
+    # And all four folds together clear the generalisation gate, which is the point of
+    # scoring them: at the full seed grid this is 3.04 % mean / 6.37 % worst.
+    assert report.mean_abs_error_pct < HOLDOUT_REFUSE_PCT, report.describe()
+
+    blind = [s for s in specs if not verdict[s.label]]
+    assert not check_admissible(blind).admissible
+    with pytest.raises(InadmissibleFitSet, match="resolve the geometric arc"):
+        fit_shared(blind, **FAST)
 
 
 @pytest.mark.skipif(not AMP_KCL.is_dir(), reason="AMP_v1 NIST standards not present")
@@ -869,9 +1039,14 @@ def test_answer_key_one_artifact_for_every_order_of_the_same_standards(
 
     monkeypatch.setattr(module, "_canonical_order", lambda spectra: list(spectra))
     monkeypatch.setattr(module, "_stacked_start", continuation)
+    # Both refusals lifted, and the second one is a finding rather than boilerplate:
+    # the retired construction drives one of these two orderings to Qg 9.7e-8, which is
+    # in the poisoned band, so ImplausibleArtifact fires on the historical defect
+    # itself. The control needs the artifact, not the refusal, so both are lifted here.
     continued = [fit_shared([specs[i] for i in o],
                             seed_grid=(SHARED_SEED_GRID[0],),
-                            max_order_spread_pct=math.inf).Qg for o in orders]
+                            max_order_spread_pct=math.inf, max_qg=math.inf).Qg
+                 for o in orders]
     assert max(continued) > 10 * min(continued), (
         "the retired construction returned the same artifact for both orders on the "
         "real corpus, so the invariance assertion above is vacuous")
@@ -891,17 +1066,62 @@ def test_answer_key_a_poisoned_artifact_is_refused_rather_than_returned() -> Non
     specs = _amp_standards(truncate_hf=True)
 
     # A bounded per-start budget, and it is a real finding rather than a convenience:
-    # aimed at the poisoned basin, one of these two starts spends the whole default
-    # 120 000 nfev and takes tens of minutes. Winning starts use 40-2400. See
-    # `fit_shared`'s `max_nfev`.
+    # aimed at the poisoned basin these two starts take 11 s and 80 s unbounded, which
+    # is 93 % of the whole grid's wall time, while winning starts use 34-734 nfev. See
+    # `MAX_NFEV_GLOBAL`, which this measurement is part of the case for lowering.
+    #
+    # The Qg ceiling is lifted because the subject here is the *spread* refusal: this
+    # artifact trips both, and the assertions below are about the one that fires first.
     permitted = fit_shared(specs, seed_grid=POISONED_STARTS, max_nfev=4_000,
-                           max_order_spread_pct=math.inf)
+                           max_order_spread_pct=math.inf, max_qg=math.inf)
     assert permitted.n_consensus == len(POISONED_STARTS)
     assert permitted.railed() == ()
     assert permitted.order_spread_pct > ORDER_SPREAD_REFUSE_PCT
 
     with pytest.raises(UnstableFitSurface, match="order spread"):
         fit_shared(specs, seed_grid=POISONED_STARTS, max_nfev=4_000)
+
+
+#: Two starts inside the poisoned basin and **close enough together to agree with each
+#: other**. Measured on the four standards: they reach costs within 1.02x, so both are
+#: in consensus, and they disagree about ``R_sol`` by ~1-2 % — under
+#: :data:`ORDER_SPREAD_REFUSE_PCT` by two orders of magnitude — while the artifact they
+#: agree on is wrong by 7689 %. Contrast :data:`POISONED_STARTS`, which straddle the
+#: basin and so disagree by 1.96e5 %.
+CLUSTERED_POISONED_STARTS = ({"Qg": 4e-8, "ng": 0.95, "nd": 0.85},
+                             {"Qg": 8e-8, "ng": 0.95, "nd": 0.85})
+
+
+@pytest.mark.skipif(not AMP_KCL.is_dir(), reason="AMP_v1 NIST standards not present")
+def test_answer_key_the_qg_band_catches_what_the_order_spread_does_not() -> None:
+    """The measurement that makes :class:`ImplausibleArtifact` non-redundant.
+
+    The control is the whole test. Reproducibility and correctness are different
+    properties, and this is the case that separates them: two descents into the same
+    wrong basin agree to ~1 %, ``railed()`` fires on neither, ``status`` reports success
+    for both, and the answer is wrong by four orders of magnitude. Every refusal that
+    existed before this one passes it.
+    """
+    specs = _amp_standards(truncate_hf=True)
+    # Bounded for the same reason the POISONED_STARTS test is: aimed at this basin, an
+    # unbounded start spends minutes. The verdict is stable across 1 000-8 000 nfev.
+    bounded = dict(seed_grid=CLUSTERED_POISONED_STARTS, max_nfev=2_000)
+
+    permitted = fit_shared(specs, max_qg=math.inf, **bounded)
+    assert permitted.n_consensus == len(CLUSTERED_POISONED_STARTS)
+    assert permitted.railed() == ()
+    assert permitted.order_spread_pct < ORDER_SPREAD_REFUSE_PCT, (
+        "the spread refusal already catches this, so the band proves nothing here")
+    assert permitted.Qg > QG_PLAUSIBLE_MAX
+
+    # And it is genuinely wrong, not merely unusual — 1.3e5 % on the most dilute
+    # standard against AMP_v1's own artifact.
+    worst = max(abs(100.0 * (fit_frozen(s, permitted).R_sol - s.reference_ohm)
+                    / s.reference_ohm) for s in specs)
+    assert worst > 1_000.0
+
+    with pytest.raises(ImplausibleArtifact, match="plausible ceiling"):
+        fit_shared(specs, **bounded)
 
 
 @pytest.mark.skipif(not AMP_KCL.is_dir(), reason="AMP_v1 NIST standards not present")

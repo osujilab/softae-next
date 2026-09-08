@@ -31,6 +31,19 @@ The split, and why each line is where it is::
     PER WELL  R0, R1, Qd        fitted per spectrum
     REPORTED  R_sol = R0 + R1   unconditionally
 
+Four refusals sit around that fit, and **each asks a question the others cannot**::
+
+    check_admissible          can this SET identify the shared three?   InadmissibleFitSet
+    order_spread_pct          was the minimum REPRODUCIBLE?             UnstableFitSurface
+    Qg plausibility band      is the minimum PHYSICAL?                  ImplausibleArtifact
+    holdout_report            does it PREDICT a spectrum it has not     PoorGeneralisation
+                              seen? (needs an answer key)
+
+The middle two are the pair most easily confused, and the measurement that separates
+them is in :class:`ImplausibleArtifact`: two seed grids clustered inside the poisoned
+basin reproduce each other to 0.5 % and 2 % while being wrong by 7689 % and 8251 %.
+**Reproducibility is not correctness**, and only the third row asks about the second.
+
 **All three shared parameters are load-bearing, and this was measured.** Sharing only
 ``Qg`` and ``nd`` — pinning the geometric element to an ideal capacitor, ``ng = 1`` —
 does not degrade gracefully: it gives ``+4.3e8 %`` on the most conductive standard.
@@ -139,32 +152,60 @@ CONSTRAINED_FIT_TOL = 1e-14
 #: Iteration ceilings. Generous for the same reason ``fitter.DEFAULT_MAX_NFEV`` is:
 #: a failure to converge should be reported, not manufactured by too small a budget.
 #:
-#: **The multi-start changed the calculus here and the default has NOT been changed to
-#: match — deliberately, because doing so would invalidate every number in this file.**
-#: Per start, four NIST standards, full grid, measured 2026-09-08:
+#: **``MAX_NFEV_GLOBAL`` was 120 000 and is now 20 000 — and the reason it was left at
+#: 120 000 in Wave 1A does not survive re-measurement, so it is worth stating what
+#: actually happens rather than repeating it.** ``[a184]`` §4(b) reported that the two
+#: ``Qg = 4e-8`` starts "spend the full 120 000". **They do not.** Per start, four NIST
+#: standards, full grid, each start timed alone, three preparations:
 #:
-#: ===================  ============  ================
-#: start (seed ``Qg``)   ``nfev``      cost reached
-#: ===================  ============  ================
-#: 4e-12 .. 4e-9         36 .. 480     0.235 .. 1.28
-#: **4e-8 (both)**       **120 000**   **3.4 .. 4.7**
-#: ===================  ============  ================
+#: ===================  ==================  ============  ==================
+#: start (seed ``Qg``)   ``nfev``            status        cost reached
+#: ===================  ==================  ============  ==================
+#: 4e-12 .. 4e-9         34 .. 734           ftol / xtol   0.235 .. 6.73
+#: **4e-8 (both)**       **2 125 .. 31 444** ftol / xtol   **1.9 .. 5.4**
+#: ===================  ==================  ============  ==================
 #:
-#: The eight useful starts finish in 4 s between them; the two aimed at the poisoned
-#: basin spend the entire ceiling — minutes each — to reach a cost an order of magnitude
-#: worse, which neither wins nor joins the consensus set. With one start the ceiling was
-#: the only safety net; with ten the other nine are, so a start that exhausts its budget
-#: reports ``status = 0`` and simply loses. **A ceiling of 20 000 was tried and is
-#: accuracy-neutral where it has been measured**: on the four standards it returns the
-#: identical artifact (``Qg`` 6.028e-10, cost 0.235321) and the identical scores
-#: (``R_sol`` 3.5438 % mean / 4.8858 % worst, σ 0.9815 %) in 76.5 s against 85.6 s.
-#: It is left un-lowered anyway, because "identical on one corpus of four liquids" is
-#: not the same as accuracy-neutral, and a default that governs convergence belongs in a
-#: step that can re-run the answer keys behind it rather than in a defect fix.
-#: :func:`fit_shared` takes ``max_nfev``, so a caller who knows its starts are bad can
-#: bound them today — which is what the poisoned-artifact test does.
+#: The ceiling was never binding: every start terminates on tolerance, the worst at 26 %
+#: of it. What it was buying was *permission* — the poisoned starts take 42–108 s each
+#: to converge to a cost an order of magnitude worse than the winner's, and on the four
+#: standards **those two starts are 91 s of a 96 s call (thin) and 115 s of 123 s (full
+#: conditioning): 93–95 % of the wall time spent on two descents that neither win nor
+#: join the consensus set.**
+#:
+#: **20 000 is accuracy-neutral over every fit this module has been measured on**, which
+#: is the standard Wave 1A said the change had to meet and could not meet from inside a
+#: defect fix. Bitwise-identical ``(Qg, ng, nd)``, cost, consensus count and order
+#: spread against 120 000 for: the four standards on both preparations at ceilings
+#: 40 000 / 20 000 / 8 000 / 4 000 / 2 000 / 1 000 / 500 — every one of them — and all
+#: eleven ≥2-member subsets of the four standards on both preparations at
+#: 6 000 — 22 further independent fits. On the full-conditioned four standards the whole
+#: call is **140.7 s at 120 000 against 75.6 s at 20 000, same artifact to the last
+#: digit.** It is 29× the largest *winning* start measured here (688 ``nfev``), 27× the
+#: largest start that reached consensus (734), and 8× the largest winner `[a184]`
+#: reported (~2 400) — so it truncates losers only.
+#:
+#: **It does not go lower than that, and the reason is the direction of the risk.** The
+#: ceiling is not accuracy-neutral by nature — it is accuracy-neutral *on this corpus*,
+#: where the winner converges in 41-48 ``nfev``. Truncating a *loser* costs nothing;
+#: truncating a *winner* manufactures a non-convergence that reports as a fit, which is
+#: the failure this constant exists to prevent. The films, which have no answer key,
+#: could easily need more iterations than four clean liquids do. 20 000 keeps more than
+#: an order of magnitude of headroom over anything observed; 500 keeps none.
+#:
+#: **The ceiling is not where the cost is, and the honest lever is somewhere this change
+#: deliberately does not touch.** Lowering it to 20 000 roughly halves the call and the
+#: two poisoned starts still run — most of what remains is theirs. Deleting them from
+#: :data:`SHARED_SEED_GRID` returns a bitwise-identical artifact and would remove ~93 %
+#: of the runtime — **and it is refused anyway**, because those two entries are what
+#: demonstrate that the good basin is *preferred* rather than merely reachable, and they
+#: are the only starts that can show the poisoned basin exists at all. A grid that
+#: cannot reach the failure cannot evidence the refusal.
+#:
+#: With one start the ceiling was the only safety net; with ten the other nine are, so a
+#: start that exhausts its budget reports ``status = 0`` and loses on cost.
+#: :func:`fit_shared` still takes ``max_nfev`` for a caller who knows its starts are bad.
 MAX_NFEV_SINGLE = 40_000
-MAX_NFEV_GLOBAL = 120_000
+MAX_NFEV_GLOBAL = 20_000
 
 #: Multipliers on the conductance estimate of ``R_sol`` used to seed :func:`fit_frozen`.
 #:
@@ -257,8 +298,99 @@ EXACT_COST_PER_RESIDUAL = 1e-12
 ORDER_SPREAD_REFUSE_PCT = 100.0
 
 #: How many spectra in the fitting set must show a **resolved** geometric arc before
-#: the shared parameters are identifiable. See :func:`check_admissible`.
-MIN_ARC_RESOLVED = 2
+#: the shared parameters are identifiable. See :func:`check_admissible`, which carries
+#: the measurement this number was re-derived from — it was ``2`` until 2026-09-08 and
+#: the ``2`` was calibrated against seeding that no longer exists.
+MIN_ARC_RESOLVED = 1
+
+#: Ceiling on a plausible fitted ``Qg``, in F·s^(n−1). **A refusal on the artifact's
+#: own value**, and the only one here that does not ask the fit to grade itself.
+#:
+#: Two measured populations, both on the four NIST KCl standards, both on the current
+#: module. "Returned" means what :func:`fit_shared` hands back — the winner on cost —
+#: over every one of the eleven subsets of the four standards with ≥2 members, on two
+#: independent preparations (thin, and the offline harness's full conditioning chain):
+#:
+#: ====================================  ====================  ==================
+#: population                             ``Qg``                ``R_sol`` MAE
+#: ====================================  ====================  ==================
+#: **returned** by the 10 subsets ×       4.76e-10 .. 1.05e-09  3.00 .. 4.39 %
+#: 2 preparations that resolve an arc
+#: losing-but-physical grid starts        1.14e-10 .. 3.13e-09  3.1 .. 59 %
+#: (never returned; recorded for margin)
+#: **returned by the subset that          **1.14e-07 ..         **2338 / 2401 %**
+#: resolves NO arc** (1413 + 4500)        1.32e-07**
+#: **returned with the grid restricted    **8.42e-08 ..         **5944 .. 8251 %**
+#: to the poisoned basin**, 4 routes      1.47e-07**
+#: ====================================  ====================  ==================
+#:
+#: Widest returned good value 1.05e-09 against lowest poisoned 8.42e-08 is **80×, with
+#: nothing in between**, and ``1e-8`` is very nearly the geometric centre of that gap:
+#: 9.5× above the widest good artifact ever returned, 8.4× below the lowest poisoned
+#: one. Even counting the losing starts — descents that never win and so are never
+#: handed back — the widest physical-basin ``Qg`` is 3.13e-09, still 3.2× below the
+#: ceiling. The gap is the evidence; ``1e-8`` is a readable number inside it.
+#:
+#: **Two warnings that belong on this constant rather than in a spec.**
+#:
+#: 1. ``Qg`` is a *geometric* CPE and this ceiling is therefore **corpus-specific in a
+#:    way** :data:`ORDER_SPREAD_REFUSE_PCT` **is not**: it is a dimensional quantity
+#:    scaling with electrode area and gap, measured on AMP_v1's KCl cell. The separation
+#:    here is 80× between the two populations; a fixture whose geometry differs by more
+#:    than about a decade from that cell can move a *good* ``Qg`` into this band. It is a
+#:    keyword on :func:`fit_shared` for exactly that reason, and re-deriving it is part
+#:    of commissioning a new fixture, not an optional refinement.
+#: 2. **There is deliberately no band on** ``nd``, and the reason is a measurement that
+#:    contradicts ``eis_estimator_pipeline.md`` §2.2(b). That spec records good ``nd``
+#:    0.75–0.77 against poisoned 0.34–0.52, "non-overlapping". Re-measured here: the
+#:    poisoned *basin* does sit at ``nd`` 0.33–0.46, but the poisoned artifact produced
+#:    by the arc-blind subset sits at ``nd`` **0.7622 / 0.7660 — inside the spec's good
+#:    window** — while legitimate consensus starts reach 0.8499. So an ``nd`` band would
+#:    miss a real poisoning and false-fire on real good fits, and every case it does
+#:    catch is already caught by ``Qg``. ``SUBAGENT_RULES`` §3.1: a second condition that
+#:    only ever fires when the first does is not a second opinion.
+QG_PLAUSIBLE_MAX = 1e-8
+
+#: Refusal threshold on :attr:`HoldoutReport.mean_abs_error_pct`, in percent.
+#:
+#: :func:`holdout_report` computes the only genuine generalisation number this codebase
+#: has — fit N artifacts each missing one spectrum, predict the one that was held out —
+#: and until 2026-09-08 **nothing refused on it.** Measured populations, four NIST
+#: standards, both preparations:
+#:
+#: ==========================================  ==============  ==============
+#: artifact                                     in-sample mean  leave-one-out
+#: ==========================================  ==============  ==============
+#: shipped grid, gate at ``MIN_ARC_RESOLVED``   3.54 / 3.73 %   **3.04 / 2.44 %**
+#: (worst single fold)                          4.89 / 5.59 %   6.37 / 4.36 %
+#: **grid restricted to the poisoned basin**    **7669 / 5870%** **39.97 / 40.96 %**
+#: (worst single fold)                          18 123 %        82.43 / 84.06 %
+#: ==========================================  ==============  ==============
+#:
+#: (thin / full-conditioned, the same two preparations throughout this module.)
+#:
+#: **The leave-one-out gap is 13×, not the four orders of magnitude the in-sample
+#: column suggests, and that difference is itself the finding.** Two of the four
+#: poisoned folds escape the basin — their ``Qg`` comes back at 8.3e-10 — so the mean
+#: they contribute to is dragged back toward the good population. A gap that narrow
+#: cannot be split by "put the constant in the middle" the way
+#: :data:`ORDER_SPREAD_REFUSE_PCT`'s four-order gap could.
+#:
+#: **So the number is anchored on utility instead, and that is the honest basis:** a
+#: 25 % error on ``R_sol`` propagates to a 25 % error on σ, which is already useless for
+#: the campaign this feeds, so there is no reason to buy margin above it. It sits ~8×
+#: above the worst good mean, above the worst single good fold (6.37 %), and below the
+#: only bad population measured (39.97 %) — but by 1.6×, which is thin, and a corpus
+#: whose honest generalisation is worse than 25 % would be refused. That is the
+#: intended reading: this gate says *"not good enough to use"*, not *"detectably
+#: poisoned"*.
+#:
+#: **The gate is on the mean, and** :attr:`HoldoutReport.worst_abs_error_pct` **is
+#: reported but not gated.** With four standards a per-fold extreme is one number from
+#: one fit; thresholding it would be calibrating on n = 1. That is the part to revisit
+#: when the corpus grows, and it is a real hole: a single catastrophic fold among many
+#: good ones is diluted by the mean — exactly what the 39.97 % row above is.
+HOLDOUT_REFUSE_PCT = 25.0
 
 
 # ── The known fixture shunt ──────────────────────────────────────────────────
@@ -495,36 +627,48 @@ class Admissibility:
 def check_admissible(
     spectra: list[ConstrainedSpectrum], *, min_arc_resolved: int = MIN_ARC_RESOLVED
 ) -> Admissibility:
-    """Can this set identify the shared three? **It refuses — and its evidence expired.**
+    """Can this set identify the shared three? **Kept, and recalibrated from 2 to 1.**
 
-    Leave-one-out over the four NIST standards, this gate deliberately bypassed so the
-    artifacts could be looked at rather than assumed. Measured twice, against the same
-    data, before and after :func:`fit_shared` became a multi-start:
+    The reasoning was always this: below the geometric arc's crossover the sweep sees
+    only the blocking electrode, so nothing constrains ``Qg`` or ``ng``, and a set with
+    no arc-resolved member is identifying them from nothing. **The reasoning survived
+    re-measurement and the threshold did not.** ``MIN_ARC_RESOLVED`` was ``2``, and the
+    ``2`` came from `[a178]` §3 — dropping an arc-resolved standard broke the fold at
+    −84.06 % / −74.38 % against the *continuation* seeding :data:`SHARED_SEED_GRID`
+    replaced. Re-measured on the multi-start those same two folds read **−6.44 % /
+    −2.48 %** with their ``Qg`` in the good band: the gate was refusing two of four
+    leave-one-out folds for no measured benefit.
 
-    ===============  =========================  =========================
-    fold (held out)  continuation (2026-09-04)  multi-start (2026-09-08)
-    ===============  =========================  =========================
-    ``kcl_45uS``     Qg 9.04e-08, **−84.06 %**  Qg 5.91e-10, **−6.44 %**   REFUSE
-    ``kcl_84uS``     Qg 8.79e-08, **−74.38 %**  Qg 6.94e-10, **−2.48 %**   REFUSE
-    ``kcl_1413uS``   Qg 9.28e-10, +2.45 %       Qg 7.27e-10, +2.81 %       pass
-    ``kcl_4500uS``   Qg 8.93e-10, +1.81 %       Qg 5.64e-10, −0.10 %       pass
-    ===============  =========================  =========================
+    So the question was re-asked from scratch rather than the old answer defended. All
+    eleven subsets of the four NIST standards with ≥2 members, this gate bypassed, each
+    artifact scored against AMP_v1's ``R_sol`` on **all four** standards — in-sample for
+    members, genuine holdout for non-members — on two independent preparations:
 
-    **The left-hand column is what this gate was calibrated against, and the right-hand
-    column is the code that ships.** Against the continuation the gate discriminated
-    perfectly — the refused folds sat at 84 % and 74 % with ``Qg`` 97× high, and nothing
-    about them looked wrong from the inside. Against the multi-start the refused folds
-    are −6.4 % and −2.5 %, their ``Qg`` is in the good band, and they are barely worse
-    than the folds the gate passes. **On today's code this gate refuses two of four
-    folds for no measured benefit**, which is a recalibration question, not something to
-    settle inside a defect fix: the behaviour is left exactly as it was and the evidence
-    is recorded here rather than quietly kept.
+    ==================  ===  =============================  ======================
+    arc-resolved in set   n   ``R_sol`` MAE over all four    ``Qg``
+    ==================  ===  =============================  ======================
+    2                     4   3.00 .. 4.28 %                 4.79e-10 .. 7.13e-10
+    **1**                 6   **3.10 .. 4.12 %**             5.52e-10 .. 7.43e-10
+    **0**                 1   **2337.9 %**                   **1.324e-07**
+    ==================  ===  =============================  ======================
 
-    What still stands is the *reasoning*: below the geometric arc's crossover the sweep
-    sees only the blocking electrode, so nothing constrains ``Qg`` or ``ng``, and a set
-    with fewer than two arc-resolved members is identifying them from nothing. What no
-    longer stands is the claim that the consequence is catastrophic. See
-    ``eis_estimator_action_plan.md`` Wave 2A.
+    (thin preparation; the full conditioning chain gives 3.22–4.11 / 3.06–4.39 / **2401.1
+    %** and ``Qg`` **1.14e-07** for the same three groups.)
+
+    **One arc-resolved spectrum is indistinguishable from two — 3.10–4.12 % against
+    3.00–4.28 %, interleaved — and zero is 560× worse on both preparations.** The
+    threshold belongs between 0 and 1, so it is 1. The single narc = 0 case is
+    ``kcl_1413uS + kcl_4500uS``, the only subset of this corpus with no arc-resolved
+    member, and its artifact lands at ``Qg`` 1.3e-7 — inside the poisoned band of
+    :data:`QG_PLAUSIBLE_MAX`, which is the mechanism the reasoning above predicts.
+
+    **The honest limit on this recalibration: n = 1 on the refusing side.** Four
+    standards admit exactly one arc-blind subset, so "0 is catastrophic" rests on a
+    single measurement (repeated on two preparations, which is not the same as two
+    populations). The passing side is n = 10 and interleaved, which is the half that
+    matters for *not* refusing correct work — a gate that cries wolf is the one that
+    gets overridden. Widening the corpus would strengthen the refusing side; nothing
+    here waits on it.
     """
     n = len(spectra)
     resolved = tuple(s.label for s in spectra if arc_is_resolved(s.freq_hz, s.z))
@@ -660,9 +804,11 @@ class SharedArtifact:
     def railed(self) -> tuple[str, ...]:
         """Shared parameters resting on a bound — the artifact's own alarm.
 
-        A railed ``nd`` is the specific signature of the inadmissible folds, and it
-        survives even when :func:`check_admissible` passed, so it is reported rather
-        than assumed away.
+        **Reported, and measured not to be sufficient.** Every poisoned artifact this
+        module has produced — the arc-blind subset, and four seed grids aimed at the
+        poisoned basin — returns ``()`` here: the closest any of them comes to a bound
+        is ``nd`` 0.334 against a floor of 0.30. That is why
+        :data:`QG_PLAUSIBLE_MAX` exists and why this stayed a report.
         """
         out = []
         for name, v in self.shared.items():
@@ -718,6 +864,56 @@ class UnstableFitSurface(InadmissibleFitSet):
     """
 
 
+class ImplausibleArtifact(InadmissibleFitSet):
+    """The descents agreed with each other, and agreed on a non-physical geometry.
+
+    The one refusal here that looks at *what the artifact says* rather than at how the
+    optimiser got there — and the measurement that makes it necessary is that
+    :class:`UnstableFitSurface` provably does not close this door. Two independent
+    seed grids aimed at the poisoned basin, on the four NIST standards:
+
+    ==========================  ============  ==============  =================
+    seed grid                    ``Qg``        order spread    ``R_sol`` MAE
+    ==========================  ============  ==============  =================
+    shipped ``POISONED_STARTS``  9.38e-08      1.96e5 %        refused already
+    Qg 4e-8 + 8e-8, nd 0.85      9.38e-08      **2.06 %**      **7689 %**
+    Qg 1e-7 + 1.2e-7, nd 0.45    9.48e-08      **0.51 %**      **8251 %**
+    ==========================  ============  ==============  =================
+
+    **Two descents into the same wrong basin agree with each other perfectly**, and
+    agreement is the entire content of ``order_spread_pct``. :meth:`SharedArtifact.railed`
+    fires on none of these either — ``nd`` 0.334 is not quite on its 0.30 bound. Without
+    this class the bottom two rows are returned, converged, self-consistent and wrong by
+    four orders of magnitude. ``SUBAGENT_RULES`` §3.1: the consensus statistic answers
+    *"was this minimum reproducible"*, which is a different question from *"is this
+    minimum the right one"*, and it returns the shape of a pass for both.
+
+    A subclass of :class:`InadmissibleFitSet` for the same reason
+    :class:`UnstableFitSurface` is: :func:`holdout_report` records it as a refused fold
+    rather than crashing on an unfamiliar type.
+    """
+
+
+def implausible_shared(
+    artifact: SharedArtifact, *, max_qg: float = QG_PLAUSIBLE_MAX
+) -> str:
+    """Why *artifact*'s shared parameters are non-physical, or ``""`` if they are not.
+
+    Split out of :func:`fit_shared` so it can be applied to an artifact that was already
+    fitted — a stored one, or one obtained with the refusal explicitly disabled — and so
+    the band can be tested without running a fit. See :data:`QG_PLAUSIBLE_MAX` for the
+    populations behind the ceiling, and for why ``nd`` is deliberately not checked.
+    """
+    qg = artifact.Qg
+    if qg != qg:
+        return "Qg is NaN — the fit did not return a geometric element at all"
+    if math.isfinite(max_qg) and qg > max_qg:
+        return (f"Qg {qg:.4g} is above the plausible ceiling {max_qg:.4g}: the "
+                f"geometric element has absorbed something that is not geometry, and "
+                f"it is shared, so every spectrum in the set carries it")
+    return ""
+
+
 def _canonical_order(
     spectra: list[ConstrainedSpectrum],
 ) -> list[ConstrainedSpectrum]:
@@ -764,6 +960,7 @@ def fit_shared(
     min_arc_resolved: int = MIN_ARC_RESOLVED,
     seed_grid: tuple[dict[str, float], ...] = SHARED_SEED_GRID,
     max_order_spread_pct: float = ORDER_SPREAD_REFUSE_PCT,
+    max_qg: float = QG_PLAUSIBLE_MAX,
     max_nfev: int = MAX_NFEV_GLOBAL,
 ) -> SharedArtifact:
     """Fit ``Qg, ng, nd`` once across *spectra*, with ``R0, R1, Qd`` free per spectrum.
@@ -772,25 +969,29 @@ def fit_shared(
     applied to the stacked problem. The answer does not depend on the order of
     *spectra*, which was the defect this replaced: see :data:`SHARED_SEED_GRID`.
 
-    Two refusals, both raising :class:`InadmissibleFitSet` or a subclass, because a
-    refusal is the deliverable for a set that cannot support an artifact:
+    Three refusals, all raising :class:`InadmissibleFitSet` or a subclass, because a
+    refusal is the deliverable for a set that cannot support an artifact. **They ask
+    three different questions and the order they run in is the order of increasing
+    cost, not of importance:**
 
-    * :func:`check_admissible` says the shared three are not identifiable at all. Cheap,
-      model-free, and it runs first.
-    * the consensus starts disagree by more than *max_order_spread_pct* about some
-      spectrum's ``R_sol`` — :class:`UnstableFitSurface`. This also fires when fewer
-      than two starts reached consensus, because a single descent cannot show that its
-      minimum is reproducible and "could not judge" must not be spelled the same way as
-      "checked and clean".
+    * *can this set identify the shared three at all* — :func:`check_admissible`. Cheap,
+      model-free, and it runs before any fitting.
+    * *was the minimum reproducible* — the consensus starts disagree by more than
+      *max_order_spread_pct* about some spectrum's ``R_sol``,
+      :class:`UnstableFitSurface`. This also fires when fewer than two starts reached
+      consensus, because a single descent cannot show that its minimum is reproducible
+      and "could not judge" must not be spelled the same way as "checked and clean".
+    * *is the minimum physical* — ``Qg`` above *max_qg*, :class:`ImplausibleArtifact`.
+      **This one is not redundant with the one above and that was measured**: seed grids
+      clustered inside the poisoned basin reproduce each other to 0.51 % and 2.06 %
+      while being wrong by 7689 % and 8251 %. Reproducibility and correctness are
+      different properties and only this refusal asks about the second.
 
-    *max_nfev* bounds **each start**, not the call. It exists because the multi-start
-    changed what a runaway descent costs: with one start the budget was the safety net,
-    and with ten the other nine are, so a start that exhausts its budget simply reports
-    ``status = 0`` and loses on cost. The default is unchanged from the single-start
-    era and every measurement in this module was taken at it; lowering it is a way to
-    bound a call whose starts are known to be bad, not a tuning knob. Observed winning
-    starts use 40-2400 ``nfev``, four to five orders below the default, while a start
-    aimed deliberately at the poisoned basin can spend the whole of it.
+    *max_nfev* bounds **each start**, not the call: ten starts at the default can cost
+    ten times it. With one start the budget was the safety net; with ten the other nine
+    are, so a start that exhausts its budget reports ``status = 0`` and loses on cost.
+    Observed winning starts use 34-734 ``nfev``, so the default is not a tuning knob —
+    see :data:`MAX_NFEV_GLOBAL` for what it is and what it is measured to cost.
     """
     admissible = check_admissible(spectra, min_arc_resolved=min_arc_resolved)
     if not admissible.admissible:
@@ -862,6 +1063,12 @@ def fit_shared(
             f"starts exceeds {max_order_spread_pct:g}% — the stacked minimum is not "
             f"reproducible from independent starting points, so its R_sol is arbitrary "
             f"({artifact.describe()})")
+    # After the spread refusal, not before it. Both fire on the shipped poisoned grid,
+    # and leaving that case reported as UnstableFitSurface keeps the Wave-1 contract
+    # intact; what this adds is the case the spread refusal *passes*.
+    reason = implausible_shared(artifact, max_qg=max_qg)
+    if reason:
+        raise ImplausibleArtifact(f"{reason} ({artifact.describe()})")
     return artifact
 
 
@@ -948,29 +1155,86 @@ class HoldoutReport:
                 f"{refused}")
 
 
+class PoorGeneralisation(InadmissibleFitSet):
+    """The artifact was fitted, was plausible, and does not predict a spectrum it
+    has not seen.
+
+    The last of the refusals, and the only one with an answer key behind it: the three
+    in :func:`fit_shared` are all self-consistency tests that a set of standards is not
+    required for, while this one asks whether the number is *right*. It is therefore
+    also the one that cannot run on a campaign well — nothing there carries a
+    :attr:`ConstrainedSpectrum.reference_ohm` — which is exactly why the other three
+    exist and why this is not a substitute for them.
+    """
+
+
+def refuse_unless_generalises(
+    report: HoldoutReport, *, max_mean_abs_error_pct: float = HOLDOUT_REFUSE_PCT
+) -> HoldoutReport:
+    """Raise :class:`PoorGeneralisation` unless *report*'s mean error is under the limit.
+
+    Returns *report* unchanged when it passes, so it composes as
+    ``refuse_unless_generalises(holdout_report(specs))`` and the caller keeps the
+    report. :func:`holdout_report` applies it by default; this is the seam for a caller
+    holding a report it obtained some other way.
+
+    **NaN refuses.** An empty ``results`` — every fold refused, or no spectrum carrying
+    a reference — makes the mean NaN, and NaN is *"could not judge"*, which must not be
+    spelled the same way as *"checked and clean"* (``SUBAGENT_RULES`` §3.1(a)). The
+    comparison is written on the passing side for that reason, as in :func:`fit_shared`.
+
+    An ``in_sample`` report is refused on the same threshold and the message says so.
+    Passing it proves strictly less than passing a leave-one-out one — that is what
+    :attr:`HoldoutReport.kind` is load-bearing *for* — but an artifact that cannot
+    reproduce the standards it was fitted on has failed something real, so the number is
+    worth refusing on rather than ignoring.
+    """
+    if not math.isfinite(max_mean_abs_error_pct):
+        return report
+    mean = report.mean_abs_error_pct
+    if mean != mean:
+        raise PoorGeneralisation(
+            f"no holdout case could be scored, so generalisation is unjudged rather "
+            f"than acceptable ({report.describe()})")
+    if not mean <= max_mean_abs_error_pct:
+        claim = ("generalisation" if report.kind == "leave_one_out"
+                 else "in-sample agreement, which is a weaker claim still")
+        raise PoorGeneralisation(
+            f"mean |error| {mean:.4g}% against the known references exceeds "
+            f"{max_mean_abs_error_pct:g}% — the artifact fails on {claim} "
+            f"({report.describe()})")
+    return report
+
+
 def holdout_report(
     spectra: list[ConstrainedSpectrum],
     *,
     kind: str = "leave_one_out",
     tol: float = CONSTRAINED_FIT_TOL,
     min_arc_resolved: int = MIN_ARC_RESOLVED,
+    max_mean_abs_error_pct: float = HOLDOUT_REFUSE_PCT,
     **fit_kwargs: Any,
 ) -> HoldoutReport:
-    """Fit, then score against :attr:`ConstrainedSpectrum.reference_ohm`.
+    """Fit, score against :attr:`ConstrainedSpectrum.reference_ohm`, **and refuse**.
 
     ``kind="in_sample"`` fits one artifact on everything and scores everything against
     it. ``kind="leave_one_out"`` fits N artifacts, each missing one spectrum, and scores
     only the held-out one — the number that is actually a generalisation claim.
 
-    **A refused fold is recorded, not skipped.** With four standards, two of the four
-    LOO folds are inadmissible by construction (each drops one of the two arc-resolved
-    spectra), so a report that silently averaged over "the folds that worked" would
-    hide the module's own headline limitation. A fold refused by
-    :class:`UnstableFitSurface` is recorded the same way, which is why that class
-    subclasses :class:`InadmissibleFitSet`.
+    **A refused fold is recorded, not skipped.** A report that silently averaged over
+    "the folds that worked" would hide the module's own headline limitation, so a fold
+    refused by any :class:`InadmissibleFitSet` — including
+    :class:`UnstableFitSurface` and :class:`ImplausibleArtifact`, which is why both
+    subclass it — is recorded with its reason.
 
-    *fit_kwargs* reach :func:`fit_shared` unchanged — ``seed_grid`` and
-    ``max_order_spread_pct``.
+    **The report is also a gate**, via :func:`refuse_unless_generalises` and
+    :data:`HOLDOUT_REFUSE_PCT`; ``max_mean_abs_error_pct=math.inf`` is the one explicit
+    way to ask for the report regardless. It was purely a report until 2026-09-08:
+    it computed the only genuine generalisation number here and nothing acted on it,
+    which is ``SUBAGENT_RULES`` §3.1(b) — the work was done and the answer discarded.
+
+    *fit_kwargs* reach :func:`fit_shared` unchanged — ``seed_grid``,
+    ``max_order_spread_pct``, ``max_qg``, ``max_nfev``.
     """
     if kind == "in_sample":
         artifact = fit_shared(spectra, tol=tol, min_arc_resolved=min_arc_resolved,
@@ -979,7 +1243,9 @@ def holdout_report(
             HoldoutResult(s.label, s.reference_ohm,
                           fit_frozen(s, artifact, tol=tol).R_sol)
             for s in spectra if s.reference_ohm == s.reference_ohm)
-        return HoldoutReport("in_sample", results, (), (artifact,))
+        return refuse_unless_generalises(
+            HoldoutReport("in_sample", results, (), (artifact,)),
+            max_mean_abs_error_pct=max_mean_abs_error_pct)
 
     if kind != "leave_one_out":
         raise ValueError(f"unknown holdout kind {kind!r}")
@@ -999,5 +1265,7 @@ def holdout_report(
         if held.reference_ohm == held.reference_ohm:
             results.append(HoldoutResult(held.label, held.reference_ohm,
                                          fit_frozen(held, artifact, tol=tol).R_sol))
-    return HoldoutReport("leave_one_out", tuple(results), tuple(refused),
-                         tuple(artifacts))
+    return refuse_unless_generalises(
+        HoldoutReport("leave_one_out", tuple(results), tuple(refused),
+                      tuple(artifacts)),
+        max_mean_abs_error_pct=max_mean_abs_error_pct)
