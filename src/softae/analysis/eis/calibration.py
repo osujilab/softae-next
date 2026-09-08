@@ -70,6 +70,10 @@ MEASUREMENT_ROLES = (
     "blank_load",
     "reference_cap",
     "reference_r",
+    # Quarantined misplaced-lead ``reference_r`` attempt (ids 3892-3895): recognised so
+    # it is not coerced to ``sample``, but kept out of ``COMMISSIONING_ROLES`` because it
+    # derives nothing — it means nothing in the prompts or the capability ladder.
+    "reference_r_misplaced_lead",
 )
 
 #: Roles that are commissioning artifacts rather than data.
@@ -139,6 +143,9 @@ ELECTRODE_MODES = ("unknown", "two", "three")
 #: blaming mismarked parts are withdrawn.
 TWO_TERMINAL_ROLES = frozenset({
     "blank_short", "blank_load", "blank_open", "reference_cap", "reference_r",
+    # The same two-terminal measurement as ``reference_r`` — the defect is a misplaced
+    # lead, not a different electrode topology — so R24 must judge it identically.
+    "reference_r_misplaced_lead",
 })
 
 

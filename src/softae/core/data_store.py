@@ -747,8 +747,11 @@ def _fit_report_columns(report: Any | None) -> dict[str, Any]:
         n_points_dropped=int(n_dropped) if n_dropped is not None else None,
         report_mode=str(getattr(sigma, "mode", "split")),
         R_sum_ohm=(
+            # ``sum_unqualified`` is a sum too — reported with no covariance to judge
+            # the split, rather than with a rho that found it unidentifiable. Storing
+            # NULL here spelled "split" for a row that is not one (engine_support.py).
             _f_or_none(getattr(sigma, "R_reported_ohm", None))
-            if getattr(sigma, "R_basis", "") == "sum" else None
+            if getattr(sigma, "R_basis", "") in ("sum", "sum_unqualified") else None
         ),
         R_sum_se_ohm=_f_or_none(getattr(sigma, "R_reported_se_ohm", None)),
         rho_series_bulk=_f_or_none(getattr(sigma, "rho", None)),

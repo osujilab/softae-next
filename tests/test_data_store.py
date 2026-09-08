@@ -2140,6 +2140,91 @@ class TestFitQualityColumns:
 
 
 # ---------------------------------------------------------------------------
+# The reported-resistance basis reaching `R_sum_ohm`
+# ---------------------------------------------------------------------------
+
+
+class TestBothSumBasesReachTheRSumColumn:
+    """``sum_unqualified`` is a sum too, and the column has to say so.
+
+    `engine_support.BASIS_SUM_UNQUALIFIED` separates a sum reported because **no
+    covariance existed at all** from a `"sum"` reported because rho was computed and
+    found the split unidentifiable. This boundary tested `R_basis == "sum"` exactly,
+    so a row on the newer basis stored NULL — absence spelled with the token for
+    *"this row is a split"* (SUBAGENT_RULES §3.1(a)), and the harder of the two to
+    notice later because nothing marks it as absent rather than as split.
+
+    Written because nothing else in the suite referenced `sum_unqualified` at all:
+    the widened condition would otherwise be certified by a green run that would
+    have been just as green without it.
+    """
+
+    def _report(self, basis: str, se: float):
+        # The real dataclasses, not a stand-in: a duck-typed sigma would not prove
+        # production can carry this basis at all (SUBAGENT_RULES §3.1(e)).
+        from softae.analysis.eis.report import SigmaReport, SpectrumReport
+
+        return SpectrumReport(engine="gated", sigma=SigmaReport(
+            R_reported_ohm=1234.5, R_reported_se_ohm=se, R_basis=basis))
+
+    @pytest.mark.parametrize("basis", ["sum", "sum_unqualified"])
+    def test_a_sum_reported_resistance_is_stored_whichever_basis_licensed_it(
+            self, store_with_run, basis: str) -> None:
+        # `"sum"` is the regression guard and `"sum_unqualified"` is the fix; both
+        # are a reported R_series+R_bulk, so both belong in the column.
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        store.record_fit(mid, _FakeFitResult(), report=self._report(basis, 12.0))
+        assert store.query_fits(measurement_id=mid)[0]["R_sum_ohm"] == 1234.5
+
+    def test_a_split_basis_still_stores_null_so_the_condition_stays_a_condition(
+            self, store_with_run) -> None:
+        """The negative control, and the reason the pair above discriminates.
+
+        Widening the test to "always populate" would pass both cases above while
+        recording a sum for a row that reported a split. Only this notices.
+        """
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        store.record_fit(mid, _FakeFitResult(),
+                         report=self._report("split_bulk", 12.0))
+        assert store.query_fits(measurement_id=mid)[0]["R_sum_ohm"] is None
+
+    def test_the_nan_se_this_basis_carries_becomes_none_at_the_boundary(self) -> None:
+        """Asserted on `_fit_report_columns`, because the round trip cannot say it.
+
+        `_resolve_reported_resistance` returns NaN for the SE on this basis — there
+        is no covariance to propagate — and `R_sum_se_ohm` is populated
+        unconditionally, relying on `_f_or_none` to render that as absent. sqlite3
+        binds NaN to NULL by itself, so a stored row reads NULL either way; the same
+        vacuity `test_a_nan_metric_becomes_none_at_the_boundary_not_at_the_driver`
+        documents above.
+        """
+        from softae.core.data_store import _fit_report_columns
+
+        columns = _fit_report_columns(self._report("sum_unqualified", float("nan")))
+        assert columns["R_sum_ohm"] == 1234.5
+        assert columns["R_sum_se_ohm"] is None
+
+    def test_the_basis_literal_here_still_matches_engine_supports_constant(self) -> None:
+        """The cost of spelling the basis as a literal, made visible.
+
+        This module imports no constants from `engine_support` and tests the basis
+        as a plain string, matching its neighbours. That is one rename away from
+        silently reverting the fix — every test above would keep passing, because
+        they spell the literal too — so the source is pinned against the constant.
+        """
+        import inspect
+
+        from softae.analysis.eis.engine_support import BASIS_SUM_UNQUALIFIED
+        from softae.core import data_store as ds_mod
+
+        assert BASIS_SUM_UNQUALIFIED == "sum_unqualified"
+        assert f'"{BASIS_SUM_UNQUALIFIED}"' in inspect.getsource(
+            ds_mod._fit_report_columns)
+
+
+# ---------------------------------------------------------------------------
 # Skipped-channel provenance on the run row (halt/park Priority 4)
 # ---------------------------------------------------------------------------
 
