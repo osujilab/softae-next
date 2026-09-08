@@ -502,7 +502,21 @@ def gate_tand_slope(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> GateRe
     the windows the window function is willing to return. :func:`log_slope`'s own
     default of five stands for its other three callers, which are windowed differently
     or not at all; had this call kept it, a four-point segment would have been selected
-    and then fitted to NaN, which this gate spells as a reject.
+    and then fitted to NaN, which this gate spells as a failure.
+
+    **Severity is ``flag``, not ``block_spectrum``, and that is a deliberate
+    downgrade.** The verdict is trustworthy only where
+    :func:`~softae.analysis.eis.admittance.parallel_branch_window` selects the right
+    segment, and two shapes it does not handle were measured on real data: a tan δ
+    curve with **two** local maxima, where the global-argmax anchor locks onto the
+    taller but physically wrong hump, and a band with **no** interior maximum because
+    the relaxation corner sits above the sweep on a very conductive sample. Both put
+    the fit on the wrong data rather than near the threshold, so no value of
+    ``tand_slope_max`` rescues either, and all four NIST KCl standards were rejected
+    by this gate on spectra :func:`gate_series_rc` passed. The gate stays — it is the
+    strongest measured Front-1 separator on the film corpus (sep +0.52) — but as an
+    advisory reading rather than a power to empty a fitting set. See
+    ``docs/SubAgent docs/eis_gate_stack_recalibrate_or_retire.md``.
     """
     f = np.asarray(f, dtype=float)
     tand = loss_tangent(Z)
@@ -516,18 +530,19 @@ def gate_tand_slope(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> GateRe
         # DELIBERATELY NOT `GateResult.unchecked`, and this is settled — do not
         # re-litigate it here. "Insufficient valid tanδ points" is an absence of
         # input, so on the face of it this belongs with the `checked=False` sites;
-        # but it is the one such branch that returns `passed=False`, on a
-        # `BLOCK_SPECTRUM` that `reduce_gates` turns into REJECT. Marking it
+        # but it is the one such branch that returns `passed=False`. Marking it
         # `checked=False, passed=False` would be the sole exception to the
         # `__post_init__` invariant, and an invariant with an exception no longer
         # lets a consumer conclude anything from `checked` alone. Flipping `passed`
-        # instead would change which spectra are rejected — a verdict change
-        # smuggled into a record change. So the site keeps `passed=False,
-        # checked=True` and is carried as a known mis-spelling, alongside
-        # `gate_series_rc`'s NaN-slope branch, which is the same failure at the same
-        # severity and returns the opposite verdict. Resolving the pair needs a
-        # verdict change and its own wave.
-        return GateResult("tand_slope", BLOCK_SPECTRUM, False,
+        # instead would change the recorded verdict — a verdict change smuggled into
+        # a record change. So the site keeps `passed=False, checked=True` and is
+        # carried as a known mis-spelling, alongside `gate_series_rc`'s NaN-slope
+        # branch, which is the same failure returning the opposite verdict. Since
+        # the severity downgrade the two branches no longer share a severity either,
+        # so `gate_series_rc` alone still turns this absence into a REJECT while
+        # this one now reduces to SUSPECT. Resolving the pair needs a verdict change
+        # and its own wave.
+        return GateResult("tand_slope", FLAG, False,
                           "insufficient valid tanδ points to take a slope", ok,
                           {"tand_slope": float("nan")})
 
@@ -535,7 +550,7 @@ def gate_tand_slope(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> GateRe
     kind = ("parallel conduction present" if passed
             else "SERIES parasitic — no conductivity content at any frequency")
     return GateResult(
-        "tand_slope", BLOCK_SPECTRUM, passed,
+        "tand_slope", FLAG, passed,
         f"d log tanδ/d log f = {slope:+.2f} over {int(window.sum())} pts ({kind})", ok,
         {"tand_slope": slope, "tand_window_pts": float(window.sum())},
     )
@@ -1505,6 +1520,16 @@ def run_gates(
     the topology triad is run as a *group*: every member evaluates, and only then
     does the chain stop. Non-triad blocking gates still short-circuit, because there
     is no diagnostic value in running a topology test on a stuck instrument.
+
+    **What the group rule now buys, since :func:`gate_tand_slope` became a ``flag``.**
+    It is no longer what preserves §3.5.3's mutual confirmation: a ``flag`` never
+    short-circuits anything, so both formulations reach the log on every spectrum
+    regardless, and :func:`gate_series_rc` — the triad's only remaining
+    ``block_spectrum`` member — is evaluated last. The rule is not vacuous, though.
+    A failed :func:`gate_series_rc` still does not stop the chain, so
+    :func:`gate_valley_feature` and :func:`gate_plateau_in_band` continue to report
+    on a spectrum the triad refused, which is what makes the rejection diagnosable
+    rather than merely recorded.
     """
     f = np.asarray(f, dtype=float)
     Z = np.asarray(Z, dtype=complex)

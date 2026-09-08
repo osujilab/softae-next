@@ -646,7 +646,10 @@ class TestVocabularyBridge:
     def test_a_blocking_failure_reduces_to_reject_so_the_optimizer_is_told_nothing(self):
         from softae.analysis.eis.gates import BLOCK_SPECTRUM, GateResult
 
-        blocked = GateResult("tand_slope", BLOCK_SPECTRUM, False, "series",
+        # `series_rc_topology` rather than `tand_slope`: the latter is a `flag` since
+        # the severity downgrade, so that pairing is a shape no gate can now produce
+        # and the fixture would be testing a code state that never existed.
+        blocked = GateResult("series_rc_topology", BLOCK_SPECTRUM, False, "series",
                              np.ones(4, bool))
         report = reduce_gates([blocked], n_surviving=20, min_fit_pts=8)
         assert report.verdict is Verdict.REJECT

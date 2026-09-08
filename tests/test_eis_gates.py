@@ -78,9 +78,12 @@ class TestTopologyAdmission:
         assert "tand_slope" in _failed(results)
 
     def test_the_triad_runs_as_a_group_so_two_independent_formulations_confirm_each_other(self):
-        # The printed runner breaks on the first failed block_spectrum, which would
-        # mean series_rc_topology never evaluates once tand_slope has failed — and
-        # §3.5.3 calls their agreement "the confirmation".
+        # §3.5.3 calls agreement between the two formulations "the confirmation", so
+        # both have to reach the log on the same spectrum. Since tand_slope became a
+        # `flag` it no longer short-circuits anything, and series_rc_topology — the
+        # triad's only remaining block_spectrum member — is evaluated last, so the
+        # group rule is not what carries this any more. The property under test is
+        # unchanged and still worth pinning: both verdicts, once, on one spectrum.
         f, Z = pure_series_rc()
         _, results, _ = run_gates(f, Z, _ctx())
         failed = _failed(results)
@@ -107,6 +110,37 @@ class TestTopologyAdmission:
             "if this stops being true the deviation is no longer needed")
         assert windowed < global_slope
         assert windowed <= GateSettings().tand_slope_max
+
+    def test_a_series_parasitic_is_identified_by_tand_slope_but_no_longer_blocked_by_it(self):
+        """The downgrade, pinned where reverting it goes red.
+
+        ``gate_tand_slope`` still *identifies* the series parasitic — that is the
+        strongest measured Front-1 separator on the film corpus and none of it is
+        given up here. What it no longer carries is the power to empty a fitting set
+        on its own, because its window is demonstrably wrong on two real shapes (a
+        double-humped tan δ, and a relaxation corner above the swept band) and
+        rejected all four NIST KCl standards that ``gate_series_rc`` passed.
+
+        So: the verdict stands, the mask is untouched, and this one failure alone
+        does not reject the spectrum. Anything else on the same spectrum still can —
+        which is why ``blocked_by`` is asked about *this* result rather than the run.
+        """
+        from softae.analysis.eis.gates import blocked_by
+
+        f, Z = pure_series_rc()
+        _, results, _ = run_gates(f, Z, _ctx())
+        r = next(x for x in results if x.name == "tand_slope")
+
+        assert not r.passed, "the discrimination must not have been weakened"
+        assert r.metrics["tand_slope"] > GateSettings().tand_slope_max
+        assert "SERIES parasitic" in r.detail
+
+        assert r.severity == FLAG
+        assert np.asarray(r.mask).all() and r.n_dropped == 0, (
+            "an advisory gate never removes a point")
+        assert blocked_by([r]) is None, (
+            "this gate alone must no longer reject a spectrum — the line that "
+            "goes red if the severity is put back to block_spectrum")
 
     def test_a_dispersive_dielectric_is_flagged_by_capacitance_flatness_and_nothing_else(self):
         f, Z = dispersive_dielectric()
@@ -233,7 +267,10 @@ class TestTandWindowShapes:
 
         r = gate_tand_slope(f, Z, _ctx())
         assert r.metrics["tand_slope"] == pytest.approx(1.0, abs=0.01)
-        assert not r.passed and r.severity == BLOCK_SPECTRUM
+        # The discrimination is unchanged — the slope reads +1 and the gate fails.
+        # Only the consequence moved: advisory since the severity downgrade, because
+        # this window is right here and demonstrably wrong on the KCl standards.
+        assert not r.passed and r.severity == FLAG
 
     def test_tand_window_with_too_few_valid_points_returns_the_full_band(self):
         # Three usable points spread across a 41-point sweep: too few to locate a peak,
@@ -954,8 +991,10 @@ class TestCouldNotCheckCensus:
         otherwise stop the chain before the triad.
 
         **This is also the exhibit for the one site left deliberately alone.**
-        ``tand_slope`` fails on the *same* absence at the *same* severity and returns
-        the opposite verdict; see the comment at that branch in ``gates.py``.
+        ``tand_slope`` fails on the *same* absence and returns the opposite verdict;
+        see the comment at that branch in ``gates.py``. Since the severity downgrade
+        the two no longer share a severity either, so only ``series_rc_topology``
+        turns this absence into a REJECT.
         """
         f, Z = reference_spectrum()
         Z = np.abs(Z.real) + 0j
