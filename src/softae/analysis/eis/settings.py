@@ -160,13 +160,16 @@ class GateSettings:
     def describe(self) -> str:
         """One line an operator can sanity-check the settings against.
 
-        ``rho_degenerate`` drives two different tests and the line says both, because
-        naming only one would misdescribe whichever is omitted. ``gate_degeneracy`` is
-        **two-sided on the magnitude** (``|ρ| ≥ |rho_degenerate|`` is degenerate), while
-        ``engine_support._resolve_reported_resistance`` keeps the **one-sided** rule that
-        chooses the reported resistance — a deliberate divergence documented in
-        ``gate_degeneracy``. The gate's half reads ``abs()`` so the string cannot disagree
-        with the gate if an operator writes the threshold positive.
+        ``rho_degenerate`` drives two tests and the line names both, because naming only
+        one would misdescribe whichever is omitted. Since ``db0b9ae`` (2026-09-03) they
+        are the *same* test: ``gate_degeneracy`` and
+        ``engine_support._resolve_reported_resistance`` are both **two-sided on the
+        magnitude** — ``|ρ| ≥ |rho_degenerate|`` is degenerate, and the engine reports
+        ``R_series + R_bulk`` rather than the split there. (Before that commit the engine
+        kept a one-sided ``ρ ≤ rho_degenerate`` and the two deliberately disagreed; the
+        divergence is documented in ``gate_degeneracy``.) Both halves read ``abs()`` so
+        the string cannot disagree with either if an operator writes the threshold
+        positive.
         """
         if not self.enabled:
             return (
@@ -177,7 +180,7 @@ class GateSettings:
             f"EIS gates enforcing: tanδ slope ≤ {self.tand_slope_max:+.2f}, "
             f"≥ {self.min_fit_pts} surviving points, "
             f"degenerate at |ρ| ≥ {abs(self.rho_degenerate):.2f} "
-            f"(engine reports sum-only below ρ = {self.rho_degenerate:+.2f})."
+            f"(engine reports sum-only when |ρ| ≥ {abs(self.rho_degenerate):.2f})."
         )
 
 

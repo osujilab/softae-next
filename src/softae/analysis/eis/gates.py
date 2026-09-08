@@ -898,17 +898,20 @@ def gate_degeneracy(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> GateRe
        because separating "numerically dead" from "correlated past the design threshold"
        is information this gate did not previously carry.
 
-       **``engine_support.py`` still applies the ONE-SIDED rule, and that is deliberate.**
-       :func:`~softae.analysis.eis.engine_support._resolve_reported_resistance` chooses
-       the *reported resistance* with
-       ``degenerate = cov.singular or (rho == rho and rho <= float(rho_degenerate))``,
-       so on the 9 positive-ρ spectra the engine returns the split (``R_bulk`` alone)
-       while this gate now says the split is degenerate. The divergence is intentional
-       and the engine's rule lives in another session's file: this gate is advisory and
-       records a fact about identifiability, whereas moving the engine's rule would move
-       all 9 reported numbers. **Do not "reconcile" it by reverting this gate.** The
-       detail string names which side the degeneracy is on precisely so the two records
-       can be read against each other.
+       **``engine_support.py`` applies the SAME two-sided rule as of ``db0b9ae``
+       (2026-09-03); before that it did not.**
+       :func:`~softae.analysis.eis.engine_support._resolve_reported_resistance` now
+       chooses the *reported resistance* with
+       ``degenerate = cov.singular or (rho == rho and abs(rho) >= abs(rho_degenerate))``,
+       so the 9 positive-ρ spectra above get the sum from the engine and a FAIL from this
+       gate — one rule, two records. The one-sided/two-sided distinction is documented
+       because the two genuinely disagreed for a while: this gate went two-sided in
+       ``3e51ac0`` while the engine kept ``rho <= rho_degenerate`` and returned the split
+       (``R_bulk`` alone) on those same 9. That divergence was held deliberately — this
+       gate is advisory, whereas moving the engine's rule moved 9 reported numbers, so it
+       waited on the reference-resistor answer key. **It is gone: a change to either rule
+       is now a change to both.** The detail string still names which side the degeneracy
+       is on, because the two sides remain different findings under one rule.
     """
     ok = _all_pass(np.asarray(f).size)
     fit = ctx.get("fit")
@@ -952,11 +955,11 @@ def gate_degeneracy(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> GateRe
         suffix = " — relaxation corner out of band; reporting the sum, not the split"
     else:
         # The other side of the same rank deficiency. Worth its own words because the
-        # engine's one-sided rule does NOT treat it as degenerate, so the record must
-        # not read as though the sum was reported here.
+        # two sides are different findings, not because they are treated differently:
+        # since `db0b9ae` the engine reports the sum on this side too.
         suffix = (" — positive degeneracy: the same rank deficiency with the ridge "
-                  "running the other way, so the split is invented; the engine's "
-                  "one-sided rule still reports the split")
+                  "running the other way, so the split is invented; the engine "
+                  "reports the sum here too")
     return GateResult(
         "degeneracy", FLAG, passed,
         f"ρ(R_series, R_bulk) = {rho:+.3f}" + suffix,
