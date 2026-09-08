@@ -34,7 +34,7 @@ delegated to subagents.
 1. **Checks ownership before staging** → `python tools/whose.py --staged --me <session>` must exit
    zero before any `git add` is proposed to the operator (see "Shared-tree ownership")
 1. **Spawns update subagents** → updates PROGRESS.md, USER_GUIDE.md, ACTION_PLAN.md and other ".\docs" files as needed
-1. **Recurrent workflow reminders** → occasionally reminds the system to retain this workflow structure (roughly every three prompts).
+1. User-facing updates are in BLUF (bottom-line upfront) format.
 
 The orchestrator **never** edits source files directly — edits stay delegated. Reading directly is
 required, not merely permitted, because the comparison in step 2 depends on the orchestrator having
