@@ -5,14 +5,19 @@ anything off disk, so they hold on a machine with no ``AMP_v1`` beside it and no
 DataStore. Ground truth is then exactly known, which is the only way to test a fitter
 without inheriting the very estimator being tested.
 
-The two answer-key tests at the bottom read real data and skip cleanly when it is
-absent. They exist because a fitter that recovers its own forward model proves only
-that the algebra round-trips — ``SUBAGENT_RULES`` §3.2 — and the corpus is what says
-whether the branch is reached by anything real.
+The answer-key tests at the bottom read real data and skip cleanly when it is absent.
+They exist because a fitter that recovers its own forward model proves only that the
+algebra round-trips — ``SUBAGENT_RULES`` §3.2 — and the corpus is what says whether the
+branch is reached by anything real. **Order dependence is the case that made that
+concrete**: the synthetic ladder cannot show it at all, because spectra
+:func:`model_impedance` generated exactly give a cost surface with one reachable basin,
+so the order-invariance test that discriminates is the one against the four NIST
+standards, with the retired seeding restored in process as its control.
 """
 
 from __future__ import annotations
 
+import itertools
 import math
 from pathlib import Path
 
@@ -22,17 +27,21 @@ import pytest
 from softae.analysis.eis.calibration import FixtureConductance
 from softae.analysis.eis.constrained_fit import (
     BOUNDS,
+    CONSENSUS_COST_FACTOR,
     CONSTRAINED_FIT_TOL,
-    CONTINUATION_RESET,
+    ORDER_SPREAD_REFUSE_PCT,
     PARAM_NAMES,
     PER_SPECTRUM_PARAMS,
     R_SOL_SEED_MULTIPLIERS,
     SHARED_PARAMS,
+    SHARED_SEED_GRID,
     Admissibility,
     ConstrainedSpectrum,
     HoldoutResult,
     InadmissibleFitSet,
+    SharedArtifact,
     ShuntTable,
+    UnstableFitSurface,
     arc_is_resolved,
     check_admissible,
     conductance_r_sol,
@@ -42,6 +51,30 @@ from softae.analysis.eis.constrained_fit import (
     holdout_report,
     model_impedance,
 )
+
+#: Arguments for the tests whose subject is something *other* than the multi-start —
+#: tolerance handling, holdout bookkeeping, order invariance.
+#:
+#: The full grid costs ~25 s per :func:`fit_shared` on noise-free synthetic spectra and
+#: minutes on the near-degenerate ones: four of its ten starts converge to a cost around
+#: 1e-20 and then crawl there for thousands of iterations, which is a property of data
+#: the forward model generated *exactly*, not of the optimiser — on the real corpus the
+#: whole grid takes ~30 s. Paying the synthetic price in every test would put this file
+#: at half an hour for no added coverage, so the two entries here stand in wherever the
+#: grid's width is not the subject; the ``artifact`` fixture and the answer-key
+#: in-sample test still run it at full width.
+#:
+#: The infinite limit is deliberate and explicit rather than incidental: two starts that
+#: land in different basins leave one in consensus and a NaN spread, which
+#: :func:`fit_shared` refuses on by design, and an explicit infinity is the only way to
+#: ask for the artifact anyway.
+FAST = dict(seed_grid=(SHARED_SEED_GRID[1], SHARED_SEED_GRID[3]),
+            max_order_spread_pct=math.inf)
+
+#: Three grid entries that all stop in the same shallow region of the surface at cost
+#: ~0.6 and **disagree** about ``R_sol`` by ~6 % — measured, on the synthetic ladder.
+#: Real multi-start disagreement, which is what the refusal is for.
+POOR_STARTS = (SHARED_SEED_GRID[0], SHARED_SEED_GRID[2], SHARED_SEED_GRID[4])
 
 # ── The forward model, and the truth the tests measure against ───────────────
 
@@ -76,9 +109,20 @@ def synth(
                                pinned_l_H=pinned_l_H, reference_ohm=r_sol)
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def ladder() -> list[ConstrainedSpectrum]:
     return [synth(label, r) for label, r in TRUE_R_SOL.items()]
+
+
+@pytest.fixture(scope="module")
+def artifact(ladder) -> SharedArtifact:
+    """One good artifact, fitted once and shared by every test that only needs one.
+
+    Module-scoped because :func:`fit_shared` now runs the whole seed grid and the
+    spectra are frozen dataclasses over read-only arrays — there is nothing for a test
+    to mutate, and refitting it a dozen times is the single largest cost in this file.
+    """
+    return fit_shared(ladder)
 
 
 # ── The split: three shared, three per spectrum, L in neither ────────────────
@@ -93,45 +137,207 @@ def test_parameter_split_partitions_names_with_l_pinned_out() -> None:
     assert "Rleak" not in PARAM_NAMES
 
 
-def test_fit_shared_recovers_the_shared_three_from_the_forward_model(ladder) -> None:
-    artifact = fit_shared(ladder)
+def test_fit_shared_recovers_the_shared_three_from_the_forward_model(artifact) -> None:
     for name, truth in TRUE_SHARED.items():
         assert getattr(artifact, name) == pytest.approx(truth, rel=1e-3), name
-    assert artifact.labels == tuple(TRUE_R_SOL)
+    # Canonical, not as-passed: the fit sorts the set before stacking so that the
+    # residual vector is a function of the set (see fit_shared), and the labels record
+    # the order actually fitted.
+    assert artifact.labels == tuple(sorted(TRUE_R_SOL))
     assert artifact.railed() == ()
 
 
-def test_fit_shared_shares_one_value_across_every_spectrum(ladder) -> None:
+def test_fit_shared_shares_one_value_across_every_spectrum(ladder, artifact) -> None:
     """The property that distinguishes this from N independent fits."""
-    artifact = fit_shared(ladder)
-    frozen = artifact.shared
-    assert set(frozen) == set(SHARED_PARAMS)
+    assert set(artifact.shared) == set(SHARED_PARAMS)
     # Each spectrum's own truth differs in R_sol by ~90x, yet one triple serves all.
     for spec in ladder:
         fit = fit_frozen(spec, artifact)
         assert fit.R_sol == pytest.approx(spec.reference_ohm, rel=1e-3), spec.label
 
 
-def test_fit_frozen_varies_only_the_per_spectrum_three(ladder) -> None:
-    artifact = fit_shared(ladder)
+def test_fit_frozen_varies_only_the_per_spectrum_three(ladder, artifact) -> None:
     a = fit_frozen(ladder[0], artifact)
     b = fit_frozen(ladder[-1], artifact)
     # The per-spectrum parameters move with the spectrum...
     assert a.R0 != b.R0 and a.R1 != b.R1
-    # ...while the artifact they were fitted against is unchanged by fitting.
-    assert artifact.shared == fit_shared(ladder).shared
+    # ...while the artifact they were fitted against is unchanged by fitting, and a
+    # refit of the same set lands in the same place.
+    for name, value in fit_shared(ladder, **FAST).shared.items():
+        assert value == pytest.approx(artifact.shared[name], rel=1e-6), name
 
 
-def test_continuation_reset_names_only_the_resistances() -> None:
-    """The seeding rule worth 1.4 % against 28 000 % — see the constant's docstring."""
-    assert set(CONTINUATION_RESET) == {"R0", "R1"}
-    assert set(CONTINUATION_RESET) <= set(PER_SPECTRUM_PARAMS)
+# ── Order invariance — the defect this module was committed carrying ─────────
+#
+# `fit_shared` as committed at f79e463 built its starting point as a continuation:
+# each spectrum seeded from the *previous* spectrum's fit, resetting only R0/R1, with
+# the median of that chain as the stacked fit's x0. Reorder the input and the chain
+# reorders, so the stacked fit starts somewhere else and `least_squares`, being local,
+# finishes somewhere else. Measured on the four NIST standards: 24 permutations of the
+# same four spectra spanned R_sol MAE 1.561 % to 1.065e9 %, with `check_admissible`
+# True on all 24 and `railed()` firing on none.
+
+def test_fit_shared_gives_one_answer_for_every_order_of_the_same_set(ladder) -> None:
+    """All 24 permutations of one four-spectrum set, one artifact.
+
+    **This assertion is not self-validating** and the file carries two things that say
+    so: the control immediately below shows it goes red when order dependence is
+    present, and ``test_answer_key_...order`` shows it goes red on the *real* corpus
+    against the seeding this replaced. On noise-free synthetic spectra the retired
+    continuation passes this test too — the cost surface has a single basin the model
+    generated itself — which is exactly ``SUBAGENT_RULES`` §3.2 and the reason the
+    answer-key version exists.
+    """
+    shared = [fit_shared(list(perm), **FAST).shared
+              for perm in itertools.permutations(ladder)]
+    assert len(shared) == 24
+    for name in SHARED_PARAMS:
+        values = [s[name] for s in shared]
+        assert max(values) == pytest.approx(min(values), rel=1e-6), name
+
+
+def test_the_order_invariance_check_goes_red_when_the_start_depends_on_order(
+        ladder, monkeypatch) -> None:
+    """Positive control — ``SUBAGENT_RULES`` §3.1(e).
+
+    An invariance assertion is worth nothing unless order dependence, when it exists,
+    reaches it. The start builder is replaced by one that seeds **every** spectrum from
+    whichever spectrum happens to be first in the list — order-dependent by
+    construction, in the same shape the continuation was — and the assertion above must
+    then fail.
+    """
+    from softae.analysis.eis import constrained_fit as module
+
+    def first_spectrum_start(spectra, shared, tol):
+        x0 = [shared[p] for p in SHARED_PARAMS]
+        for _ in spectra:
+            x0 += [module._seed(spectra[0])[p] for p in PER_SPECTRUM_PARAMS]
+        return x0
+
+    # Both halves of the fix come out: `_canonical_order` would otherwise make even a
+    # deliberately order-dependent start builder order-free, and the control would come
+    # back green while proving nothing — SUBAGENT_RULES §3.1's harness case.
+    monkeypatch.setattr(module, "_canonical_order", lambda spectra: list(spectra))
+    monkeypatch.setattr(module, "_stacked_start", first_spectrum_start)
+    # Four orderings, not all 24: a bad start makes every descent slow, and four is
+    # already enough to show the difference — measured, this construction spans 7.3 %
+    # in Qg over the full 24 where the shipped one spans 0.
+    orders = [ladder, ladder[::-1], [ladder[i] for i in (2, 0, 3, 1)],
+              [ladder[i] for i in (1, 3, 0, 2)]]
+    qg = [fit_shared(list(o), **FAST).Qg for o in orders]
+    assert max(qg) > min(qg) * (1 + 1e-6), (
+        "an order-dependent start produced the same Qg for every order, so the "
+        "invariance test above cannot distinguish the two constructions")
+
+
+def test_seed_grid_is_a_fixed_module_constant_not_derived_from_the_data() -> None:
+    """The property that makes the fit order-free: nothing about the grid is fitted."""
+    assert len(SHARED_SEED_GRID) >= 2
+    for entry in SHARED_SEED_GRID:
+        assert set(entry) == set(SHARED_PARAMS)
+        for name, value in entry.items():
+            lo, hi = BOUNDS[name]
+            assert lo <= value <= hi, (name, value)
+    # Decades either side of `_seed`'s default Qg, the same shape as
+    # R_SOL_SEED_MULTIPLIERS one level down.
+    qg = sorted({e["Qg"] for e in SHARED_SEED_GRID})
+    assert qg[-1] / qg[0] >= 1e3
+    assert len({e["nd"] for e in SHARED_SEED_GRID}) >= 2
+
+
+def test_each_spectrums_start_depends_only_on_itself(ladder) -> None:
+    """``_stacked_start`` is order-free by shape, and this reads that off directly.
+
+    The per-spectrum block a spectrum gets must be the same block wherever it sits in
+    the list — a stronger and far cheaper statement than the end-to-end permutation
+    test, and the one that says *why* the end-to-end result holds.
+    """
+    from softae.analysis.eis import constrained_fit as module
+
+    entry = SHARED_SEED_GRID[0]
+    forward = module._stacked_start(ladder, entry, CONSTRAINED_FIT_TOL)
+    backward = module._stacked_start(list(reversed(ladder)), entry,
+                                     CONSTRAINED_FIT_TOL)
+    n_shared, n_each = len(SHARED_PARAMS), len(PER_SPECTRUM_PARAMS)
+    for i in range(len(ladder)):
+        j = len(ladder) - 1 - i
+        assert forward[n_shared + i * n_each: n_shared + (i + 1) * n_each] == \
+            pytest.approx(backward[n_shared + j * n_each: n_shared + (j + 1) * n_each])
+
+
+# ── The order spread, and the refusal built on it ────────────────────────────
+
+def test_fit_shared_reports_the_spread_between_its_starts(artifact) -> None:
+    """:attr:`SharedArtifact.order_spread_pct`, the counterpart to seed_spread_pct."""
+    assert artifact.n_starts == len(SHARED_SEED_GRID)
+    assert 2 <= artifact.n_consensus <= artifact.n_starts
+    assert artifact.order_spread_pct == pytest.approx(0.0, abs=1e-3)
+    assert artifact.seed in SHARED_SEED_GRID
+    assert f"{artifact.n_consensus}/{artifact.n_starts} starts" in artifact.describe()
+
+
+def test_fit_shared_refuses_when_the_starts_do_not_agree(ladder) -> None:
+    """Three starts that reach the same cost and different answers.
+
+    :data:`POOR_STARTS` is not a contrivance in shape — they are entries of the shipped
+    grid, and on this ladder all three stop at cost ~0.6 within a factor of 1.02 of each
+    other, so all three are in consensus, and they disagree about ``R_sol`` by ~6 %. The
+    threshold is then the only thing varied: above the measured spread the artifact is
+    returned, below it the same fit refuses.
+    """
+    returned = fit_shared(ladder, seed_grid=POOR_STARTS)
+    assert returned.n_consensus == len(POOR_STARTS)
+    assert returned.order_spread_pct > 1.0
+
+    with pytest.raises(UnstableFitSurface, match="order spread") as exc:
+        fit_shared(ladder, seed_grid=POOR_STARTS, max_order_spread_pct=1.0)
+    assert "not reproducible" in str(exc.value)
+
+
+def test_fit_shared_refuses_when_only_one_start_reached_the_minimum(ladder) -> None:
+    """A single descent cannot show that its minimum is reproducible.
+
+    ``SUBAGENT_RULES`` §3.1(a): the spread is NaN there, and NaN must not be spelled the
+    same way as "the starts agreed". One grid entry is the smallest instance of it.
+    """
+    with pytest.raises(UnstableFitSurface, match="1/1 consensus"):
+        fit_shared(ladder, seed_grid=(SHARED_SEED_GRID[0],))
+
+
+def test_unstable_fit_surface_is_recorded_as_a_refused_fold(ladder) -> None:
+    """It subclasses InadmissibleFitSet so ``holdout_report`` records it, not crashes."""
+    assert issubclass(UnstableFitSurface, InadmissibleFitSet)
+    report = holdout_report(ladder, kind="leave_one_out",
+                            seed_grid=(SHARED_SEED_GRID[0],))
+    assert len(report.refused) == len(ladder)
+    assert report.results == ()
+    assert all("order spread" in reason for _, reason in report.refused)
+
+
+def test_fit_shared_rejects_an_empty_seed_grid(ladder) -> None:
+    with pytest.raises(ValueError, match="seed_grid is empty"):
+        fit_shared(ladder, seed_grid=())
+
+
+def test_consensus_window_is_relative_with_an_absolute_floor() -> None:
+    """Both halves are load-bearing and the floor was bought by a failure.
+
+    A purely relative window asks the wrong question when the fit is exact: the
+    synthetic ladder converges to cost ~1e-29, ``1.5x`` of which admits nothing but the
+    winner, and a *perfect* recovery was refused for lack of anyone to agree with.
+    """
+    from softae.analysis.eis import constrained_fit as module
+
+    assert CONSENSUS_COST_FACTOR > 1.0
+    assert module.EXACT_COST_PER_RESIDUAL > 0.0
+    # The floor must be far below any measured spectrum's cost per residual: the four
+    # NIST standards fit at ~0.25 over ~320 residuals, i.e. ~8e-4 per residual.
+    assert module.EXACT_COST_PER_RESIDUAL < 1e-6
 
 
 # ── R_sol = R0 + R1, unconditionally ─────────────────────────────────────────
 
-def test_r_sol_is_the_sum_not_the_bulk_term(ladder) -> None:
-    artifact = fit_shared(ladder)
+def test_r_sol_is_the_sum_not_the_bulk_term(ladder, artifact) -> None:
     for spec in ladder:
         fit = fit_frozen(spec, artifact)
         assert fit.R_sol == fit.R0 + fit.R1
@@ -153,7 +359,8 @@ def test_r_sol_is_reported_even_when_the_split_is_unidentifiable() -> None:
                           {**TRUE_SHARED, "R0": 50.0, "R1": 49_950.0, "Qd": 2e-6},
                           spec.y_shunt, 0.0),
         y_shunt=spec.y_shunt, reference_ohm=50_000.0)
-    artifact = fit_shared([spec, *[synth(k, v) for k, v in TRUE_R_SOL.items()]])
+    artifact = fit_shared([spec, *[synth(k, v) for k, v in TRUE_R_SOL.items()]],
+                          **FAST)
     fit = fit_frozen(spec, artifact)
     assert fit.R_sol == pytest.approx(50_000.0, rel=1e-2)
 
@@ -164,7 +371,7 @@ def test_pinned_inductance_is_consumed_not_fitted() -> None:
     """A spectrum built with a real lead L is recovered when L is pinned to it."""
     l_lead = 1.7294984432805884e-06          # mux16 L_lead_H, ch25
     specs = [synth(k, v, pinned_l_H=l_lead) for k, v in TRUE_R_SOL.items()]
-    artifact = fit_shared(specs)
+    artifact = fit_shared(specs, **FAST)
     for name, truth in TRUE_SHARED.items():
         assert getattr(artifact, name) == pytest.approx(truth, rel=1e-3), name
     for spec in specs:
@@ -268,12 +475,12 @@ def test_known_shunt_is_recovered_through_the_fit_not_absorbed() -> None:
         blind.append(ConstrainedSpectrum(label, freq, z, np.zeros(40, dtype=complex),
                                          reference_ohm=r_sol))
 
-    supplied = fit_shared(specs)
+    supplied = fit_shared(specs, **FAST)
     for spec in specs:
         assert fit_frozen(spec, supplied).R_sol == pytest.approx(
             spec.reference_ohm, rel=1e-3), spec.label
 
-    ignored = fit_shared(blind)
+    ignored = fit_shared(blind, **FAST)
     worst = max(abs(fit_frozen(s, ignored).R_sol / s.reference_ohm - 1.0)
                 for s in blind)
     assert worst > 0.01, "zeroing the shunt changed nothing — it is not reaching the model"
@@ -327,8 +534,7 @@ def test_check_admissible_accepts_the_ladder(ladder) -> None:
     assert verdict.n_residuals > verdict.n_free
 
 
-def test_admissibility_travels_on_the_artifact(ladder) -> None:
-    artifact = fit_shared(ladder)
+def test_admissibility_travels_on_the_artifact(artifact) -> None:
     assert artifact.admissibility is not None
     assert artifact.admissibility.admissible
 
@@ -348,8 +554,8 @@ def test_loose_tolerance_stops_short_of_the_minimum() -> None:
     that the loose run still reports a successful status.
     """
     ladder = [synth(k, v) for k, v in TRUE_R_SOL.items()]
-    loose = fit_shared(ladder, tol=1e-8)
-    tight = fit_shared(ladder, tol=CONSTRAINED_FIT_TOL)
+    loose = fit_shared(ladder, tol=1e-8, **FAST)
+    tight = fit_shared(ladder, tol=CONSTRAINED_FIT_TOL, **FAST)
     assert tight.cost < loose.cost
     assert loose.status > 0, "the loose run reports success — that is the whole problem"
     assert tight.tol == CONSTRAINED_FIT_TOL and loose.tol == 1e-8
@@ -363,7 +569,7 @@ def test_loose_tolerance_is_warned_about(monkeypatch) -> None:
     monkeypatch.setattr(
         module.logger, "warning",
         lambda event, **kw: events.append((event, kw)))
-    fit_shared([synth(k, v) for k, v in TRUE_R_SOL.items()], tol=1e-6)
+    fit_shared([synth(k, v) for k, v in TRUE_R_SOL.items()], tol=1e-6, **FAST)
     assert [e for e, _ in events] == ["eis_constrained_fit_loose_tolerance"]
     assert events[0][1]["tol"] == 1e-6
 
@@ -376,7 +582,7 @@ def test_tight_tolerance_is_not_warned_about(monkeypatch) -> None:
     events: list[str] = []
     monkeypatch.setattr(module.logger, "warning",
                         lambda event, **kw: events.append(event))
-    fit_shared([synth(k, v) for k, v in TRUE_R_SOL.items()])
+    fit_shared([synth(k, v) for k, v in TRUE_R_SOL.items()], **FAST)
     assert events == []
 
 
@@ -396,7 +602,7 @@ def test_tolerance_reaches_the_optimiser(monkeypatch) -> None:
         return real(*args, **kwargs)
 
     monkeypatch.setattr(module, "least_squares", spy)
-    fit_shared([synth(k, v) for k, v in TRUE_R_SOL.items()], tol=1e-9)
+    fit_shared([synth(k, v) for k, v in TRUE_R_SOL.items()], tol=1e-9, **FAST)
     assert seen and set(seen) == {1e-9}
 
 
@@ -408,16 +614,14 @@ def test_multistart_grid_spans_decades_either_side_of_the_estimate() -> None:
     assert 1.0 in R_SOL_SEED_MULTIPLIERS
 
 
-def test_fit_frozen_reports_its_seed_spread(ladder) -> None:
+def test_fit_frozen_reports_its_seed_spread(ladder, artifact) -> None:
     """A good artifact is seed-insensitive, and the spread is how that is known."""
-    artifact = fit_shared(ladder)
     fit = fit_frozen(ladder[0], artifact)
     assert fit.seed_spread_pct == pytest.approx(0.0, abs=1e-6)
     assert fit.seed_multiplier in R_SOL_SEED_MULTIPLIERS
 
 
-def test_fit_frozen_recovers_from_a_deliberately_bad_single_seed(ladder) -> None:
-    artifact = fit_shared(ladder)
+def test_fit_frozen_recovers_from_a_deliberately_bad_single_seed(ladder, artifact) -> None:
     spec = ladder[0]
     only_bad = fit_frozen(spec, artifact, multipliers=(0.001,))
     every = fit_frozen(spec, artifact, multipliers=R_SOL_SEED_MULTIPLIERS)
@@ -434,7 +638,7 @@ def test_holdout_result_error_is_signed_relative_percent() -> None:
 
 
 def test_holdout_report_in_sample_scores_every_reference(ladder) -> None:
-    report = holdout_report(ladder, kind="in_sample")
+    report = holdout_report(ladder, kind="in_sample", **FAST)
     assert report.kind == "in_sample"
     assert len(report.results) == len(ladder)
     assert report.mean_abs_error_pct < 1.0
@@ -442,7 +646,7 @@ def test_holdout_report_in_sample_scores_every_reference(ladder) -> None:
 
 
 def test_holdout_report_leave_one_out_scores_only_held_out_spectra(ladder) -> None:
-    report = holdout_report(ladder, kind="leave_one_out")
+    report = holdout_report(ladder, kind="leave_one_out", **FAST)
     assert report.kind == "leave_one_out"
     assert len(report.results) + len(report.refused) == len(ladder)
     assert report.worst_abs_error_pct >= report.mean_abs_error_pct
@@ -452,7 +656,7 @@ def test_holdout_report_records_refused_folds_rather_than_skipping_them() -> Non
     """A fold dropped for inadmissibility must be visible, not averaged away."""
     good = [synth("wide_a", 70_000.0), synth("wide_b", 38_000.0)]
     blind = synth("high_only", 2_400.0, band=(2.0e4, 2.0e5))
-    report = holdout_report([*good, blind], kind="leave_one_out")
+    report = holdout_report([*good, blind], kind="leave_one_out", **FAST)
     refused = {label for label, _ in report.refused}
     assert refused == {"wide_a", "wide_b"}
     assert "INADMISSIBLE" in dict(report.refused)["wide_a"]
@@ -461,7 +665,7 @@ def test_holdout_report_records_refused_folds_rather_than_skipping_them() -> Non
 
 def test_holdout_report_rejects_an_unknown_kind(ladder) -> None:
     with pytest.raises(ValueError, match="unknown holdout kind"):
-        holdout_report(ladder, kind="optimistic")
+        holdout_report(ladder, kind="optimistic", **FAST)
 
 
 # ── Housekeeping ─────────────────────────────────────────────────────────────
@@ -485,12 +689,38 @@ def test_artifact_railed_names_a_parameter_resting_on_a_bound() -> None:
 
 
 def test_module_is_not_wired_into_any_live_path() -> None:
-    """It ships inert. This test is what makes that a contract rather than a comment."""
+    """It ships inert. This test is what makes that a contract rather than a comment.
+
+    Read off the **import graph**, not off the text. The substring version of this test
+    was fooled the first time another module mentioned this one in a docstring
+    (``conditioning.py``, which names it precisely to say it is inert) — a false failure
+    on correct work, which is the direction that teaches people to override a check. An
+    ``ast`` walk sees imports and dynamic-import strings and does not see prose.
+    """
+    import ast
+
+    def imports_it(path: Path) -> bool:
+        # ``utf-8-sig``: several GUI modules in this tree carry a BOM, and ``ast.parse``
+        # rejects the U+FEFF that plain ``utf-8`` decoding leaves at the front.
+        tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                if any("constrained_fit" in a.name for a in node.names):
+                    return True
+            elif isinstance(node, ast.ImportFrom):
+                if "constrained_fit" in (node.module or "") or \
+                        any(a.name == "constrained_fit" for a in node.names):
+                    return True
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                # importlib.import_module("…eis.constrained_fit") and friends.
+                if "eis.constrained_fit" in node.value:
+                    return True
+        return False
+
     src = Path(__file__).resolve().parents[1] / "src" / "softae"
-    importers = [p for p in src.rglob("*.py")
-                 if p.name != "constrained_fit.py"
-                 and "constrained_fit" in p.read_text(encoding="utf-8")]
-    assert importers == [], f"constrained_fit is referenced by {importers}"
+    importers = [str(p) for p in src.rglob("*.py")
+                 if p.name != "constrained_fit.py" and imports_it(p)]
+    assert importers == [], f"constrained_fit is imported by {importers}"
 
 
 # ── Answer keys. Real data; skipped when it is not here ──────────────────────
@@ -543,51 +773,157 @@ def _load_amp_csv(path: Path) -> tuple[np.ndarray, np.ndarray]:
     return f[order], z[order]
 
 
-@pytest.mark.skipif(not AMP_KCL.is_dir(), reason="AMP_v1 NIST standards not present")
-def test_answer_key_nist_standards_split_admissible_from_inadmissible_folds() -> None:
-    """The gate must fire on exactly the folds that produce a wrong artifact.
+def _amp_standards(*, truncate_hf: bool = False) -> list[ConstrainedSpectrum]:
+    """The four NIST standards, loaded once in one place.
 
-    Measured with the gate bypassed: dropping ``kcl_45uS`` or ``kcl_84uS`` gives
-    ``R_sol`` −84.1 % / −74.4 % on the held-out standard, while dropping either
-    concentrated standard gives +2.5 % / +1.8 %. This asserts the gate's verdict
-    matches that partition — the §3.2 check that the branch is reached by real data.
+    The preparation is deliberately thinner than the offline harness's — no short-blank
+    correction, no |Z| window, no linear-KK truncation, ``L`` pinned to 0 — so what these
+    tests exercise is the fit rather than a conditioning chain that does not ship in
+    ``src/`` at all.
     """
     specs = []
     for label, ref in AMP_R_SOL.items():
         f, z = _load_amp_csv(AMP_KCL / f"{label}.csv")
         keep = np.isfinite(z) & (z.real > 0)
+        if truncate_hf:
+            keep = keep & _truncate_hf_inductive(f, z)
         specs.append(ConstrainedSpectrum(label, f[keep], z[keep],
                                          np.zeros(int(keep.sum()), dtype=complex),
                                          reference_ohm=ref))
+    return specs
+
+
+#: Two grid entries in the poisoned basin — ``Qg`` three decades high, ``nd`` near 0.34.
+#: Restricting the multi-start to them is how a *poisoned artifact* is produced on
+#: purpose now that ordering cannot produce one: measured on the four standards they
+#: reach costs within 1.5x of each other and ``R_sol`` values 1.95e5 % apart.
+POISONED_STARTS = (SHARED_SEED_GRID[8], SHARED_SEED_GRID[9])
+
+
+@pytest.mark.skipif(not AMP_KCL.is_dir(), reason="AMP_v1 NIST standards not present")
+def test_answer_key_nist_standards_split_admissible_from_inadmissible_folds() -> None:
+    """The gate fires on exactly the two folds that drop an arc-resolved standard.
+
+    This pins the *verdict*, which is unchanged, and it is worth being explicit that the
+    verdict is no longer the same claim it was. Measured with the gate bypassed, the two
+    refused folds gave −84.1 % / −74.4 % against the retired continuation seeding and
+    give **−6.4 % / −2.5 %** against the multi-start, while the two passed folds give
+    +2.8 % / −0.1 %. The partition is the same and the justification for it has thinned
+    to almost nothing — see :func:`check_admissible`'s docstring and Wave 2A. The
+    assertion here is deliberately on the partition and not on the errors, so it says
+    what it still knows.
+    """
+    specs = _amp_standards()
 
     verdict = {s.label: arc_is_resolved(s.freq_hz, s.z) for s in specs}
     assert verdict == {"kcl_45uS": True, "kcl_84uS": True,
                        "kcl_1413uS": False, "kcl_4500uS": False}
 
     refused = {label for label, _ in
-               holdout_report(specs, kind="leave_one_out").refused}
+               holdout_report(specs, kind="leave_one_out", **FAST).refused}
     assert refused == {"kcl_45uS", "kcl_84uS"}
 
 
 @pytest.mark.skipif(not AMP_KCL.is_dir(), reason="AMP_v1 NIST standards not present")
-def test_answer_key_nist_standards_reproduce_the_constrained_r_sol() -> None:
-    """In-sample ``R_sol`` against AMP_v1's constrained artifact: 2.9 % mean here.
+def test_answer_key_one_artifact_for_every_order_of_the_same_standards(
+        monkeypatch) -> None:
+    """Order invariance **on the corpus where order dependence was measured.**
 
-    The preparation is deliberately thinner than the offline harness's (no short-blank
-    correction, no |Z| window, no linear-KK truncation, ``L`` pinned to 0) because those
-    steps were measured to be worth ~1.3 percentage points between them, while
-    :func:`_truncate_hf_inductive` is worth three orders of magnitude. So the tolerance
-    is loose on purpose: the claim under test is that the constrained fit lands *near*
-    an independent codebase's answer on a quantity where an unconstrained fit of the
-    same circuit is off by orders of magnitude — not that it reproduces a decimal.
+    The synthetic version of this test cannot discriminate and says so: spectra the
+    forward model generated exactly give a surface the retired continuation navigates
+    identically from either end. Real spectra do not, and the control half below is the
+    proof — the same four standards, the same optimiser, the same tolerance, only the
+    seeding put back, land 88x apart in ``Qg`` and at ``R_sol`` MAE 2.06 % against
+    8546 % purely by reversing the list.
     """
-    specs = []
-    for label, ref in AMP_R_SOL.items():
-        f, z = _load_amp_csv(AMP_KCL / f"{label}.csv")
-        keep = np.isfinite(z) & (z.real > 0) & _truncate_hf_inductive(f, z)
-        specs.append(ConstrainedSpectrum(label, f[keep], z[keep],
-                                         np.zeros(int(keep.sum()), dtype=complex),
-                                         reference_ohm=ref))
+    specs = _amp_standards(truncate_hf=True)
+    orders = ((0, 1, 2, 3), (3, 2, 1, 0))
+
+    artifacts = [fit_shared([specs[i] for i in o], **FAST) for o in orders]
+    for other in artifacts[1:]:
+        assert other.labels == artifacts[0].labels
+        for name, value in other.shared.items():
+            assert value == pytest.approx(artifacts[0].shared[name], rel=1e-9), name
+
+    # -- the positive control: the whole fix reverted, in process --
+    #
+    # Both halves have to come out, and that is the point of doing it here rather than
+    # trusting the shape of the code: `_canonical_order` alone would make even the
+    # retired seeding order-free, so a control that patched only the seeding would come
+    # back green and prove nothing.
+    from softae.analysis.eis import constrained_fit as module
+
+    def continuation(spectra, shared, tol):
+        """``fit_shared``'s start construction as committed at ``f79e463``."""
+        seeds, previous = [], None
+        for spec in spectra:
+            start = module._seed(spec) if previous is None else dict(previous)
+            start.update({p: module._seed(spec)[p] for p in ("R0", "R1")})
+            fitted, _ = module._fit_free(spec, start, PARAM_NAMES, tol)
+            seeds.append(fitted)
+            previous = fitted
+        x0 = [float(np.median([s[p] for s in seeds])) for p in SHARED_PARAMS]
+        for s in seeds:
+            x0 += [s[p] for p in PER_SPECTRUM_PARAMS]
+        return x0
+
+    monkeypatch.setattr(module, "_canonical_order", lambda spectra: list(spectra))
+    monkeypatch.setattr(module, "_stacked_start", continuation)
+    continued = [fit_shared([specs[i] for i in o],
+                            seed_grid=(SHARED_SEED_GRID[0],),
+                            max_order_spread_pct=math.inf).Qg for o in orders]
+    assert max(continued) > 10 * min(continued), (
+        "the retired construction returned the same artifact for both orders on the "
+        "real corpus, so the invariance assertion above is vacuous")
+
+
+@pytest.mark.skipif(not AMP_KCL.is_dir(), reason="AMP_v1 NIST standards not present")
+def test_answer_key_a_poisoned_artifact_is_refused_rather_than_returned() -> None:
+    """The refusal, at the shipped threshold, on real data.
+
+    Ordering can no longer drive the fit into the poisoned basin, so the basin is
+    reached the only way left: by restricting the multi-start to it. Both starts
+    converge, both report success, ``railed()`` fires on neither — and they disagree
+    about ``R_sol`` by 1.95e5 %, which is what
+    :data:`~softae.analysis.eis.constrained_fit.ORDER_SPREAD_REFUSE_PCT` is calibrated
+    to catch. Without the refusal this returns a confidently wrong number.
+    """
+    specs = _amp_standards(truncate_hf=True)
+
+    # A bounded per-start budget, and it is a real finding rather than a convenience:
+    # aimed at the poisoned basin, one of these two starts spends the whole default
+    # 120 000 nfev and takes tens of minutes. Winning starts use 40-2400. See
+    # `fit_shared`'s `max_nfev`.
+    permitted = fit_shared(specs, seed_grid=POISONED_STARTS, max_nfev=4_000,
+                           max_order_spread_pct=math.inf)
+    assert permitted.n_consensus == len(POISONED_STARTS)
+    assert permitted.railed() == ()
+    assert permitted.order_spread_pct > ORDER_SPREAD_REFUSE_PCT
+
+    with pytest.raises(UnstableFitSurface, match="order spread"):
+        fit_shared(specs, seed_grid=POISONED_STARTS, max_nfev=4_000)
+
+
+@pytest.mark.skipif(not AMP_KCL.is_dir(), reason="AMP_v1 NIST standards not present")
+def test_answer_key_nist_standards_reproduce_the_constrained_r_sol() -> None:
+    """In-sample ``R_sol`` against AMP_v1's constrained artifact: 3.54 % mean here.
+
+    Scored the way that actually matters — σ against NIST after AMP's own two-parameter
+    cell-constant calibration — the same fit gives **0.98 % in-sample**, against
+    AMP_v1's published 1.15 %; leave-one-out on ``R_sol`` over the two admissible folds
+    is 1.46 % mean, 2.81 % worst. The tolerance below is loose on purpose: the claim
+    under test is that the constrained fit lands *near* an independent codebase's answer
+    on a quantity where an unconstrained fit of the same circuit is off by orders of
+    magnitude, not that it reproduces a decimal.
+
+    This runs the full :data:`SHARED_SEED_GRID`, so it is also the accuracy half of the
+    order-invariance change. On the offline harness's fuller conditioning, where the two
+    are directly comparable, the retired continuation scored σ 1.43 % in-sample /
+    3.04 % leave-one-out for its **best** ordering of these four spectra and worse for
+    fifteen of the other twenty-three; the multi-start scores 1.13 % / 2.41 % for all
+    twenty-four.
+    """
+    specs = _amp_standards(truncate_hf=True)
     report = holdout_report(specs, kind="in_sample")
     assert report.mean_abs_error_pct < 10.0, report.describe()
     assert report.worst_abs_error_pct < 15.0, report.describe()

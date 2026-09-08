@@ -50,16 +50,28 @@ So the registry model is not reusable *as a registry model* here. Its docstring
 (*"SHIPS UNUSED — L must be pinned from a short blank"*) names exactly this design, and
 the pinning it asks for is what :attr:`ConstrainedSpectrum.pinned_l_H` carries.
 
-**One preparation step is a precondition, and it is not optional.** Spectra must reach
-this module with the contiguous ``Im Z > 0`` run at the top of the band already removed
-— :func:`~softae.analysis.eis.gates.gate_hf_inductive`'s job, and it already ships.
-Measured on the four NIST standards, leaving those points in takes the in-sample
-``R_sol`` error from **2.9 % to 6295 %**, while the short-blank correction, the |Z|
-window and the linear-KK truncation are together worth about 1.3 percentage points. The
-asymmetry has a cause: a blocking cell has no inductance of its own, so an inductive
-point is the fixture, and the optimiser parks it in ``Qg`` — a **shared** parameter, so
-a handful of bad points at one end of one spectrum corrupts the artifact for the entire
-set. Sharing parameters shares contamination too.
+**HF-inductive truncation is worth having, and it is no longer a precondition — that
+claim did not survive the multi-start.** Spectra should reach this module with the
+contiguous ``Im Z > 0`` run at the top of the band removed
+(:func:`~softae.analysis.eis.gates.gate_hf_inductive`'s rule, which already ships).
+Measured against the four NIST standards, same thin preparation both times:
+
+======================  =======================  =====================
+what was measured        R_sol MAE (in-sample)    σ MAE vs NIST
+======================  =======================  =====================
+before the multi-start   2.9 % → **6295 %**       —
+after the multi-start    3.54 % → **3.50 %**      0.98 % → **2.41 %**
+======================  =======================  =====================
+
+So the three orders of magnitude were a property of the *seeding*, not of the inductive
+points: leaving them in perturbed the continuation's chain enough to send it into the
+poisoned basin, and any ordering could do the same to a clean set. What survives is a
+factor of ~2.5 on σ, which is a real effect and a real reason to truncate, but it is not
+a precondition and this module no longer behaves catastrophically without it. The
+mechanism named for the old figure still holds directionally — a blocking cell has no
+inductance of its own, so an inductive point is the fixture and the optimiser parks it
+in ``Qg``, which is *shared*, so a handful of bad points at one end of one spectrum
+degrades the artifact for the whole set. Sharing parameters shares contamination too.
 """
 
 from __future__ import annotations
@@ -126,6 +138,31 @@ CONSTRAINED_FIT_TOL = 1e-14
 
 #: Iteration ceilings. Generous for the same reason ``fitter.DEFAULT_MAX_NFEV`` is:
 #: a failure to converge should be reported, not manufactured by too small a budget.
+#:
+#: **The multi-start changed the calculus here and the default has NOT been changed to
+#: match — deliberately, because doing so would invalidate every number in this file.**
+#: Per start, four NIST standards, full grid, measured 2026-09-08:
+#:
+#: ===================  ============  ================
+#: start (seed ``Qg``)   ``nfev``      cost reached
+#: ===================  ============  ================
+#: 4e-12 .. 4e-9         36 .. 480     0.235 .. 1.28
+#: **4e-8 (both)**       **120 000**   **3.4 .. 4.7**
+#: ===================  ============  ================
+#:
+#: The eight useful starts finish in 4 s between them; the two aimed at the poisoned
+#: basin spend the entire ceiling — minutes each — to reach a cost an order of magnitude
+#: worse, which neither wins nor joins the consensus set. With one start the ceiling was
+#: the only safety net; with ten the other nine are, so a start that exhausts its budget
+#: reports ``status = 0`` and simply loses. **A ceiling of 20 000 was tried and is
+#: accuracy-neutral where it has been measured**: on the four standards it returns the
+#: identical artifact (``Qg`` 6.028e-10, cost 0.235321) and the identical scores
+#: (``R_sol`` 3.5438 % mean / 4.8858 % worst, σ 0.9815 %) in 76.5 s against 85.6 s.
+#: It is left un-lowered anyway, because "identical on one corpus of four liquids" is
+#: not the same as accuracy-neutral, and a default that governs convergence belongs in a
+#: step that can re-run the answer keys behind it rather than in a defect fix.
+#: :func:`fit_shared` takes ``max_nfev``, so a caller who knows its starts are bad can
+#: bound them today — which is what the poisoned-artifact test does.
 MAX_NFEV_SINGLE = 40_000
 MAX_NFEV_GLOBAL = 120_000
 
@@ -138,19 +175,86 @@ MAX_NFEV_GLOBAL = 120_000
 #: :attr:`WellFit.seed_spread_pct` is reported rather than discarded.
 R_SOL_SEED_MULTIPLIERS: tuple[float, ...] = (0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0)
 
-#: The only parameters re-seeded from the spectrum itself when :func:`fit_shared` walks
-#: the set building its starting point. Everything else is **carried forward from the
-#: previous spectrum's fit** — a continuation, not N independent fits.
+#: Starting points for the shared three in :func:`fit_shared`'s multi-start, one
+#: stacked fit per entry, lowest cost kept. **The same principle as
+#: :data:`R_SOL_SEED_MULTIPLIERS`, applied one level up**: decades either side of the
+#: default, wide enough that no single descent decides the answer.
 #:
-#: **Measured, and it is the difference between 1.4 % and 28 000 %.** Re-seeding ``Qd``
-#: per spectrum as well (the obvious reading of "seed each spectrum from itself") drops
-#: the stacked fit into a different basin: on the four NIST standards it converges at
-#: cost 3.53 after 12 451 ``nfev`` with ``Qg`` three decades high and ``nd`` near its
-#: lower bound, against cost 0.33 after 47 ``nfev`` for the continuation. Both runs
-#: report a completed optimisation. ``R0``/``R1`` must be re-seeded because they span
-#: the conductivity ladder the set exists to cover; the CPE parameters must not, because
-#: their continuity across the set is the information the shared fit is built from.
-CONTINUATION_RESET: tuple[str, ...] = ("R0", "R1")
+#: **This replaced a continuation, and the continuation was order-dependent.** The
+#: previous construction walked the set seeding each spectrum from the *previous*
+#: spectrum's fit, resetting only ``R0``/``R1``, and took the median of that chain as
+#: ``x0``. Reordering the input therefore reordered the chain and landed the stacked fit
+#: in a different basin: **24 permutations of the same four NIST standards spanned
+#: ``R_sol`` MAE 1.561 % to 1.065e9 %**, with :func:`check_admissible` returning True on
+#: all 24 and :meth:`SharedArtifact.railed` firing on none. A clean *duplicate* at
+#: position 0 gave 91 870 %; the dirtiest spectrum at position 4 gave 2.16 %. "Poisons
+#: the artifact" was a property of a spectrum's *position*, not of the spectrum.
+#:
+#: The continuation was itself chosen on measurement and the measurement was real:
+#: re-seeding ``Qd`` per spectrum *while the shared three were also free from their
+#: defaults* converges at cost 3.53 / 28 395 % error against cost 0.33 / 1.4 % for the
+#: continuation. That result is not a case for the continuation, only against one naive
+#: alternative. :func:`_stacked_start` keeps what the continuation was buying — a
+#: per-spectrum ``Qd`` that has already been fitted rather than guessed — by fitting
+#: each spectrum's ``R0``/``R1``/``Qd`` **with the candidate shared triple frozen**,
+#: exactly as :func:`fit_frozen` does. Each spectrum's start then depends only on
+#: itself, so the construction is order-free by shape rather than by luck.
+#:
+#: ``Qg`` steps by decades because it is the parameter the two known basins separate on
+#: (good ``Qg`` ~1e-9, poisoned ~1e-7); ``nd`` carries two entries because the poisoned
+#: basin also sits low in ``nd`` (~0.39) and a grid that cannot start there cannot
+#: demonstrate that the good basin is preferred. On the four standards the grid reaches
+#: cost 0.2537 — below the continuation's own best of 0.33 — from three separate entries.
+SHARED_SEED_GRID: tuple[dict[str, float], ...] = tuple(
+    {"Qg": qg, "ng": 0.95, "nd": nd}
+    for qg in (4e-12, 4e-11, 4e-10, 4e-9, 4e-8)
+    for nd in (0.85, 0.55)
+)
+
+#: A start counts as agreeing with the winner when its cost is within this factor of
+#: the winner's. Starts that stopped somewhere worse are describing a *different*
+#: minimum and their disagreement is expected, not evidence; the question
+#: :attr:`SharedArtifact.order_spread_pct` asks is whether the descents that reached
+#: the **same** minimum also reached the same answer.
+CONSENSUS_COST_FACTOR = 1.5
+
+#: Floor under :data:`CONSENSUS_COST_FACTOR`'s window, expressed per residual.
+#:
+#: **A purely relative window asks the wrong question when the fit is exact**, and this
+#: was found the hard way: on a spectrum synthesised from :func:`model_impedance` the
+#: winning start reaches cost 1.3e-29, so a window of 1.5x admits nothing but itself,
+#: the spread is NaN, and a *perfect* recovery is refused. ``1e-12`` per residual is a
+#: modulus-weighted residual of about a part per million per point — orders below any
+#: real measurement, so on measured data (best cost ~0.25 over ~320 residuals) the floor
+#: never binds and the relative window decides. It exists only to keep "several starts
+#: recovered the answer exactly" from reading as "no start agreed with the winner".
+EXACT_COST_PER_RESIDUAL = 1e-12
+
+#: Refusal threshold on :attr:`SharedArtifact.order_spread_pct`, in percent.
+#:
+#: **Derived from the separation between two measured populations, not chosen round.**
+#: Running :data:`SHARED_SEED_GRID` over fitting sets whose quality is known
+#: independently — ``R_sol`` against AMP_v1's own constrained artifact, and σ against
+#: NIST after the same cell-constant calibration AMP applies to its own:
+#:
+#: ==================================  ==========  ==========  ==============
+#: fitting set                          R_sol MAE   σ MAE       order spread
+#: ==================================  ==========  ==========  ==============
+#: 4 NIST standards, conditioned         3.73 %      1.13 %      **5.04 %**
+#: LOO fold dropping ``kcl_1413uS``      4.02 %      —           **3.20 %**
+#: LOO fold dropping ``kcl_4500uS``      3.82 %      —           **5.19 %**
+#: 4 standards synthesised from
+#: :func:`model_impedance` (exact)       ~0 %        —           **1.5e-9 %**
+#: same 4 standards, grid restricted
+#: to the poisoned basin                 5894 %      102 476 %   **1.35e5 %**
+#: ==================================  ==========  ==========  ==============
+#:
+#: Worst good case 5.19 %, only poisoned case 1.35e5 % — four orders of magnitude apart
+#: with nothing in between. The constant sits a factor of ~20 above the worst good case
+#: rather than on it, and is still three orders below the poisoned one, so it is
+#: insensitive to where in that gap it is placed. **The gap is the evidence; 100 is only
+#: a readable number inside it.** See :func:`fit_shared` for what happens above it.
+ORDER_SPREAD_REFUSE_PCT = 100.0
 
 #: How many spectra in the fitting set must show a **resolved** geometric arc before
 #: the shared parameters are identifiable. See :func:`check_admissible`.
@@ -391,31 +495,36 @@ class Admissibility:
 def check_admissible(
     spectra: list[ConstrainedSpectrum], *, min_arc_resolved: int = MIN_ARC_RESOLVED
 ) -> Admissibility:
-    """Can this set identify the shared three? **Measured, and it refuses.**
+    """Can this set identify the shared three? **It refuses — and its evidence expired.**
 
-    Leave-one-out over the four NIST standards, with this gate deliberately bypassed so
-    the bad artifacts could be looked at rather than assumed:
+    Leave-one-out over the four NIST standards, this gate deliberately bypassed so the
+    artifacts could be looked at rather than assumed. Measured twice, against the same
+    data, before and after :func:`fit_shared` became a multi-start:
 
-    ===============  ==========  =============  ===========
-    fold (held out)  fitted Qg   R_sol error    this gate
-    ===============  ==========  =============  ===========
-    ``kcl_45uS``     9.04e-08    **−84.06 %**   REFUSE
-    ``kcl_84uS``     8.79e-08    **−74.38 %**   REFUSE
-    ``kcl_1413uS``   9.28e-10    +2.45 %        pass
-    ``kcl_4500uS``   8.93e-10    +1.81 %        pass
-    ===============  ==========  =============  ===========
+    ===============  =========================  =========================
+    fold (held out)  continuation (2026-09-04)  multi-start (2026-09-08)
+    ===============  =========================  =========================
+    ``kcl_45uS``     Qg 9.04e-08, **−84.06 %**  Qg 5.91e-10, **−6.44 %**   REFUSE
+    ``kcl_84uS``     Qg 8.79e-08, **−74.38 %**  Qg 6.94e-10, **−2.48 %**   REFUSE
+    ``kcl_1413uS``   Qg 9.28e-10, +2.45 %       Qg 7.27e-10, +2.81 %       pass
+    ``kcl_4500uS``   Qg 8.93e-10, +1.81 %       Qg 5.64e-10, −0.10 %       pass
+    ===============  =========================  =========================
 
-    The two refused folds are exactly the two that drop an arc-resolved standard, and
-    their ``Qg`` is **97× high**. Nothing about those artifacts looks wrong from the
-    inside: the optimiser converges, the residuals are small, no parameter is railed,
-    and the numbers are simply not the ones being asked for. The gate fires on both bad
-    folds and on neither good one — so it discriminates on the real corpus, which is
-    the check ``SUBAGENT_RULES`` §3.2 asks for and which no amount of unit testing
-    would have supplied.
+    **The left-hand column is what this gate was calibrated against, and the right-hand
+    column is the code that ships.** Against the continuation the gate discriminated
+    perfectly — the refused folds sat at 84 % and 74 % with ``Qg`` 97× high, and nothing
+    about them looked wrong from the inside. Against the multi-start the refused folds
+    are −6.4 % and −2.5 %, their ``Qg`` is in the good band, and they are barely worse
+    than the folds the gate passes. **On today's code this gate refuses two of four
+    folds for no measured benefit**, which is a recalibration question, not something to
+    settle inside a defect fix: the behaviour is left exactly as it was and the evidence
+    is recorded here rather than quietly kept.
 
-    The difference between a usable artifact and a confidently wrong one is therefore a
-    property of the **fitting set**, knowable before any fitting happens, and a refusal
-    is the only honest output for the bad case.
+    What still stands is the *reasoning*: below the geometric arc's crossover the sweep
+    sees only the blocking electrode, so nothing constrains ``Qg`` or ``ng``, and a set
+    with fewer than two arc-resolved members is identifying them from nothing. What no
+    longer stands is the claim that the consequence is catastrophic. See
+    ``eis_estimator_action_plan.md`` Wave 2A.
     """
     n = len(spectra)
     resolved = tuple(s.label for s in spectra if arc_is_resolved(s.freq_hz, s.z))
@@ -475,6 +584,20 @@ def _seed(spec: ConstrainedSpectrum, multiplier: float = 1.0) -> dict[str, float
             "Qg": 4e-11, "ng": 0.95, "Qd": 2e-6, "nd": 0.85}
 
 
+def _spread_pct(values: list[float]) -> float:
+    """``100·(max − min)/min`` over the finite positive entries; NaN below two.
+
+    NaN is the honest answer for "one value" and it must stay distinguishable from
+    ``0.0``, which is the answer for "several values that agree" — ``SUBAGENT_RULES``
+    §3.1(a). Both :attr:`WellFit.seed_spread_pct` and
+    :attr:`SharedArtifact.order_spread_pct` are this quantity.
+    """
+    finite = [v for v in values if v == v and v > 0]
+    if len(finite) < 2:
+        return float("nan")
+    return 100.0 * (max(finite) - min(finite)) / min(finite)
+
+
 def _fit_free(
     spec: ConstrainedSpectrum, start: dict[str, float], free: tuple[str, ...], tol: float
 ) -> tuple[dict[str, float], Any]:
@@ -515,6 +638,20 @@ class SharedArtifact:
     #: artifact because it is a property of the artifact, not of one spectrum.
     n_shunt_held: int = 0
     admissibility: Admissibility | None = None
+    #: Entries in :data:`SHARED_SEED_GRID` that were run, and how many of them landed
+    #: within :data:`CONSENSUS_COST_FACTOR` of the winner's cost.
+    n_starts: int = 0
+    n_consensus: int = 0
+    #: The grid entry the winning descent started from.
+    seed: dict[str, float] = field(default_factory=dict)
+    #: **The counterpart to :attr:`WellFit.seed_spread_pct`, one level up.** Worst
+    #: disagreement, in percent, between the consensus starts about any one spectrum's
+    #: ``R_sol``. Independent descents that reached the *same* minimum should also have
+    #: reached the same answer; when they did not, the minimum is a valley floor and the
+    #: number that comes out of it is arbitrary. NaN when fewer than two starts reached
+    #: consensus — "could not judge", which :func:`fit_shared` refuses on rather than
+    #: passing through as if it were agreement.
+    order_spread_pct: float = float("nan")
 
     @property
     def shared(self) -> dict[str, float]:
@@ -539,7 +676,9 @@ class SharedArtifact:
         rail = f", RAILED: {','.join(self.railed())}" if self.railed() else ""
         return (f"artifact from {len(self.labels)} spectra: Qg={self.Qg:.4g} "
                 f"ng={self.ng:.4f} nd={self.nd:.4f} (cost {self.cost:.4g}, "
-                f"status {self.status}, {self.nfev} nfev{rail})")
+                f"status {self.status}, {self.nfev} nfev, order spread "
+                f"{self.order_spread_pct:.3g}% over {self.n_consensus}/{self.n_starts} "
+                f"starts{rail})")
 
 
 @dataclass(frozen=True)
@@ -569,20 +708,101 @@ class WellFit:
         return self.R0 + self.R1
 
 
+class UnstableFitSurface(InadmissibleFitSet):
+    """The starts that reached the same minimum did not reach the same answer.
+
+    A subclass of :class:`InadmissibleFitSet` because it is the same kind of event —
+    this set cannot support an artifact — and because every caller that already records
+    a refusal (:func:`holdout_report`) should record this one too, rather than crashing
+    on a new exception type.
+    """
+
+
+def _canonical_order(
+    spectra: list[ConstrainedSpectrum],
+) -> list[ConstrainedSpectrum]:
+    """The set's own order, so the stacked problem does not depend on the caller's.
+
+    **The second half of order invariance, and it is not the seeding.** A fixed seed
+    grid makes the *starting point* a function of the set; the residual vector is still
+    stacked in the caller's order, so :func:`~scipy.optimize.least_squares` sees permuted
+    Jacobian rows and ``trf`` takes a different path through the same surface. Measured
+    on the four NIST standards from identical starting points: three orderings gave
+    ``Qg`` 1.168e-9 / 1.261e-9 / 1.299e-9 — an 11.3 % spread, with the accuracy barely
+    moving (``R_sol`` MAE 2.107 / 2.112 / 2.171 %). Small, and the same kind of thing,
+    and there is no reason to keep it.
+
+    Ties are spectra this module cannot tell apart; ``sorted`` is stable, so a repeated
+    label still gives a deterministic result for any given call.
+    """
+    return sorted(spectra, key=lambda s: s.label)
+
+
+def _stacked_start(
+    spectra: list[ConstrainedSpectrum], shared: dict[str, float], tol: float
+) -> list[float]:
+    """One starting vector for the stacked fit, from one grid entry.
+
+    **Order-free by shape.** Each spectrum's ``R0``/``R1``/``Qd`` are fitted against
+    *itself* with the candidate shared triple frozen — :func:`fit_frozen`'s inner loop —
+    so the vector this returns is a function of the set, not of the sequence. Nothing
+    is carried between spectra.
+    """
+    x0 = [shared[p] for p in SHARED_PARAMS]
+    for spec in spectra:
+        start = _seed(spec)
+        start.update(shared)
+        fitted, _ = _fit_free(spec, start, PER_SPECTRUM_PARAMS, tol)
+        x0 += [fitted[p] for p in PER_SPECTRUM_PARAMS]
+    return x0
+
+
 def fit_shared(
     spectra: list[ConstrainedSpectrum],
     *,
     tol: float = CONSTRAINED_FIT_TOL,
     min_arc_resolved: int = MIN_ARC_RESOLVED,
+    seed_grid: tuple[dict[str, float], ...] = SHARED_SEED_GRID,
+    max_order_spread_pct: float = ORDER_SPREAD_REFUSE_PCT,
+    max_nfev: int = MAX_NFEV_GLOBAL,
 ) -> SharedArtifact:
     """Fit ``Qg, ng, nd`` once across *spectra*, with ``R0, R1, Qd`` free per spectrum.
 
-    Raises :class:`InadmissibleFitSet` when :func:`check_admissible` refuses — the
-    refusal is the deliverable for that case, not a degraded artifact.
+    **Multi-start over a fixed grid, lowest cost kept** — :func:`fit_frozen`'s pattern,
+    applied to the stacked problem. The answer does not depend on the order of
+    *spectra*, which was the defect this replaced: see :data:`SHARED_SEED_GRID`.
+
+    Two refusals, both raising :class:`InadmissibleFitSet` or a subclass, because a
+    refusal is the deliverable for a set that cannot support an artifact:
+
+    * :func:`check_admissible` says the shared three are not identifiable at all. Cheap,
+      model-free, and it runs first.
+    * the consensus starts disagree by more than *max_order_spread_pct* about some
+      spectrum's ``R_sol`` — :class:`UnstableFitSurface`. This also fires when fewer
+      than two starts reached consensus, because a single descent cannot show that its
+      minimum is reproducible and "could not judge" must not be spelled the same way as
+      "checked and clean".
+
+    *max_nfev* bounds **each start**, not the call. It exists because the multi-start
+    changed what a runaway descent costs: with one start the budget was the safety net,
+    and with ten the other nine are, so a start that exhausts its budget simply reports
+    ``status = 0`` and loses on cost. The default is unchanged from the single-start
+    era and every measurement in this module was taken at it; lowering it is a way to
+    bound a call whose starts are known to be bad, not a tuning knob. Observed winning
+    starts use 40-2400 ``nfev``, four to five orders below the default, while a start
+    aimed deliberately at the poisoned basin can spend the whole of it.
     """
     admissible = check_admissible(spectra, min_arc_resolved=min_arc_resolved)
     if not admissible.admissible:
         raise InadmissibleFitSet(admissible.describe())
+    if not seed_grid:
+        raise ValueError("seed_grid is empty — there is nothing to start from")
+    if len({tuple(sorted(e.items())) for e in seed_grid}) != len(seed_grid):
+        # Two identical starts descend identically, so they would report perfect
+        # agreement while constituting one opinion — a clean-looking spread that was
+        # never measured. SUBAGENT_RULES §3.1(a).
+        raise ValueError("seed_grid has duplicate entries; a repeated start is not a "
+                         "second opinion about the minimum")
     if tol > CONSTRAINED_FIT_TOL:
         logger.warning(
             "eis_constrained_fit_loose_tolerance", tol=tol,
@@ -592,37 +812,57 @@ def fit_shared(
                  "on R_sol with status=3"),
         )
 
+    spectra = _canonical_order(spectra)
     n = len(spectra)
-    seeds: list[dict[str, float]] = []
-    previous: dict[str, float] | None = None
-    for spec in spectra:
-        start = _seed(spec) if previous is None else dict(previous)
-        start.update({p: _seed(spec)[p] for p in CONTINUATION_RESET})
-        fitted, _ = _fit_free(spec, start, PARAM_NAMES, tol)
-        seeds.append(fitted)
-        previous = fitted
-
-    x0 = [float(np.median([s[p] for s in seeds])) for p in SHARED_PARAMS]
-    for s in seeds:
-        x0 += [s[p] for p in PER_SPECTRUM_PARAMS]
     lo, hi = _pack_bounds(n)
-    x0 = np.clip(np.asarray(x0, dtype=float), lo, hi)
 
     def stacked(x: np.ndarray) -> np.ndarray:
         return np.concatenate([_residual(spectra[i], _unpack(x, i)) for i in range(n)])
 
-    res = least_squares(stacked, x0, bounds=(lo, hi), method="trf",
-                        max_nfev=MAX_NFEV_GLOBAL, x_scale="jac",
-                        xtol=tol, ftol=tol, gtol=tol)
+    runs: list[tuple[dict[str, float], Any]] = []
+    for candidate in seed_grid:
+        x0 = np.clip(np.asarray(_stacked_start(spectra, candidate, tol), dtype=float),
+                     lo, hi)
+        runs.append((candidate, least_squares(
+            stacked, x0, bounds=(lo, hi), method="trf", max_nfev=max_nfev,
+            x_scale="jac", xtol=tol, ftol=tol, gtol=tol)))
+
+    seed, res = min(runs, key=lambda r: r[1].cost)
+    window = max(res.cost * CONSENSUS_COST_FACTOR,
+                 EXACT_COST_PER_RESIDUAL * res.fun.size)
+    consensus = [r for _, r in runs if r.cost <= window]
+
+    def r_sol_of(run: Any, i: int) -> float:
+        p = _unpack(run.x, i)
+        return p["R0"] + p["R1"]
+
+    per_spectrum = [_spread_pct([r_sol_of(r, i) for r in consensus]) for i in range(n)]
+    # One unjudgeable spectrum makes the artifact unjudgeable — ``max`` over a list
+    # containing NaN is order-dependent, so the NaN is propagated deliberately.
+    spread = (float("nan") if any(s != s for s in per_spectrum)
+              else max(per_spectrum))
 
     held = sum(s.shunt.n_held for s in spectra if s.shunt is not None)
-    return SharedArtifact(
+    artifact = SharedArtifact(
         Qg=float(res.x[0]), ng=float(res.x[1]), nd=float(res.x[2]),
         labels=tuple(s.label for s in spectra),
         cost=float(res.cost), status=int(res.status), nfev=int(res.nfev),
         n_free=int(res.x.size), n_residuals=int(res.fun.size), tol=float(tol),
         n_shunt_held=held, admissibility=admissible,
+        n_starts=len(runs), n_consensus=len(consensus), seed=dict(seed),
+        order_spread_pct=spread,
     )
+    # Not ``spread > limit``: NaN fails every comparison, so the test is written on the
+    # passing side and NaN — "could not judge" — falls through to the refusal. An
+    # infinite limit is the one explicit way to ask for the artifact regardless; it is
+    # never the default, and ``order_spread_pct`` still reports the NaN.
+    if math.isfinite(max_order_spread_pct) and not spread <= max_order_spread_pct:
+        raise UnstableFitSurface(
+            f"order spread {spread:.4g}% over {len(consensus)}/{len(runs)} consensus "
+            f"starts exceeds {max_order_spread_pct:g}% — the stacked minimum is not "
+            f"reproducible from independent starting points, so its R_sol is arbitrary "
+            f"({artifact.describe()})")
+    return artifact
 
 
 def fit_frozen(
@@ -650,12 +890,9 @@ def fit_frozen(
     assert best is not None
 
     fitted, res, m = best
-    finite = [v for v in sums if v == v and v > 0]
-    spread = (100.0 * (max(finite) - min(finite)) / min(finite)
-              if len(finite) > 1 else float("nan"))
     return WellFit(label=spectrum.label, R0=fitted["R0"], R1=fitted["R1"],
                    Qd=fitted["Qd"], cost=float(res.cost), ok=bool(res.status > 0),
-                   seed_multiplier=float(m), seed_spread_pct=spread)
+                   seed_multiplier=float(m), seed_spread_pct=_spread_pct(sums))
 
 
 # ── Validation: hold one out, report the error ───────────────────────────────
@@ -717,6 +954,7 @@ def holdout_report(
     kind: str = "leave_one_out",
     tol: float = CONSTRAINED_FIT_TOL,
     min_arc_resolved: int = MIN_ARC_RESOLVED,
+    **fit_kwargs: Any,
 ) -> HoldoutReport:
     """Fit, then score against :attr:`ConstrainedSpectrum.reference_ohm`.
 
@@ -727,10 +965,16 @@ def holdout_report(
     **A refused fold is recorded, not skipped.** With four standards, two of the four
     LOO folds are inadmissible by construction (each drops one of the two arc-resolved
     spectra), so a report that silently averaged over "the folds that worked" would
-    hide the module's own headline limitation.
+    hide the module's own headline limitation. A fold refused by
+    :class:`UnstableFitSurface` is recorded the same way, which is why that class
+    subclasses :class:`InadmissibleFitSet`.
+
+    *fit_kwargs* reach :func:`fit_shared` unchanged — ``seed_grid`` and
+    ``max_order_spread_pct``.
     """
     if kind == "in_sample":
-        artifact = fit_shared(spectra, tol=tol, min_arc_resolved=min_arc_resolved)
+        artifact = fit_shared(spectra, tol=tol, min_arc_resolved=min_arc_resolved,
+                              **fit_kwargs)
         results = tuple(
             HoldoutResult(s.label, s.reference_ohm,
                           fit_frozen(s, artifact, tol=tol).R_sol)
@@ -746,7 +990,8 @@ def holdout_report(
     for held in spectra:
         rest = [s for s in spectra if s is not held]
         try:
-            artifact = fit_shared(rest, tol=tol, min_arc_resolved=min_arc_resolved)
+            artifact = fit_shared(rest, tol=tol, min_arc_resolved=min_arc_resolved,
+                                  **fit_kwargs)
         except InadmissibleFitSet as exc:
             refused.append((held.label, str(exc)))
             continue
