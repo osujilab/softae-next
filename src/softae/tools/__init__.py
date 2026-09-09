@@ -4,42 +4,21 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sys
 from typing import Any, Callable
 
 import structlog
 
+from softae import use_utf8_console
+
 logger = structlog.get_logger(__name__)
 
 
-def use_utf8_console() -> None:
-    """Make stdout/stderr survive non-ASCII output on a Windows console.
-
-    Every CLI here prints characters outside cp1252 — ``⚠`` in warnings, ``σ``/``Ω``/
-    ``δ`` throughout the EIS reporting, ``≲`` for an upper bound, ``→`` in the "run
-    this next" hints. The rig runs on Windows, where ``sys.stdout`` defaults to the
-    ANSI code page, and printing any of them raises ``UnicodeEncodeError``.
-
-    That is not cosmetic. It surfaced as ``softae-commission derive`` **crashing with a
-    traceback** part-way through a real derivation, after the artifacts had been read
-    and before the calibration was written — the command appeared to fail at the
-    analysis, when in fact it had failed at the ``print``. A tool that dies on its own
-    warning text is worse than one that cannot warn.
-
-    ``errors="replace"`` rather than a strict re-encode: a console that genuinely
-    cannot render a glyph should show a substitute, never abort the command that was
-    trying to tell the operator something.
-    """
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is None:
-            continue
-        try:
-            reconfigure(encoding="utf-8", errors="replace")
-        except (ValueError, OSError):
-            # A redirected or wrapped stream may refuse. Losing the nicer encoding is
-            # acceptable; failing to start the tool is not.
-            pass
+# ``use_utf8_console`` is defined in ``softae/__init__.py`` and re-exported here.
+# It lives at the package root because that is the only module every caller imports:
+# the guarantee is now automatic (widening at import, only when the console's codec
+# cannot carry the text), and the fifteen explicit calls below in the CLI ``main()``s
+# import it from here as they always have. Re-exported rather than moved so those
+# fifteen ``from softae.tools import use_utf8_console`` lines keep working unchanged.
 
 
 def add_verbosity_flag(parser: argparse.ArgumentParser) -> None:
