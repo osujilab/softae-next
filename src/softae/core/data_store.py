@@ -31,7 +31,11 @@ import numpy as np
 import structlog
 
 from softae.analysis.conditions import resolve_temperature_C
-from softae.analysis.eis.calibration import MEASUREMENT_ROLES
+from softae.analysis.eis.calibration import (
+    MEASUREMENT_ROLES,
+    TWO_TERMINAL_ROLES,
+    electrode_mode_ok,
+)
 from softae.analysis.eis.geometry import THICKNESS_METHODS, CellConstant
 from softae.analysis.eis_data import EISResult
 
@@ -1250,6 +1254,16 @@ class DataStore:
         written *after* this row exists, so that the file can name the row it belongs
         to, and :meth:`set_measurement_payload` attaches it. ``sample_uuid`` is
         accepted now and minted in T2.6.
+
+        :raises ValueError: if *role* is one of
+            :data:`~softae.analysis.eis.calibration.TWO_TERMINAL_ROLES` and
+            *electrode_mode* is not ``'two'``. Such a row is uncalibratable in
+            principle rather than merely uncalibrated (R24/F17), so it is refused at
+            the boundary instead of being stored and discovered later. **No row is
+            written.** A *sample* is unconstrained and keeps the ``'unknown'``
+            default. Historical rows are untouched — the sanctioned way to rescue one
+            stays ``commission.py --declare-electrode-mode``, which records the
+            operator's assertion *as* an assertion.
         """
         role = str(role or "sample")
         if role not in MEASUREMENT_ROLES:
@@ -1259,6 +1273,34 @@ class DataStore:
                     "become a calibration artifact",
             )
             role = "sample"
+
+        # R24/F17 write boundary. `electrode_mode_ok` already computes exactly this
+        # answer, but until now only at *derive* time (workflows/commissioning.py) and
+        # at *import* time (tools/commission.py) — nothing asked it at write time, so a
+        # two-terminal role could commit with mode 'unknown' and become permanently
+        # uncalibratable, needing an operator's memory of the bench state to rescue it
+        # (measurement_id 1931, ch32's 2026-08-05 short). This is the convergence point
+        # of all three write paths, and the ONLY one `reference_r_misplaced_lead` ever
+        # passes through — it is not in COMMISSIONING_ROLES, so it has no CLI path at
+        # all and no guard upstream of here could reach it.
+        #
+        # The predicate is REUSED rather than restated: two functions computing the same
+        # fact would be free to drift, and this one carries the F17 reasoning in the
+        # refusal text the caller sees.
+        #
+        # Deliberately placed *after* the coercion above, not before: the check must
+        # judge the role that will actually be stored. A typo'd role has already become
+        # 'sample' by here and so cannot trip this guard — which is right, since it is
+        # not being filed as a calibration artifact either.
+        mode = str(electrode_mode or "unknown")
+        if role in TWO_TERMINAL_ROLES:
+            ok, why = electrode_mode_ok(role, mode)
+            if not ok:
+                raise ValueError(
+                    f"cannot record a '{role}' measurement with "
+                    f"electrode_mode={mode!r}: {why}"
+                )
+
         # Make file path relative to project_dir for portability.
         rel_path: str | None = None
         if eis_result.raw_file_path:

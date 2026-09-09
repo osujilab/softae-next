@@ -103,9 +103,15 @@ async def test_a_commissioning_role_does_not_inherit_the_samples_re_default(tmp_
     run_id = store.start_run("ht_experiment")
     ex = WorkflowExecutor(manager, data_store=store, run_id=run_id)
 
+    # `electrode_mode` is tagged because a two-terminal role is now unwritable
+    # without one (R24, enforced in `record_measurement`). It is incidental to what
+    # this test pins — the `re_connection` default — but without it the router's
+    # `except Exception` swallows the refusal and no row is written at all, so the
+    # assertions below would fail on an absent row rather than a wrong default.
     step = WorkflowStep(name="eis_ch1", instrument="pico0",
                         method="eis_extractdata", params={"channel": 1},
-                        tags={"role": "blank_open", "fixture_id": "mux16"})
+                        tags={"role": "blank_open", "fixture_id": "mux16",
+                              "electrode_mode": "two"})
     await ex._route_result(step, _raw_eis())
 
     row = store._conn.execute(

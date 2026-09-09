@@ -129,7 +129,13 @@ async def test_golden_eis_routing_rows_and_files(connected_manager, data_store):
         tags={
             "role": "blank_open",
             "fixture_id": "mux16",
-            "electrode_mode": "2T",
+            # 'two', not '2T'. The vocabulary is the one `electrode_mode_ok`
+            # judges and the one the DataStore actually holds — every stored row
+            # is 'two' or 'unknown'. '2T' was a token no writer ever emitted, so
+            # it pinned a round trip the rig could not produce; against the
+            # write-time R24 guard it now reads as *no mode recorded* and the
+            # blank is refused.
+            "electrode_mode": "two",
             "nominal": "100.0",
             "thermal_history": "as_received",
             "re_connection": "tied_to_ce",
@@ -199,7 +205,7 @@ async def test_golden_eis_routing_rows_and_files(connected_manager, data_store):
             "role": "blank_open",
             "fixture_id": "mux16",
             "nominal_value": 100.0,
-            "electrode_mode": "2T",
+            "electrode_mode": "two",
             "thermal_history": "as_received",
             "sweep_order": 2,
             "re_connection": "tied_to_ce",

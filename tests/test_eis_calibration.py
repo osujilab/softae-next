@@ -978,8 +978,11 @@ class TestTheNominalSurvivesAcquisition:
         f = _freqs(10)
         eis = EISResult.from_arrays(channel=32, f=f, z_real=np.full(10, 9931.7),
                                     z_imag_neg=np.zeros(10))
+        # electrode_mode is explicit only to satisfy the R24 write guard; this test is
+        # about nominal_value round-tripping, not about the mode.
         mid = store.record_measurement(run_id, eis, role="blank_load",
-                                       fixture_id="mux16", nominal_value=9900.0)
+                                       fixture_id="mux16", nominal_value=9900.0,
+                                       electrode_mode="two")
         row = store._conn.execute(
             "SELECT nominal_value FROM measurements WHERE measurement_id = ?",
             (mid,)).fetchone()
@@ -998,7 +1001,11 @@ class TestTheNominalSurvivesAcquisition:
         f = _freqs(10)
         eis = EISResult.from_arrays(channel=32, f=f, z_real=np.full(10, 9931.7),
                                     z_imag_neg=np.zeros(10))
-        mid = store.record_measurement(run_id, eis, role="blank_load")
+        # electrode_mode is explicit only to satisfy the R24 write guard. The point of
+        # this test is the *absent nominal_value*, which stays absent — passing a mode
+        # does not fill in a marking.
+        mid = store.record_measurement(run_id, eis, role="blank_load",
+                                       electrode_mode="two")
         row = store._conn.execute(
             "SELECT nominal_value FROM measurements WHERE measurement_id = ?",
             (mid,)).fetchone()
@@ -1179,11 +1186,25 @@ class TestTheDeriveCommandReadsPerAcquisitionFacts:
     """``_load_role_spectra`` is where the collapse happened; this is the round trip."""
 
     def _store_with_three_caps(self, tmp_path):
+        """Three reference caps, the first of which has **no recorded mode**.
+
+        That first row is a *historical* row — one written before R24 was enforced at
+        write time — and it has to be built as one. ``record_measurement`` now refuses
+        a two-terminal role with mode ``'unknown'`` outright, so the row is recorded
+        honestly and then demoted with raw SQL, which is precisely the state the
+        database was left in by the pre-guard writers (measurement_id 1931 and the
+        2026-08-05 ch32 sweep).
+
+        Writing it any other way would lose the thing these tests exist to check: the
+        guard stops *new* unknown rows, it does not retro-fix old ones, and
+        ``--declare-electrode-mode`` is still the only sanctioned way to rescue them.
+        """
         from softae.analysis.eis_data import EISResult
         from softae.core.data_store import DataStore
 
         store = DataStore(tmp_path / "proj")
         run_id = store.start_run("commission_reference_cap", mode="commissioning")
+        predates_the_guard = []
         for i, (C, nominal, mode) in enumerate((
                 (1e-10, 1e-10, "unknown"), (1e-10, 1e-10, "two"), (1e-9, 1e-9, "two"))):
             f, Z = _capacitor(C=C, tand=5e-4)
@@ -1193,9 +1214,17 @@ class TestTheDeriveCommandReadsPerAcquisitionFacts:
                                         z_imag_neg=-Z.imag,
                                         raw_file_path=str(dest))
             eis.save(dest)
-            store.record_measurement(run_id, eis, role="reference_cap",
-                                     fixture_id="mux16", nominal_value=nominal,
-                                     electrode_mode=mode)
+            mid = store.record_measurement(run_id, eis, role="reference_cap",
+                                           fixture_id="mux16", nominal_value=nominal,
+                                           electrode_mode="two")
+            if mode == "unknown":
+                predates_the_guard.append(mid)
+
+        for mid in predates_the_guard:
+            store._conn.execute(
+                "UPDATE measurements SET electrode_mode = 'unknown' "
+                "WHERE measurement_id = ?", (mid,))
+        store._conn.commit()
         return store
 
     def test_each_row_comes_back_with_its_own_marking_and_mode(self, tmp_path):
@@ -1316,8 +1345,10 @@ class TestMeasurementRoleRecording:
 
     def test_a_blank_is_recorded_through_the_very_same_path(self, tmp_path):
         store, run_id, eis = self._store_and_result(tmp_path)
+        # electrode_mode is explicit only to satisfy the R24 write guard; what this
+        # test pins is that role/fixture_id take the ordinary measurement path.
         mid = store.record_measurement(run_id, eis, role="blank_short",
-                                       fixture_id="mux16")
+                                       fixture_id="mux16", electrode_mode="two")
         row = store._conn.execute(
             "SELECT role, fixture_id FROM measurements WHERE measurement_id = ?",
             (mid,)).fetchone()
@@ -1338,7 +1369,11 @@ class TestMeasurementRoleRecording:
         # A live role (ids 3892-3895, the 2026-09-03 misplaced-lead resistor attempt)
         # that the coercion above used to file as ordinary sample data.
         store, run_id, eis = self._store_and_result(tmp_path)
-        mid = store.record_measurement(run_id, eis, role="reference_r_misplaced_lead")
+        # electrode_mode is explicit only to satisfy the R24 write guard; this test is
+        # about the role surviving coercion, not about the mode.
+        mid = store.record_measurement(run_id, eis,
+                                       role="reference_r_misplaced_lead",
+                                       electrode_mode="two")
         row = store._conn.execute(
             "SELECT role FROM measurements WHERE measurement_id = ?", (mid,)).fetchone()
         assert row[0] == "reference_r_misplaced_lead"
@@ -1382,6 +1417,152 @@ class TestElectrodeMode:
         ok, why = electrode_mode_ok("blank_short", "unknown")
         assert not ok
         assert "no recorded electrode mode" in why
+
+
+class TestElectrodeModeWriteBoundary:
+    """R24 is enforced at *write* time, not only at derive and import time.
+
+    ``electrode_mode_ok`` has always known that a two-terminal role with mode
+    ``'unknown'`` is unusable, but until now nobody asked it before the INSERT — so the
+    row committed, and the only thing that could rescue it afterwards was an operator's
+    memory of the bench state weeks later (measurement_id 1931, ch32's 2026-08-05
+    short). ``record_measurement`` is the convergence point of all three write paths
+    and the *only* one ``reference_r_misplaced_lead`` has, since it is absent from
+    ``COMMISSIONING_ROLES`` and therefore has no CLI path at all.
+
+    These tests live here rather than in ``test_data_store.py`` because what they pin is
+    R24/F17 semantics — which roles, and why ``'unknown'`` is refused rather than
+    assumed — and that vocabulary is owned and documented in this file.
+    """
+
+    def _store_and_result(self, tmp_path):
+        from softae.analysis.eis_data import EISResult
+        from softae.core.data_store import DataStore
+
+        store = DataStore(tmp_path / "proj")
+        run_id = store.start_run("commissioning")
+        f = _freqs(10)
+        eis = EISResult.from_arrays(channel=1, f=f, z_real=np.full(10, 5.4),
+                                    z_imag_neg=np.zeros(10))
+        return store, run_id, eis
+
+    def _row_count(self, store):
+        return store._conn.execute(
+            "SELECT COUNT(*) FROM measurements").fetchone()[0]
+
+    @pytest.mark.parametrize("role", sorted(TWO_TERMINAL_ROLES))
+    def test_a_two_terminal_role_defaulting_to_unknown_is_refused_and_writes_no_row(
+            self, role, tmp_path):
+        """The default *is* the defect: no caller has to opt in to get 'unknown'."""
+        store, run_id, eis = self._store_and_result(tmp_path)
+        before = self._row_count(store)
+
+        with pytest.raises(ValueError) as exc:
+            store.record_measurement(run_id, eis, role=role)   # no electrode_mode
+
+        assert role in str(exc.value)
+        assert "unknown" in str(exc.value)
+        # The refusal must be a refusal, not a warning with a row behind it.
+        assert self._row_count(store) == before, "a refused measurement left a row"
+        store.close()
+
+    def test_the_misplaced_lead_role_is_refused_though_it_has_no_cli_path(
+            self, tmp_path):
+        """Its only protection is this guard — commission.py cannot even name it.
+
+        ``reference_r_misplaced_lead`` is deliberately absent from
+        ``COMMISSIONING_ROLES``, so ``--role`` will not accept it on either the run or
+        the import subcommand. A fix scoped to the CLI would leave this role's sole
+        write path wide open, which is why the boundary is in the DataStore.
+        """
+        from softae.analysis.eis.calibration import COMMISSIONING_ROLES
+
+        assert "reference_r_misplaced_lead" not in COMMISSIONING_ROLES, \
+            "if this role gains a CLI path, that path needs its own guard too"
+
+        store, run_id, eis = self._store_and_result(tmp_path)
+        before = self._row_count(store)
+
+        with pytest.raises(ValueError):
+            store.record_measurement(run_id, eis,
+                                     role="reference_r_misplaced_lead")
+
+        assert self._row_count(store) == before
+        store.close()
+
+    def test_three_electrode_mode_is_refused_at_write_time_too(self, tmp_path):
+        """Not just absence — an actively wrong mode is equally uncalibratable (F17)."""
+        store, run_id, eis = self._store_and_result(tmp_path)
+        before = self._row_count(store)
+
+        with pytest.raises(ValueError) as exc:
+            store.record_measurement(run_id, eis, role="blank_short",
+                                     electrode_mode="three")
+
+        assert "uncalibratable" in str(exc.value)
+        assert self._row_count(store) == before
+        store.close()
+
+    def test_a_declared_two_electrode_blank_records_exactly_as_before(self, tmp_path):
+        """The guard must not cost the legitimate commissioning path anything."""
+        store, run_id, eis = self._store_and_result(tmp_path)
+
+        mid = store.record_measurement(run_id, eis, role="blank_short",
+                                       fixture_id="mux16", electrode_mode="two")
+
+        row = store._conn.execute(
+            "SELECT role, electrode_mode FROM measurements WHERE measurement_id = ?",
+            (mid,)).fetchone()
+        assert tuple(row) == ("blank_short", "two")
+        store.close()
+
+    def test_a_sample_with_an_unknown_mode_still_records(self, tmp_path):
+        """Negative control: the guard is scoped to TWO_TERMINAL_ROLES.
+
+        A film in contact with the reference stripe *does* establish an ionic path, so a
+        sample's mode is genuinely unconstrained. If this ever fails, the guard has
+        become a blanket refusal and every ordinary measurement on the rig is blocked.
+        """
+        store, run_id, eis = self._store_and_result(tmp_path)
+
+        mid = store.record_measurement(run_id, eis, role="sample",
+                                       electrode_mode="unknown")
+
+        row = store._conn.execute(
+            "SELECT role, electrode_mode FROM measurements WHERE measurement_id = ?",
+            (mid,)).fetchone()
+        assert tuple(row) == ("sample", "unknown")
+        store.close()
+
+    def test_the_ordinary_default_call_is_untouched(self, tmp_path):
+        """The overwhelmingly common call passes neither role nor electrode_mode."""
+        store, run_id, eis = self._store_and_result(tmp_path)
+
+        mid = store.record_measurement(run_id, eis)
+
+        row = store._conn.execute(
+            "SELECT role, electrode_mode FROM measurements WHERE measurement_id = ?",
+            (mid,)).fetchone()
+        assert tuple(row) == ("sample", "unknown")
+        store.close()
+
+    def test_a_typo_role_coerces_to_sample_before_the_mode_is_judged(self, tmp_path):
+        """Ordering: the guard judges the role that will actually be STORED.
+
+        An unrecognised role is coerced to ``'sample'`` above, so it cannot trip this
+        guard — which is correct, because it is not being filed as a calibration
+        artifact either. Placing the mode check before the coercion would refuse a typo
+        that the store had already decided to treat as ordinary sample data.
+        """
+        store, run_id, eis = self._store_and_result(tmp_path)
+
+        mid = store.record_measurement(run_id, eis, role="blank_shrot")
+
+        row = store._conn.execute(
+            "SELECT role FROM measurements WHERE measurement_id = ?",
+            (mid,)).fetchone()
+        assert row[0] == "sample"
+        store.close()
 
 
 class TestPhaseTableFromOneComponent:
