@@ -33,6 +33,8 @@ inter-stripe geometry, not the fixture.
 
 from __future__ import annotations
 
+import math
+import statistics
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -66,6 +68,11 @@ ARTIFACT_SETUP = {
     "reference_cap": "a low-loss C0G/NP0 capacitor (100 pF - 1 nF, tan d < 1e-3)",
     "reference_r": "a reference resistor; repeat once per impedance decade",
 }
+
+
+#: Median per-decade loss angle (degrees) above which a "reference capacitor" is not
+#: usable as a phase reference. See :func:`phase_reference_is_plausible`.
+PHASE_REFERENCE_MAX_EPS_DEG = 15.0
 
 
 @dataclass(frozen=True)
@@ -194,6 +201,69 @@ def build_commissioning_workflow(
             "setup_required": ARTIFACT_SETUP.get(role, ""),
         },
     )
+
+
+def phase_reference_is_plausible(
+    eps_deg: Sequence[float],
+    *,
+    limit_deg: float = PHASE_REFERENCE_MAX_EPS_DEG,
+) -> tuple[bool, str]:
+    """Whether these per-decade loss angles can be an **instrument** phase floor.
+
+    Mirrors :func:`~softae.analysis.eis.calibration.short_is_plausible`: the one
+    artifact whose answer is partly known in advance gets checked against it, and an
+    implausible one is refused rather than written into a constant nothing could have
+    produced.
+
+    **The judgement is on phase, not on the marking**, and that distinction is the
+    whole correctness of this function. A part can be mismarked and still be a perfectly
+    good phase reference: mux16's id 3493 is marked 1 nF, measures 119.4 pF (0.119x, and
+    it duly fires ``eis_reference_cap_mismatch``), and contributes eps of 1.42-4.35 deg
+    — entirely in family with the correctly-marked 3491/3492 and already in the live
+    table without harm. Gating on the marking ratio would drop it and *change a good
+    phase table*. Marking accuracy and phase quality are different properties of the
+    same part, and only the second one is what the table is made of.
+
+    **Why 15 deg.** An instrument's phase floor is a small residual error. The largest
+    this rig has ever measured is 6.12 deg (the live mux16 headline), and a C0G/NP0
+    reference is specified at tan d < 1e-3, i.e. its own contribution is 0.06 deg. A
+    median loss angle of 15 deg is tan d = 0.27 — better than a quarter of the stored
+    energy dissipated — which is over twice the worst instrument residual on record here
+    and ~260x anything a C0G can contribute even far out of spec. Nothing that lossy is
+    the instrument; it is a lossy dielectric, or a part that is not the capacitor on the
+    label. mux16's id 1933 is the case in hand: 100 pF marked, 26.22 nF measured, eps
+    58.88/31.05/29.27 deg — tan(58.88 deg) = 1.65, a dielectric's tan d and not an
+    error bar. Admitting it would replace the system-wide phase floor with that part's
+    loss tangent.
+
+    The threshold sits between two well-separated families rather than near either: 3.3x
+    above the worst per-decade point of the three in-family capacitors (4.54 deg) and
+    2x below the *best* decade of the implausible one (29.27 deg).
+
+    The statistic is the **median** of the per-decade points, which is neither the rule
+    :func:`~softae.analysis.eis.calibration.derive_phase_table` follows nor a
+    contradiction of it (SUBAGENT_RULES.md 3.3). That function refuses the sweep minimum
+    because it is computing a *bound*, and a bound must not be understated. This is not
+    computing anything: it is asking whether the part is a low-loss capacitor at all,
+    and a lossy dielectric is lossy across its whole sweep. The median says "most of
+    this part's decades are lossy" — the max would let one noisy decade discard a good
+    part, and the min would admit a lossy one on its single luckiest decade.
+
+    Judged on **exactly the values that would be tabulated**, not on the raw sweep or on
+    ``tand_min``: the gate has to read what it is about to admit, or it is checking a
+    different question than the one asked (SUBAGENT_RULES.md 3.1).
+    """
+    finite = [float(e) for e in (eps_deg or []) if e == e]
+    if not finite:
+        return True, ""
+    median = float(statistics.median(finite))
+    if median > float(limit_deg):
+        return False, (
+            f"median per-decade loss angle {median:.2f} deg > {float(limit_deg):g} deg "
+            f"(tan d = {math.tan(math.radians(median)):.3g}) — a lossy dielectric, not "
+            f"an instrument phase floor"
+        )
+    return True, ""
 
 
 def derive_calibration(
@@ -408,6 +478,8 @@ def derive_calibration(
             eps_points.append(ref.eps_deg)
         measured.add(int(acq.channel))
 
+    rejected_phase_refs: list[tuple[int, str]] = []
+    phase_refs_contributed = 0
     for acq in artifacts.get("reference_cap", []):
         ch = int(acq.channel)
         nom = _nominal_for("reference_cap", acq)
@@ -433,17 +505,56 @@ def derive_calibration(
         # built from stray-corrected impedances would claim a phase floor that no sample
         # measurement ever experiences. tand_min and its |Z| are raw for the same reason.
         z_dec, e_dec = derive_phase_table(acq.freq_hz, acq.Z, load="capacitive")
-        if z_dec:
+        # Nothing used to read the plausibility of what this loop was about to append,
+        # so an implausible part's loss tangent became the instrument's phase floor —
+        # the one number the whole artifact exists to establish. `phase_table_gate`
+        # inside derive_phase_table drops railed and wrong-quadrant POINTS; it cannot
+        # see that the surviving points describe a lossy dielectric rather than a
+        # reference capacitor, because those points are perfectly well-formed.
+        #
+        # Refused per part, and NOT fatal when it is the only one: unlike the short
+        # blank, an absent phase table is a supported state. `capabilities()` then
+        # reports phase_floor_measured=False and `next_artifact` asks for a reference
+        # capacitor — which is the artifact-level surface of this refusal, and the
+        # honest one.
+        usable, why = phase_reference_is_plausible(e_dec)
+        if z_dec and not usable:
+            rejected_phase_refs.append((ch, why))
+            logger.warning("commissioning_reference_cap_phase_implausible",
+                           channel=ch, measurement_id=acq.measurement_id,
+                           eps_deg=[round(float(e), 3) for e in e_dec],
+                           z_ohm=[float(z) for z in z_dec],
+                           limit_deg=PHASE_REFERENCE_MAX_EPS_DEG,
+                           nominal_F=nom, C_F=cap.C_F, reason=why,
+                           msg="excluded from the phase table — this part's loss, not "
+                               "the instrument's error. Its capacitance is still "
+                               "reported; only its phase contribution is dropped")
+        elif z_dec:
             z_points.extend(z_dec)
             eps_points.extend(e_dec)
             load_kind = "capacitive"
+            phase_refs_contributed += 1
         measured.add(ch)
         logger.info("commissioning_reference_cap", channel=ch,
                     nominal_F=nom, C_F=cap.C_F, C_raw_F=cap.C_raw_F,
                     C_corrected_F=cap.C_corrected_F if cap.corrected else None,
                     C_stray_F=cap.C_stray_F if cap.corrected else None,
                     tand_min=cap.tand_min, at_ohm=cap.z_at_tand_min_ohm,
-                    tand_basis="raw_Z")
+                    tand_basis="raw_Z",
+                    phase_contributed=bool(z_dec) and usable)
+
+    if rejected_phase_refs and not phase_refs_contributed:
+        # Nothing survived. The set is still derived — the short and load constants are
+        # unaffected — but the operator must hear that the artifact they ran contributed
+        # no phase floor, because the ladder's "next: reference_cap" would otherwise
+        # read as "you never ran one".
+        logger.warning(
+            "commissioning_no_usable_phase_reference",
+            channels=[ch for ch, _ in rejected_phase_refs],
+            reasons=[reason for _ch, reason in rejected_phase_refs],
+            msg="no reference capacitor contributed a phase floor; it stays "
+                "unmeasured. Check the part against its marking on a meter — a "
+                "low-loss C0G/NP0 is what this artifact needs")
 
     phase = PhaseAccuracyTable()
     if z_points:

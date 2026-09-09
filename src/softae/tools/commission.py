@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -67,7 +68,12 @@ EXIT_DECLINED = 2
 
 
 def _parse_channels(text: str) -> list[int]:
-    """``"1, 3-6"`` → ``[1, 3, 4, 5, 6]`` — the same syntax the GUI accepts."""
+    """``"1, 3-6"`` → ``[1, 3, 4, 5, 6]`` — the same syntax the GUI accepts.
+
+    Also parses ``--declare-ids``. Channels and measurement ids are both "a list of
+    integers the operator types", and a second copy of this would drift from the
+    syntax the operator has already learned.
+    """
     out: list[int] = []
     for part in str(text).split(","):
         part = part.strip()
@@ -174,6 +180,51 @@ def _cmd_run(args) -> int:
         print("    and will be REFUSED at derive time.")
     print()
 
+    # --yes must not be able to INVENT the electrode mode.
+    #
+    # `--yes` skips a *prompt*; it cannot answer a question that was never asked. The
+    # jumper question used to live entirely inside the interactive branch below, so
+    # `--yes` fell through to `electrode_mode = "two"` and recorded, as the operator's
+    # provenance, a positive claim about how the bench was wired that nobody made. That
+    # is worse than an honest 'unknown': 'unknown' is refused downstream and can still
+    # be rescued by an explicit declaration, whereas a fabricated 'two' passes every
+    # check there is and is indistinguishable from an operator who really did fit the
+    # jumper.
+    #
+    # An honest 'unknown' is no longer available either: `record_measurement` now
+    # refuses any TWO_TERMINAL_ROLES row whose mode is not 'two' (R24/F17), so a sweep
+    # recording one would drive the rig and then throw the spectrum away. The only two
+    # correct outcomes are therefore a REFUSAL or an EXPLICIT operator assertion, and
+    # `--electrode-mode two` already IS that assertion -- it is what `import` demands
+    # (required=True) for exactly this fact, so no second flag is invented for it here.
+    #
+    # Both guards sit before the prompts and before `create_manager`: a run that cannot
+    # be recorded must not first ask the operator to confirm hardware, and must never
+    # reach the instruments.
+    if needs_two and args.electrode_mode not in (None, "two"):
+        print(f"'{args.role}' cannot be recorded as {args.electrode_mode}-electrode.",
+              file=sys.stderr)
+        print("  A two-terminal load has no ionic path to RE, so the value would be",
+              file=sys.stderr)
+        print("  uncalibratable in principle (F17). The store REFUSES the row, and it",
+              file=sys.stderr)
+        print("  would be refused after the sweep had already run.", file=sys.stderr)
+        print("  Fit the jumper (RE tied to CE) and pass --electrode-mode two.",
+              file=sys.stderr)
+        return EXIT_FAILED
+
+    if args.yes and needs_two and args.electrode_mode is None:
+        print(f"--yes cannot answer the jumper question for '{args.role}'.",
+              file=sys.stderr)
+        print("  Skipping the prompt is not the same as confirming the jumper, and",
+              file=sys.stderr)
+        print("  assuming 'two' would record a claim about the bench that nobody made.",
+              file=sys.stderr)
+        print("  Pass --electrode-mode two to assert it explicitly, or drop --yes and",
+              file=sys.stderr)
+        print("  answer at the prompt.", file=sys.stderr)
+        return EXIT_FAILED
+
     if not args.yes:
         try:
             reply = input("Is the hardware in place? [y/N] ").strip().lower()
@@ -194,13 +245,22 @@ def _cmd_run(args) -> int:
             if jumper not in ("y", "yes"):
                 print("Declined — measure two-terminal references with RE tied to CE.",
                       file=sys.stderr)
-                print("  Re-run once the jumper is fitted, or pass --electrode-mode "
-                      "three\n  to record the spectrum anyway (it will not enter a "
-                      "calibration).", file=sys.stderr)
+                # The old hint offered `--electrode-mode three` to "record the
+                # spectrum anyway". That route is gone: the store refuses the
+                # row, so the advice would now cost a sweep and yield nothing.
+                print("  Re-run once the jumper is fitted. No mode records this",
+                      file=sys.stderr)
+                print("  measurement without it — the row is refused at the "
+                      "store.", file=sys.stderr)
                 return EXIT_DECLINED
             args.electrode_mode = "two"
 
     if args.electrode_mode is None:
+        # Reachable only for a role that is NOT two-terminal, and every role `run`
+        # accepts is in TWO_TERMINAL_ROLES today, so the guards above have already
+        # settled the mode for all of them. Left rather than deleted: what makes it
+        # dead is COMMISSIONING_ROLES being a subset of TWO_TERMINAL_ROLES, which is a
+        # property of the current role set and not a structural one.
         args.electrode_mode = "two" if needs_two else "three"
     print(f"  electrode mode: {args.electrode_mode}-electrode")
 
@@ -382,7 +442,8 @@ def _load_role_spectra(
 
 
 def _declare_electrode_mode(
-    store: Any, fixture_id: str, mode: str, artifacts: dict[str, list]
+    store: Any, fixture_id: str, mode: str, artifacts: dict[str, list],
+    measurement_ids: Iterable[int] | None = None,
 ) -> None:
     """Record an operator's assertion about how existing spectra were sensed.
 
@@ -407,34 +468,83 @@ def _declare_electrode_mode(
     Roles are inspected **per acquisition**. A role summarised by its newest row would
     report "two" for a set that still contains an unknown-mode sweep, and this branch
     would then skip the very rows it exists to fix.
+
+    **The declaration can name its rows.** *measurement_ids* narrows it to exactly those
+    acquisitions; ``None`` keeps the original role-wide sweep, which is still the right
+    shape when a whole pre-jumper session is being declared at once. The scoped form
+    exists because the role was never a scope: it is a *kind of artifact*, and an
+    operator who remembers fitting the jumper for two specific sweeps is asserting
+    something about those two sweeps and nothing else. A ``--channel`` filter would not
+    do — on the mux16 record the two rows to declare are ch32 and the row to leave alone
+    is ch31, so channel happens to separate them *today*, and a ch32 unknown row
+    imported next month would be swept in silently by a filter that looked correct when
+    it was written.
+
+    An id that names no unknown-mode acquisition is **reported, not ignored**. Silently
+    declaring nothing for a mistyped id is a refusal wearing a pass's clothes
+    (SUBAGENT_RULES.md §3.1a), and the operator would go on believing the row was
+    declared.
     """
+    scope = None if measurement_ids is None else {int(i) for i in measurement_ids}
     changed: list[str] = []
+    declared: list[int] = []
     for role, items in sorted(artifacts.items()):
         unknown = [a for a in items if (a.electrode_mode or "unknown") == "unknown"]
+        if scope is not None:
+            # Narrowed, not substituted: the role loop and the fixture clause below
+            # still apply, and the id list only removes rows from what they selected.
+            unknown = [a for a in unknown if a.measurement_id in scope]
+            if not unknown:
+                continue    # this role holds none of the named rows — not a mismatch
         if not unknown:
             explicit = sorted({a.electrode_mode for a in items if a.electrode_mode})
             if explicit and mode not in explicit:
                 print(f"  ! {role} is recorded as {'/'.join(explicit)}-electrode — not "
                       f"overridden. Re-import the file if that record is wrong.")
             continue
-        cur = store._conn.execute(
-            "UPDATE measurements SET electrode_mode = ? "
-            "WHERE role = ? AND electrode_mode = 'unknown' "
-            "AND (fixture_id = ? OR fixture_id IS NULL)",
-            (mode, role, fixture_id),
-        )
+        sql = ("UPDATE measurements SET electrode_mode = ? "
+               "WHERE role = ? AND electrode_mode = 'unknown' "
+               "AND (fixture_id = ? OR fixture_id IS NULL)")
+        params: list[Any] = [mode, role, fixture_id]
+        if scope is not None:
+            ids = sorted(int(a.measurement_id) for a in unknown
+                         if a.measurement_id is not None)
+            sql += f" AND measurement_id IN ({', '.join('?' * len(ids))})"
+            params.extend(ids)
+            declared.extend(ids)
+        cur = store._conn.execute(sql, tuple(params))
         if cur.rowcount:
             changed.append(f"{role} ({cur.rowcount} row(s))")
     store._conn.commit()
 
+    unmatched = sorted(scope - set(declared)) if scope is not None else []
+
     if changed:
-        print(f"  Declared {mode}-electrode for: {', '.join(changed)}")
+        where = (f", scoped to id(s) {', '.join(str(i) for i in sorted(declared))}"
+                 if scope is not None else "")
+        print(f"  Declared {mode}-electrode for: {', '.join(changed)}{where}")
         print("    Recorded against the measurements — this is now their provenance.")
+        # The scope is part of the provenance, not decoration: a declaration naming two
+        # rows and one that swept three are different assertions, and the log is the
+        # only place that difference survives.
         logger.warning("commissioning_electrode_mode_declared", fixture=fixture_id,
                        mode=mode, roles=changed,
+                       scope="measurement_ids" if scope is not None else "all_unknown",
+                       requested_ids=sorted(scope) if scope is not None else None,
+                       declared_ids=sorted(declared) if scope is not None else None,
                        msg="operator assertion, not a measured fact")
-    else:
+    elif scope is None:
         print(f"  (nothing to declare — no '{fixture_id}' spectra had an unknown mode)")
+
+    if unmatched:
+        named = ", ".join(str(i) for i in unmatched)
+        print(f"  ! no unknown-mode '{fixture_id}' acquisition for id(s) {named} — "
+              f"nothing was declared for them. Check the id, and that the row is "
+              f"still 'unknown'.")
+        logger.warning("commissioning_electrode_mode_scope_unmatched",
+                       fixture=fixture_id, mode=mode, ids=unmatched,
+                       msg="named rows were not declared — an unmatched id is a "
+                           "declaration that did not happen")
 
 
 def _print_found(artifacts: dict[str, list], modes: dict[str, str]) -> None:
@@ -495,6 +605,22 @@ def _sources(artifacts: dict[str, list]) -> dict[str, int]:
 
 
 def _cmd_derive(args) -> int:
+    declare_ids: list[int] | None = None
+    if args.declare_ids:
+        # Refused rather than ignored: a scope silently dropped because the mode flag
+        # was forgotten would declare EVERY unknown row of every role — the opposite
+        # of what was typed, and invisible until the next derive.
+        if not args.declare_electrode_mode:
+            print("--declare-ids scopes --declare-electrode-mode; pass that too, or "
+                  "drop --declare-ids to declare every unknown-mode row.",
+                  file=sys.stderr)
+            return EXIT_FAILED
+        declare_ids = _parse_channels(args.declare_ids)
+        if not declare_ids:
+            print(f"--declare-ids {args.declare_ids!r} names no measurement id.",
+                  file=sys.stderr)
+            return EXIT_FAILED
+
     store, _project = _open_store(args)
     try:
         artifacts, nominals, modes = _load_role_spectra(store, args.fixture)
@@ -509,7 +635,8 @@ def _cmd_derive(args) -> int:
 
         if args.declare_electrode_mode:
             _declare_electrode_mode(
-                store, args.fixture, args.declare_electrode_mode, artifacts)
+                store, args.fixture, args.declare_electrode_mode, artifacts,
+                measurement_ids=declare_ids)
             # Re-read rather than patch in place: the declaration was written to the
             # database, and what derives must be what the record now says.
             artifacts, nominals, modes = _load_role_spectra(store, args.fixture)
@@ -734,9 +861,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--electrode-mode", choices=("two", "three"),
                      dest="electrode_mode", default=None,
                      help="how the cell is sensed; two-terminal references REQUIRE "
-                          "'two' (RE tied to CE). Prompted when omitted.")
+                          "'two' (RE tied to CE). Prompted when omitted, and "
+                          "MANDATORY alongside --yes.")
     run.add_argument("--yes", "-y", action="store_true",
-                     help="skip the 'is the hardware in place?' prompt")
+                     help="skip the 'is the hardware in place?' prompt. Does NOT "
+                          "answer the jumper question: --electrode-mode two must be "
+                          "given explicitly with it.")
     run.add_argument("--mock", action="store_true")
     run.set_defaults(func=_cmd_run)
 
@@ -773,6 +903,11 @@ def build_parser() -> argparse.ArgumentParser:
                      dest="declare_electrode_mode", default=None,
                      help="assert how spectra with an UNKNOWN mode were sensed, and "
                           "record it. Never overrides an explicitly recorded mode.")
+    der.add_argument("--declare-ids", dest="declare_ids", default=None,
+                     metavar="IDS",
+                     help='scope --declare-electrode-mode to these measurement ids, '
+                          'e.g. "1931,1932" or "1931-1932". Without it the declaration '
+                          'sweeps EVERY unknown-mode row of every role present.')
     # Overrides, not inputs: each acquisition's own recorded marking governs by
     # default. These exist for a part mis-entered at acquisition time, and they apply
     # to EVERY acquisition of that role.
