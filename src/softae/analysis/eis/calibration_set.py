@@ -39,6 +39,29 @@ from softae.analysis.eis.calibration import (
 logger = structlog.get_logger(__name__)
 
 
+#: Which commissioning artifact each per-channel constant is derived from.
+#:
+#: This is the cross-file half of a contract with
+#: :func:`softae.workflows.commissioning.derive_calibration`, which is the only
+#: producer of a :class:`CalibrationSet` with a non-empty ``channels_assumed``. It
+#: derives the series pair from ``blank_short`` and the shunt constant from
+#: ``blank_open``, and it copies the representative channel's constants **only** for
+#: the short-derived pair. Nothing in the type system enforces that, so it is written
+#: down here: a constant added to the class without an entry here reports no spread at
+#: all rather than a wrong one.
+_CONSTANT_SOURCE_ROLE: dict[str, str] = {
+    "R_short_ohm": "blank_short",
+    "L_lead_H": "blank_short",
+    "C_stray_F": "blank_open",
+}
+
+#: Roles whose constants ``derive_calibration`` propagates to channels that did not
+#: measure them — i.e. the roles for which ``channels_assumed`` is meaningful. Only
+#: the short is inherited today; an open blank is either measured on a channel or
+#: absent from the mapping entirely.
+_INHERITED_ROLES: frozenset[str] = frozenset({"blank_short"})
+
+
 @dataclass(frozen=True)
 class CalibrationSet:
     """Everything commissioning derived, for one fixture, at one hardware state."""
@@ -147,19 +170,57 @@ class CalibrationSet:
             return True
         return self.hardware_hash != current
 
+    def measured_channels(self, field_name: str) -> tuple[int, ...]:
+        """Channels whose *field_name* is a measurement, not an inherited copy.
+
+        :attr:`channels_measured` cannot answer this on its own: it is the union over
+        **every** commissioning role, so it says "some artifact was recorded on this
+        channel", not "this constant was measured here". Since ``f282e2f`` the two are
+        deliberately not disjoint — a channel measured open, and inheriting its short,
+        is in both sets — so filtering on it alone counts inherited copies as
+        independent measurements.
+
+        The per-field answer comes from :data:`_CONSTANT_SOURCE_ROLE` plus
+        :attr:`channels_assumed`, and it is exact rather than a heuristic:
+        ``derive_calibration`` computes ``assumed = all_channels - set(R_short)``
+        **before** copying the representative's pair in, so ``channels_assumed`` is
+        precisely the set that did not measure its own short blank. The open-derived
+        constants are never inherited by any code path, so every key of one of those
+        mappings is a measurement.
+
+        An unlisted field returns ``()`` rather than falling back to
+        :attr:`channels_measured`. A new per-channel constant must therefore *declare*
+        where it comes from before this method will report a spread for it — "we do not
+        know this field's provenance" must not be spelled the same way as "measured
+        everywhere", which is the mistake this method exists to undo.
+        """
+        role = _CONSTANT_SOURCE_ROLE.get(field_name)
+        mapping = getattr(self, field_name, None)
+        if role is None or not isinstance(mapping, Mapping):
+            return ()
+        channels = {int(ch) for ch in mapping} & {int(c) for c in self.channels_measured}
+        if role in _INHERITED_ROLES:
+            channels -= {int(c) for c in self.channels_assumed}
+        return tuple(sorted(channels))
+
     def measured_spread(self, field_name: str = "C_stray_F") -> float:
-        """max/min of a per-channel constant over the channels actually measured.
+        """max/min of a per-channel constant over the channels that **measured it**.
 
         The empirical size of what :attr:`channels_assumed` is assuming away. NaN when
-        fewer than two channels were measured — with one channel there is nothing to
+        fewer than two channels measured it — with one channel there is nothing to
         compare, and reporting 1.0 would read as "no variation" rather than "unknown".
+
+        That NaN is the whole point, and the scope is what makes it work. Filtering on
+        :attr:`channels_measured` alone, this returned **exactly 1.0** on a calibration
+        regenerated after ``f282e2f``: eight channels inherit one short blank, the
+        eight copies are bit-identical, and ``max/min`` over them is 1.0 — the function
+        doing the precise thing its own docstring exists to prevent. It read as NaN
+        before only because those channels then carried no ``R_short`` entry at all,
+        which is correctness by absence rather than by construction.
         """
-        mapping = getattr(self, field_name, None)
-        if not isinstance(mapping, Mapping):
-            return float("nan")
-        vals = [float(v) for ch, v in mapping.items()
-                if ch in self.channels_measured
-                and float(v) == float(v) and float(v) > 0]
+        vals = [float(getattr(self, field_name)[ch])
+                for ch in self.measured_channels(field_name)]
+        vals = [v for v in vals if v == v and v > 0]
         if len(vals) < 2:
             return float("nan")
         return float(max(vals) / min(vals))
