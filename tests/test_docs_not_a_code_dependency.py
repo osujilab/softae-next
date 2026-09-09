@@ -21,16 +21,12 @@ What the detector sees, and what it does not, is spelled out on `_path_segments`
 `/` joining, `os.path.join`, f-strings and module-level constants into a read call. It
 does **not** follow a path across a function boundary, out of a container, or in from a
 config file or CLI argument.
-
-`tools/whose.py` is exactly that blind spot, and is recorded in `ACCEPTED_READS` — see
-the note there.
 """
 
 from __future__ import annotations
 
 import ast
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -86,24 +82,16 @@ TRACKED_DOCS_DIRS = frozenset({"api"})
 #: category: it must work on a fresh checkout, and that is the category this guard exists
 #: to protect.
 #:
-#: An entry is not merely tolerated, either. Admission carries an obligation — the
-#: refusal the category argument leans on is *asserted*, against the real file, further
-#: down this module. See `test_whose_refuses_a_missing_map_rather_than_answering` and
-#: its neighbours.
-ACCEPTED_READS: dict[str, str] = {
-    "tools/whose.py": (
-        "Coordination tooling, not product code. Reading `docs/SubAgent docs/"
-        "OWNERSHIP.toml` IS its purpose: the map is per-working-tree session state — who "
-        "holds which paths right now — so it is correctly absent from a fresh clone, "
-        "which has no sessions to describe. Nothing shipped imports it; it is run by hand "
-        "and by the pre-commit gate, both of which only exist where sessions do. The "
-        "category argument is backed by a tested contract below: with no map it refuses "
-        "and names the cause rather than answering permissively. Note the entry is "
-        "documentation rather than suppression today — whose.py routes DEFAULT_MAP "
-        "through a function parameter, which the detector below cannot follow, so it "
-        "would not be flagged in any case."
-    ),
-}
+#: An entry is not merely tolerated, either. Admission carries an obligation: the
+#: behaviour the category argument leans on — that the tool REFUSES on a fresh
+#: checkout rather than answering permissively — must be *asserted* against the real
+#: file by a test that travels with that file, not merely described here. An entry
+#: without such a test is an assertion about a category, which is what this list
+#: exists to stop being sufficient.
+#:
+#: The list is empty today. That is not a claim that no exemptible file exists; it is
+#: a claim that nothing under `src/`, `tests/` or `tools/` currently needs one.
+ACCEPTED_READS: dict[str, str] = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -508,174 +496,6 @@ def test_accepted_reads_are_not_stale() -> None:
         assert (REPO_ROOT / relpath).is_file(), (
             f"ACCEPTED_READS names {relpath}, which does not exist — remove the entry"
         )
-
-
-# --------------------------------------------------------------------------- #
-# the obligation the ACCEPTED_READS entry carries
-# --------------------------------------------------------------------------- #
-#
-# The entry above is admitted on category — coordination tooling reading session state.
-# The category argument leans on one behaviour: on a checkout with no map, whose.py must
-# REFUSE, not answer. If it ever answered, the exemption would flip from "correct by
-# category" to a violation of exactly the kind this module exists to catch — and a
-# quiet one, because "nothing is foreign" is the answer a pre-commit gate is happiest
-# to hear. So the behaviour is asserted here rather than asserted in a comment.
-#
-# What is pinned is the *shape* of the refusal, not its prose: a non-zero exit that is
-# not the "checked, found something" code, output naming the map it could not read, and
-# the absence of any permissive answer. Message wording and line numbers are left free
-# deliberately; a test that pins those tests the message, not the contract.
-
-WHOSE_PY = REPO_ROOT / "tools" / "whose.py"
-
-#: Fragments of whose.py's *successful* answers. None of these may appear when the map
-#: is unusable: they are what "checked, and nothing is wrong" looks like on stdout, and
-#: an unusable map has checked nothing. Compared case-folded.
-_PERMISSIVE_ANSWERS = ("unclaimed", "nothing staged", "staged path(s), all")
-
-#: whose.py's module docstring fixes 1 as "the gate found something" and reserves a
-#: separate code for "the map cannot be trusted". The exact error code is not pinned —
-#: only that a broken map is not reported as a clean-ish finding.
-_EXIT_FINDINGS = 1
-
-
-def _run_whose(
-    args: list[str], *, script: Path = WHOSE_PY
-) -> subprocess.CompletedProcess[str]:
-    """Run whose.py the way the protocol runs it: a subprocess, not an import.
-
-    Importing and monkeypatching would test a rearrangement of the module rather than
-    the tool the pre-commit gate actually invokes — including its `main()` return path
-    and its own stdout/stderr handling.
-
-    `script` is a parameter only so an anti-vacuity run can point these same assertions
-    at a deliberately broken copy and watch them go red; every test here uses the real
-    file.
-    """
-    return subprocess.run(
-        [sys.executable, str(script), *args],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=120,
-    )
-
-
-def _assert_refused_without_answering(
-    done: subprocess.CompletedProcess[str], map_path: Path
-) -> None:
-    """The contract: refused, said which file, and did not answer anyway."""
-    combined = f"{done.stdout}\n{done.stderr}"
-    context = f"\nexit={done.returncode}\nstdout:\n{done.stdout}\nstderr:\n{done.stderr}"
-
-    assert done.returncode != 0, (
-        "whose.py exited 0 with an unusable ownership map. A caller cannot distinguish "
-        "that from a clean gate, which is precisely the failure the tool documents "
-        "itself as avoiding — and the condition that would turn its ACCEPTED_READS "
-        f"exemption into a violation.{context}"
-    )
-    assert done.returncode != _EXIT_FINDINGS, (
-        "whose.py reported an unusable map with the exit code that means 'checked, "
-        "found something'. Those must stay distinct: one is a coordination finding to "
-        f"act on, the other is the tool declining to answer.{context}"
-    )
-
-    assert map_path.name in combined, (
-        "whose.py refused but did not name the map it could not use, so the operator "
-        f"cannot tell an absent map from a malformed one or a wrong --map.{context}"
-    )
-
-    lowered = combined.lower()
-    for marker in _PERMISSIVE_ANSWERS:
-        assert marker not in lowered, (
-            f"whose.py printed {marker!r} — an answer — while holding an unusable map. "
-            "The wrong answer wearing the safe answer's clothes is the whole hazard "
-            f"here; refusing must not look like reporting nothing foreign.{context}"
-        )
-
-    assert "Traceback (most recent call last)" not in combined, (
-        "whose.py crashed rather than refusing. A traceback is a loud failure, but not "
-        "a diagnosed one, and it means the refusal path was not the path taken."
-        f"{context}"
-    )
-
-
-def test_whose_refuses_a_missing_map_rather_than_answering(tmp_path: Path) -> None:
-    """No map on disk: the fresh-checkout condition, reproduced without touching one.
-
-    `--map` points at a path inside `tmp_path` that was never created. The live map at
-    `docs/SubAgent docs/OWNERSHIP.toml` is coordination state for concurrent sessions
-    and is never moved, renamed or perturbed to produce this condition.
-    """
-    absent = tmp_path / "no_such_ownership_map.toml"
-    assert not absent.exists(), "fixture precondition: the map must not be there"
-
-    done = _run_whose(["tools/whose.py", "--map", str(absent)])
-    _assert_refused_without_answering(done, absent)
-
-
-def test_whose_gate_refuses_a_missing_map(tmp_path: Path) -> None:
-    """The same refusal on the mode that matters: the pre-commit staged gate.
-
-    Lookup mode being safe would not save anything on its own — the gate is what stands
-    between a session and staging another session's work.
-    """
-    absent = tmp_path / "no_such_ownership_map.toml"
-
-    done = _run_whose(
-        ["--staged", "--me", "eis-acq-session", "--map", str(absent)]
-    )
-    _assert_refused_without_answering(done, absent)
-
-
-def test_whose_refuses_a_claimless_map(tmp_path: Path) -> None:
-    """A map present but empty of claims is the permissive answer's best disguise.
-
-    It parses, it has sessions, and every lookup against it comes back unowned — so a
-    gate run on it reports nothing foreign about a tree full of foreign work. Absence of
-    the file is loud; absence of its *contents* is the quiet version of the same thing,
-    and must be refused just as hard.
-    """
-    claimless = tmp_path / "claimless_ownership_map.toml"
-    claimless.write_text('sessions = ["probe-session"]\n', encoding="utf-8")
-
-    done = _run_whose(["tools/whose.py", "--map", str(claimless)])
-    _assert_refused_without_answering(done, claimless)
-
-
-def test_whose_answers_normally_from_a_usable_map(tmp_path: Path) -> None:
-    """Positive control for the three refusals above.
-
-    Every one of those asserts a non-zero exit, which a subprocess yields for a wrong
-    interpreter, a wrong script path, a wrong working directory or an import error just
-    as readily as for the branch under test. This invocation differs from them in one
-    respect — the map is usable — and must succeed. If it fails, the refusal tests are
-    proving nothing about whose.py.
-    """
-    usable = tmp_path / "ownership_fixture.toml"
-    usable.write_text(
-        'sessions = ["probe-session"]\n'
-        "\n"
-        "[[claim]]\n"
-        'id = "probe-claim"\n'
-        'session = "probe-session"\n'
-        'paths = ["tools/*.py"]\n'
-        'note = "fixture claim for the positive control"\n'
-        'claimed = "2026-01-01"\n',
-        encoding="utf-8",
-    )
-
-    done = _run_whose(["tools/whose.py", "--map", str(usable)])
-
-    assert done.returncode == 0, (
-        "whose.py could not answer from a well-formed map, so the refusal tests above "
-        f"may be passing for an unrelated reason.\nstdout:\n{done.stdout}\n"
-        f"stderr:\n{done.stderr}"
-    )
-    assert "probe-session" in done.stdout, (
-        f"expected the fixture's owner in the lookup output, got:\n{done.stdout}"
-    )
 
 
 # --------------------------------------------------------------------------- #

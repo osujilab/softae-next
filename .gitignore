@@ -59,3 +59,12 @@ docs/*
 !docs/architecture.md
 # the mkdocs homepage; without it a clone's site root is a 404
 !docs/index.md
+
+# ─── Machine-local session coordination ───────────────────────────────
+# The ownership map `docs/SubAgent docs/OWNERSHIP.toml` is already private
+# under the `docs/*` rule above: it is per-working-tree session state, and a
+# fresh clone has no sessions to describe. Its reader and that reader's tests
+# are the same category of thing, so they travel with the map rather than with
+# the repository. Anchored to the repo root so they match nothing else.
+/tools/whose.py
+/tests/test_whose.py

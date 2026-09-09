@@ -272,6 +272,8 @@ than edited, sitting beside `SESSION_MAIL.md` because it is coordination state t
 - **`whose.py` fails loudly on a missing or malformed map.** A silent empty map would answer
   "nothing is foreign" to every question, which is the failure shape `SUBAGENT_RULES.md` §3
   describes: the wrong answer wearing the safe answer's clothes.
+- **`whose.py`, its tests and its map are machine-local and not tracked.** A fresh clone will not
+  have them; they live beside the sessions they describe, not in the repository.
 - **Prefer a new file to a contested edit.** A new module importing an in-flight file costs that
   file zero edits and is separately reviewable — the pattern that let `rig_session.py`,
   `campaign_discovery.py` and `rig_claim.py` land while their neighbours were held by others.
