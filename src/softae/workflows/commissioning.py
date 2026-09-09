@@ -233,9 +233,12 @@ def derive_calibration(
     R24/F17 refusal then applies **per acquisition**, so one pre-jumper sweep is
     dropped without taking its re-measured siblings with it.
 
-    Channels present in *all_channels* but not measured are recorded as
-    ``channels_assumed``, so using one **logs the assumption** rather than silently
-    extrapolating a fixture constant across the mux.
+    Channels present in *all_channels* without a short blank of their own are recorded
+    as ``channels_assumed``, so using one **logs the assumption** rather than silently
+    extrapolating a fixture constant across the mux. The test is the short specifically,
+    not "any artifact": a channel measured open but never shorted inherits its series
+    pair and is listed as doing so, which means ``channels_assumed`` and
+    ``channels_measured`` are **not** disjoint.
     """
     from softae.analysis.eis.calibration import (
         CalibrationSet,
@@ -457,9 +460,18 @@ def derive_calibration(
     z_min = min(z_points) if z_points else float("nan")
     z_max = max(z_points) if z_points else float("nan")
 
+    # Assumed on the strength of the SHORT specifically, not of the shared `measured`
+    # set. Only the blank_short loop populates R_short/L_lead, but every role's loop
+    # adds to `measured` — so a channel whose one artifact was an open blank was
+    # excluded from the inheritance below while never having gone through the short
+    # loop either, and ended up with no series pair at all: not measured, not assumed,
+    # silently absent. mux16.toml's ch17-23 are exactly that. `measured` keeps its own
+    # meaning ("some artifact was recorded here") for channels_measured below; the two
+    # sets are therefore no longer disjoint, which is correct — a channel can have been
+    # measured open and still be inheriting its short.
     assumed: tuple[int, ...] = ()
     if all_channels:
-        assumed = tuple(sorted(set(int(c) for c in all_channels) - measured))
+        assumed = tuple(sorted(set(int(c) for c in all_channels) - set(R_short)))
         if assumed and representative_channel is not None:
             rep = int(representative_channel)
             for ch in assumed:

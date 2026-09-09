@@ -854,6 +854,43 @@ class TestDeriveCalibrationEndToEnd:
         # Inherited constants are present, but flagged by that membership.
         assert cal.R_short_ohm[3] == pytest.approx(cal.R_short_ohm[1])
 
+    def test_a_channel_measured_open_but_never_shorted_still_inherits_the_series_pair(
+            self):
+        """The live mux16 shape: an artifact that is not a short must not suppress
+        inheritance of the one pair only a short can produce.
+
+        ``channels_assumed`` used to be defined as the complement of a *shared*
+        ``measured`` set that every role's loop added to, but only ``blank_short``
+        populates ``R_short_ohm``/``L_lead_H``. So a channel whose only artifact was an
+        open blank was excluded from the inheritance loop while never having gone
+        through the short loop either — neither measured nor assumed for the series
+        pair, and no entry at all. `calibration/eis/mux16.toml` carries exactly this:
+        ch17-23 sit in ``channels_measured`` on the strength of one 2026-08-06 open and
+        have neither an ``R_short_ohm`` nor an ``L_lead_H`` key. Basing ``assumed`` on
+        ``set(R_short)`` restores what the field's own docstring already claims it
+        means.
+        """
+        from softae.workflows.commissioning import derive_calibration
+
+        f, Z = _short()
+        # 1 nF keeps |Z| under the ceiling, so this reads as a usable open -- the same
+        # verdict the seven tied ch17-23 blanks got.
+        f_open = _freqs()
+        Z_open = 1.0 / (1j * 2 * np.pi * f_open * 1e-9)
+        cal = derive_calibration(
+            {"blank_short": [(1, f, Z)], "blank_open": [(2, f_open, Z_open)]},
+            all_channels=range(1, 4), representative_channel=1,
+            electrode_modes=ALL_TWO)
+
+        # ch2 lacks its own short, so it inherits -- and says so.
+        assert 2 in cal.channels_assumed
+        assert cal.R_short_ohm[2] == pytest.approx(cal.R_short_ohm[1])
+        assert cal.L_lead_H[2] == pytest.approx(cal.L_lead_H[1])
+        # ...while `channels_measured` keeps its own meaning, unchanged: ch2 did have a
+        # real artifact recorded. The two sets are no longer disjoint, deliberately.
+        assert 2 in cal.channels_measured
+        assert cal.C_stray_F[2] == pytest.approx(1e-9, rel=1e-6)
+
     def test_a_reference_capacitor_populates_the_phase_table(self):
         from softae.workflows.commissioning import derive_calibration
 
@@ -1294,6 +1331,17 @@ class TestMeasurementRoleRecording:
         row = store._conn.execute(
             "SELECT role FROM measurements WHERE measurement_id = ?", (mid,)).fetchone()
         assert row[0] == "sample"
+        store.close()
+
+    def test_the_quarantined_misplaced_lead_role_is_recorded_as_itself_not_as_a_sample(
+            self, tmp_path):
+        # A live role (ids 3892-3895, the 2026-09-03 misplaced-lead resistor attempt)
+        # that the coercion above used to file as ordinary sample data.
+        store, run_id, eis = self._store_and_result(tmp_path)
+        mid = store.record_measurement(run_id, eis, role="reference_r_misplaced_lead")
+        row = store._conn.execute(
+            "SELECT role FROM measurements WHERE measurement_id = ?", (mid,)).fetchone()
+        assert row[0] == "reference_r_misplaced_lead"
         store.close()
 
 
