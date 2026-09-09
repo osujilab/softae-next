@@ -230,13 +230,61 @@ class TestElectrodeConfigurationFactor:
         assert cfg["k_config_factor"] == 1.0              # but not applied
         assert cfg["k_config_verified"] is False
 
-    def test_verifying_it_selects_the_configuration_factor_without_repeating_it(self):
+    def test_verifying_the_board_alone_no_longer_arms_the_theoretical_factor(self):
+        # Checking the board's symmetry and RE centring is a *precondition* of the
+        # configuration factor, not a measurement of it. A boolean must not be
+        # sufficient on its own to select a number nothing on this board supplied, so
+        # the flag alone now fails closed to 1.0 — the R26 posture, one branch earlier.
+        import structlog
+
         from softae.analysis.eis.geometry import cell_config
 
-        assert cell_config({"electrode_configuration": "3-electrode",
-                            "k_config_verified": True})["k_config_factor"] == 2.0
-        assert cell_config({"electrode_configuration": "2-electrode",
-                            "k_config_verified": True})["k_config_factor"] == 1.0
+        with structlog.testing.capture_logs():
+            three = cell_config({"electrode_configuration": "3-electrode",
+                                 "k_config_verified": True})
+        assert three["k_config_factor"] == 1.0
+        assert three["k_config_verified"] is True      # still recorded, just not armed
+
+        # 2-electrode is unchanged in both value *and* silence: its predicted factor
+        # already is the default, so nothing is being withheld to warn about.
+        with structlog.testing.capture_logs() as two_logs:
+            two = cell_config({"electrode_configuration": "2-electrode",
+                               "k_config_verified": True})
+        assert two["k_config_factor"] == 1.0
+        assert [e for e in two_logs
+                if e["event"] == "eis_k_config_verified_without_factor"] == []
+
+    def test_withholding_the_factor_is_announced_rather_than_silent(self):
+        import structlog
+
+        from softae.analysis.eis.geometry import cell_config
+
+        with structlog.testing.capture_logs() as logs:
+            cell_config({"electrode_configuration": "3-electrode",
+                         "k_config_verified": True})
+        warned = [e for e in logs
+                  if e["event"] == "eis_k_config_verified_without_factor"]
+        assert len(warned) == 1
+        assert warned[0]["log_level"] == "warning"
+        assert warned[0]["electrode_config"] == "3-electrode"
+        assert warned[0]["predicted"] == 2.0        # what was declined, on record
+        assert warned[0]["applied_factor"] == 1.0   # what was actually used
+        assert "k_config_factor" in warned[0]["msg"]
+
+    def test_an_explicit_factor_alongside_verification_warns_about_nothing(self):
+        # That path is unaffected: an explicit factor wins outright, so nothing is
+        # withheld and there is nothing to tell the operator.
+        import structlog
+
+        from softae.analysis.eis.geometry import cell_config
+
+        with structlog.testing.capture_logs() as logs:
+            cfg = cell_config({"electrode_configuration": "3-electrode",
+                               "k_config_verified": True,
+                               "k_config_factor": 2.0})
+        assert cfg["k_config_factor"] == 2.0
+        assert [e for e in logs
+                if e["event"] == "eis_k_config_verified_without_factor"] == []
 
     def test_an_explicit_factor_overrides_the_configuration_default(self):
         from softae.analysis.eis.geometry import cell_config
@@ -307,7 +355,12 @@ class TestReferenceElectrodeContactPrecondition:
     """
 
     def _cfg(self, **over):
-        base = {"electrode_configuration": "3-electrode", "k_config_verified": True}
+        # The factor is stated explicitly, not inferred from `k_config_verified`: the
+        # flag alone no longer selects one (it fails closed to 1.0 and warns). Without
+        # the explicit 2.0 every test below would enter R26's demotion with the factor
+        # already at 1.0 and pass without exercising the demotion at all.
+        base = {"electrode_configuration": "3-electrode", "k_config_verified": True,
+                "k_config_factor": 2.0}
         base.update(over)
         return base
 

@@ -380,17 +380,40 @@ def cell_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
         )
         electrode_config = "unverified"
 
-    # Declaring the configuration records a fact; it does not arm the correction.
-    # The factor follows the configuration only once `k_config_verified` says the
-    # symmetry behind it was actually checked on this board. An explicit factor still
-    # wins outright, for a board whose measured ratio is neither 1 nor 2.
+    # Declaring the configuration records a fact; it does not arm the correction —
+    # and neither does `k_config_verified` on its own. A boolean saying the board's
+    # symmetry and RE centring were checked is a precondition of the theoretical
+    # factor, not a measurement of it, so it cannot select a number. Only an explicit
+    # `k_config_factor` applies one. Same posture as R26 below: fail closed to 1.0 and
+    # say so, rather than silently dividing by a value nothing on this board supplied.
     verified = bool(config.get("k_config_verified", False))
+    predicted = CONFIG_FACTORS.get(electrode_config, DEFAULT_K_CONFIG_FACTOR)
     if "k_config_factor" in config:
         k_factor = _f("k_config_factor", DEFAULT_K_CONFIG_FACTOR)
-    elif verified:
-        k_factor = CONFIG_FACTORS.get(electrode_config, DEFAULT_K_CONFIG_FACTOR)
     else:
         k_factor = DEFAULT_K_CONFIG_FACTOR
+        # Only warn when something is actually being withheld: for `2-electrode` and
+        # `unverified` the predicted factor already *is* the default, so there is no
+        # correction to decline and nothing for the operator to act on.
+        if verified and predicted != DEFAULT_K_CONFIG_FACTOR:
+            logger.warning(
+                "eis_k_config_verified_without_factor",
+                electrode_config=electrode_config,
+                predicted=predicted,
+                applied_factor=DEFAULT_K_CONFIG_FACTOR,
+                msg="K_config_factor NOT applied: k_config_verified records that the "
+                    "board's stripe symmetry and RE centring were checked, and that "
+                    "alone is not sufficient to arm the theoretical configuration "
+                    "factor -- the factor itself remains unconfirmed on this board. "
+                    "Set an explicit k_config_factor in [eis.cell] to apply any "
+                    "correction. Absolute sigma stays unqualified; relative trends "
+                    "are unaffected",
+                # ASCII deliberately: this fires on a WARNING path that reaches a
+                # plain stdout logger, and a cp1252 console raises UnicodeEncodeError
+                # on a Greek sigma. The sibling `eis_k_config_unarmed` message above
+                # still carries a literal sigma and has the same latent crash --
+                # reported, not fixed here.
+            )
     if not (k_factor > 0):
         k_factor = DEFAULT_K_CONFIG_FACTOR
 
