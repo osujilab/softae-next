@@ -24,8 +24,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from softae.analysis.eis.calibration import FixtureConductance
+from softae.analysis.eis.calibration import CalibrationSet, FixtureConductance
 from softae.analysis.eis.constrained_fit import (
+    BEYOND_COVERAGE_POLICIES,
     BOUNDS,
     CONSENSUS_COST_FACTOR,
     CONSTRAINED_FIT_TOL,
@@ -47,6 +48,7 @@ from softae.analysis.eis.constrained_fit import (
     PoorGeneralisation,
     SharedArtifact,
     ShuntTable,
+    UnmeasuredFixtureShunt,
     UnstableFitSurface,
     arc_is_resolved,
     check_admissible,
@@ -500,10 +502,21 @@ def test_fixture_admittance_is_evaluated_per_frequency_not_collapsed() -> None:
 
 
 def test_fixture_admittance_adds_the_stray_capacitance_as_reactance() -> None:
+    """``beyond_coverage="zero"`` is load-bearing here, not decoration.
+
+    A caller with a stray capacitance and no conductance table is exactly the case
+    :class:`UnmeasuredFixtureShunt` refuses, so this test has to *declare* that the
+    conductance is absent on purpose. Before 2026-09-08 it passed ``None`` and said
+    nothing, which is the same silence a channel with no ``G_fixture`` would have made.
+    """
     freq = np.array([100.0, 1000.0])
-    shunt = fixture_admittance(freq, None, 5.3e-11)
+    shunt = fixture_admittance(freq, None, 5.3e-11, beyond_coverage="zero")
     assert np.allclose(shunt.y.real, 0.0)
     assert shunt.y.imag == pytest.approx(2 * math.pi * freq * 5.3e-11)
+    # And the table says the conductance was never measured, rather than measured to be
+    # zero everywhere: a fully covered spectrum reports the opposite of this.
+    assert shunt.n_held == shunt.n_points == 2
+    assert shunt.held_fraction == 1.0
 
 
 def test_fixture_admittance_reports_points_beyond_the_measured_band() -> None:
@@ -532,6 +545,85 @@ def test_fixture_admittance_rejects_an_unknown_policy() -> None:
     with pytest.raises(ValueError, match="beyond_coverage"):
         fixture_admittance(np.array([100.0]), _dielectric_table(), 0.0,
                            beyond_coverage="wing it")
+
+
+def test_an_absent_conductance_table_is_refused_rather_than_treated_as_zero() -> None:
+    """The refusal. Before it, this call returned a shunt of exactly zero and a
+    ``ShuntTable`` reporting ``n_held = 0`` — full coverage of nothing."""
+    freq = np.logspace(1.0, 5.0, 20)
+    with pytest.raises(UnmeasuredFixtureShunt, match="no G_fixture"):
+        fixture_admittance(freq, None, 5.3e-11)
+
+
+def test_an_empty_conductance_table_is_refused_the_same_as_none() -> None:
+    """A ``FixtureConductance`` with no rows is the shape ``from_dict`` produces for a
+    channel whose open blank was unusable, and it must not read as a measurement."""
+    empty = FixtureConductance(freq_hz=(), G_S=())
+    assert empty.is_empty
+    with pytest.raises(UnmeasuredFixtureShunt):
+        fixture_admittance(np.logspace(1.0, 5.0, 20), empty, 0.0)
+
+
+def test_the_shunt_refusal_is_in_the_modules_own_refusal_hierarchy() -> None:
+    """One idiom, not four. Every refusal in this module is an
+    :class:`InadmissibleFitSet`, so a caller that wants to catch all of them catches
+    one type — and a ``ValueError`` handler written before this existed still works."""
+    assert issubclass(UnmeasuredFixtureShunt, InadmissibleFitSet)
+    assert issubclass(UnmeasuredFixtureShunt, ValueError)
+
+
+def test_the_refusal_names_the_way_out_of_it() -> None:
+    """A refusal with no stated escape gets worked around rather than answered."""
+    with pytest.raises(UnmeasuredFixtureShunt) as excinfo:
+        fixture_admittance(np.logspace(1.0, 5.0, 8), None, 0.0)
+    assert "beyond_coverage='zero'" in str(excinfo.value)
+
+
+def test_a_declared_absent_shunt_is_distinguishable_from_a_measured_one() -> None:
+    """The point of the whole item: the two cases must not produce the same record.
+
+    ``held_fraction`` is what a consumer would read to ask "how much of this was
+    measured?", and until 2026-09-08 both answers were 0.0.
+    """
+    freq = np.logspace(math.log10(20.0), math.log10(1.0e5), 25)
+    declared = fixture_admittance(freq, None, 0.0, beyond_coverage="zero")
+    measured = fixture_admittance(freq, _dielectric_table(), 0.0)
+
+    assert declared.held_fraction == 1.0
+    assert measured.held_fraction == 0.0
+    assert np.allclose(declared.y, 0.0)
+    assert np.all(measured.y.real > 0.0)
+
+
+def test_an_unknown_policy_is_rejected_even_with_no_table_to_apply_it_to() -> None:
+    """The policy check is hoisted, so the two refusals cannot mask each other: a
+    caller who typoed the opt-out hears about the typo, not about the missing table."""
+    assert "zero" in BEYOND_COVERAGE_POLICIES
+    with pytest.raises(ValueError, match="beyond_coverage"):
+        fixture_admittance(np.array([100.0]), None, 0.0, beyond_coverage="zeroo")
+
+
+def test_the_refused_shape_is_what_the_live_calibration_hands_a_sample_channel() -> None:
+    """``SUBAGENT_RULES`` §3.1(e) — production must be able to produce what is injected.
+
+    ``CalibrationSet.G_fixture`` is a ``dict[int, FixtureConductance]``, so an unlisted
+    channel yields ``None`` from a plain ``.get`` — the exact argument the refusal fires
+    on. The mapping below mirrors ``eis_calibrations`` id 23 (``mux16``, 2026-09-03),
+    which carries ``G_fixture`` for channels 17-23 and 25 and for no other, while 3 538
+    of the corpus's 3 872 ``role='sample'`` rows sit on channels that have none.
+    """
+    calibration = CalibrationSet(
+        fixture_id="mux16", created_at="2026-09-03",
+        G_fixture={ch: _dielectric_table() for ch in (17, 18, 19, 20, 21, 22, 23, 25)},
+    )
+    freq = np.logspace(math.log10(20.0), math.log10(1.0e5), 25)
+
+    assert calibration.G_fixture.get(25) is not None
+    assert fixture_admittance(freq, calibration.G_fixture.get(25), 0.0).n_held == 0
+
+    assert calibration.G_fixture.get(1) is None, "the premise of the refusal"
+    with pytest.raises(UnmeasuredFixtureShunt):
+        fixture_admittance(freq, calibration.G_fixture.get(1), 0.0)
 
 
 def test_known_shunt_is_recovered_through_the_fit_not_absorbed() -> None:

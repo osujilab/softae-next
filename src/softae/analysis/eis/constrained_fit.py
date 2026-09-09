@@ -395,6 +395,13 @@ HOLDOUT_REFUSE_PCT = 25.0
 
 # ── The known fixture shunt ──────────────────────────────────────────────────
 
+#: The policies :func:`fixture_admittance` accepts for points ``G_fixture`` does not
+#: cover — and, since 2026-09-08, for the case where it covers *nothing* because there
+#: is no table at all. ``"zero"`` is the only one that means anything there, and saying
+#: it is how a caller declares the shunt negligible rather than merely unmeasured.
+BEYOND_COVERAGE_POLICIES = ("hold", "drop", "zero")
+
+
 @dataclass(frozen=True)
 class ShuntTable:
     """``Y_shunt(f)`` evaluated on one spectrum's frequencies, with its own accounting.
@@ -405,6 +412,11 @@ class ShuntTable:
     what to do with that rather than inherit whichever answer happens to fall out.
     Holding the endpoint is a choice with a cost, so the count of points it was applied
     to travels with the values.
+
+    ``n_held == n_points`` — a :attr:`held_fraction` of exactly 1.0 — is the shape of a
+    spectrum with **no** measured shunt at all, reachable only by declaring
+    ``beyond_coverage="zero"``; see :class:`UnmeasuredFixtureShunt` for why that has to
+    be declared rather than inferred.
     """
 
     y: np.ndarray
@@ -460,8 +472,21 @@ def fixture_admittance(
     ``"zero"``
         Treat the uncovered points as having no fixture shunt. **Only** legitimate when
         the open blank was judged unusable, which is itself positive evidence that the
-        shunt is negligible.
+        shunt is negligible. **It is also the whole-table case**: with no ``G_fixture``
+        at all every point is uncovered, so this is the one policy that still means
+        something, and choosing it is how the absence gets *declared*.
+
+    :raises UnmeasuredFixtureShunt: when *conductance* carries no table and
+        *beyond_coverage* is not ``"zero"``. That combination used to return a shunt of
+        exactly zero reporting ``n_held = 0``, which is indistinguishable from full
+        coverage — see the exception's own docstring for the population this would run
+        silently wrong on.
     """
+    if beyond_coverage not in BEYOND_COVERAGE_POLICIES:
+        # Hoisted out of the interpolation branch: a policy this function does not
+        # understand is an error whether or not there is a table to apply it to.
+        raise ValueError(f"unknown beyond_coverage policy {beyond_coverage!r}")
+
     f = np.asarray(freq_hz, dtype=float)
     y = np.zeros(f.shape, dtype=complex)
     n_held = 0
@@ -480,11 +505,24 @@ def fixture_admittance(
             g = np.where(outside, np.nan, g)
         elif beyond_coverage == "zero":
             g = np.where(outside, 0.0, g)
-        elif beyond_coverage != "hold":
-            raise ValueError(f"unknown beyond_coverage policy {beyond_coverage!r}")
         y = y + g
     elif gf.size:
         raise ValueError("G_fixture freq_hz and G_S differ in length")
+    elif beyond_coverage == "zero":
+        # Declared absent. Every point is beyond a coverage of nothing, so the whole
+        # spectrum is counted as held — `held_fraction` reads 1.0 and the log below
+        # fires, neither of which a genuinely measured shunt can produce.
+        n_held = int(f.size)
+    else:
+        raise UnmeasuredFixtureShunt(
+            "no G_fixture: the fixture shunt would be exactly zero at every frequency "
+            "and the ShuntTable would report full coverage of it. On a blocking cell "
+            "the low-frequency tail is largely the shunt, and Qg is shared across the "
+            "set, so one uncorrected spectrum moves the artifact for all of them. "
+            "Supply a FixtureConductance for this channel, or declare the absence with "
+            "beyond_coverage='zero' — legitimate only when the open blank was judged "
+            "unusable, which is itself evidence the shunt is negligible."
+        )
 
     stray = float(c_stray_F)
     if stray == stray and stray:
@@ -604,6 +642,37 @@ def arc_is_resolved(freq_hz: np.ndarray, z: np.ndarray) -> bool:
 
 class InadmissibleFitSet(ValueError):
     """The fitting set cannot identify the shared parameters. A refusal, not a failure."""
+
+
+class UnmeasuredFixtureShunt(InadmissibleFitSet):
+    """No ``G_fixture`` for this channel, and nobody said the shunt was negligible.
+
+    Raised by :func:`fixture_admittance`, which is 180 lines above this — the module's
+    other refusals sit beside their raisers, and this one cannot, because its base class
+    is declared here. The raise site names it.
+
+    **Why a refusal and not a zero.** Until 2026-09-08 an absent conductance table left
+    ``y`` at its initialised zeros and the function returned normally, reporting
+    ``n_held = 0`` — which is :attr:`ShuntTable.held_fraction` of 0.0, the *same* value a
+    fully covered spectrum reports. "Never measured" was spelled with the token for
+    "measured everywhere" (``SUBAGENT_RULES`` §3.1(a)), and the resulting fit is not
+    merely uncorrected: on a blocking cell the low-frequency tail is largely the shunt,
+    so the optimiser puts the missing admittance somewhere — and ``Qg`` is *shared*, so
+    it lands in the artifact for the whole set.
+
+    **The population makes this urgent rather than tidy.** The live calibration
+    (``eis_calibrations`` id 23, ``mux16``, 2026-09-03) carries ``G_fixture`` — and
+    ``C_stray_F`` — for channels **17-23 and 25 only**, while 3 538 of the corpus's
+    3 872 ``role='sample'`` measurements (91 %) sit on channels that have neither.
+    Wired as it stood, nine of every ten samples would have been fitted against a shunt
+    of exactly zero **and nothing in the result would have said so**, while the
+    remaining 334 got a real one — a systematic split inside a single campaign, in the
+    parameter the design shares.
+
+    The escape is :func:`fixture_admittance`'s ``beyond_coverage="zero"``, which is the
+    same declaration the policy already carried for *partial* coverage: the open blank
+    was judged unusable, which is itself positive evidence the shunt is negligible.
+    """
 
 
 @dataclass(frozen=True)
