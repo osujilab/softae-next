@@ -1758,11 +1758,13 @@ A single nominal thickness applied across a series is a defect, not a simplifica
 principle σ = K_geom / (`k_config_factor` · R) with a factor of 2.
 
 > **The factor ships unarmed (`k_config_verified = false`, factor 1.0), which changes no
-> number.** The symmetry argument predicts exactly 2.00, but the only direct measurement on
-> this rig gives 1.28× and 1.46×, and the derivation is contingent on stripe symmetry and RE
-> centring — neither yet verified on this board. Until it is armed, absolute σ reports as
-> *scale unqualified*; **relative trends are unaffected**, since a constant factor cannot
-> reorder a series. Campaigns ranking formulations are valid now.
+> number.** The symmetry argument predicts exactly 2.00 and the source (overhaul §3.8) states
+> it without hedge — but it is contingent on stripe symmetry and RE centring, which §3.8 says
+> should be verified once and recorded, and nobody has done that on this board. So the factor
+> is unarmed because a check is outstanding, not because a measurement has come back against
+> it. Until it is armed, absolute σ reports as *scale unqualified*; **relative trends are
+> unaffected**, since a constant factor cannot reorder a series. Campaigns ranking
+> formulations are valid now.
 
 #### Arming it takes two checks, and one of them is per sample
 

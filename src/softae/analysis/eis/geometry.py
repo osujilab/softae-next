@@ -79,12 +79,24 @@ CONFIG_FACTORS = {"3-electrode": 2.0, "2-electrode": 1.0, "unverified": 1.0}
 
 #: Shipped default. **Deliberately 1.0, which changes no number.**
 #:
-#: R20 is right that the term must exist and be auditable, but the only direct
-#: measurement in the record does not confirm its value: overhaul §3.8's back-to-back
-#: comparison of the same two films gives ``Z_2el/Z_3el`` = 1.28× and 1.46×, not the
-#: 2.00 the symmetry predicts. The gap is not small enough to be noise and not
-#: consistent enough to be a different constant, and the symmetry result is contingent
-#: on two things nobody has verified on this board — stripe symmetry and RE centring.
+#: R20 is right that the term must exist and be auditable. What has not happened is the
+#: verification the symmetry argument rests on. Overhaul §3.8 states ``K_config_factor
+#: = 2`` without hedge and calls it "contingent only on stripe symmetry and RE centring,
+#: both of which should be verified once and recorded." Neither has been recorded for
+#: this board. The factor therefore ships unarmed because its stated precondition is
+#: outstanding — **not** because any measurement has been shown to contradict it.
+#:
+#: .. note::
+#:    Earlier revisions of this comment cited "§3.8's back-to-back comparison" as
+#:    measuring ``Z_2el/Z_3el`` = 1.28× and 1.46× against the predicted 2.00. Those
+#:    numbers are real arithmetic — a per-channel shorted÷open division of §3.8's own
+#:    ``R_sol`` table (8.09e5/6.33e5 = 1.278, 1.05e6/7.19e5 = 1.460) — but **§3.8 never
+#:    performs that division and never offers it as a test of the symmetry factor.**
+#:    What §3.8 computes from that table is a *cross-channel* "replicate agreement"
+#:    ratio (1.300× shorted, 1.136× open), used to argue three-electrode is the more
+#:    reproducible configuration; §3.10 and R20/R23/R26 then restate ``= 2`` unhedged.
+#:    So 1.28×/1.46× is an unreviewed downstream calculation, not the source's finding,
+#:    and it is not the reason this ships at 1.0.
 #:
 #: So the term ships built, recorded and reported, at the value that leaves every
 #: existing σ untouched. Relative trends — which a constant factor cannot affect —
@@ -124,9 +136,10 @@ class CellConstant:
     #:
     #: Separate from :attr:`electrode_config` on purpose. The configuration is a
     #: wiring fact anyone can read off the board; the *factor* rests on stripe
-    #: symmetry and RE centring, and overhaul §3.8's own measurement (1.28×, 1.46×)
-    #: does not reproduce the predicted 2.00. Folding the two into one flag would let
-    #: "we know it is 3-electrode" silently arm a correction nothing has confirmed.
+    #: symmetry and RE centring, which overhaul §3.8 says "should be verified once and
+    #: recorded" and which nothing on this board has recorded. Folding the two into one
+    #: flag would let "we know it is 3-electrode" silently arm a correction whose own
+    #: stated precondition has never been checked.
     k_config_verified: bool = False
     #: Whether **this sample's** ionic path to the reference stripe was confirmed —
     #: overhaul R26.

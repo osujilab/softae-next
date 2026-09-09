@@ -1116,16 +1116,22 @@ thickness_max_cm = 0.05    # 500 um; above this a "thickness" is a placeholder
 # for the other electrochemical techniques that need it or fit it better). That is a
 # wiring fact and is recorded as one.
 #
-# Recording the configuration does NOT arm the correction. The factor rests on stripe
-# symmetry and RE centring, and the only direct measurement on this rig (overhaul 3.8,
-# same two films back to back) gives Z_2el/Z_3el = 1.28x and 1.46x -- not the 2.00 the
-# symmetry predicts. Neither value is noise, so k_config_verified stays false and
-# k_config_factor stays 1.0, which changes no number.
+# Recording the configuration does NOT arm the correction. Overhaul 3.8 states the
+# factor as 2 without hedge, and calls it contingent "only on stripe symmetry and RE
+# centring, both of which should be verified once and recorded". Neither has been
+# recorded for this board. So k_config_verified stays false and k_config_factor stays
+# 1.0, which changes no number -- an outstanding precondition, NOT a measurement that
+# contradicts the value. (An earlier version of this comment cited "Z_2el/Z_3el = 1.28x
+# and 1.46x" against 2.00. Those numbers are a real per-channel division of 3.8's own
+# R_sol table, but 3.8 never performs that division nor offers it as a test of the
+# factor; what it computes there is a cross-channel replicate-agreement ratio,
+# 1.300x/1.136x, about reproducibility. Do not cite 1.28x/1.46x as the source's finding.)
 #
 # To arm it: measure stripe symmetry and RE centring on the board, then either set
 #     k_config_verified = true          # -> uses 2.0, the symmetry value
-# or pin the measured ratio directly:
-#     k_config_factor   = 1.37          # explicit override wins over both
+# or, if a measurement of the ratio itself exists, pin THAT number here:
+#     k_config_factor   = <measured>    # explicit override wins over both
+# There is no measured ratio to put here yet; the key takes a plain float.
 #
 # Until then absolute sigma reports as "scale unqualified". RELATIVE trends are
 # unaffected either way, the factor being a constant across a series -- so campaigns

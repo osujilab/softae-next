@@ -169,9 +169,10 @@ class TestElectrodeConfigurationFactor:
         return CellConstant(**base)
 
     def test_the_shipped_default_changes_no_number(self):
-        # The doc's symmetry argument says 2.00; the only direct measurement on this
-        # rig (overhaul §3.8) says 1.28x and 1.46x. Neither 2.00 nor noise — so the
-        # term ships built and recorded at the value that moves nothing.
+        # §3.8's symmetry argument says 2.00, unhedged, and makes it contingent on a
+        # stripe-symmetry/RE-centring check that "should be verified once and recorded"
+        # — never recorded for this board. The precondition is outstanding, so the term
+        # ships built and recorded at the value that moves nothing.
         cell = self._cell()
         assert cell.k_config_factor == 1.0
         assert cell.K_per_cm == pytest.approx(cell.K_geometric_per_cm)
@@ -184,9 +185,10 @@ class TestElectrodeConfigurationFactor:
 
     def test_knowing_the_wiring_is_not_the_same_as_verifying_the_factor(self):
         # The rig is permanently 3-electrode, which is a fact anyone can read off the
-        # board. The *factor* rests on stripe symmetry and RE centring, which nobody
-        # has measured — and §3.8's own 1.28x/1.46x does not reproduce the predicted
-        # 2.00. One flag for both would let the wiring fact silently arm a correction.
+        # board. The *factor* rests on stripe symmetry and RE centring, which §3.8 says
+        # should be verified once and recorded and which nobody has recorded here. One
+        # flag for both would let the wiring fact silently arm a correction whose own
+        # stated precondition has never been checked.
         cell = self._cell(electrode_config="3-electrode")
         assert cell.config_declared is True
         assert cell.config_factor_verified is False
