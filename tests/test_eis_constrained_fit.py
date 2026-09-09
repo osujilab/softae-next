@@ -216,7 +216,7 @@ def test_the_order_invariance_check_goes_red_when_the_start_depends_on_order(
     construction, in the same shape the continuation was — and the assertion above must
     then fail.
     """
-    from softae.analysis.eis import constrained_fit as module
+    from softae.analysis.eis.constrained_fit import fit as module
 
     def first_spectrum_start(spectra, shared, tol):
         x0 = [shared[p] for p in SHARED_PARAMS]
@@ -262,7 +262,7 @@ def test_each_spectrums_start_depends_only_on_itself(ladder) -> None:
     the list — a stronger and far cheaper statement than the end-to-end permutation
     test, and the one that says *why* the end-to-end result holds.
     """
-    from softae.analysis.eis import constrained_fit as module
+    from softae.analysis.eis.constrained_fit import fit as module
 
     entry = SHARED_SEED_GRID[0]
     forward = module._stacked_start(ladder, entry, CONSTRAINED_FIT_TOL)
@@ -777,7 +777,7 @@ def test_tolerance_reaches_the_optimiser(monkeypatch) -> None:
     Without this the test above could pass on two runs that both used the default —
     SUBAGENT_RULES §3.1(e).
     """
-    from softae.analysis.eis import constrained_fit as module
+    from softae.analysis.eis.constrained_fit import fit as module
 
     seen: list[float] = []
     real = module.least_squares
@@ -964,8 +964,15 @@ def test_module_is_not_wired_into_any_live_path() -> None:
         return False
 
     src = Path(__file__).resolve().parents[1] / "src" / "softae"
+    # What the ``p.name != "constrained_fit.py"`` exclusion became when the module
+    # became a package: the package's own siblings import each other, and must not read
+    # as importers of it. They do so *relatively* — ``from .model import ...`` — which
+    # the walk above already does not match, so this is belt to that braces; it is here
+    # so that an absolute intra-package import would not silently fail the contract
+    # either. Everything outside the package is scanned exactly as before.
+    pkg = src / "analysis" / "eis" / "constrained_fit"
     importers = [str(p) for p in src.rglob("*.py")
-                 if p.name != "constrained_fit.py" and imports_it(p)]
+                 if not p.is_relative_to(pkg) and imports_it(p)]
     assert importers == [], f"constrained_fit is imported by {importers}"
 
 
@@ -1113,7 +1120,7 @@ def test_answer_key_one_artifact_for_every_order_of_the_same_standards(
     # trusting the shape of the code: `_canonical_order` alone would make even the
     # retired seeding order-free, so a control that patched only the seeding would come
     # back green and prove nothing.
-    from softae.analysis.eis import constrained_fit as module
+    from softae.analysis.eis.constrained_fit import fit as module
 
     def continuation(spectra, shared, tol):
         """``fit_shared``'s start construction as committed at ``f79e463``."""
