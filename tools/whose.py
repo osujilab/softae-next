@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """whose.py — answer "who owns this path?" from a declared map, not by inference.
 
 Three sessions (`parallel-session`, `afl-session`, `eis-acq-session`) share one
