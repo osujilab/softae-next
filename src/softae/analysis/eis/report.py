@@ -53,12 +53,47 @@ from typing import Any
 import numpy as np
 import structlog
 
+from softae.analysis.eis.engine_support import BASIS_SUM_UNQUALIFIED
+
 logger = structlog.get_logger(__name__)
 
 #: Fraction of surviving points above ``Z_φ`` beyond which an unqualified envelope
 #: forces a bound. Half is deliberate: it is the point past which the *typical* point
 #: in the spectrum is untrustworthy, not merely the tail.
 DEFAULT_ABOVE_CEILING_FRAC = 0.5
+
+#: How :meth:`SigmaReport.describe` names each reporting basis, keyed by the token
+#: :func:`~softae.analysis.eis.engine_support._resolve_reported_resistance` returns.
+#:
+#: **A mapping rather than a two-branch conditional, and the reason is a defect this
+#: shape makes unrepeatable.** Until 2026-09-08 the line read
+#: ``"R_series+R_bulk" if R_basis == "sum" else "R_bulk"``, so every basis the test did
+#: not name fell to the ``else`` — and on 2026-09-04 a third basis arrived. A row
+#: reported on :data:`~softae.analysis.eis.engine_support.BASIS_SUM_UNQUALIFIED` is a
+#: **sum**, and the operator was told ``R_bulk``: the string named the *split* for a
+#: measurement that is the *chain*, with no hint that the two had been confused. Any
+#: consumer reading ``describe()`` — the analysis tab, a browse dialog, a pasted line in
+#: a lab notebook — would have read a partition that was never determined.
+#:
+#: **The default for an unrecognised key is deliberately not a basis name.** An
+#: unrecognised token means the renderer has fallen behind its producer, which is
+#: exactly what happened here, and ``SUBAGENT_RULES`` §3.1(a) is that "unknown" must not
+#: be spelled with the token for a specific checked claim.
+#:
+#: ``"(unqualified)"`` borrows :attr:`SigmaReport.mode`'s own idiom — the same word
+#: ``"bound_unqualified"`` uses, for the same reason: the claim stands, the evidence
+#: that would qualify it does not. Here that evidence is a covariance, so there is no
+#: ρ with which to judge the split and no standard error to propagate; the sum is still
+#: the DC resistance of the chain by arithmetic, which is what licenses reporting it.
+#:
+#: **Blast radius is zero on the shipped configuration and this is still not cosmetic.**
+#: ``[eis] engine = "legacy"`` and ``_legacy_report`` hardcodes ``"split_bulk"``, so no
+#: stored row has ever carried the third basis. It goes live with the E6 flip.
+BASIS_TEXT = {
+    "split_bulk": "R_bulk",
+    "sum": "R_series+R_bulk",
+    BASIS_SUM_UNQUALIFIED: "R_series+R_bulk (unqualified)",
+}
 
 
 @dataclass(frozen=True)
@@ -73,7 +108,10 @@ class SigmaReport:
 
     R_reported_ohm: float = float("nan")
     R_reported_se_ohm: float = float("nan")
-    R_basis: str = "split_bulk"       # "sum" | "split_bulk"
+    #: Which resistance :attr:`R_reported_ohm` is — the keys of :data:`BASIS_TEXT`,
+    #: which is also what renders it. ``_resolve_reported_resistance`` is the only
+    #: production producer of anything but the default.
+    R_basis: str = "split_bulk"       # "split_bulk" | "sum" | "sum_unqualified"
     rho: float = float("nan")
 
     K_per_cm: float = float("nan")
@@ -118,7 +156,7 @@ class SigmaReport:
         return f"{self.value:.3g} S/cm{unc}{tag}"
 
     def describe(self) -> str:
-        basis = "R_series+R_bulk" if self.R_basis == "sum" else "R_bulk"
+        basis = BASIS_TEXT.get(self.R_basis, f"unrecognised basis {self.R_basis!r}")
         if self.config_factor_verified:
             cfg = f", {self.electrode_config} ÷{self.k_config_factor:g}"
         else:

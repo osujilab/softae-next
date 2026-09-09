@@ -96,9 +96,23 @@ class TestTheRolePredicate:
     def test_an_unrecognised_role_is_not_treated_as_a_sample(self):
         """An allow-list, because "undeclared" must not be spelled "checked and clean".
 
-        ``reference_r_misplaced_lead`` is a live DataStore role — four rows — that is
-        not in ``MEASUREMENT_ROLES``. An exemption list would have narrowed those
-        reference resistors against a window derived from their own siblings.
+        **The predicate reads** ``SAMPLE_ROLES``, **not** ``MEASUREMENT_ROLES``, and
+        that is the whole reason this holds: ``SAMPLE_ROLES`` is
+        ``{"sample", "drift_repeat"}``, so anything else is excluded by not being a
+        sample — whether or not the rest of the pipeline has heard of it.
+
+        ``reference_r_misplaced_lead`` is the case that makes the difference visible. It
+        is a live DataStore role — four rows, the quarantined misplaced-lead attempt at
+        ids 3892-3895 — and it was in **neither** tuple when this test was written. It
+        joined ``MEASUREMENT_ROLES`` at ``5ad5884`` and this assertion did not move,
+        because membership there was never what made it ``False``. An earlier docstring
+        said it was, which would have licensed a future reader to delete the assertion
+        the moment the role was declared.
+
+        The inversion is what the allow-list buys: an exemption *list* would have to
+        name every non-sample role in advance, so an undeclared one falls through and
+        those reference resistors get narrowed against a window derived from their own
+        siblings.
         """
         assert not magnitude_window_applies("reference_r_misplaced_lead")
         assert not magnitude_window_applies("")

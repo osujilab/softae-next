@@ -16,12 +16,15 @@ import pytest
 
 pytest.importorskip("impedance")
 
+from softae.analysis.circuit_fitting import FitResult  # noqa: E402
 from softae.analysis.eis.engine import _resolve_reported_resistance  # noqa: E402
+from softae.analysis.eis.engine_support import BASIS_SUM_UNQUALIFIED  # noqa: E402
 from softae.analysis.eis.fitter import (  # noqa: E402
     FitCovariance,
     fit_spectrum,
     fit_with_covariance,
 )
+from softae.analysis.eis.report import BASIS_TEXT, SigmaReport  # noqa: E402
 from tests.eis_synthetic import (  # noqa: E402
     DEFAULT_C_PAR,
     DEFAULT_CPE_N,
@@ -232,7 +235,16 @@ class TestPeggedAgainstTheBoundsProductionActuallyBuilds:
 
 
 class TestSumVersusSplitIsBehavioural:
-    """R2: the pipeline selects, the analyst is never handed the choice."""
+    """R2: the pipeline selects, the analyst is never handed the choice.
+
+    **The no-covariance branch is deliberately not here.** It lives in
+    ``tests/test_eis_engine_support.py::TestNoCovarianceReportsTheSum``, which injects a
+    real :class:`~softae.analysis.circuit_fitting.FitResult`. A duplicate of it stood in
+    this class until 2026-09-08 asserting the *retired* behaviour — a fall back to the
+    split — and stayed green only because its duck-typed stand-in had no ``R0``
+    attribute for the sum to be formed from, which no production fit lacks
+    (``SUBAGENT_RULES`` §3.1(e)).
+    """
 
     def _fit(self, R_bulk: float, guess):
         f, Z = reference_spectrum(R_bulk=R_bulk, noise_pct=1.0, seed=3)
@@ -263,15 +275,82 @@ class TestSumVersusSplitIsBehavioural:
         _, _, basis, _ = _resolve_reported_resistance(_Fit(), rho_degenerate=-0.95)
         assert basis == "sum"
 
-    def test_a_fit_without_covariance_falls_back_to_the_split_as_the_legacy_path_does(self):
-        class _Fit:
-            model_name = "simpleSalt"
-            R1 = 1234.0
-            covariance = None
 
-        R, se, basis, rho = _resolve_reported_resistance(_Fit(), rho_degenerate=-0.95)
-        assert (R, basis) == (1234.0, "split_bulk")
-        assert np.isnan(se) and np.isnan(rho)
+class TestTheReportedBasisIsRenderedForTheOperator:
+    """The seam between the basis a fit is reported on and the sentence saying so.
+
+    Tested together because the defect lived exactly in the join: on 2026-09-04
+    :func:`_resolve_reported_resistance` gained a third basis, and
+    :meth:`~softae.analysis.eis.report.SigmaReport.describe` still tested
+    ``R_basis == "sum"`` exactly — so the new one fell to an ``else`` that named the
+    **split** for a measurement that is the **chain**. Nothing was red: the producer's
+    tests never render, and the renderer had no tests at all.
+    """
+
+    @staticmethod
+    def _line(basis: str, R: float = 9547.0) -> str:
+        return SigmaReport(mode="value", value=1.2e-4, rel_uncertainty=0.08,
+                           R_reported_ohm=R, R_basis=basis,
+                           K_per_cm=12.3).describe()
+
+    @classmethod
+    def _rendered_basis(cls, basis: str) -> str:
+        """Just the basis name, sliced out of the whole operator line."""
+        return cls._line(basis).split(" from ", 1)[1].split(" = ", 1)[0]
+
+    def test_the_split_is_named_the_bulk_resistance(self):
+        assert self._rendered_basis("split_bulk") == "R_bulk"
+
+    def test_the_rho_decided_sum_is_named_the_series_chain(self):
+        assert self._rendered_basis("sum") == "R_series+R_bulk"
+
+    def test_the_unqualified_sum_is_named_a_sum_and_not_the_split(self):
+        """The defect, pinned on the concrete string rather than on it having moved."""
+        assert (self._rendered_basis(BASIS_SUM_UNQUALIFIED)
+                == "R_series+R_bulk (unqualified)")
+        assert "from R_bulk" not in self._line(BASIS_SUM_UNQUALIFIED)
+
+    def test_the_two_sums_stay_distinguishable_in_the_operator_string(self):
+        # A sum with a propagated SE and a real rho is a different claim from a sum with
+        # neither, and a reader who cannot tell them apart reads "nothing was measured"
+        # as "measured and degenerate". Both concrete, so this cannot pass by both
+        # rendering as the split.
+        assert self._rendered_basis("sum") == "R_series+R_bulk"
+        assert (self._rendered_basis(BASIS_SUM_UNQUALIFIED)
+                == "R_series+R_bulk (unqualified)")
+
+    def test_an_unrecognised_basis_is_not_silently_named_the_split(self):
+        """``SUBAGENT_RULES`` §3.1(a): a renderer that has fallen behind its producer
+        must say so, not answer with whichever basis happens to be the ``else``."""
+        rendered = self._rendered_basis("basis_from_the_future")
+        assert rendered == "unrecognised basis 'basis_from_the_future'"
+        assert rendered != "R_bulk"
+
+    def test_the_renderer_keys_off_the_producers_own_constant(self):
+        """Not a re-spelled literal — the drift this whole item is about."""
+        from softae.analysis.eis import report
+
+        assert report.BASIS_SUM_UNQUALIFIED is BASIS_SUM_UNQUALIFIED
+        assert set(BASIS_TEXT) == {"split_bulk", "sum", BASIS_SUM_UNQUALIFIED}
+
+    def test_a_production_no_covariance_fit_reaches_the_operator_as_a_sum(self):
+        """``SUBAGENT_RULES`` §3.2 — the branch composed end to end on the shape real
+        data has, not on a fixture chosen to reach it.
+
+        ``fit_circuit`` fits through ``impedance``'s ``CustomCircuit``, which discards
+        ``pcov``, so every fit it returns arrives here with ``covariance=None``. The
+        value and the name are asserted in one string so a sum cannot be reported under
+        the split's label again without this failing.
+        """
+        fit = FitResult(model_name="simpleSalt",
+                        parameters=np.array([658.0, 1e-7, 0.7, 8889.0, 1e-10]),
+                        R0=658.0, R1=8889.0, R0_guess=100.0, R1_guess=1.0e4,
+                        z_indices=[0, 3], success=True, covariance=None)
+
+        R, se, basis, rho = _resolve_reported_resistance(fit, rho_degenerate=-0.95)
+        assert basis == BASIS_SUM_UNQUALIFIED
+        assert R == pytest.approx(658.0 + 8889.0)
+        assert "from R_series+R_bulk (unqualified) = 9547 " in self._line(basis, R)
 
 
 class TestFitSpectrumShape:

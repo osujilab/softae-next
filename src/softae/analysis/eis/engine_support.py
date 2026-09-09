@@ -250,21 +250,29 @@ def _as_eis(eis_result: Any, freq: np.ndarray, Z: np.ndarray, mask: np.ndarray) 
 #: :attr:`SigmaReport.mode`'s own idiom (``"bound_unqualified"``): the claim, standing
 #: without the evidence that would qualify it.
 #:
-#: .. warning::
-#:    **Two consumers outside this module test the basis with ``== "sum"`` exactly and
-#:    do not yet know this value.** Both were left alone deliberately — they are held
-#:    under other claims — and both are one line:
+#: .. note::
+#:    **Both consumers outside this module that tested the basis with ``== "sum"``
+#:    exactly now know this value.** They were the flip-preconditions for the constant,
+#:    and each was one line; the record is kept here because neither site shows why it
+#:    has to distinguish the two sums:
 #:
-#:    * ``report.py:121`` (:meth:`SigmaReport.describe`) renders any unrecognised basis
-#:      as ``"R_bulk"``, so an operator-facing string would name the split for a sum;
-#:    * ``data_store.py:751`` populates ``fit_results.R_sum_ohm`` only for ``"sum"``, so
-#:      a row reported on this basis stores ``NULL`` there.
+#:    * :meth:`~softae.analysis.eis.report.SigmaReport.describe` used to render any
+#:      unrecognised basis as ``"R_bulk"``, so an operator-facing string named the split
+#:      for a sum. It now renders from :data:`~softae.analysis.eis.report.BASIS_TEXT`,
+#:      keyed by this constant imported from here rather than by a re-spelled literal.
+#:      Closed in Wave 3A.
+#:    * ``_fit_report_columns`` in :mod:`softae.core.data_store` populated
+#:      ``fit_results.R_sum_ohm`` for ``"sum"`` only, so a row reported on this basis
+#:      stored ``NULL`` there — the harder of the two to notice later, because nothing
+#:      marks a ``NULL`` as *absent* rather than as *split*. Closed in ``5ad5884``; it
+#:      spells the literal rather than importing it, pinned by a test that asserts the
+#:      spelling still matches this constant.
 #:
-#:    Blast radius today is **zero on the shipped engine**: ``[eis] engine = "legacy"``
-#:    and ``_legacy_report`` never calls this function. Both sites must move before
-#:    ``engine = "gated"``, and before any shadow-rehearsal output is cited on the basis
-#:    column — a stored ``NULL`` ``R_sum_ohm`` beside a sum-reported σ is the harder of
-#:    the two to notice later, because nothing marks it as absent rather than as split.
+#:    Blast radius was **zero on the shipped engine** throughout, and still is: ``[eis]
+#:    engine = "legacy"`` and ``_legacy_report`` never calls this function, so no stored
+#:    row has ever carried this basis. That is what let the two fixes land separately —
+#:    not what made them optional. It stops being true at the ``engine = "gated"`` flip,
+#:    from which point shadow-rehearsal output may be cited on the basis column.
 BASIS_SUM_UNQUALIFIED = "sum_unqualified"
 
 
