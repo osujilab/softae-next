@@ -92,9 +92,17 @@ EXIT_NOT_A_SHADOW_RUN = 2
 
 #: Events only the gated engine can emit.  Their presence is the proof the flip took;
 #: their absence means the log is from a legacy run whatever the config says now.
+#:
+#: ``eis_split_unqualified`` belongs here for the same reason ``eis_split_degenerate``
+#: does, by the *opposite* half of one branch: only the covariance-preserving gated
+#: fitter can report that a covariance is **absent**, because legacy has no covariance
+#: concept with which to notice an absence.  A log carrying only that event — a run
+#: whose every fit came back without covariance, so no split was ever ρ-judged — is
+#: still a gated run, and was read as a legacy one until it was added.
 GATED_ONLY_EVENTS = frozenset({
     "eis_gate_would_reject", "eis_gate_rejected", "eis_gate_points_dropped",
     "eis_gate_suspect", "eis_gate_raised", "eis_split_degenerate",
+    "eis_split_unqualified",
     "eis_correction_skipped", "eis_fit_not_admitted", "eis_spectrum_metrics",
     "objective_declined_bound", "objective_rejected_by_gates",
 })

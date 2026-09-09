@@ -68,6 +68,16 @@ QUALITY_WOULD_REJECT = (
     "2026-08-10 14:47:55 [warning  ] quality_gate_would_reject      "
     "issues=['only 4 points survived'] metrics={'n_points': 4.0} "
     "msg='gate disabled — measurement used despite failing checks'")
+#: Copied verbatim from a rehearsal log (``logs/rehearsal_20260909T012005Z.log``), which
+#: is where this event was first seen in the wild. ``engine_support`` logs it whenever a
+#: fit arrives with no covariance and the sum ``R_series + R_bulk`` is therefore reported
+#: unqualified instead of ρ-resolved — an *absence* only the gated fitter can report.
+SPLIT_UNQUALIFIED = (
+    "2026-09-09 01:20:32 [info     ] eis_split_unqualified          "
+    "msg='no covariance — no rho with which to judge the split; "
+    "reporting R_series+R_bulk' r_bulk_ohm=35278.56910783953 "
+    "r_series_ohm=2254.245175504921 r_sum_ohm=37532.81428334445"
+)
 CLI_PRINT = "  [3] -> 1.234e+05"
 LEGACY_RUN = [ROUTED.format(ch=1), SHADOW_SIGMA, CLI_PRINT]
 
@@ -176,6 +186,15 @@ class TestWouldRejectCounting:
 class TestEngineEvidence:
     def test_gated_events_are_the_proof_the_flip_took(self):
         assert summarize(one_rejected_spectrum(1)).is_shadow_run is True
+
+    def test_an_unqualified_split_alone_is_gated_engine_evidence(self):
+        # A run whose every fit came back WITHOUT covariance logs no ρ verdict, no
+        # eis_split_degenerate and — if nothing else tripped — no gate event either.
+        # Only the gated fitter can report a covariance's absence at all, so the one
+        # event it does emit has to count, or such a log reviews as legacy and exits 2.
+        rv = summarize([ROUTED.format(ch=1), SPLIT_UNQUALIFIED])
+        assert rv.is_shadow_run is True
+        assert rv.n_gated_events == 1
 
     def test_a_legacy_log_is_not_a_shadow_run_however_it_is_labelled(self):
         # eis_objective_shadow fires under BOTH engines — the σ path runs either way —
