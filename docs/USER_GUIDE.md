@@ -1446,7 +1446,7 @@ chore.
 
 ```bash
 softae-commission status                                    # what is calibrated, what is next
-softae-commission run blank_short --channels 1-32 --fixture mux16 --yes
+softae-commission run blank_short --channels 1-32 --fixture mux16 --electrode-mode two --yes
 softae-commission derive --fixture mux16                    # spectra → calibration → TOML
 softae-commission history --fixture mux16                   # successive sets = drift
 ```
