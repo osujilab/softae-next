@@ -4,10 +4,19 @@ Two routes behind two independent flags, and the distinction between them is the
 subject of this file:
 
 ``budget_cap`` (A)
-    Bounds how long the **same** estimator may run. It cannot move a reported number,
-    and that is provable rather than hopeful: a bounded run is a strict *prefix* of the
-    unbounded one's trajectory, so a fit that was going to exhaust 20 000 evaluations
-    exhausts 2 000 instead, declines identically, and falls back identically.
+    Bounds how long the **same** estimator may run. A bounded run is a strict *prefix*
+    of the unbounded one's trajectory, so a fit that was going to exhaust the general
+    ceiling exhausts ``[eis.pregate] max_nfev`` instead, declines identically, and falls
+    back identically.
+
+    **The "cannot move a reported number" half of that is now an assumption, not a
+    proof, and this file should not be read as certifying it.** It was measured against
+    a general ceiling of 20 000; that ceiling is 64 000 as of 2026-09-10, and on the
+    *general* population 17 of 17 fits that exhausted 20 000 were then shown to converge
+    given room. Whether the blocking-open population still fails to converge at the
+    higher ceiling has not been re-measured. The prefix argument survives; the empirical
+    claim that exhaustion is inevitable here does not, and it is the second one the
+    equality depends on.
 ``two_point_open`` (B)
     Changes **which** estimator produces ``R1`` on the open population, and therefore
     changes the number. Operator-authorized, epoch-grade (schema epoch 5), labelled on
@@ -24,6 +33,7 @@ has its leverage. Every spectrum still produces an ``R1``.
 from __future__ import annotations
 
 import ast
+import contextlib
 import inspect
 import tomllib
 from pathlib import Path
@@ -42,6 +52,34 @@ from softae.analysis.eis.engine_support import (
 from softae.analysis.eis.geometry import CellConstant
 from softae.analysis.eis.settings import EISSettings, GateSettings
 from tests.eis_synthetic import as_eis_result, reference_spectrum
+
+
+@contextlib.contextmanager
+def pinned_general_ceiling(nfev: int):
+    """Run the general-population fitter on *nfev* instead of the shipped ceiling.
+
+    **A test's runtime should not track a production knob.** Several tests here drive
+    ``analyze_spectrum`` on a deliberately non-converging spectrum with no caller
+    budget, so they inherit :data:`~softae.analysis.eis.fitter.DEFAULT_MAX_NFEV` and get
+    slower every time anyone tunes it. Raising it 20 000 → 64 000 on 2026-09-10 tripled
+    two of them (29.7 s → 95.9 s and 16.4 s → 49.6 s, against a ceiling ratio of 3.2×),
+    and that cost lands on every future tier-3 run — the gate the raise exists to keep
+    affordable.
+
+    **Use this only where the budget is not the subject.** It is not a general speed-up:
+    a test whose point is *what the shipped ceiling does* must keep paying for it, or it
+    stops testing the shipped configuration. ``TestBudgetCapBoundsEffortWithoutMovingA
+    Number.test_a_capped_spectrum_reports_the_same_r1_as_an_uncapped_one`` is exactly
+    that case and deliberately does **not** use this.
+    """
+    import softae.analysis.eis.fitter as fitter_mod
+
+    real = fitter_mod.general_max_nfev
+    fitter_mod.general_max_nfev = lambda *_a, **_k: int(nfev)
+    try:
+        yield
+    finally:
+        fitter_mod.general_max_nfev = real
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -317,6 +355,17 @@ class TestBudgetCapBoundsEffortWithoutMovingANumber:
         — 0.000e+00 worst relative difference — because the capped fit declines exactly
         where the uncapped one did and both then take the same fallback. Here the same
         equality is asserted end to end rather than inside the fitter.
+
+        **This test deliberately pays the shipped ceiling and must not be decoupled with
+        :func:`pinned_general_ceiling`.** Its ``off`` arm is the *uncapped control*, and
+        "uncapped" has to mean what production means by it. The premise the equality
+        rests on — that this spectrum exhausts its budget either way and both arms then
+        report the same legacy number — is **budget-dependent**: measured 2026-09-10, 17
+        of 17 spectra that exhausted 20 000 converge when given 500 000, so a high enough
+        ceiling turns exhaustion into convergence and this equality could genuinely
+        break. That is precisely what the test should catch. Shrinking the control to
+        make it fast would pin the property at a budget production never uses — sound,
+        and never reached by real data — so the cost is the price of the check.
         """
         eis = as_eis_result(*blocking_tail())
         off = analyze_spectrum(eis, cell=CELL, settings=_gated(),
@@ -385,14 +434,26 @@ class TestTwoPointReadIsAClosedFormCircle:
         assert _two_point_fit(as_eis_result(f, Z), "simpleSalt") is None
 
     def test_a_declining_read_leaves_the_ordinary_route_in_charge(self):
-        """A decline may never cost a spectrum its fit — it falls through, silently."""
+        """A decline may never cost a spectrum its fit — it falls through, silently.
+
+        The budget is **not** this test's subject, so it is pinned rather than inherited
+        (see :func:`pinned_general_ceiling`). What is asserted is a comparison *between
+        the two arms* — same spectrum, same route, one with (B) armed and declining —
+        and that comparison holds at any budget the two share. Both arms still exhaust
+        and still fall through to the ordinary route, which is the behaviour under test;
+        only the size of the bill changes.
+        """
         eis = as_eis_result(*blocking_tail())
-        off = analyze_spectrum(eis, cell=CELL, settings=_gated(),
-                               pregate=PregateSettings())
-        armed = analyze_spectrum(eis, cell=CELL, settings=_gated(),
-                                 pregate=PregateSettings(two_point_open=True))
+        with pinned_general_ceiling(2_000):
+            off = analyze_spectrum(eis, cell=CELL, settings=_gated(),
+                                   pregate=PregateSettings())
+            armed = analyze_spectrum(eis, cell=CELL, settings=_gated(),
+                                     pregate=PregateSettings(two_point_open=True))
         assert getattr(armed.fit, "estimator", None) is None
         assert np.isnan(off.fit.R1) == np.isnan(armed.fit.R1)
+        # Anti-vacuity: the pinned budget must still leave a fit object on both arms,
+        # or "the ordinary route is in charge" would pass on two absences.
+        assert off.fit is not None and armed.fit is not None
 
 
 class TestClosedArcsAreUntouched:

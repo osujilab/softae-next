@@ -518,3 +518,135 @@ class TestPerQuestionIdentifiability:
         assert cov.supports("nope") is False
         assert cov.sum_determined("R0", "nope") is False
         assert cov.split_identifiable("nope", "R1") is False
+
+
+class TestTheGeneralPopulationCeiling:
+    """``max_nfev=None`` is a *ceiling*, resolved once in the callee, and configurable.
+
+    The pre-gate's cap governs the blocking-open population only; everything else ran
+    at the module default. These pin the three properties that make that default a
+    deliberate runaway net rather than an accident: it is resolved in one place, a
+    caller's own budget still wins, and a capped run agrees bitwise with an uncapped one
+    on a fit that converges inside both.
+    """
+
+    def test_no_caller_budget_resolves_to_the_configured_ceiling(self):
+        from softae.analysis.eis import fitter as fitter_mod
+
+        seen: list[int | None] = []
+        real = fitter_mod.general_max_nfev
+
+        def spy():
+            seen.append(1234)
+            return 1234
+
+        fitter_mod.general_max_nfev = spy
+        try:
+            f, Z = reference_spectrum()
+            fit_with_covariance(f, Z, CIRCUIT, GUESS)
+        finally:
+            fitter_mod.general_max_nfev = real
+        assert seen == [1234], "the ceiling must be resolved exactly once, in the callee"
+
+    def test_a_caller_budget_wins_and_the_config_is_not_consulted(self):
+        from softae.analysis.eis import fitter as fitter_mod
+
+        called: list[int] = []
+        real = fitter_mod.general_max_nfev
+        fitter_mod.general_max_nfev = lambda: called.append(1) or 20_000
+        try:
+            f, Z = reference_spectrum()
+            fit_with_covariance(f, Z, CIRCUIT, GUESS, max_nfev=40)
+        finally:
+            fitter_mod.general_max_nfev = real
+        assert called == []
+
+    def test_the_ceiling_reads_its_config_key(self):
+        from softae.analysis.eis.fitter import general_max_nfev
+
+        assert general_max_nfev({"fit_max_nfev": 7777}) == 7777
+
+    @pytest.mark.parametrize("bad", [{}, {"fit_max_nfev": "many"},
+                                     {"fit_max_nfev": 0}, {"fit_max_nfev": -5},
+                                     {"fit_max_nfev": None}])
+    def test_a_missing_or_unusable_value_falls_back_to_the_documented_default(self, bad):
+        """Same posture as every other EIS settings reader: a typo changes nothing."""
+        from softae.analysis.eis.fitter import DEFAULT_MAX_NFEV, general_max_nfev
+
+        assert general_max_nfev(bad) == DEFAULT_MAX_NFEV
+
+    def test_the_shipped_ceiling_is_64000_and_clears_the_measured_converging_cluster(
+            self):
+        """Pins the value AND the reason, because the number alone reads as arbitrary.
+
+        64 000 is not a round guess; it sits in the gap measured on 2026-09-10 between
+        two clusters of *converging* ``nfev`` over a seeded 600-spectrum sample:
+
+            ... 45 586 · 52 244 · 53 843  ‖  115 781 · 205 673 · 216 955 · 426 217
+
+        Twelve of the seventeen fits the old 20 000 ceiling was truncating converge at
+        or below 53 843 and are captured. The five past the gap keep falling back to the
+        legacy fitter exactly as they do today — no regression — and they are also the
+        least trustworthy of the set: measurement 596 spends 216 955 evaluations to
+        reach ``R1 = 1.885e10`` Ω, 130× above this fixture's phase-verified |Z| ceiling.
+
+        The bound on the other side is wall clock, not safety: at the slowest measured
+        rate (997 residual evaluations/s) 64 000 is ~58 s, inside the operator's ~60 s
+        per-spectrum limit, where 500 000 would be ~387 s.
+
+        **And the thing most worth not re-learning: this ceiling stops nothing.** 17 of
+        17 truncated fits converge given 500 000; no runaway was found. It is a latency
+        dial. The "3 of 4 are genuine runaways" claim it replaced was an artifact of a
+        200 000 probe ceiling — four of the seventeen need more than 200 000 and all
+        four converge.
+        """
+        from softae.analysis.eis.fitter import DEFAULT_MAX_NFEV
+
+        assert DEFAULT_MAX_NFEV == 64_000
+        # The two properties the number has to have, spelled as inequalities so a future
+        # edit that keeps the constant but breaks the reasoning still fails here.
+        assert DEFAULT_MAX_NFEV > 53_843, (
+            "the ceiling must clear the largest converging nfev in the captured cluster"
+        )
+        assert DEFAULT_MAX_NFEV < 115_781, (
+            "the ceiling must stay below the expensive/out-of-envelope cluster, whose "
+            "cost is what the ~60 s per-spectrum bound refuses"
+        )
+
+    def test_the_ceiling_is_not_restated_in_the_shipped_config(self):
+        """One number, one home — the mechanism decision, made explicit.
+
+        ``general_max_nfev`` promises that *absence and the documented default are the
+        same number*. Adding ``[eis] fit_max_nfev`` to ``softae_config.toml`` would make
+        a second copy that nothing reconciles, and a drifted pair is a config file that
+        looks authoritative while the code disagrees. The key stays available as an
+        operator override; it is simply not shipped with a value.
+        """
+        from softae.config import loader
+
+        assert "fit_max_nfev" not in (loader.load().get("eis", {}) or {})
+
+    def test_a_ceiling_above_what_a_converging_fit_needs_changes_nothing(self):
+        """The property that makes this a net and not a truncation, asserted bitwise.
+
+        The synthetic fit converges in 1 156 residual evaluations (measured), so a
+        ceiling anywhere above that must return the *identical* parameter vector and
+        covariance — not merely a close one.
+        """
+        f, Z = reference_spectrum()
+        uncapped = fit_with_covariance(f, Z, CIRCUIT, GUESS, max_nfev=20_000)
+        capped = fit_with_covariance(f, Z, CIRCUIT, GUESS, max_nfev=2_000)
+        assert uncapped is not None and capped is not None
+        assert capped.values.tobytes() == uncapped.values.tobytes()
+        assert capped.pcov.tobytes() == uncapped.pcov.tobytes()
+
+    def test_a_ceiling_below_what_the_fit_needs_truncates_rather_than_agreeing(self):
+        """POSITIVE CONTROL for the test above.
+
+        Without it, "capped == uncapped" would pass just as well if the cap were being
+        dropped on the floor and never reaching the optimiser (SUBAGENT_RULES §3.1(e)).
+        A ceiling of 20 must visibly refuse.
+        """
+        f, Z = reference_spectrum()
+        starved = fit_with_covariance(f, Z, CIRCUIT, GUESS, max_nfev=20)
+        assert starved is None

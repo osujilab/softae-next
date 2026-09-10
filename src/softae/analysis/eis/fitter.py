@@ -61,9 +61,110 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-#: Iteration ceiling. Generous — a failure to converge should be reported as one,
-#: not manufactured by a budget too small for a five-parameter fit.
-DEFAULT_MAX_NFEV = 20_000
+#: Residual-evaluation ceiling for a fit whose caller names no budget of its own — the
+#: **general population**, everything outside the pre-gate's blocking-open route.
+#:
+#: **THIS IS A LATENCY DIAL, NOT A SAFETY GUARD, and that is the correction that
+#: matters most on this line.** Every previous version of this comment — and the
+#: ``[eis.pregate] max_nfev`` comment that still cites it — described the ceiling as a
+#: net that stops runaways. **No runaway has ever been found.** Re-measured 2026-09-10:
+#: all **17 of 17** spectra that exhausted the old 20 000 ceiling **converge** when given
+#: 500 000. Not one is a runaway. The ceiling has nothing to catch; what it actually
+#: decides is how long the slowest spectrum is allowed to take.
+#:
+#: **The "3 of 4 are genuine runaways" note that stood here until 2026-09-10 was an
+#: artifact of its own probe ceiling.** That measurement re-ran four exhausting fits at
+#: 200 000 and called the three that exhausted *again* runaways. Four of the seventeen
+#: measured since need **more than 200 000** — 205 673, 216 955, 283 793 and 426 217 —
+#: and every one of them converges. A probe ceiling cannot distinguish "diverges" from
+#: "needs more than I gave it", and reporting the first when you measured the second is
+#: how a latency knob acquires a safety story it never earned.
+#:
+#: MEASURED 2026-09-09/10, read-only, over a seeded sample of **600 spectra of the 3 752
+#: resolvable** (of 3 771 measurements carrying an ``eis_file_path``; 3 897 measurements
+#: in the store), driven through :func:`~softae.analysis.eis.engine.analyze_spectrum`
+#: with the shipped config — so the population is ``surviving``, the gate-corrected trace
+#: this function actually receives, not the raw stored one. **404** of the resulting
+#: ``least_squares`` calls carried no caller budget and so reached this ceiling:
+#:
+#: ============================= ==========
+#: converging fits (387 of 404)   ``nfev``
+#: ============================= ==========
+#: min                                   18
+#: median                                58
+#: p75                                  207
+#: p90                                  659
+#: p95                                1 618
+#: p99                               10 268
+#: max **within 20 000**             18 242
+#: ============================= ==========
+#:
+#: The other **17 (4.2 % of general-population fits, 2.8 % of the sample)** exhausted
+#: 20 000 and were re-run at 500 000. Their true converging ``nfev``:
+#:
+#:   23 789 · 25 400 · 29 398 · 33 410 · 35 929 · 37 461 · 41 807 · 42 698 · 42 924 ·
+#:   45 586 · 52 244 · 53 843 ‖ 115 781 · 205 673 · 216 955 · 283 793 · 426 217
+#:
+#: **64 000 sits at that gap**, and was chosen over 500 000 for three reasons:
+#:
+#: * **The expensive tail and the dubious tail are the same tail.** The five past the
+#:   ‖ are the least trustworthy of the set. Measurement 596 needs 216 955 evaluations
+#:   to converge on ``R1 = 1.885e10`` Ω — **130× above the phase-verified |Z| ceiling of
+#:   1.4456e8** in ``calibration/eis/mux16.toml``, i.e. not an impedance this instrument
+#:   can measure. Spending four more minutes to reach a number outside the envelope buys
+#:   nothing.
+#: * **No regression.** Those five keep exhausting and keep falling back to the legacy
+#:   fitter, reporting exactly the ``R1`` they report today. The change is strictly an
+#:   addition: 12 spectra gain their converged value, none loses anything.
+#: * **Cost is bounded and stated.** 1.52× corpus analysis time (688 s → 1 047 s over
+#:   600 spectra), worst single spectrum **58.2 s** against the operator's ~60 s bound.
+#:   Measured rate is 997–1717 residual evaluations/s (median 1 384, n = 208), so 64 000
+#:   is ~58 s at the slowest rate observed and ~46 s at the median.
+#:
+#: **This changes published numbers, and the direction is not validated.** 12 of the 17
+#: report a different ``R1``; 12 of the 13 numeric-to-numeric changes exceed 2×, the
+#: extremes being 48× down (1605) and 24× up (2016). Three spectra that report NaN today
+#: (367, 369, 2261) gain a number. *Converged is not the same claim as correct* — nothing
+#: here checks the converged value against ground truth, and the standing finding that
+#: this engine is anti-correlated with accuracy on real spectra is untouched by it.
+#:
+#: The larger lever is elsewhere: 79.4 % of all residual evaluations over the sample are
+#: finite-difference Jacobian columns (``jac='2-point'``, ``n_params = 5``), not optimiser
+#: steps. An analytic Jacobian was declined by the operator on risk grounds — a wrong one
+#: degrades fits silently — and is recorded here as considered, not as pending.
+DEFAULT_MAX_NFEV = 64_000
+
+#: ``[eis] fit_max_nfev`` — the config key for :data:`DEFAULT_MAX_NFEV`.
+_MAX_NFEV_KEY = "fit_max_nfev"
+
+
+def general_max_nfev(config: Mapping[str, Any] | None = None) -> int:
+    """The general-population ceiling, from ``[eis] fit_max_nfev``.
+
+    Absent or unparseable falls back to :data:`DEFAULT_MAX_NFEV` — the posture every
+    other EIS settings reader takes (:func:`~softae.analysis.eis.settings.eis_settings`,
+    :func:`~softae.analysis.eis.engine_support.pregate_settings`): a typo in a config
+    file must leave the engine on the route it takes today rather than stopping a
+    campaign. The key is deliberately **not** in the shipped ``softae_config.toml``;
+    its absence and its documented default are the same number.
+    """
+    if config is None:
+        try:
+            from softae.config import loader
+
+            config = loader.load().get("eis", {}) or {}
+        except Exception:      # noqa: BLE001 - an unreadable config must not stop a fit
+            config = {}
+    try:
+        value = int(config.get(_MAX_NFEV_KEY, DEFAULT_MAX_NFEV))
+    except (TypeError, ValueError):
+        logger.warning("eis_fit_max_nfev_unparseable", default=DEFAULT_MAX_NFEV)
+        return DEFAULT_MAX_NFEV
+    if value < 1:
+        logger.warning("eis_fit_max_nfev_not_positive", value=value,
+                       default=DEFAULT_MAX_NFEV)
+        return DEFAULT_MAX_NFEV
+    return value
 
 #: Convergence tolerance for ``ftol``/``xtol``/``gtol``.
 #:
@@ -418,7 +519,7 @@ def fit_with_covariance(
     constants: Mapping[str, float] | None = None,
     bounds: tuple[Sequence[float], Sequence[float]] | None = None,
     weight_by_modulus: bool = True,
-    max_nfev: int = DEFAULT_MAX_NFEV,
+    max_nfev: int | None = None,
     tol: float = DEFAULT_FIT_TOL,
 ) -> FitCovariance | None:
     """Fit *circuit* to ``(freq, Z)`` and keep ``pcov``.
@@ -431,13 +532,19 @@ def fit_with_covariance(
     :class:`FitCovariance` with ``singular=True`` and NaN covariance, so degeneracy is
     reported as **unidentifiable** rather than as a fabricated ``ρ``, and one bad
     spectrum cannot end a 32-channel batch.
+
+    ``max_nfev=None`` — a caller that names no budget — takes the general-population
+    runaway ceiling, :func:`general_max_nfev`. The default is resolved *here* rather
+    than restated at each call site so there is exactly one copy of it; that is also
+    what lets ``fit_spectrum`` keep passing nothing when it has nothing to pass.
     """
     try:
         from impedance.models.circuits.fitting import (  # type: ignore
             set_default_bounds,
-            wrapCircuit,
         )
         from scipy.optimize import curve_fit  # type: ignore
+
+        from softae.analysis.eis.circuit_expr import wrap_circuit
     except Exception:
         logger.warning("eis_fitter_backend_unavailable", exc_info=True)
         return None
@@ -461,6 +568,8 @@ def fit_with_covariance(
     lo = np.asarray(bounds[0], dtype=float) if bounds else None
     hi = np.asarray(bounds[1], dtype=float) if bounds else None
 
+    budget = general_max_nfev() if max_nfev is None else int(max_nfev)
+
     ydata = np.hstack([Zc.real, Zc.imag])
     kwargs: dict[str, Any] = {}
     if bounds is not None:
@@ -468,16 +577,19 @@ def fit_with_covariance(
         # is the only one that accepts ``x_scale``.  See below — that argument is
         # what makes this fit converge at all.
         # ``tol`` defaults to 1e-8; see DEFAULT_FIT_TOL for the measurement. Iteration
-        # count dominates the cost here because ``wrapCircuit`` evaluates a built
-        # circuit *string* on every residual call — 0.76 ms each, measured.
+        # count dominates the cost here because the residual evaluates a circuit
+        # expression per call — 0.76 ms each with ``impedance``'s own ``wrapCircuit``,
+        # which re-parses and re-compiles the circuit *string* every time.
+        # :mod:`softae.analysis.eis.circuit_expr` compiles it once instead: same numbers,
+        # bitwise, at ~0.07 ms a call.
         kwargs.update(
             bounds=(lo, hi),
             x_scale="jac",
-            max_nfev=int(max_nfev),
+            max_nfev=budget,
             ftol=float(tol), xtol=float(tol), gtol=float(tol),
         )
     else:
-        kwargs["maxfev"] = int(max_nfev)
+        kwargs["maxfev"] = budget
 
     if weight_by_modulus:
         mag = np.abs(Zc)
@@ -488,7 +600,7 @@ def fit_with_covariance(
 
     try:
         popt, pcov = curve_fit(
-            wrapCircuit(circuit, held), f, ydata,
+            wrap_circuit(circuit, held), f, ydata,
             p0=np.asarray(initial_guess, dtype=float), **kwargs,
         )
     except Exception as exc:
@@ -533,9 +645,11 @@ def fit_spectrum(eis_result: Any, model_name: str = "blocking_coplanar", *,
     :func:`softae.analysis.circuit_fitting.fit_circuit`'s contract.
 
     *max_nfev* bounds the optimiser's residual-evaluation budget for this one call.
-    **``None`` is not "no budget" — it is the module default**, so an omitted argument
-    reproduces the call this function has always made, byte for byte; that is what
-    makes the parameter additive rather than a behaviour change.
+    **``None`` is not "no budget" — it is the module default**, resolved by the callee
+    through :func:`general_max_nfev`, so an omitted argument reproduces the call this
+    function has always made, byte for byte; that is what makes the parameter additive
+    rather than a behaviour change. The argument is *not* restated here even as a
+    default, so the "additive" claim keeps resting on it simply not being passed.
 
     It exists because :func:`fit_with_covariance` already takes the bound and nothing
     could reach it. :func:`~softae.analysis.eis.engine.analyze_spectrum` uses it on the
@@ -580,8 +694,8 @@ def fit_spectrum(eis_result: Any, model_name: str = "blocking_coplanar", *,
     guess = [seed.get(n, 1.0) for n in names] or [r0_guess, 1e-7, 0.8, r1_guess, 3e-10]
 
     # Spelled as a splat rather than as `max_nfev=max_nfev or DEFAULT_MAX_NFEV` so the
-    # default lives in exactly one place: the callee's signature. Restating it here
-    # would be a second copy to keep in step.
+    # default lives in exactly one place: the callee, which resolves `None` through
+    # `general_max_nfev`. Restating it here would be a second copy to keep in step.
     budget = {} if max_nfev is None else {"max_nfev": int(max_nfev)}
     cov = fit_with_covariance(freq, Z, circuit, guess, constants=constants, **budget)
 

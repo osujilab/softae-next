@@ -14,6 +14,7 @@ import pytest
 
 from softae.analysis.circuit_fitting import fit_circuit
 from softae.analysis.eis.engine import analyze_spectrum
+from softae.analysis.eis.envelope import InstrumentEnvelope
 from softae.analysis.eis.geometry import CellConstant
 from softae.analysis.eis.policy import reduce_gates
 from softae.analysis.eis.report import SigmaReport, SpectrumReport
@@ -35,32 +36,37 @@ def _gated(enabled: bool = True) -> EISSettings:
 
 
 class TestEngineSelection:
-    def test_an_unconfigured_rig_selects_the_engine_whose_failure_mode_is_better_understood(self):
-        """The shipped default is ``legacy``, and this is provisional, not settled.
+    def test_the_shipped_engine_is_gated_with_the_gates_still_observing_only(self):
+        """The shipped default is ``gated`` as of 2026-09-09, on the operator's ruling.
 
-        Measured against a numpy-only physics anchor (Kása circle right-intercept plus
-        low-f Re(Y) plateau, no project analysis code) on all ten real probe-3ch-v3
-        spectra with ``engine`` passed explicitly, legacy is closer on 6/10: median
-        error 5.54× low vs 8.75×, worst case 17.9× vs 224.3×, within 5× on 5/10 vs
-        3/10. The decisive pair is ch32_002/ch32_003, whose arc sits below the sweep
-        floor: legacy 4.06× and 4.83× low, gated 224.3× and 182.7× low ([a97] §1-§2).
+        This assertion was ``== "legacy"`` from 2026-08-25 (the ``[a98]`` revert) until
+        the ruling. The evidence that held it there is not retracted and is worth
+        keeping in front of whoever reads this next: measured against a numpy-only
+        physics anchor (Kása circle right-intercept plus low-f Re(Y) plateau, no project
+        analysis code) on all ten real probe-3ch-v3 spectra with ``engine`` passed
+        explicitly, legacy was closer on 6/10 — median error 5.54× low vs 8.75×, worst
+        case 17.9× vs 224.3× — the decisive pair being ch32_002/ch32_003, whose arc sits
+        below the sweep floor, where legacy lands 4.06×/4.83× low and gated 224.3×/182.7×
+        ([a97] §1-§2). The operator's ruling is to observe the gated engine on real runs
+        rather than keep predicting it; the accuracy question above is not thereby
+        settled, and ``fit_results.engine`` records which engine wrote each row so the
+        comparison stays available and the flip stays reversible.
 
-        The test's name is the claim, and it is literal rather than rhetorical. Legacy
-        is the engine that reports "arc did not close in band — R1 extrapolated" where
-        gated returns a confident wrong number ([a97] §3); the failure mode is better
-        understood because legacy announces it. Legacy is not thereby *right* — both
-        engines read low on all ten, and on 8 of the 10 neither is fit to report R1,
-        because the arc was never in the measured band.
+        **The two flags are separate and the second one is the one that refuses.**
+        ``[eis.gates] enabled`` stays ``False``, so no spectrum is rejected: a would-be
+        REJECT is logged as ``eis_gate_would_reject`` and downgraded to SUSPECT
+        (``policy.reduce_gates``), and ``analyze_spectrum``'s R18 early return is behind
+        the same flag.
 
-        Gated stays the direction of travel. Its deficit is concentrated on arcs below
-        the sweep floor — the mechanism `kk_truncation` ([a89]) describes — so
-        extending the sweep downward, or gating on ``arc_closure()``, is what flips
-        this assertion back. Expect that; do not treat this as permanent.
-
-        The second assertion is a separate claim from the first and survives either
-        setting unchanged: gates run and LOG under this default, and refuse nothing.
+        **"Observing only" does not mean "changing nothing", and the old wording here
+        said it did.** ``run_gates`` applies every ``block_point`` mask regardless of
+        ``enabled`` — only the REJECT short-circuit reads it — so under this pairing
+        points ARE dropped before the fit and R1/σ move accordingly. Measured on 515
+        stored spectra across 170 runs before the flip: 66.2 % lose at least one point,
+        16.8 % of all points go, and R1 is unchanged on 1. That is the whole reason the
+        flip is worth observing rather than assuming.
         """
-        assert eis_settings().engine == "legacy"
+        assert eis_settings().engine == "gated"
         assert eis_settings().gates.enabled is False
 
     def test_an_unknown_engine_name_falls_back_to_legacy_rather_than_raising(self):
@@ -1148,6 +1154,82 @@ class TestTheReportSaysWhichFitterProducedTheNumber:
         # exactly why the second field has to exist.
         assert report.engine == "gated"
 
+    def test_a_gated_fit_that_converges_then_rails_still_gets_a_legacy_number(self):
+        """The ordering defect, and the number it used to lose.
+
+        ``_demote_if_railed`` clears ``success`` to say *this is not a measurement*.
+        It used to run only AFTER the branch that fetches a legacy substitute, so a fit
+        that **converged and then railed** was stranded: demoted, and never offered the
+        fallback that a non-converging fit is offered. It reported nothing at all.
+
+        Measured, not hypothesised — measurement 1400 is exactly this shape: the fit
+        converges at ``nfev = 42 924`` (``ftol`` satisfied, ``status = 2``) with
+        ``R_series`` railed to 9.5e-40. At the old 20 000 ceiling it never got that far
+        and took the ordinary ``legacy_fit_failed`` route, reporting 3.23e7; raising the
+        ceiling to 64 000 let it converge and it then reported NaN. So this test guards
+        a regression that the cap raise introduces, and it must hold independently of
+        the cap.
+
+        The injected shape is one production really makes: a real ``FitCovariance``
+        whose ``pegged()`` names ``R0`` against ``simpleSalt``'s own zero lower bound,
+        which is what ``railed_measurand`` reads on the gated path.
+        """
+        import numpy as _np
+
+        from softae.analysis.circuit_fitting import CIRCUIT_MODELS
+        from softae.analysis.circuit_fitting import FitResult as _FitResult
+        from softae.analysis.eis.engine_support import _demote_if_railed
+        from softae.analysis.eis.fitter import FitCovariance
+        from softae.analysis.eis.models import parameter_names
+
+        lower, upper = CIRCUIT_MODELS["simpleSalt"]["bounds"]
+        names = parameter_names(CIRCUIT_MODELS["simpleSalt"]["circuit"], {})
+        collapsed = [4.6e-62, 1e-7, 0.7, 5.0e4, 1e-10]   # R0 on its floor of zero
+
+        def _converges_then_rails(*_a, **_k):
+            return _FitResult(
+                model_name="simpleSalt",
+                parameters=_np.asarray(collapsed, dtype=float),
+                R0=collapsed[0], R1=collapsed[3],
+                R0_guess=100.0, R1_guess=1.0e4,
+                z_indices=[0, 3],
+                success=True,          # the optimiser DID converge
+                covariance=FitCovariance(
+                    names=names,
+                    values=_np.asarray(collapsed, dtype=float),
+                    pcov=_np.eye(len(collapsed)) * 1e-4,
+                    n_points=40,
+                    bounds=(_np.asarray(lower, dtype=float),
+                            _np.asarray(upper, dtype=float)),
+                ),
+            )
+
+        # Anti-vacuity: the injected fit must actually rail, or this test proves
+        # nothing about the ordering. Checked on a throwaway copy so the demotion
+        # below is still the engine's own first one.
+        assert _demote_if_railed(_converges_then_rails()), \
+            "the fixture does not rail, so the fallback branch is never exercised"
+
+        import softae.analysis.eis.fitter as fitter_mod
+
+        saved = fitter_mod.fit_spectrum
+        fitter_mod.fit_spectrum = _converges_then_rails
+        try:
+            report = analyze_spectrum(as_eis_result(*reference_spectrum()),
+                                      cell=CELL, settings=_gated())
+        finally:
+            fitter_mod.fit_spectrum = saved
+
+        # The defect itself: a number, not nothing.
+        assert report.fit is not None
+        assert report.fit.R1 == report.fit.R1, \
+            "a converged-then-railed fit was stranded with no resistance at all"
+        assert np.isfinite(report.fit.R1) and report.fit.R1 > 0
+
+        # And it is labelled for what it is, not merged into the 41 %.
+        assert report.fitter == "legacy_fit_railed"
+        assert report.engine == "gated"
+
     def test_a_substituted_number_and_a_missing_one_are_not_collapsed(self):
         """The distinction that survives, and it is the one that changes a reader's job.
 
@@ -1320,3 +1402,123 @@ class TestAGatedModelWithNoLegacyEquivalentDoesNotCrashWhenTheFitFails:
             analyze_spectrum(as_eis_result(*reference_spectrum()), cell=CELL, engine="gated",
                              model_name="no_such_model",
                              settings=_gated(enabled=False))
+
+
+# ── The zero-survivor refusal, in BOTH flag states ───────────────────────────
+
+#: An envelope whose ``|Z|`` floor sits an order of magnitude above the spectrum below,
+#: so ``gate_magnitude_window`` — a ``block_point`` gate — masks every point.
+#:
+#: Stated here rather than resolved from the shipped calibration deliberately: the
+#: defect is in ``analyze_spectrum``, not in ``mux16.toml``, and a test that reached for
+#: the commissioned window would go quiet the day that window moved. The shipped
+#: pairing does produce this state on real data — 5 of 515 stored spectra, and every
+#: parametrisation of ``test_gui_eis_sigma_source.py``'s missing-thickness test — but
+#: what is under test is what the engine does once it is in it.
+NARROW_WINDOW = InstrumentEnvelope(z_min_ohm=1.0e4, magnitude_window_measured=True)
+
+
+def _all_points_masked_spectrum():
+    """A clean Debye spectrum: 30 well-formed points, |Z| ≈ 100–150 Ω.
+
+    Monotonic frequency, correct quadrant, finite throughout — nothing an instrument
+    would call broken. It simply sits below :data:`NARROW_WINDOW`'s floor, so all
+    thirty points are masked and ``min_points`` is left with an empty survivor set.
+    """
+    f = np.logspace(1, 5, 30)
+    tau = 2 * np.pi * f * 1e-6
+    return as_eis_result(
+        f, (100 + 50 / (1 + tau**2)) - 1j * np.abs(50 * tau / (1 + tau**2)))
+
+
+def _refused(enabled: bool):
+    return analyze_spectrum(_all_points_masked_spectrum(), cell=CELL,
+                            envelope=NARROW_WINDOW, settings=_gated(enabled=enabled))
+
+
+class TestAZeroSurvivorSpectrumIsRefusedInBothFlagStates:
+    """``[eis.gates] enabled`` gated the verdict AND, by accident, the emptiness check.
+
+    The two are different questions. A REJECT is a *policy*: an operator may choose to
+    observe it rather than enforce it, which is precisely what the flag exists to allow.
+    An empty survivor set is *arithmetic*: there is nothing to fit in either flag state,
+    and ``np.argmin`` of an empty sequence is a ``ValueError`` rather than an opinion.
+
+    **The inversion is the point.** Before the fix the conservative-looking pairing was
+    the dangerous one — ``enabled=True`` returned a clean refusal because R18 caught it,
+    ``enabled=False`` raised out of ``extract_features`` — and the shipped config is the
+    second one. Four call sites do not absorb that exception, two of them inside a
+    ``QThread.run`` where the batch's ``finished`` signal then never emits and the
+    window hangs rather than reporting an error.
+    """
+
+    def test_the_masks_really_do_empty_this_spectrum_in_both_states(self):
+        # The premise, checked rather than assumed. If a threshold change ever let one
+        # point survive, every assertion below would pass against a spectrum that no
+        # longer visits the branch — SUBAGENT_RULES §3.2, a sound check never reached.
+        for enabled in (True, False):
+            report = _refused(enabled)
+            assert int(np.asarray(report.mask, dtype=bool).sum()) == 0, enabled
+            failed = {e["gate"] for e in report.gate_log if not e["passed"]}
+            assert {"magnitude_window", "min_points"} <= failed, enabled
+
+    def test_neither_flag_state_raises_and_both_return_the_same_refusal_shape(self):
+        for enabled in (True, False):
+            report = _refused(enabled)
+            assert report.fit is None, enabled
+            assert report.sigma.mode == "unavailable", enabled
+            assert not report.sigma.is_value, enabled
+            assert report.engine == "gated", enabled
+            # Provenance survives a refusal: the correction that was in force, the
+            # cell, the envelope and the gate log are all still on the report.
+            assert report.cell is CELL, enabled
+            assert report.envelope is NARROW_WINDOW, enabled
+            assert report.correction is not None, enabled
+            assert report.gate_log, enabled
+
+    def test_the_verdict_still_obeys_the_flag_even_though_the_refusal_does_not(self):
+        """The narrow fix stated as a boundary: emptiness is unconditional, policy isn't.
+
+        Simply dropping ``gate_cfg.enabled`` from the R18 condition would also have
+        stopped the crash — and would have made observing-only enforce *every* REJECT,
+        a far larger change to what production reports than the bug being fixed. So the
+        verdict must still differ across the two states: ``reduce_gates`` downgrades a
+        would-be REJECT to SUSPECT under observation, and that is untouched.
+        """
+        assert _refused(True).quality.verdict is Verdict.REJECT
+        observing = _refused(False)
+        assert observing.quality.verdict is Verdict.SUSPECT
+        assert "gates observing only" in observing.quality.issues
+
+    def test_an_ordinary_policy_reject_is_still_fitted_when_the_gates_only_observe(self):
+        """The other side of that boundary — the regression this fix could have caused.
+
+        ``stuck_instrument`` fails a ``block_spectrum`` gate but keeps all 41 of its
+        points, so it is a policy REJECT and nothing else. Under observation it must
+        still reach the fitter, exactly as before.
+        """
+        observing = analyze_spectrum(as_eis_result(*stuck_instrument()), cell=CELL,
+                                     settings=_gated(enabled=False))
+        assert int(np.asarray(observing.mask, dtype=bool).sum()) == 41
+        assert observing.fit is not None
+        assert observing.quality.verdict is Verdict.SUSPECT
+
+    def test_the_log_says_nothing_survived_rather_than_only_that_it_was_rejected(self):
+        """An operator reading "rejected" wants to know which of the two it was.
+
+        And ``enforced`` must not claim an authority the gates did not have: under
+        observing-only it is the arithmetic refusing, not the gates.
+        """
+        import structlog
+
+        for enabled in (True, False):
+            with structlog.testing.capture_logs() as logs:
+                _refused(enabled)
+            events = {e["event"]: e for e in logs}
+            assert "eis_spectrum_no_surviving_points" in events, enabled
+            assert events["eis_spectrum_no_surviving_points"]["enforcing"] is enabled
+            metrics = events["eis_spectrum_metrics"]
+            assert metrics["report_mode"] == "no_surviving_points", enabled
+            assert metrics["n_surviving"] == 0, enabled
+            assert metrics["enforced"] is enabled, enabled
+            assert metrics["fit_ok"] is False, enabled

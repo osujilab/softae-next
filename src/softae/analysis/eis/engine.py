@@ -579,17 +579,59 @@ def analyze_spectrum(
     pre = reduce_gates(results, n_surviving=n_surviving,
                        min_fit_pts=gate_cfg.min_fit_pts, enabled=gate_cfg.enabled)
 
+    # Two refusals share one return shape, and only ONE of them is a policy.
+    #
     # R18: do not hand an inadmissible spectrum to an optimiser. Only when the gates
     # are actually enforcing — observing-only must not change what happens.
-    if gate_cfg.enabled and pre.verdict is Verdict.REJECT:
+    policy_reject = gate_cfg.enabled and pre.verdict is Verdict.REJECT
+
+    # …and the emptiness refusal, which is deliberately NOT behind that flag, because
+    # it is not a policy at all. ``run_gates`` applies every ``block_point`` mask
+    # regardless of ``enabled`` — only the REJECT short-circuit above reads it — so a
+    # spectrum can arrive here with an empty survivor set in EITHER flag state. There
+    # is no argmin of an empty sequence: ``extract_features`` raises ``ValueError``
+    # straight out of ``analyze_spectrum``, and four GUI call sites do not absorb it
+    # (two inside a ``QThread.run``, where the batch's ``finished`` signal then never
+    # emits and the window hangs instead of reporting an error).
+    #
+    # So the flag's own inversion was the bug: with ``enabled=True`` this spectrum
+    # returned cleanly and with ``enabled=False`` — the conservative-looking pairing —
+    # it raised. An operator may choose to *observe* a verdict rather than enforce it;
+    # nobody can choose to fit nothing.
+    #
+    # Deliberately ``== 0`` rather than ``< min_fit_pts``. The min_fit_pts comparison
+    # IS the policy — it is the rule ``reduce_gates`` applies to reach REJECT — and it
+    # stays behind the flag with every other threshold. Zero is arithmetic.
+    no_surviving_points = n_surviving == 0
+
+    if policy_reject or no_surviving_points:
         # Never reached in a shadow run, and recorded anyway: a spectrum that simply
         # vanishes from the population once the flag flips would bias every later
         # re-review of the same log without leaving a trace that it had.
+        #
         # ``report_mode`` is honestly absent here — the decision is taken after the
-        # fit, and this spectrum never reached one.
+        # fit, and this spectrum never reached one — and it says WHICH absence, because
+        # an operator reading "rejected" wants to know whether the gates judged this
+        # spectrum or whether nothing survived for them to judge.
+        #
+        # ``enforced`` is the policy question, so it tracks ``policy_reject`` and not
+        # the return. Reporting ``enforced=True`` for an observing-only run would tell
+        # every later reader of this log that the gates had authority over data they
+        # did not have; the refusal below is the arithmetic refusing, not the gates.
+        if no_surviving_points:
+            logger.warning(
+                "eis_spectrum_no_surviving_points",
+                channel=getattr(eis_result, "channel", None),
+                n_dropped=int(np.asarray(mask, dtype=bool).size),
+                enforcing=bool(gate_cfg.enabled),
+                msg="every point was masked — nothing to fit, so no fit is reported "
+                    "regardless of whether the gates are enforcing",
+            )
         _log_spectrum_metrics(
             eis_result, freq=freq, Z=Z, quality=pre, results=results, mask=mask,
-            enforced=True, report_mode="not_reached", fit_ok=False,
+            enforced=policy_reject,
+            report_mode="no_surviving_points" if no_surviving_points else "not_reached",
+            fit_ok=False,
         )
         return SpectrumReport(
             engine="gated", fit=None,
@@ -649,11 +691,27 @@ def analyze_spectrum(
             if fit is not None:
                 fitter_used = "two_point"
         if fit is None and pre_cfg.budget_cap:
-            # (A). Same estimator, bounded effort, and it cannot move a number: the
-            # unbounded fit was measured to exhaust its 20 000 evaluations and return
-            # nothing on this exact population, and a bounded run is a strict prefix
-            # of that trajectory — so it fails identically, falls back identically,
-            # and reports the identical R₁ two orders of magnitude sooner.
+            # (A). Same estimator, bounded effort. The argument that licensed this was
+            # *the unbounded fit was measured to exhaust its 20 000 evaluations and
+            # return nothing on this exact population, so a bounded run is a strict
+            # prefix of that trajectory* — it fails identically and reports the
+            # identical R₁ two orders of magnitude sooner.
+            #
+            # **THAT ARGUMENT IS NOW STALE IN ITS SECOND HALF AND MUST NOT BE REUSED.**
+            # "Exhausts and returns nothing" was measured against a 20 000 ceiling that
+            # no longer exists — ``fitter.DEFAULT_MAX_NFEV`` is 64 000 as of 2026-09-10,
+            # and on the general population 17 of 17 fits that exhausted 20 000 were
+            # then shown to CONVERGE given room. Nobody has re-measured whether the
+            # blocking-open population still fails to converge at the higher ceiling, so
+            # "a cap here cannot move a number" is currently an assumption, not a result.
+            #
+            # It is left armed because it is the shipped, operator-authorised state and
+            # because this cap is read from ``[eis.pregate] max_nfev`` rather than from
+            # the ceiling above — so raising the ceiling did not silently change what
+            # this route does. Scale of the open question, from the same 600-spectrum
+            # sample: 191 fits take this route and 134 of them (70.2 %) exhaust the 2 000
+            # cap, which is 22.3 % of the corpus — far more spectra than the raise above
+            # touches. Re-measuring it is its own task and its own claim.
             budget = pre_cfg.max_nfev
 
     if fit is None:
@@ -668,13 +726,34 @@ def analyze_spectrum(
         # never assigned: the only way to enter it is a model neither registry knows,
         # and `fit_circuit` then raises the identical `ValueError` one line later.
         fit = fit_spectrum(surviving, model_name, max_nfev=budget)
+        # Demotion runs HERE as well as after the fallback, and the two calls answer
+        # different questions. This one asks *may the gated fit be reported at all*;
+        # the one below asks it of whatever fit is finally reported.
+        #
+        # Without this call a fit that CONVERGED and then railed was stranded: it is
+        # not a measurement — `_demote_if_railed` clears `success` precisely to say so
+        # — but it never reached the substitute a non-converging fit reaches, because
+        # the only demotion ran after the branch that fetches one. Measured on
+        # measurement 1400: the fit converges at nfev 42 924 (`ftol` satisfied) with
+        # `R_series` railed to 9.5e-40, and reported NOTHING where the 20 000 ceiling
+        # had it report the legacy 3.23e7. Raising the ceiling is what made that
+        # reachable, so this is a precondition of the raise and not a companion to it.
+        railed_gated = _demote_if_railed(fit)
         if not fit.success:
-            # The gated fitter ran and did not converge — [p92] §1 measured this at 22
-            # of 54 rows, every one "maximum number of function evaluations exceeded".
+            # The gated fitter did not converge — [p92] §1 measured this at 22 of 54
+            # rows, every one "maximum number of function evaluations exceeded" — or it
+            # converged onto a bound and the call above demoted it.
             if model_name in CIRCUIT_MODELS:
                 # A legacy equivalent exists. Its number is legacy output, labelled so.
                 fit = fit_circuit(surviving, model_name)
-                fitter_used = "legacy_fit_failed"
+                # The two routes are kept apart for the reason `report.py` keeps
+                # `legacy_fit_failed` and `gated_no_fallback` apart: one says the
+                # optimiser never arrived, the other says it arrived at a wall. Only
+                # the second had a converged fit to reject, and collapsing them would
+                # make `legacy_fit_failed`'s own documented meaning — "because the
+                # gated fit did not converge" — false for part of its population.
+                fitter_used = ("legacy_fit_railed" if railed_gated
+                               else "legacy_fit_failed")
             else:
                 # A gated-registry model has NO legacy equivalent — the two registries
                 # have an EMPTY intersection — so there is nothing to fall back *to*.
@@ -687,8 +766,25 @@ def analyze_spectrum(
                 # resistances — and the label says a fallback was unavailable rather
                 # than untried.
                 fitter_used = "gated_no_fallback"
-    # After the fallback, never before it: demoting a railed fit clears
-    # ``success``, and the line above reads that flag as "try the other fitter".
+    # After the fallback, and this call is NOT made redundant by the one before it.
+    # That one judges the gated fit; this one judges whatever fit is actually reported
+    # — which, when a substitute was taken, is the LEGACY fit, and a legacy fit rails
+    # too. Deleting this in favour of the earlier call would let a railed legacy number
+    # through wearing ``success = True``, which is the whole condition
+    # ``_demote_if_railed`` exists to catch.
+    #
+    # Only ONE object is ever demoted twice — the gated fit on the ``gated_no_fallback``
+    # route, where no substitute replaces it — and there the repeat is exact:
+    # ``railed_measurand`` answers from ``fit.covariance.pegged()``, which demotion does
+    # not touch, so it re-reports the same bound and rewrites the same three fields with
+    # the same values. When a substitute IS taken, ``fit`` is a fresh object from
+    # ``fit_circuit`` and this is its first and only demotion. (The legacy branch of
+    # ``railed_measurand`` does read ``fit.R1``, which demotion sets to NaN, so a second
+    # call there could lose the R₁-bound reason — no path reaches that, and this note is
+    # here so the next reader does not create one.)
+    #
+    # ``railed`` therefore always describes the reported fit, which is what
+    # ``quality.issues`` below wants.
     railed = _demote_if_railed(fit)
     # Judged on ``surviving`` — the corrected, truncated points R₁ actually came
     # from. Judging the raw sweep would credit the fit with a low-frequency point

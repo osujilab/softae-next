@@ -71,10 +71,25 @@ logger = structlog.get_logger(__name__)
 #: CLOSED-biased verdict and gains no policy).
 DEFAULT_PREGATE_PHASE_MAX_DEG = -60.0
 
-#: Residual-evaluation budget for the capped fit. Two orders below
-#: :data:`~softae.analysis.eis.fitter.DEFAULT_MAX_NFEV` and still an order above the
-#: cost of every fit measured to converge at all on this corpus, so the cap sits in
-#: the empty band between "converges" and "never will".
+#: Residual-evaluation budget for the capped fit: **2 000**.
+#:
+#: Stated as its own number, and deliberately **not** as a ratio to
+#: :data:`~softae.analysis.eis.fitter.DEFAULT_MAX_NFEV`. This line read "two orders
+#: below" that constant from the day it was written until 2026-09-10, when the constant
+#: moved 20 000 → 64 000 and the sentence became false without anything touching this
+#: file. A comment that describes a *relationship* to a value someone else tunes is a
+#: comment that goes stale silently; a comment that names its own number cannot.
+#:
+#: What the value rests on, which is a fact about the corpus rather than about the other
+#: constant: 2 000 is an order of magnitude above the cost of every fit measured to
+#: converge at all on the blocking-open population, so it sits in the empty band between
+#: "converges" and "never will".
+#:
+#: **That band was measured on the population this cap governs, and the general
+#: population no longer behaves the way it does.** 17 of 17 general-population fits that
+#: exhausted 20 000 converge when given 500 000 (2026-09-10). Nobody has re-run the
+#: equivalent check here, so do not carry the general result across: see the note at
+#: ``engine.py``'s route (A), which records the same open question.
 DEFAULT_PREGATE_MAX_NFEV = 2_000
 
 

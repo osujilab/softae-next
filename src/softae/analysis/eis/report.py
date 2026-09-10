@@ -212,9 +212,13 @@ class SpectrumReport:
     #: ``"two_point"``             the pre-gate open-arc route; **changes R₁**
     #: ``"legacy_fit_failed"``     ``fit_circuit``, because the gated fit did not
     #:                             converge — **this is the 41 %**
-    #: ``"gated_no_fallback"``     the gated fit did not converge and the model has NO
-    #:                             legacy equivalent, so nothing was fallen back *to*;
-    #:                             the failed gated fit stands, ``success=False``
+    #: ``"legacy_fit_railed"``     ``fit_circuit``, because the gated fit *converged*
+    #:                             and then rested on a box constraint, so
+    #:                             ``_demote_if_railed`` removed its measurement claim
+    #: ``"gated_no_fallback"``     the gated fit did not converge (or converged and
+    #:                             railed) and the model has NO legacy equivalent, so
+    #:                             nothing was fallen back *to*; the failed gated fit
+    #:                             stands, ``success=False``
     #: ``""``                      not applicable (legacy engine), or a report built
     #:                             before this field existed
     #: ==========================  ================================================
@@ -223,6 +227,23 @@ class SpectrumReport:
     #: one says a legacy number was substituted, the other says none could be and the
     #: row therefore carries no resistance at all. Collapsing them would hide which,
     #: and only the second leaves the measurand missing.
+    #:
+    #: ``"legacy_fit_railed"`` is split from ``"legacy_fit_failed"`` on the same
+    #: principle and was added 2026-09-10 with the ``fit_max_nfev`` raise. Both
+    #: substitute a legacy number, but the reasons are not the same finding: one says
+    #: the optimiser never arrived, the other that it arrived at a wall. Reporting the
+    #: second as the first would make this table's own definition of
+    #: ``"legacy_fit_failed"`` — *"because the gated fit did not converge"* — false for
+    #: part of its population, and would silently inflate the 41 % statistic with fits
+    #: that converged.
+    #:
+    #: **Rare, and measured rather than assumed.** A converged-then-railed fit occurred
+    #: **0 times in 600 sampled spectra at the 20 000 ceiling** and 1 time in the 17
+    #: that ceiling was truncating (measurement 1400, which converges at nfev 42 924).
+    #: That is *not observed*, not *impossible*: nothing stops a fit converging quickly
+    #: and railing, so the route is structurally reachable at any ceiling and simply was
+    #: not taken by the sample. No stored row carries this value, so nothing persisted
+    #: needs migrating — but a reader should not treat its absence as a guarantee.
     #:
     #: .. note::
     #:    A fourth value, ``"legacy_unknown_model"``, was documented here until
