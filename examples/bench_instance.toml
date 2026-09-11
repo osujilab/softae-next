@@ -1,0 +1,120 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Bench instance — ONE fully-specified recipe, cast four times.
+#
+#   softae-campaign check examples/bench_instance.toml
+#   softae-campaign run   examples/bench_instance.toml --head-up --yes \
+#       --project <project>
+#
+# THIS IS THE PINNED-RECIPE SHAPE, AND IT NEEDS NO NEW MACHINERY.
+# Every `[[general_formulation.axes]]` below has `low == high`, which is what
+# `CompositionAxis` means by *pinned* (its own docstring, composition_axes.py):
+# `axes_parameter_space` omits a pinned axis and `build_targets_from_axes`
+# substitutes the constant, so the optimizer is never handed a degenerate
+# dimension and the suggestion cannot perturb the recipe.
+#
+# What makes it run FOUR times is the one honest search dimension:
+# `[parameter_space.replicate]`, an `int` 1..budget under `optimizer = "grid"`.
+# Grid turns an int axis into `min(n_points, high - low + 1)` points and
+# `n_points` is the campaign budget, so it yields exactly `budget` suggestions
+# and then `None`. `replicate` names a fact that genuinely varies across the
+# four wells — which well — and lands in the DOE row, so the DataStore records
+# a replicate set rather than four rows that merely look identical.
+#
+# A degenerate FLOAT parameter would be refused at both gates (`low >= high`),
+# and an empty `parameter_space` is refused by the loader. The int replicate
+# axis is the shape that is legal *and* says what it is.
+#
+# NO `[[run_plan.phases]]` BLOCK HERE, AND THAT IS NOT AN OVERSIGHT.
+# `run_plan` is still in `campaign_spec_io._UNSUPPORTED` — the codec has not
+# been written (it is Wave B2) — so adding a phases block would make this file
+# fail to load, loudly, at the first `softae-campaign check`. This campaign
+# therefore runs the engine's pointwise layout: per-channel deposit + EIS, with
+# no ANNEAL or EQUILIBRATE phase. Do not "fix" this by inventing a block; the
+# fix is the codec.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name     = "bench_instance_pinned"
+pcb_name = "SoftAE_EIS_4Stripe"
+
+# Direction is DERIVED, never stated. This is composition mode, so the objective
+# resolves to conductivity and `objective = "auto"` maximises it. Writing an
+# explicit direction that disagrees is refused rather than preferred.
+objective = "auto"
+
+# Deterministic by construction: grid walks its points in order, and every point
+# maps to the same recipe anyway. `seed` is irrelevant here and left at default.
+optimizer = "grid"
+
+# Four wells, four suggestions, one physical run: `batch = true` casts one
+# suggestion per channel in a single round rather than replicating one
+# suggestion across all four. With a pinned recipe both produce identical
+# volumes; batch is chosen so each well is scored against its OWN spectrum.
+channels = [1, 2, 3, 4]
+batch    = true
+budget   = 4
+
+# EVERY top-level key must stay ABOVE the first `[table]` header: TOML assigns a
+# bare key to the most recently opened table, so a key written below
+# `[parameter_space.replicate]` silently becomes a *parameter attribute*.
+
+# The only searched dimension, and it is not a composition target. `high` must
+# equal `budget`: grid emits `high - low + 1` int points, so a smaller `high`
+# exhausts early and a larger one is truncated to `budget` by `n_points`.
+[parameter_space.replicate]
+type = "int"
+low  = 1
+high = 4
+
+# ── The recipe, pinned ───────────────────────────────────────────────────────
+#
+# Stock names resolve against the shared solution catalog (the same CSVs the
+# deposition twin and the consumables ledger read) — a name the catalog does not
+# know is refused at load, since the solver cannot turn a target into volumes.
+#
+# `pump_assignment` puts the silica on pump 1 because `[dropcast]
+# particulate_pumps = [1]` in softae_config.toml: pump 1 is the line with the
+# anti-clog purge window, and the silica sol is the particulate stock.
+#
+# `target_deposition_uL` is the DRIED-film volume. At 4.5 µL this recipe solves
+# to ~97 µL of wet cast against the 4-stripe well's ~118.8 µL capacity — inside
+# the well with headroom. It scales close to linearly, so raising it much past 5
+# overflows; `budget_uL` below is the hard stop that turns an overflow into a
+# refusal (`FormulationInfeasibleError`) instead of a spill.
+[general_formulation]
+stocks               = ["5wt% 20k PEO stock", "10 wt% silica solution", "LiCl 10M"]
+target_deposition_uL = 4.5
+budget_uL            = 118.0
+
+[general_formulation.pump_assignment]
+"5wt% 20k PEO stock"     = 0
+"10 wt% silica solution" = 1
+"LiCl 10M"               = 2
+
+# PINNED: EO:Li = 20 exactly. `low == high` is the pinning, and every key is
+# written out because an omitted one would silently take a default and search a
+# different composition.
+[[general_formulation.axes]]
+kind  = "molar_ratio"
+a     = "Ethylene oxide"
+b     = "Lithium chloride"
+low   = 20.0
+high  = 20.0
+basis = "volume"
+
+# PINNED: 10 % silica by dried volume.
+[[general_formulation.axes]]
+kind  = "dried_fraction"
+a     = "Fumed silica"
+b     = ""
+low   = 0.10
+high  = 0.10
+basis = "volume"
+
+[measurement]
+modality = "eis"
+enabled  = true
+
+# `Extended` reaches 1.2 Hz — `[eis.instrument] f_verified_lo_hz`, the lowest
+# frequency this instrument has been shown to hold at 1e4 Ω. `Quick` bottoms out
+# at 20 Hz, which is not enough band for the gated engine to judge a film.
+preset = "Extended"

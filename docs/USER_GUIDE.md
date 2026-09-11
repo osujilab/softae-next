@@ -1311,6 +1311,27 @@ a silently-defaulted field, and fields carrying live Python objects (`prior_mean
 that silently ran a different experiment from the one the file describes is the failure this
 prevents. Those campaigns are built in Python or from Tab 10.
 
+### Casting one fixed recipe N times
+
+A campaign does not have to search. A composition is **pinned** by writing it as a
+`[general_formulation]` axis with `low` equal to `high` — that is what pinning has always
+meant, and a pinned axis is left out of the optimizer's parameter space, so no suggestion can
+perturb the recipe. To cast that one recipe N times, add a single `int` axis to
+`[parameter_space]` (the shipped example calls it `replicate`) with `low = 1`, `high = N`,
+then set `optimizer = "grid"` and `budget = N`: grid walks the N points in order and every
+point solves to the same volumes, one well each.
+
+Write every axis out in full — all six keys (`kind`, `a`, `b`, `low`, `high`, `basis`),
+including `b = ""` on a `dried_fraction` axis — because an omitted key takes a default and
+casts a different composition. Any axis left *searched* (`low != high`) must also be named in
+`[parameter_space]`: `softae-campaign check` now **refuses** a spec that declares a searched
+axis it does not list. Before this, such a file loaded and cast every well at that axis's
+lower bound — a fixed recipe at the corner of the declared box, reported as a search.
+
+`examples/bench_instance.toml` is the worked example: two pinned axes, `replicate` 1–4,
+`grid`, `budget = 4`. It carries no `[[run_plan.phases]]` block, and so no anneal phase — a
+run plan cannot be written in a file at all yet (above), and that codec is upcoming work.
+
 ### What to measure — the `[measurement]` block
 
 What a campaign measures is one block, named by **modality**, so a second kind of data needs
@@ -1664,12 +1685,15 @@ Both return the same report shape, so flipping the key is the whole cutover and 
 reversible per run.
 
 `engine` and `[eis.gates] enabled` are **deliberately separate**. `engine = "gated"` with
-`enabled = false` runs every check and logs every verdict *while removing nothing* — which
-is how you review a campaign's worth of would-reject decisions before giving thresholds
-authority over data. Every gate threshold currently shipped is an engineering default from
-the specification, chosen without reference to this rig's spectra — and values for these
-thresholds *can* be derived from the spectra a shadow run produces, which is what the review
-tool's section 7 does ([§20](#20-shadow-campaign-review)).
+`enabled = false` runs every check and logs every verdict, and **failing points are still
+dropped**: what the flag withholds is the refusal, not the removal — a would-be REJECT is
+recorded as SUSPECT rather than refusing the spectrum. That is how you review a campaign's
+worth of would-reject decisions before giving thresholds authority over data.
+
+Every gate threshold currently shipped is an engineering default from the specification,
+chosen without reference to this rig's spectra — and values for these thresholds *can* be
+derived from the spectra a shadow run produces, which is what the review tool's section 7
+does ([§20](#20-shadow-campaign-review)).
 
 ### What the gates catch
 

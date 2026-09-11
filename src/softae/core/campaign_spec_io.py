@@ -59,6 +59,12 @@ from typing import Any
 import structlog
 
 from softae.core.campaign_spec_fields import OBJECT_FIELDS, UNREPRESENTABLE
+from softae.core.pinned_recipe import (
+    PinnedRecipeError,
+    check_pinning,
+    is_pinned_recipe,
+    searched_axes,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -199,12 +205,26 @@ def spec_from_dict(data: dict[str, Any], *, source: str = "<dict>") -> Any:
         raise SpecLoadError(f"{source}: {exc}") from exc
 
     _validate_parameter_space(spec.parameter_space, source)
+    # A decoder never guesses: an axis the file declares *searched* but never
+    # lists in `parameter_space` is not refused anywhere downstream — it casts
+    # every trial at the axis's lower bound on a warning, a fixed recipe wearing
+    # a search's clothes. The GUI editor refuses that shape through
+    # `validate_axes`; until this call, no file-loaded campaign ever reached a
+    # check at all.
+    try:
+        check_pinning(spec)
+    except PinnedRecipeError as exc:
+        raise SpecLoadError(f"{source}: {exc}") from exc
     # `campaign=` rather than `name=`: the key states what kind of identifier it
     # is, matching every other campaign log line in the codebase (T1.7).
+    # `recipe_pinned` / `n_searched_axes` so a DataStore reader can tell a
+    # deliberate replay from a search after the fact.
     logger.info(
         "campaign_spec_loaded", source=source, campaign=spec.name,
         n_params=len(spec.parameter_space), budget=spec.budget,
         modality=spec.measurement.modality,
+        recipe_pinned=is_pinned_recipe(spec),
+        n_searched_axes=len(searched_axes(spec)),
     )
     return spec
 
