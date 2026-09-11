@@ -381,3 +381,88 @@ class TestSegmentedScriptEmission:
                     for a, b, n in resolve_segments(segments)]
         assert emitted == expected
         assert emitted[0][1] != emitted[1][0]      # no shared boundary frequency
+
+
+# ── per-run sweep variants ───────────────────────────────────────────────────
+#
+# A run has one base sweep, at the unsuffixed path every measurement step
+# already points at. A phase asking for a different preset — the production read
+# after settling — needs its own scripts, and the step that reads them has to
+# find the path the writer used. Both ends derive the key from the resolved
+# EISParams, so the two cannot disagree.
+
+class TestSweepVariants:
+    @pytest.fixture(autouse=True)
+    def _isolated(self):
+        from softae.core.eis_scripts import reset_run_variants
+
+        reset_run_variants()
+        yield
+        reset_run_variants()
+
+    def test_path_without_a_variant_is_the_unsuffixed_one(self):
+        assert mscr_path_for_channel(4) == mscr_path_for_channel(4, variant=None)
+
+    def test_path_with_a_variant_is_distinct_and_keeps_the_extension(self):
+        base = mscr_path_for_channel(4)
+        variant = mscr_path_for_channel(4, variant="vdeadbeef")
+        assert variant != base
+        assert variant.endswith(".mscr")
+        assert "vdeadbeef" in variant
+
+    def test_first_prepared_sweep_becomes_the_run_base(self):
+        from softae.core.eis_scripts import prepare_variant
+
+        assert prepare_variant(EISParams(npts=27)) is None
+
+    def test_a_second_identical_sweep_is_still_the_base(self):
+        """Re-preparing the same sweep rewrites the base — the overwrite invariant."""
+        from softae.core.eis_scripts import prepare_variant
+
+        prepare_variant(EISParams(npts=27))
+        assert prepare_variant(EISParams(npts=27)) is None
+
+    def test_a_differing_sweep_gets_its_own_key(self):
+        from softae.core.eis_scripts import prepare_variant
+
+        prepare_variant(EISParams(npts=27))
+        key = prepare_variant(EISParams(npts=53))
+        assert key is not None
+
+    def test_the_key_is_stable_across_processes(self):
+        """It lands in a filename another process has to reproduce.
+
+        ``hash()`` is salted per interpreter, so a key derived from it would name
+        a different file on every run and the reader would miss the writer's.
+        """
+        from softae.core.eis_scripts import _variant_key
+
+        assert _variant_key(EISParams(npts=53)) == _variant_key(EISParams(npts=53))
+        assert _variant_key(EISParams(npts=53)) != _variant_key(EISParams(npts=54))
+
+    def test_an_unprepared_sweep_reads_the_base_script(self):
+        """The only file that is guaranteed to exist, and today's behaviour."""
+        from softae.core.eis_scripts import variant_for
+
+        assert variant_for(EISParams(npts=41)) is None
+
+    def test_variant_scripts_do_not_overwrite_the_base(self, tmp_path, monkeypatch):
+        import softae.core.eis_scripts as mod
+        from softae.core.eis_scripts import prepare_variant
+
+        def _redirected(channel, *, variant=None):
+            stem = f"softae_ch{int(channel)}"
+            if variant is not None:
+                stem = f"{stem}.{variant}"
+            return str(tmp_path / f"{stem}.mscr")
+
+        monkeypatch.setattr(mod, "mscr_path_for_channel", _redirected)
+
+        base_params = EISParams(npts=27)
+        other_params = EISParams(npts=53)
+        build_eis_scripts([5], base_params, variant=prepare_variant(base_params))
+        build_eis_scripts([5], other_params, variant=prepare_variant(other_params))
+
+        written = sorted(p.name for p in tmp_path.glob("*.mscr"))
+        assert len(written) == 2
+        assert "softae_ch5.mscr" in written

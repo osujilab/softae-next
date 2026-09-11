@@ -83,10 +83,14 @@ def mscr_dir(tmp_path: Path, monkeypatch) -> Path:
     """
     target = tmp_path / "mscr"
     target.mkdir()
-    monkeypatch.setattr(
-        eis_scripts, "mscr_path_for_channel",
-        lambda channel: str(target / f"softae_ch{int(channel)}.mscr"),
-    )
+
+    def _redirected(channel: int, *, variant: str | None = None) -> str:
+        stem = f"softae_ch{int(channel)}"
+        if variant is not None:
+            stem = f"{stem}.{variant}"
+        return str(target / f"{stem}.mscr")
+
+    monkeypatch.setattr(eis_scripts, "mscr_path_for_channel", _redirected)
     return target
 
 
@@ -445,3 +449,114 @@ class TestTheCampaignPathResolvesItsModality:
         rows = store.query_doe_parameters(run_id=result.run_id)
         assert len(rows) == 2
         store.close()
+
+
+# ── the spec actually reaches the step (A2) ──────────────────────────────────
+
+class TestTheMeasurementSpecDecidesWhichSweepTheStepReads:
+    """``_eis_build_measure_step(channel, spec)`` used to drop ``spec`` entirely.
+
+    Every step it built pointed at the one base ``.mscr``, whatever spec it was
+    handed — so ``settle_measure_step(..., measurement=...)`` and
+    ``confirmation_measure_step(..., measurement=...)`` advertised a per-round
+    preset that could not reach the hardware. Harmless only because every caller
+    passed the campaign's own block.
+
+    Both directions are pinned: an unprepared or base spec must give **exactly**
+    today's step, and a prepared variant must give a different script.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated(self):
+        eis_scripts.reset_run_variants()
+        yield
+        eis_scripts.reset_run_variants()
+
+    def test_the_campaigns_own_spec_still_builds_todays_step_byte_for_byte(self):
+        from softae.core.autonomous_wiring import measure_step_name
+        from softae.core.deposition_steps import eis_measure_step
+
+        spec = MeasurementSpec(preset="Quick")
+        eis_scripts.begin_run(eis_scripts.EISParams.from_preset("Quick"))
+
+        step = get_modality("eis").build_measure_step(21, spec)
+        expected = eis_measure_step(21, name=measure_step_name(21))
+        assert step.params == expected.params
+        assert step.tags == expected.tags
+        assert (step.name, step.instrument, step.method) == (
+            expected.name, expected.instrument, expected.method)
+
+    def test_a_spec_nobody_prepared_reads_the_base_script(self):
+        """No variant scripts were written, so the base is the only file there."""
+        base = get_modality("eis").build_measure_step(
+            21, MeasurementSpec(preset="Quick"))
+        unprepared = get_modality("eis").build_measure_step(
+            21, MeasurementSpec(preset="Quick", overrides={"npts": 99}))
+        assert unprepared.params["mscrpath"] == base.params["mscrpath"]
+
+    def test_a_prepared_variant_spec_reads_a_different_script(self, mscr_dir: Path):
+        """The defect, stated as a behaviour: two sweeps, two files, two steps.
+
+        This is the assertion that fails against the old ``_eis_build_measure_step``
+        — with ``spec`` dropped, both calls returned the same ``mscrpath``.
+        """
+        modality = get_modality("eis")
+        base_spec = MeasurementSpec(preset="Quick")
+        dense_spec = MeasurementSpec(preset="Quick", overrides={"npts": 99})
+
+        modality.prepare_run(base_spec, [21])
+        modality.prepare_run(dense_spec, [21], as_variant=True)
+
+        base_step = modality.build_measure_step(21, base_spec)
+        dense_step = modality.build_measure_step(21, dense_spec)
+
+        assert base_step.params["mscrpath"] != dense_step.params["mscrpath"]
+        assert base_step.tags == dense_step.tags       # only the sweep changed
+
+    def test_the_variant_script_the_step_names_is_the_one_that_was_written(
+        self, mscr_dir: Path
+    ):
+        """Writer and reader must agree, or the step reads a file nobody wrote."""
+        modality = get_modality("eis")
+        base_spec = MeasurementSpec(preset="Quick")
+        dense_spec = MeasurementSpec(preset="Quick", overrides={"npts": 99})
+
+        modality.prepare_run(base_spec, [21])
+        modality.prepare_run(dense_spec, [21], as_variant=True)
+
+        named = Path(modality.build_measure_step(21, dense_spec).params["mscrpath"])
+        assert named.exists()
+        assert named.parent == mscr_dir
+        assert "99" in named.read_text(encoding="utf-8")
+
+    def test_a_second_run_does_not_inherit_the_first_runs_variants(
+        self, mscr_dir: Path
+    ):
+        """``prepare_run`` without ``as_variant`` is a run boundary, and clears.
+
+        This is the module's founding invariant applied to variants: *"always
+        overwritten, so stale parameters cannot survive into a run"*. A variant
+        registered by run 1 and left in the map would let a step in run 2 name
+        run 1's script file — a sweep from a previous campaign, reached by a step
+        that records this campaign's preset as its provenance.
+        """
+        modality = get_modality("eis")
+        dense_spec = MeasurementSpec(preset="Quick", overrides={"npts": 99})
+        dense_params = eis_scripts.EISParams.from_preset("Quick", npts=99)
+
+        modality.prepare_run(MeasurementSpec(preset="Quick"), [21])
+        modality.prepare_run(dense_spec, [21], as_variant=True)
+        stale = modality.build_measure_step(21, dense_spec).params["mscrpath"]
+        assert eis_scripts.variant_for(dense_params) is not None
+
+        modality.prepare_run(MeasurementSpec(preset="Quick"), [21])   # run 2
+        assert eis_scripts.variant_for(dense_params) is None
+        # Compared against another step rather than against
+        # ``mscr_path_for_channel``: ``eis_measure_step`` builds the base path
+        # from its own ``tempfile.gettempdir()`` literal, so the two agree in
+        # production and diverge under this fixture. That duplication is real and
+        # predates this change.
+        base_step = modality.build_measure_step(21, MeasurementSpec(preset="Quick"))
+        after = modality.build_measure_step(21, dense_spec).params["mscrpath"]
+        assert after == base_step.params["mscrpath"]
+        assert after != stale

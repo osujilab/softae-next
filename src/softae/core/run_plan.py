@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 from softae.analysis.equilibration import (
     DEFAULT_RH_STABILITY_PCT,
@@ -46,6 +46,11 @@ from softae.analysis.equilibration import (
     DEFAULT_SETTLE_TOL_REL,
     settle_tol_rel_refusal,
 )
+
+if TYPE_CHECKING:  # annotation-only: keeps the deposition engine's import path
+    # free of the measurement and workflow-model layers.
+    from softae.core.measurement_spec import MeasurementSpec
+    from softae.core.phase_setpoints import PhaseSetpoints
 
 __all__ = [
     "PhaseKind",
@@ -196,6 +201,21 @@ class RunPhase:
     ``settle`` applies only to :attr:`PhaseKind.EQUILIBRATE`, where it is
     **required** — an equilibrate phase with no floor and no ceiling is a hold
     with no stopping rule at either end.
+
+    ``conditions`` is the environment the phase is **commanded** to hold — see
+    :class:`~softae.core.phase_setpoints.PhaseSetpoints` on why the type is named
+    for setpoints while this field keeps the operator's word. It is legal on
+    **any** kind: a cast has a casting environment, a cure has a cure
+    environment, and an equilibrate hold has its own. ``None`` means the phase
+    inherits whatever the previous one established.
+
+    ``measurement`` overrides the campaign's own :class:`MeasurementSpec` for
+    this phase only, and is legal **solely on** :attr:`PhaseKind.MEASURE`. A
+    denser preset on a FORMULATE phase would be silently ignored, so it is
+    refused instead.
+
+    Both are trailing and defaulted, so every existing positional construction
+    of a ``RunPhase`` is unchanged.
     """
 
     kind: PhaseKind
@@ -203,6 +223,16 @@ class RunPhase:
     anneal_task: str = DEFAULT_ANNEAL_TASK
     anneal_params: Mapping[str, Any] | None = None
     settle: SettlePlan | None = None
+    conditions: "PhaseSetpoints | None" = None
+    measurement: "MeasurementSpec | None" = None
+
+    def __post_init__(self) -> None:
+        if self.measurement is not None and self.kind is not PhaseKind.MEASURE:
+            raise ValueError(
+                f"{self.kind.name} carries a measurement block; only MEASURE "
+                f"acquires data, so a preset named on any other phase would be "
+                f"accepted and never reach the instrument"
+            )
 
     def label(self) -> str:
         """Short human-readable phase label (for :meth:`RunPlan.describe`)."""
@@ -228,6 +258,10 @@ class RunPhase:
             name = "Measure EIS"
         else:
             name = self.kind.value.capitalize()
+        if self.measurement is not None:
+            name = f"{name} ({self.measurement.preset})"
+        if self.conditions is not None:
+            name = f"{name} @ {self.conditions.label()}"
         scope = "per sample" if self.scope is PhaseScope.PER_SAMPLE else "per batch"
         return f"{name} [{scope}]"
 
@@ -318,6 +352,8 @@ class RunPlan:
         anneal_task: str = DEFAULT_ANNEAL_TASK,
         anneal_params: Mapping[str, Any] | None = None,
         settle: SettlePlan | None = None,
+        conditions: "Mapping[PhaseKind, PhaseSetpoints] | None" = None,
+        measurement: "MeasurementSpec | None" = None,
     ) -> "RunPlan":
         """Everything per-sample: formulate → (anneal) → (equilibrate) → (measure).
 
@@ -326,7 +362,8 @@ class RunPlan:
         """
         return cls._assemble(PhaseScope.PER_SAMPLE, measure=measure, anneal=anneal,
                              anneal_task=anneal_task, anneal_params=anneal_params,
-                             settle=settle)
+                             settle=settle, conditions=conditions,
+                             measurement=measurement)
 
     @classmethod
     def batch(
@@ -337,6 +374,8 @@ class RunPlan:
         anneal_task: str = DEFAULT_ANNEAL_TASK,
         anneal_params: Mapping[str, Any] | None = None,
         settle: SettlePlan | None = None,
+        conditions: "Mapping[PhaseKind, PhaseSetpoints] | None" = None,
+        measurement: "MeasurementSpec | None" = None,
     ) -> "RunPlan":
         """Formulate-all → anneal-all → measure-all: cast per-sample, the rest per-batch.
 
@@ -348,7 +387,8 @@ class RunPlan:
         """
         return cls._assemble(PhaseScope.PER_BATCH, measure=measure, anneal=anneal,
                              anneal_task=anneal_task, anneal_params=anneal_params,
-                             settle=settle)
+                             settle=settle, conditions=conditions,
+                             measurement=measurement)
 
     @classmethod
     def _assemble(
@@ -360,20 +400,41 @@ class RunPlan:
         anneal_task: str,
         anneal_params: Mapping[str, Any] | None,
         settle: SettlePlan | None,
+        conditions: "Mapping[PhaseKind, PhaseSetpoints] | None" = None,
+        measurement: "MeasurementSpec | None" = None,
     ) -> "RunPlan":
         """Cast per-sample, then the optional tail at *scope* — the shared spine.
 
         Order is cure → equilibrate → measure: the anneal carries the bulk of the
         hold, the equilibrate phase decides when the *tail* of it has stopped
         moving, and only then is the reading worth recording.
+
+        *conditions* is keyed **by phase kind** rather than spread over four
+        ``casting_conditions=`` / ``anneal_conditions=`` keywords: the factories
+        build at most one phase of each kind, so the mapping is total, and a key
+        for a phase the arguments did not create is a silent no-op rather than a
+        combinatorial signature. A plan needing two phases of one kind is built
+        from ``RunPhase`` objects directly, which is what the TOML codec does.
         """
-        phases: list[RunPhase] = [RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE)]
+        if measurement is not None and not measure:
+            raise ValueError(
+                "measurement= names a preset for a MEASURE phase, but measure=False "
+                "builds no MEASURE phase; the override would be silently dropped"
+            )
+        by_kind: Mapping[PhaseKind, "PhaseSetpoints"] = conditions or {}
+        phases: list[RunPhase] = [RunPhase(
+            PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE,
+            conditions=by_kind.get(PhaseKind.FORMULATE))]
         if anneal:
             phases.append(RunPhase(PhaseKind.ANNEAL, scope,
                                    anneal_task=anneal_task,
-                                   anneal_params=anneal_params))
+                                   anneal_params=anneal_params,
+                                   conditions=by_kind.get(PhaseKind.ANNEAL)))
         if settle is not None:
-            phases.append(RunPhase(PhaseKind.EQUILIBRATE, scope, settle=settle))
+            phases.append(RunPhase(PhaseKind.EQUILIBRATE, scope, settle=settle,
+                                   conditions=by_kind.get(PhaseKind.EQUILIBRATE)))
         if measure:
-            phases.append(RunPhase(PhaseKind.MEASURE, scope))
+            phases.append(RunPhase(PhaseKind.MEASURE, scope,
+                                   conditions=by_kind.get(PhaseKind.MEASURE),
+                                   measurement=measurement))
         return cls(tuple(phases))

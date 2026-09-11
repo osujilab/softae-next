@@ -227,11 +227,35 @@ def _eis_build_measure_step(channel: int, spec: "MeasurementSpec") -> "WorkflowS
     Composed, not reimplemented: the step carries the T1.5 loop-closure tags
     (``channel`` + ``measurement=primary``) that the objective extractors select
     on, and a second builder here would be a second place for those to drift.
+
+    ``spec`` decides **which sweep the step reads**. It used to be accepted and
+    dropped on the floor, which made ``settle_measure_step(..., measurement=...)``
+    and ``confirmation_measure_step(..., measurement=...)`` advertise a per-round
+    preset that could not reach the hardware: every step pointed at the one base
+    ``.mscr``, whatever spec it was handed. Harmless while every caller passed
+    the campaign's own block, and silently wrong the moment one did not.
+
+    A spec whose scripts were prepared under a variant key
+    (:func:`~softae.core.eis_scripts.prepare_variant`, called by
+    :func:`_eis_prepare_run`) points at that variant's file. Everything else —
+    the campaign's own block, and any spec in a process where no run was
+    prepared — returns the step **untouched**, so the path is the one
+    ``eis_measure_step`` builds for itself and today's behaviour is unchanged.
     """
     from softae.core.autonomous_wiring import measure_step_name
     from softae.core.deposition_steps import eis_measure_step
+    from softae.core.eis_scripts import (
+        EISParams,
+        mscr_path_for_channel,
+        variant_for,
+    )
 
-    return eis_measure_step(channel, name=measure_step_name(channel))
+    step = eis_measure_step(channel, name=measure_step_name(channel))
+    variant = variant_for(EISParams.from_preset(spec.preset, **spec.overrides))
+    if variant is None:
+        return step
+    return step.with_params(
+        mscrpath=mscr_path_for_channel(channel, variant=variant))
 
 
 def _eis_router_factory() -> "ResultRouter":
@@ -247,6 +271,7 @@ def _eis_prepare_run(
     *,
     temp_dir: str | None = None,
     emit: Callable[..., None] | None = None,
+    as_variant: bool = False,
 ) -> None:
     """Write this campaign's ``.mscr`` scripts before any measurement step runs.
 
@@ -266,15 +291,38 @@ def _eis_prepare_run(
     alone would point the writer and the reader at different paths. A modality
     whose payload location is genuinely its own — a camera writing frames — is
     what the parameter is for.
+
+    ``as_variant`` is what separates *"this is the run"* from *"this is an extra
+    sweep inside the run"*, and it defaults to the former so every existing
+    caller is unchanged in every respect — including the state it leaves behind.
+    A run-level call declares the campaign's own block the base, takes the
+    unsuffixed path, and **clears any variants a previous campaign left**; only
+    ``as_variant=True`` adds a second sweep alongside it, for a denser production
+    read after settling. Inferring the difference from the spec alone is not
+    possible — two campaigns' measurement blocks are just two values — and
+    guessing wrong writes one run's scripts over another's.
+
+    :func:`_eis_build_measure_step` finds a variant's files because both ends
+    derive the key from the same resolved :class:`EISParams`.
     """
     if not spec.enabled:
         return
 
-    from softae.core.eis_scripts import EISParams, build_eis_scripts
+    from softae.core.eis_scripts import (
+        EISParams,
+        begin_run,
+        build_eis_scripts,
+        prepare_variant,
+    )
 
     channels = list(channels)
     eis_params = EISParams.from_preset(spec.preset, **spec.overrides)
-    build_eis_scripts(channels, eis_params)
+    if as_variant:
+        variant = prepare_variant(eis_params)
+    else:
+        begin_run(eis_params)
+        variant = None
+    build_eis_scripts(channels, eis_params, variant=variant)
     if emit is not None:
         # ``n`` counts the channels *asked for*, not the files successfully
         # written — build_eis_scripts is best-effort per channel and logs its own
