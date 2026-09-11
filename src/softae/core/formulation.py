@@ -26,9 +26,12 @@ import csv
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Sequence, Union
+from typing import TYPE_CHECKING, Sequence, Union
 
 import numpy as np
+
+if TYPE_CHECKING:  # pragma: no cover - typing only; the runtime import is lazy
+    from softae.core.deposit_target import DepositTargetSpec
 
 # Recognised per-component quantity units (case-insensitive).
 _VOLUME_UNITS = {"ml", "mp", "microliter", "µl", "ul"}
@@ -1022,7 +1025,19 @@ class FormulationContext:
     silica_stock: Solution
     catalog: ChemicalCatalog
     pump_assignment: dict[str, int]     # stock name → pump index
-    target_deposition_uL: float         # dried-film volume target (sheet F82)
+    #: Dried-film volume target (sheet F82) — the *fallback* scale, read only
+    #: through :func:`softae.core.deposit_target.scale_target`.  ``None`` is
+    #: legal only alongside a :attr:`deposit_target`: a thickness-kind context
+    #: has no volume until an area is resolved, and a placeholder (0.0, a NaN)
+    #: would be a scale nobody declared travelling into a solve.
+    target_deposition_uL: float | None
+    #: What the operator actually declared about the scale — a volume, or a
+    #: thickness over :attr:`pcb_name`'s deposit area.  ``None`` keeps the
+    #: pre-thickness behaviour exactly: ``TotalDepositTarget(target_deposition_uL)``.
+    deposit_target: "DepositTargetSpec | None" = None
+    #: Board whose deposit area a thickness target resolves against.  ``None``
+    #: takes the configured default PCB, as every other twin call site does.
+    pcb_name: str | None = None
     # Dried fractions default to ``None`` → emergent from each stock's dep/carrier
     # composition (:func:`dried_fraction`).  Set them only to override that
     # physical default (a fallback for stocks whose model omits their shrinkage).
@@ -1117,10 +1132,19 @@ def plan_formulation(
         )
     sil_component = sil_components[0]
 
+    # The scale row: a declared thickness when the context carries one, else the
+    # volume it always used.  One resolver, so the ternary preset, the general
+    # composition path and the HT panel cannot disagree about what "60 µm" means.
+    from softae.core.deposit_target import scale_target
+
     targets: list[FormulationTarget] = [
         MolarRatioTarget(eo_species, li_species, float(point["eo_li_ratio"])),
         DriedFractionTarget(sil_component, float(point["silica_vol_frac"]), Basis.VOLUME),
-        TotalDepositTarget(ctx.target_deposition_uL),
+        scale_target(
+            ctx.deposit_target,
+            fallback_uL=ctx.target_deposition_uL,
+            pcb_name=ctx.pcb_name,
+        ),
     ]
     overrides: dict[str, float] = {}
     if ctx.peo_dried_frac is not None:
@@ -1280,30 +1304,44 @@ class ThicknessTarget:
     questions:
 
     * ``"dry"`` — thickness of the **dried film**, the physically meaningful one
-      (it is the ``t`` in σ = L/(R·w·t)). With the default assumption of full
-      solvent loss, dry thickness × area *is* the dried deposit volume, so this
-      basis reduces exactly to :class:`TotalDepositTarget` once an authoritative
-      area is available. That is deliberate — it needs no new solver machinery
-      and no solvent model, which is what makes dry thickness deterministic.
+      (it is the ``t`` in σ = L/(R·w·t)). What stays behind is the deposited
+      volume *plus* whatever carrier did not evaporate, so this basis is
+      coupled to ``[deposition] evaporation_pct``: at full solvent loss it
+      reduces exactly to :class:`TotalDepositTarget`, and at zero loss it
+      reduces exactly to the wet basis. See :attr:`evaporation_pct`.
     * ``"wet"`` — thickness of the **as-dispensed** liquid. Directly
       controllable and independent of any evaporation assumption, but it is not
       the quantity conductivity depends on.
 
     ⚠️ **A computed thickness is a nominal, dense-film geometric estimate.**
     Volumes are treated as additive and no dry-film density or porosity is
-    modelled, so a porous real film is thicker than this number. Sound as a
-    control target and as a consistent relative measure across a campaign; not a
-    metrology claim.
+    modelled, so a porous real film is thicker than this number. Carrier loss is
+    a single fraction applied uniformly to every stock's carrier — there is no
+    per-solvent volatility term. Sound as a control target and as a consistent
+    relative measure across a campaign; not a metrology claim.
     """
 
     value_um: float
     area_mm2: float
     basis: str = "dry"
+    #: Carrier loss (%) this dry-basis target assumes, pinning the solve against
+    #: a config that may move mid-campaign. ``None`` reads
+    #: :func:`softae.core.deposition.evaporation_pct` at solve time — the same
+    #: single parse point the deposition twin reads, so the target and the twin
+    #: cannot disagree by construction. Ignored on the wet basis, which is
+    #: independent of evaporation by definition.
+    evaporation_pct: float | None = None
 
     def __post_init__(self) -> None:
         if self.basis not in ("dry", "wet"):
             raise ValueError(
                 f"ThicknessTarget basis must be 'dry' or 'wet', got {self.basis!r}"
+            )
+        if self.evaporation_pct is not None and not (
+                0.0 <= float(self.evaporation_pct) <= 100.0):
+            raise ValueError(
+                f"ThicknessTarget evaporation_pct must be in [0, 100], got "
+                f"{self.evaporation_pct!r}"
             )
         if self.area_mm2 <= 0:
             raise ValueError(
@@ -1323,6 +1361,20 @@ FormulationTarget = Union[
     MolarRatioTarget, DriedFractionTarget, ConcentrationTarget, TotalDepositTarget,
     ThicknessTarget,
 ]
+
+
+def _thickness_evaporation_pct(target: ThicknessTarget) -> float:
+    """Carrier loss (%) a dry thickness target solves against.
+
+    An unpinned target defers to :func:`softae.core.deposition.evaporation_pct`
+    — reached through the module so the GUI spin box, the twin and this solve
+    move together rather than from three independent defaults.
+    """
+    if target.evaporation_pct is not None:
+        return float(target.evaporation_pct)
+    from softae.core import deposition
+
+    return deposition.evaporation_pct()
 
 
 def species_concentration(
@@ -1435,10 +1487,15 @@ def solve_formulation(
             # Same shape as TotalDepositTarget — both fix the scale — differing
             # only in which volume the thickness refers to.
             if t.basis == "dry":
-                # Dried volume, weighted by each stock's deposited fraction.
-                # With full solvent loss this IS TotalDepositTarget, which is
-                # why the dry basis needs no new solver machinery.
-                rows.append([depf[i] for i in range(n)])
+                # What stays behind is the dried volume plus the carrier that
+                # did not evaporate.  Writing r = 1 - e/100 for the retained
+                # carrier fraction, the twin's own arithmetic
+                # (deposition.simulate_well_deposition) expands in the per-stock
+                # volumes as  Σ v_i · [depf_i + r·(1 - depf_i)],  which is one
+                # linear row.  r = 0 gives back [depf_i] — TotalDepositTarget,
+                # the shipped 100 % default — and r = 1 gives back the wet row.
+                r = 1.0 - _thickness_evaporation_pct(t) / 100.0
+                rows.append([depf[i] + r * (1.0 - depf[i]) for i in range(n)])
             else:  # "wet"
                 # As-dispensed volume: every stock contributes its full volume,
                 # so the coefficients are 1 regardless of what dries out.

@@ -96,6 +96,10 @@ class TestThicknessTargetValidation:
     def test_the_target_reports_its_volume(self):
         assert ThicknessTarget(0.5, area_mm2=4.0).volume_uL() == pytest.approx(0.002)
 
+    def test_an_out_of_range_evaporation_is_refused(self):
+        with pytest.raises(ValueError, match=r"\[0, 100\]"):
+            ThicknessTarget(0.3, area_mm2=4.0, evaporation_pct=120.0)
+
 
 @pytest.fixture
 def stocks():
@@ -153,6 +157,43 @@ class TestSolve:
             sols, chem, [ThicknessTarget(target_um, area_mm2=area, basis="wet")])
 
         assert dry.grand_total_uL != pytest.approx(wet.grand_total_uL)
+
+    def test_scale_target_dry_basis_at_zero_evaporation_equals_the_wet_basis(
+        self, stocks
+    ):
+        """D1's r = 1 limit, algebraically: ``depf_i + 1·(1 - depf_i) == 1``.
+
+        Nothing evaporates, so the dried film *is* the whole cast and the dry
+        row collapses onto the wet one. Together with the r = 0 limit above,
+        the two ends pin the interpolation.
+        """
+        chem, sols = stocks
+        area, target_um = 4.0, 2.5
+
+        dry = solve_formulation(sols, chem, [ThicknessTarget(
+            target_um, area_mm2=area, basis="dry", evaporation_pct=0.0)])
+        wet = solve_formulation(
+            sols, chem, [ThicknessTarget(target_um, area_mm2=area, basis="wet")])
+
+        assert dry.grand_total_uL == pytest.approx(wet.grand_total_uL)
+        for name in sols:
+            assert dry.per_stock_uL[name] == pytest.approx(wet.per_stock_uL[name])
+
+    def test_the_dry_row_interpolates_monotonically_between_the_two_limits(
+        self, stocks
+    ):
+        """Partial loss must sit strictly between them, not snap to an end."""
+        chem, sols = stocks
+        area, target_um = 4.0, 2.5
+
+        totals = [
+            solve_formulation(sols, chem, [ThicknessTarget(
+                target_um, area_mm2=area, basis="dry", evaporation_pct=e)]
+            ).grand_total_uL
+            for e in (0.0, 50.0, 100.0)
+        ]
+
+        assert totals[0] < totals[1] < totals[2]
 
     def test_a_wet_target_needs_more_volume_than_a_dry_one(self, stocks):
         """Only part of what is dispensed stays behind, so hitting the same

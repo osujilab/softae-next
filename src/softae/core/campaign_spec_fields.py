@@ -132,7 +132,14 @@ _AXIS_KEYS = ("kind", "a", "b", "low", "high", "basis")
 
 _GF_KEYS = frozenset(
     {"stocks", "pump_assignment", "target_deposition_uL", "axes",
-     "budget_uL", "dried_frac"})
+     "budget_uL", "dried_frac", "thickness_um", "thickness_basis"})
+
+#: The two keys that fix a formulation's scale. Exactly one may be declared:
+#: both would let a spec state the scale twice and silently prefer one, and
+#: neither leaves the solve under-determined. Conversion between them is
+#: impossible here anyway — the area comes from ``spec.pcb_name``, which this
+#: decoder never sees.
+_SCALE_KEYS = ("target_deposition_uL", "thickness_um")
 
 
 def catalogs() -> tuple[Any, Any]:
@@ -147,6 +154,22 @@ def catalogs() -> tuple[Any, Any]:
     from softae.core.stock_assignment import catalogs_from_data_root
 
     return catalogs_from_data_root()
+
+
+def _encode_scale(value: Any) -> dict[str, Any]:
+    """Whichever scale key the context declares — never both, never neither.
+
+    ``thickness_basis`` is written whenever a thickness is, for the reason the
+    axis keys are all written: an omitted key would silently take a default and
+    cast a different film.
+    """
+    dt = getattr(value, "deposit_target", None)
+    if dt is not None and getattr(dt, "kind", None) == "thickness":
+        return {"thickness_um": float(dt.value),
+                "thickness_basis": str(dt.basis)}
+    if dt is not None:
+        return {"target_deposition_uL": float(dt.value)}
+    return {"target_deposition_uL": float(value.target_deposition_uL)}
 
 
 def encode_general_formulation(value: Any) -> Any:
@@ -171,7 +194,7 @@ def encode_general_formulation(value: Any) -> Any:
             "stocks": sorted(str(name) for name in value.stocks),
             "pump_assignment": {str(k): int(v)
                                 for k, v in value.pump_assignment.items()},
-            "target_deposition_uL": float(value.target_deposition_uL),
+            **_encode_scale(value),
             "axes": [
                 {"kind": str(ax.kind), "a": str(ax.a), "b": str(ax.b),
                  "low": float(ax.low), "high": float(ax.high),
@@ -213,7 +236,51 @@ def _axis_from_dict(row: Any, index: int) -> Any:
         raise ValueError(f"axis #{index}: {exc}") from exc
 
 
+def _decode_scale(value: dict) -> tuple[Any, float | None]:
+    """``(DepositTargetSpec, target_deposition_uL)`` from the declared scale key.
+
+    ``target_deposition_uL`` comes back ``None`` for a thickness spec: it has no
+    volume until an area is resolved, and a placeholder would be a scale nobody
+    declared travelling into a solve.
+    """
+    from softae.core.deposit_target import DepositTargetSpec
+
+    declared = [k for k in _SCALE_KEYS if k in value]
+    if len(declared) > 1:
+        raise ValueError(
+            "declares both 'target_deposition_uL' and 'thickness_um' — both fix "
+            "the scale of the cast, so a spec carrying both states it twice and "
+            "one of them would be silently ignored. Declare exactly one.")
+    if not declared:
+        raise ValueError(
+            "declares neither 'target_deposition_uL' nor 'thickness_um' — a "
+            "composition solve with no scale row is under-determined, and a "
+            "substituted default would be a scale nobody declared.")
+
+    if declared[0] == "target_deposition_uL":
+        if "thickness_basis" in value:
+            raise ValueError(
+                "'thickness_basis' has no meaning beside 'target_deposition_uL'; "
+                "it selects which volume a 'thickness_um' refers to")
+        try:
+            volume_uL = float(value["target_deposition_uL"])
+        except (TypeError, ValueError):
+            raise ValueError("'target_deposition_uL' must be a number") from None
+        return DepositTargetSpec("volume", volume_uL), volume_uL
+
+    try:
+        thickness_um = float(value["thickness_um"])
+    except (TypeError, ValueError):
+        raise ValueError("'thickness_um' must be a number") from None
+    basis = value.get("thickness_basis", "dry")
+    if not isinstance(basis, str):
+        raise ValueError("'thickness_basis' must be 'dry' or 'wet'")
+    return DepositTargetSpec("thickness", thickness_um, basis), None
+
+
 def decode_general_formulation(value: Any) -> Any:
+    from dataclasses import fields as dataclass_fields
+
     from softae.core.autonomous_wiring import GeneralFormulation
 
     if not isinstance(value, dict):
@@ -221,9 +288,10 @@ def decode_general_formulation(value: Any) -> Any:
     unknown = sorted(set(value) - _GF_KEYS)
     if unknown:
         raise ValueError(f"unknown key(s) {unknown}")
-    for required in ("stocks", "pump_assignment", "target_deposition_uL", "axes"):
+    for required in ("stocks", "pump_assignment", "axes"):
         if required not in value:
             raise ValueError(f"'{required}' is required")
+    deposit_target, target_deposition_uL = _decode_scale(value)
 
     raw_axes = value["axes"]
     if not isinstance(raw_axes, list) or not raw_axes:
@@ -263,17 +331,31 @@ def decode_general_formulation(value: Any) -> Any:
             f"list")
 
     dried = value.get("dried_frac")
-    return GeneralFormulation(
+    kwargs: dict[str, Any] = dict(
         stocks=stocks,
         catalog=chem_catalog,
         pump_assignment=pump_assignment,
-        target_deposition_uL=float(value["target_deposition_uL"]),
+        target_deposition_uL=target_deposition_uL,
         budget_uL=(None if value.get("budget_uL") is None
                    else float(value["budget_uL"])),
         dried_frac=(None if dried is None
                     else {str(k): float(v) for k, v in dried.items()}),
         axes=axes,
     )
+    # The campaign context grows its ``deposit_target`` field in wave W3
+    # (docs/SubAgent docs/thickness_target_all_paths.md). Until it does, a
+    # thickness must be refused rather than dropped: a spec that decoded
+    # without its scale would run a different experiment from the one the file
+    # describes — the exact silence this module exists to prevent.
+    if any(f.name == "deposit_target" for f in dataclass_fields(GeneralFormulation)):
+        kwargs["deposit_target"] = deposit_target
+    elif deposit_target.kind == "thickness":
+        raise ValueError(
+            "'thickness_um' cannot be carried yet: the campaign's composition "
+            "context has no deposit target field, so the thickness would be "
+            "dropped and the campaign would cast an undeclared volume. Declare "
+            "'target_deposition_uL' until the campaign wiring lands.")
+    return GeneralFormulation(**kwargs)
 
 
 #: The fields this module owns, by spec field name. :mod:`campaign_spec_io`
