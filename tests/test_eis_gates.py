@@ -701,13 +701,47 @@ class TestFrontTwo:
         r = gate_degeneracy(f, Z, self._ctx_with_fit(_Fit()))
         assert not r.passed and "unidentifiable" in r.detail
 
-    def test_every_front2_gate_is_inert_without_a_fit(self):
+    #: Front-2 members that read **nothing** from ``ctx["fit"]``. "Inert without a
+    #: fit" is not a claim these make — they judge the raw ``(f, Z)`` sweep — so the
+    #: loop below holds them out by name rather than weakening its assertion to
+    #: accommodate them. Each one gets its own test instead.
+    FIT_INDEPENDENT = {"gate_arc_closure"}
+
+    def test_every_fit_dependent_front2_gate_is_inert_without_a_fit(self):
         from softae.analysis.eis.gates import FRONT2_GATES
 
         f, Z = reference_spectrum()
         ctx = self._ctx_with_fit(None)
-        for gate in FRONT2_GATES:
+        covered = [g for g in FRONT2_GATES if g.__name__ not in self.FIT_INDEPENDENT]
+        # Without this the exclusion set above could quietly empty the loop and the
+        # test would still be green — a check that cannot fail.
+        assert len(covered) == 6, [g.__name__ for g in covered]
+        for gate in covered:
             assert gate(f, Z, ctx).passed, gate.__name__
+
+    def test_arc_closure_judges_the_sweep_so_the_fit_is_not_one_of_its_inputs(self):
+        """The one Front-2 member that is not inert without a fit, and need not be.
+
+        Its verdict on ``reference_spectrum()`` is a legitimate ``False`` — the arc
+        does not close inside this sweep — so asserting ``passed`` here would assert
+        the opposite of what the gate measures. The invariant that *does* hold is
+        that the presence or absence of a fit changes nothing about it, and that it
+        reports ``checked=True`` either way rather than going quiet.
+        """
+        from softae.analysis.eis.arc_gate import gate_arc_closure
+
+        f, Z = reference_spectrum()
+
+        class _Fit:
+            z_fit = Z
+            quality = {"residual_rms_pct": 1.0}
+
+        without = gate_arc_closure(f, Z, self._ctx_with_fit(None))
+        with_fit = gate_arc_closure(f, Z, self._ctx_with_fit(_Fit()))
+
+        assert without.checked is True, "a missing fit must not mute a gate that never read one"
+        assert without.severity == FLAG, "records only; it can refuse nothing"
+        assert (with_fit.passed, with_fit.detail) == (without.passed, without.detail)
 
 
 class TestGateResult:
@@ -1023,6 +1057,12 @@ class TestCouldNotCheckCensus:
         the three ``cov is None`` branches are not an edge case there but the norm.
         Before this field, all six reported ``passed=True`` — indistinguishable, to
         every consumer, from six gates that checked and found nothing wrong.
+
+        ``arc_closure`` is a member of the tuple but **not** of this census: it reads
+        the raw ``(f, Z)`` sweep and never the fit, so a failed fit leaves it fully
+        able to judge. It is held out below rather than the census being relaxed to
+        include it, and its own ``checked is True`` is asserted separately — an
+        exclusion that stopped being checked is how a census silently shrinks.
         """
         from softae.analysis.eis.gates import FRONT2_GATES
 
@@ -1036,9 +1076,19 @@ class TestCouldNotCheckCensus:
         assert set(checked) == {
             "residual_norm", "residual_structure", "pegged_parameters",
             "relative_standard_error", "degeneracy", "model_free_crosscheck",
+            "arc_closure",
         }, "every Front-2 gate must have run — none may short-circuit the chain"
-        assert all(v is False for v in checked.values()), checked
-        assert all(r.passed for r in results), "fail-open, and no verdict moves"
+
+        fit_dependent = {k: v for k, v in checked.items() if k != "arc_closure"}
+        assert len(fit_dependent) == 6, fit_dependent
+        assert all(v is False for v in fit_dependent.values()), fit_dependent
+        assert all(r.passed for r in results if r.name != "arc_closure"), (
+            "fail-open, and no verdict moves")
+
+        assert checked["arc_closure"] is True, (
+            "it never read the fit, so a failed fit is not an absence of evidence "
+            "for it — reporting checked=False here would be the census's own "
+            "'could not check' wearing the wrong hat")
 
     def test_a_singular_covariance_leaves_the_measurand_not_determined(self):
         """§3.5(i) — the site the whole ruling turns on.

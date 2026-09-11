@@ -414,26 +414,41 @@ class TestGatedEngineHonoursTheQualityConfig:
 
 class TestGatedEngine:
     def test_a_clean_spectrum_is_admitted_and_keeps_every_point(self):
+        # Advisories are recorded, not refusals: a clean spectrum can trip
+        # flag-severity gates (Front-2, e.g. `arc_closure`) and still be admitted
+        # with every point kept, so `gate_summary()` is entitled to read "flagged"
+        # here — it must never read the bare "pass" that means no advisories fired.
         report = analyze_spectrum(as_eis_result(*reference_spectrum()),
                                   cell=CELL, settings=_gated())
         blocking = [e for e in report.gate_log
                     if not e["passed"]
                     and e["severity"] in ("block_spectrum", "block_session")]
-        assert blocking == []
-        assert report.mask.all()
-        assert report.gate_summary() == "pass"
+        assert blocking == [], "a clean spectrum must not trip a blocking gate"
+        assert report.mask.all(), "every point must be kept"
+        assert report.n_dropped == 0
+        summary = report.gate_summary()
+        assert summary != "pass", "advisories are present and must not be hidden"
+        assert summary.endswith("flagged")
 
-    def test_the_only_advisory_a_realistic_spectrum_trips_is_the_marginal_plateau(self):
+    def test_the_advisories_a_realistic_spectrum_trips_are_the_plateau_and_the_arc(self):
         # Front-2 flags are diagnostics, not admission criteria. The model-free
         # 1/max(Re Y) estimator disagrees with the fit by ~40%, which is the estimator
         # degrading as the plateau is squeezed between the blocking onset and the
         # relaxation corner — the signal §3.7 asks to be flagged, not a bad fit.
+        #
+        # "the only advisory" was true until `gate_arc_closure` joined FRONT2_GATES
+        # (2026-09-10, [p136] §1) and is not any more: this spectrum reads OPEN —
+        # −Z″ peaks at the sweep floor with phase −60.05° there, so R1 is
+        # extrapolated rather than measured. That second name is NOT a second
+        # complaint about the fit. `arc_closure` RECORDS the arc state — whether the
+        # band actually contained the arc — which is a property of the sweep, and it
+        # would flag identically on a perfect fit of the same frequencies.
         report = analyze_spectrum(
             as_eis_result(*reference_spectrum(noise_pct=1.0, seed=3)),
             cell=CELL, settings=_gated())
         flagged = {e["gate"] for e in report.gate_log
                    if not e["passed"] and e["severity"] == "flag"}
-        assert flagged == {"model_free_crosscheck"}
+        assert flagged == {"model_free_crosscheck", "arc_closure"}
 
     def test_a_noise_free_spectrum_trips_the_runs_test_by_construction(self):
         # Worth pinning rather than working around: with no noise, the residuals are

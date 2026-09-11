@@ -271,13 +271,27 @@ def _gate_item(fit_result: Any) -> "QTableWidgetItem":
     """The Gate cell: what the admission gates did to this spectrum.
 
     ``—`` on the legacy engine, which runs no gates. Otherwise ``pass``,
-    ``N dropped``, ``N unchecked``, or ``REJECTED: <gate>``, with the full
-    per-gate log in the tooltip — R17's "no point removed without a named gate
-    and a reason", carried all the way to where someone actually looks.
+    ``<gate> flagged``, ``N dropped``, ``N unchecked``, or ``REJECTED: <gate>``,
+    with the full per-gate log in the tooltip — R17's "no point removed without a
+    named gate and a reason", carried all the way to where someone actually looks.
 
-    The rendering is
+    **A failed ``flag`` refuses nothing, drops nothing and leaves no counter, so
+    it has to be named or it is invisible.** ``gate_arc_closure`` on an ``OPEN``
+    arc is exactly that shape — ``passed=False``, ``severity="flag"``,
+    ``n_dropped=0``, ``checked=True`` — and before this branch existed it fell
+    through to the bare ``"pass"`` that means *every gate ran and none refused*.
+    The tooltip said ``FAIL`` and the cell said the opposite, which defeats the
+    whole reason the verdict was promoted into the log. The **name** is rendered
+    for a lone flag because the name is the information; two or more fall back to
+    a count, which is what fits. Only ``flag`` severity is counted here:
+    ``block_point`` failures are already visible as ``N dropped`` and would
+    otherwise be reported twice.
+
+    The rest of the rendering is
     :meth:`softae.analysis.eis.report.QualityReport.gate_summary`'s, adopted
-    token-for-token so the two surfaces cannot disagree. In particular
+    token-for-token so the two surfaces cannot disagree — **with the flag branch
+    as the one deliberate exception**: ``gate_summary`` has the same blind spot
+    and has not yet been changed. In particular
     ``checked`` is read with **no default**: ``e.get("checked") is False`` only.
     An absent ``checked`` means the entry predates the field and is rendered by
     ``passed`` — deliberately the permissive branch, because every stored
@@ -306,12 +320,22 @@ def _gate_item(fit_result: Any) -> "QTableWidgetItem":
     )
     dropped = sum(int(e.get("n_dropped", 0) or 0) for e in log)
     unchecked = sum(1 for e in log if e.get("checked") is False)
+    # Exactly the entries `_gate_mark` marks FAIL and no counter above records:
+    # `checked is not False` first, so the two surfaces order the states alike.
+    flagged = [e for e in log
+               if e.get("checked") is not False
+               and not e.get("passed", True)
+               and e.get("severity") == "flag"]
 
     if rejected is not None:
         item = _ro_item(f"REJECTED: {rejected.get('gate', '?')}")
         item.setForeground(Qt.GlobalColor.red)
     else:
         parts = []
+        if len(flagged) == 1:
+            parts.append(f"{flagged[0].get('gate', '?')} flagged")
+        elif flagged:
+            parts.append(f"{len(flagged)} flagged")
         if dropped:
             parts.append(f"{dropped} dropped")
         if unchecked:

@@ -13,9 +13,17 @@ lesson is why ``[quality] enabled`` and ``[purge] actuate`` ship false.
 
 ``enabled`` is deliberately separate from ``engine`` — the same two-flag design
 :class:`~softae.core.purge.PurgeSettings` uses. ``engine = "gated"`` with
-``enabled = false`` runs every gate and logs every verdict while removing nothing,
-so the thresholds can be observed against real runs before they are given authority
-over data.
+``enabled = false`` runs every gate and logs every verdict, so the thresholds can be
+observed against real runs before they are given authority over data.
+
+**What ``enabled = false`` withholds is the refusal, not the removal.** This paragraph
+used to end "while removing nothing" and that was false: ``run_gates`` applies every
+``block_point`` mask regardless of the flag, and only the REJECT short-circuit reads it
+(:func:`~softae.analysis.eis.policy.reduce_gates` downgrades a would-be REJECT to
+SUSPECT, and ``analyze_spectrum``'s R18 early return sits behind the same flag). So an
+observing-only run still drops points and still moves ``R1`` — it just never refuses a
+spectrum outright. ``softae_config.toml`` carries the measurement: on 515 stored spectra,
+66.2 % lose at least one point.
 """
 
 from __future__ import annotations
@@ -172,9 +180,16 @@ class GateSettings:
         positive.
         """
         if not self.enabled:
+            # This line used to end "nothing is removed", and that was FALSE.
+            # ``run_gates`` applies every ``block_point`` mask regardless of this
+            # flag; only the REJECT short-circuit reads it (``reduce_gates``
+            # downgrades a would-be REJECT to SUSPECT, and ``analyze_spectrum``'s
+            # R18 early return sits behind the same flag). What ``enabled=False``
+            # withholds is the *refusal of a spectrum*, not the dropping of points.
             return (
-                "EIS gates observe only — every check runs and logs, nothing is "
-                "removed."
+                "EIS gates observe only — every check runs and logs, and failing "
+                "points are still dropped; a would-be REJECT is recorded SUSPECT "
+                "rather than refusing the spectrum."
             )
         return (
             f"EIS gates enforcing: tanδ slope ≤ {self.tand_slope_max:+.2f}, "

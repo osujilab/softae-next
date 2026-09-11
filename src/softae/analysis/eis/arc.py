@@ -163,13 +163,39 @@ class ArcClosure:
     def as_record(self) -> dict[str, Any]:
         """The persisted form — ``run_gates`` log shape plus the four numbers.
 
-        Log shape because the column this travels in is ``fit_results.gate_log_json``,
-        whose readers sum ``n_dropped`` over every entry; an entry missing that key
-        would be a foreign object in a list with a contract.
+        **No live writer produces this today, and that is the correction.** The
+        docstring here used to say "the column this travels in is
+        ``fit_results.gate_log_json``"; since the dedicated ``arc_state`` /
+        ``arc_f_peak_hz`` / ``arc_phase_low_deg`` columns landed,
+        :func:`~softae.core.data_store._arc_columns` reads the *fit* and every row
+        written carries the literal ``"[]"`` in ``gate_log_json`` — the shim that
+        copied this record into a report's gate log was retired the moment those
+        columns existed. Grep agrees: this method has no caller in ``src/``.
+
+        The **shape** is still exact, for two reasons that outlive the writer.
+        Historical rows do carry this record in the JSON and ``shadow_db``'s
+        fallback still parses them, so the keys are a read contract even though
+        they are no longer a write contract; and any reader of that list sums
+        ``n_dropped`` over every entry, so an entry missing that key would be a
+        foreign object in a list with a contract.
+
+        ``severity`` is a real member of :data:`~softae.analysis.eis.gates.SEVERITIES`
+        rather than the string ``"annotate"`` it carried until 2026-09-10.
+        ``"annotate"`` was in no enum anywhere, so every consumer that switches on
+        severity fell through it silently — a gate-verdict shape structurally
+        incapable of producing a verdict. :data:`~softae.analysis.eis.gates.FLAG` is
+        the member that means what this record has always meant: *recorded, never
+        removes data* — the same posture :func:`annotate_arc_closure` takes and the
+        one :mod:`softae.analysis.eis.arc_gate` carries into the cascade. The import
+        is deferred for the reason :func:`arc_closure` defers ``usable_points``:
+        this module is a numpy-only leaf that ``scout``, ``equilibration`` and two
+        tools import, and ``gates`` is not on their path.
         """
+        from softae.analysis.eis.gates import FLAG
+
         return {
             "gate": "arc_closure",
-            "severity": "annotate",
+            "severity": FLAG,
             "passed": self.state == CLOSED,
             "n_dropped": self.n_dropped,
             "detail": self.detail,

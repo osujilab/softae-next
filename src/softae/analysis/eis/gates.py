@@ -1121,7 +1121,19 @@ def gate_residual_norm(f: np.ndarray, Z: np.ndarray, ctx: dict[str, Any]) -> Gat
     )
 
 
+# Mid-module by necessity, not by style: `arc_gate` imports `FLAG` and `GateResult`
+# from this module at its own module scope, so a top-of-file import here is a cycle
+# that raises `ImportError` at interpreter start — this module would be in
+# `sys.modules` but still empty. Placed here, both names are long since defined.
+from softae.analysis.eis.arc_gate import gate_arc_closure  # noqa: E402
+
 #: Front-2 gates. Run after fitting, with the fit supplied as ``ctx["fit"]``.
+#:
+#: :func:`~softae.analysis.eis.arc_gate.gate_arc_closure` is the one member that reads
+#: **nothing** from the fit — it judges the raw ``(f, Z)`` sweep — and it sits here
+#: because it is a recorder rather than an admission criterion, which is the property
+#: this tuple has and ``FRONT1_GATES`` does not: a ``flag`` after σ is built cannot
+#: reach a refusal by either of the two mechanisms that would be needed.
 #:
 #: **None of these is an admission criterion on this fixture, and the reason is structural.**
 #: ``ρ(R_series, R_bulk)`` is exactly ±1.000000 on all 28 fits of the 40-spectrum corpus
@@ -1147,6 +1159,7 @@ FRONT2_GATES: tuple[Callable[..., GateResult], ...] = (
     gate_relative_standard_error,
     gate_degeneracy,
     gate_model_free_crosscheck,
+    gate_arc_closure,
 )
 
 

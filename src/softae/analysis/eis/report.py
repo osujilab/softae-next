@@ -307,6 +307,17 @@ class SpectrumReport:
         Drops and unchecked gates are reported *together* rather than one shadowing the
         other: they are independent facts about the sweep, and a cell that showed only
         the first would hide the second exactly when both are true.
+
+        **A failed ``flag`` refuses nothing, drops nothing and leaves no counter, so it
+        has to be named or it is invisible.** ``gate_arc_closure`` on an ``OPEN`` arc is
+        exactly that shape — ``passed=False``, ``severity="flag"``, ``n_dropped=0``,
+        ``checked=True`` — and before this branch existed it fell through to the bare
+        ``"pass"`` that means *every gate ran and none refused*, the same defect
+        :meth:`~softae.gui.tabs.tab_analysis._gate_item` carried and was fixed first. The
+        **name** is rendered for a lone flag because the name is the information; two or
+        more fall back to a count. Only ``flag`` severity is counted here: a
+        ``block_point`` failure is already visible as ``N dropped`` and would otherwise
+        be reported twice.
         """
         if self.engine != "gated":
             return "—"
@@ -329,6 +340,18 @@ class SpectrumReport:
             issues = list(getattr(self.quality, "issues", ()) or ())
             return f"REJECTED: {issues[0]}" if issues else "REJECTED: quality"
         parts = []
+        # Exactly the entries `_gate_item` marks FAIL and no counter below records:
+        # `checked is not False` first, so the two surfaces order the states alike.
+        flagged = [
+            e for e in self.gate_log
+            if e.get("checked") is not False
+            and not e.get("passed", True)
+            and e.get("severity") == "flag"
+        ]
+        if len(flagged) == 1:
+            parts.append(f"{flagged[0].get('gate', '?')} flagged")
+        elif flagged:
+            parts.append(f"{len(flagged)} flagged")
         if self.n_dropped:
             parts.append(f"{self.n_dropped} dropped")
         unchecked = sum(1 for e in self.gate_log if e.get("checked") is False)

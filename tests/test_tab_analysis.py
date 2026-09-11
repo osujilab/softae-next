@@ -747,6 +747,16 @@ def _entry_dropped(name, n):
     return GateResult(name, BLOCK_POINT, True, f"{n} points removed", mask).as_log_entry()
 
 
+def _entry_flagged(name="arc_closure", detail="apex not bracketed"):
+    """A ``flag`` gate that ran and was NOT satisfied — ``gate_arc_closure`` on an OPEN arc.
+
+    The shape with no counter of its own: ``passed=False``, ``checked=True``,
+    ``n_dropped=0``, severity below any refusal. Nothing in the cell recorded it
+    before, so it rendered as the bare ``"pass"`` that claims the opposite.
+    """
+    return GateResult(name, FLAG, False, detail, _MASK_OK).as_log_entry()
+
+
 def _entry_rejected(name="stuck_instrument"):
     """A ``block_spectrum`` refusal — the whole spectrum is out."""
     return GateResult(name, BLOCK_SPECTRUM, False, "identical readings", _MASK_OK).as_log_entry()
@@ -826,6 +836,47 @@ class TestGateItemRendersThreeStates:
                _entry_unchecked("pegged_parameters"),
                _entry_rejected("stuck_instrument")]
         assert ta_mod._gate_item(_fit(log)).text() == "REJECTED: stuck_instrument"
+
+    def test_gate_item_a_failed_flag_is_never_rendered_as_a_bare_pass(self, qapp):
+        """The assertion the bug was: a failed flag that read ``pass`` on screen.
+
+        Written as ``!= "pass"`` rather than against the exact string because the
+        defect is the *conflation*, not the wording — a cell that says every gate
+        ran and none refused, over a log whose tooltip says ``FAIL``.
+        """
+        log = [_entry_passed("kk_residual"), _entry_flagged("arc_closure")]
+        assert ta_mod._gate_item(_fit(log)).text() != "pass"
+
+    def test_gate_item_one_failed_flag_renders_the_gate_name(self, qapp):
+        """A lone flag is named: with no counter to carry it, the name is the fact."""
+        log = [_entry_passed("kk_residual"), _entry_flagged("arc_closure")]
+        assert ta_mod._gate_item(_fit(log)).text() == "arc_closure flagged"
+
+    def test_gate_item_two_failed_flags_render_the_count(self, qapp):
+        log = [_entry_flagged("arc_closure"), _entry_flagged("tand_slope")]
+        assert ta_mod._gate_item(_fit(log)).text() == "2 flagged"
+
+    def test_gate_item_a_flag_renders_before_dropped_and_unchecked(self, qapp):
+        """Three independent facts; the verdict leads because the column truncates."""
+        log = [_entry_dropped("outlier", 2),
+               _entry_unchecked("pegged_parameters"),
+               _entry_flagged("arc_closure")]
+        assert (ta_mod._gate_item(_fit(log)).text()
+                == "arc_closure flagged, 2 dropped, 1 unchecked")
+
+    def test_gate_item_a_rejection_still_outranks_a_failed_flag(self, qapp):
+        """The red branch is untouched: a refusal replaces the cell, flag included."""
+        log = [_entry_flagged("arc_closure"), _entry_rejected("stuck_instrument")]
+        assert ta_mod._gate_item(_fit(log)).text() == "REJECTED: stuck_instrument"
+
+    def test_gate_item_an_unchecked_flag_counts_as_unchecked_not_flagged(self, qapp):
+        """``gate_arc_closure`` on an UNKNOWN arc: ``checked`` outranks ``passed``.
+
+        Same precedence ``_gate_mark`` applies in the tooltip, so an entry marked
+        ``unchecked`` there is never counted ``flagged`` here.
+        """
+        log = [_entry_unchecked("arc_closure", "sweep too short to judge")]
+        assert ta_mod._gate_item(_fit(log)).text() == "1 unchecked"
 
 
 class TestGateItemTooltipIsThreeState:

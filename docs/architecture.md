@@ -137,7 +137,7 @@ flowchart TD
     E --> F{block_spectrum?}
     F -->|Yes| R
     F -->|No| G[Circuit fit on surviving points]
-    G --> H["FRONT2_GATES — 6 gates, post-fit"]
+    G --> H["FRONT2_GATES — 7 gates, post-fit"]
     H --> I[SpectrumReport: verdict, gate log, surviving mask]
 ```
 
@@ -145,7 +145,7 @@ flowchart TD
 |---|---|---|---|
 | 1 | `FRONT1_PRE_CORRECTION` | 6 | The raw instrument record — *did the instrument record something real?* Correcting first would let a subtraction rescue a spectrum the measurement itself failed. |
 | 2 | `FRONT1_POST_CORRECTION` | 8, including the 3-member `TOPOLOGY_TRIAD` | Fixture-corrected data — *does this spectrum contain the physics being extracted?* Only answerable once the fixture's own contribution is gone. |
-| 3 | `FRONT2_GATES` | 6 | The fitted model — *is the fit trustworthy?* |
+| 3 | `FRONT2_GATES` | 7 | The fitted model — *is the fit trustworthy?* |
 
 A 21st gate, `gate_cross_spectrum_duplicates`, is defined and covered by tests but is called from no production path: it is series-level, needing two or more independent spectra, and `run_gates` sees one spectrum at a time.
 

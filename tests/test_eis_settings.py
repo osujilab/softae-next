@@ -9,6 +9,12 @@ One config key, ``rho_degenerate``, drives two tests — ``gate_degeneracy`` and
 on the magnitude (``|ρ| ≥ |rho_degenerate|``). The line has to carry both, attributed:
 naming only one misdescribes the other.
 
+It did it a second time, on the other branch. The observing-only line claimed "nothing is
+removed" while ``run_gates`` was dropping points on two spectra in three, because only the
+REJECT short-circuit ever read ``[eis.gates] enabled`` — and the test pinning that wording
+was *named after the false claim*, so a passing suite read as confirmation. Both branches
+are now asserted on substance, and the retracted phrase is asserted absent.
+
 Nothing here reads config or touches the rig; these are assertions about a string.
 """
 
@@ -18,8 +24,19 @@ from softae.analysis.eis.settings import GateSettings
 
 
 class TestGateSummary:
-    def test_the_summary_says_nothing_is_removed_while_the_gates_only_observe(self):
-        assert "observe only" in GateSettings().describe()
+    def test_the_summary_says_points_are_still_dropped_while_the_gates_only_observe(self):
+        # The old name and the old line both claimed "nothing is removed", and the
+        # claim was false in the shipped configuration: `run_gates` applies every
+        # `block_point` mask regardless of `[eis.gates] enabled`, and only the REJECT
+        # short-circuit reads that flag. `enabled = false` withholds the *refusal of a
+        # spectrum*, not the dropping of points — 66.2 % of 515 stored spectra lose at
+        # least one point in exactly this mode. So the assertion pins both halves, and
+        # names the retracted claim so it cannot quietly return.
+        text = GateSettings().describe()
+        assert "observe only" in text
+        assert "failing points are still dropped" in text
+        assert "recorded SUSPECT rather than refusing the spectrum" in text
+        assert "nothing is removed" not in text
 
     def test_the_degeneracy_gate_is_summarised_two_sided_on_the_magnitude(self):
         assert "|ρ| ≥ 0.95" in GateSettings(enabled=True,
