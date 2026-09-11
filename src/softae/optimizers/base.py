@@ -3,17 +3,49 @@
 from __future__ import annotations
 
 import abc
+import enum
 from typing import Any
+
+import structlog
 
 from softae.errors import OptimizerError
 
+logger = structlog.get_logger(__name__)
+
 _VALID_TYPES = {"float", "int", "categorical"}
+
+#: Redraws allowed per :meth:`BaseOptimizer.suggest` before the space is
+#: declared infeasible rather than searched.
+DEFAULT_FEASIBILITY_MAX_TRIES = 200
+
+
+class Feasibility(enum.Enum):
+    """Verdict of a deposition-feasibility check on one candidate point.
+
+    Tri-state on purpose. The predecessor contract was ``(params) -> bool`` with
+    two separate spellings of "unknown" collapsed onto ``True``: a raising check,
+    and a board that declares no capacity. Both then read, to every consumer, as
+    *checked and clean* — SUBAGENT_RULES 3.1(a).
+
+    :attr:`UNCHECKED` is admitted by the optimizer (an unsolvable point is not a
+    proven-bad one, and carving an invisible hole in the search space is worse)
+    but it is **counted**, so the pre-cast gate and the run report can act on
+    something the optimizer could not vouch for.
+    """
+
+    FEASIBLE = "feasible"
+    INFEASIBLE = "infeasible"
+    UNCHECKED = "unchecked"
 
 
 class BaseOptimizer(abc.ABC):
     """Abstract base class for all SoftAE optimizers.
 
-    Subclasses must implement :meth:`suggest`, :meth:`tell`, and :meth:`best`.
+    Subclasses implement :meth:`_propose`, :meth:`tell`, and :meth:`best`.
+    :meth:`suggest` is a **template method** owned by this class: it wraps
+    ``_propose`` in the feasibility loop so every backend — random, grid,
+    Bayesian, pooled — is filtered identically, rather than only the one that
+    happened to read the hook.
     """
 
     def __init__(
@@ -58,22 +90,121 @@ class BaseOptimizer(abc.ABC):
         self._parameter_space = parameter_space
         self._objective = objective
         self._seed = seed
-        #: ``(params) -> bool`` — a known, deterministic, cheap constraint the
-        #: optimizer must not propose outside of (P7.1). Declared here so every
-        #: optimizer carries the attribute even if only some act on it, and so
-        #: the caller sets it the same way regardless of backend.
+        #: ``(params) -> Feasibility`` — the tri-state constraint every optimizer
+        #: is filtered by (W2). Set externally by the campaign host; ``None``
+        #: means no constraint was declared, which is *not* the same as one that
+        #: could not answer.
         #:
         #: Deliberately NOT serialized by ``to_dict``: it is a live callable
         #: belonging to the host's twin, and a resumed run rebuilds it from the
         #: spec rather than restoring a stale closure.
+        self.check_feasible_fn = None
+        #: Legacy ``(params) -> bool | None`` hook (P7.1), still honoured because
+        #: the campaign wiring sets it. Adapted in :meth:`check_feasible`:
+        #: ``None`` — the "board declares no capacity" spelling — and a raising
+        #: call both become :attr:`Feasibility.UNCHECKED` rather than ``True``.
         self.feasibility_fn = None
+        #: Redraws per :meth:`suggest`. Instance-level so a subclass or a test
+        #: can shorten it without touching the module default.
+        self._feasibility_max_tries = DEFAULT_FEASIBILITY_MAX_TRIES
+        #: Proposals refused by the filter, and proposals it could not judge.
+        #: Both are checkpointed: a resumed run must still be able to report
+        #: that the space was mostly infeasible.
+        self._n_rejected = 0
+        self._n_unchecked = 0
         self._history: list[tuple[dict[str, Any], float]] = []
+
+    # ── Feasibility (W2) ────────────────────────────────────────────
+
+    def check_feasible(self, params: dict[str, Any]) -> "Feasibility":
+        """Tri-state verdict on *params*.
+
+        No hook at all → :attr:`Feasibility.FEASIBLE`: nothing was declared, so
+        there is no constraint to violate. A hook that *exists* and cannot answer
+        → :attr:`Feasibility.UNCHECKED`. Those two must not share a token, which
+        is the whole point of the enum.
+        """
+        fn = self.check_feasible_fn
+        if fn is not None:
+            try:
+                verdict = fn(params)
+            except Exception:
+                logger.warning("check_feasible_fn_failed", exc_info=True)
+                return Feasibility.UNCHECKED
+            if isinstance(verdict, Feasibility):
+                return verdict
+            logger.warning(
+                "check_feasible_fn_returned_non_verdict", got=repr(verdict),
+                msg="expected a Feasibility member; treating as unchecked",
+            )
+            return Feasibility.UNCHECKED
+
+        fn = self.feasibility_fn
+        if fn is None:
+            return Feasibility.FEASIBLE
+        try:
+            verdict = fn(params)
+        except Exception:
+            logger.warning("feasibility_fn_failed", exc_info=True)
+            return Feasibility.UNCHECKED
+        if verdict is None:
+            return Feasibility.UNCHECKED
+        return Feasibility.FEASIBLE if verdict else Feasibility.INFEASIBLE
+
+    @property
+    def n_rejected(self) -> int:
+        """Proposals the filter refused. Non-zero alongside a ``None`` from
+        :meth:`suggest` means *exhausted by rejection*, not converged."""
+        return self._n_rejected
+
+    @property
+    def n_unchecked(self) -> int:
+        """Proposals admitted that the filter could not judge."""
+        return self._n_unchecked
+
+    # ── Template method ─────────────────────────────────────────────
+
+    def suggest(self) -> dict[str, Any] | None:
+        """Next parameter set to evaluate, or ``None`` if exhausted.
+
+        Two ``None``s, and the caller can tell them apart via :attr:`n_rejected`:
+        ``_propose`` returning ``None`` is *genuine* exhaustion (budget spent,
+        grid walked, pool empty); running out of tries is a space the filter
+        refused. A grid exhausted by rejection and a grid exhausted by search
+        must not print the same word.
+        """
+        for _ in range(self._feasibility_max_tries):
+            params = self._propose()
+            if params is None:
+                return None
+            verdict = self.check_feasible(params)
+            if verdict is Feasibility.INFEASIBLE:
+                self._n_rejected += 1
+                continue
+            if verdict is Feasibility.UNCHECKED:
+                self._n_unchecked += 1
+            self._on_accept(params)
+            return params
+        logger.warning(
+            "search_space_infeasible", tries=self._feasibility_max_tries,
+            n_rejected=self._n_rejected,
+            msg="every proposal was refused by the feasibility filter; the "
+                "declared bounds are probably wrong",
+        )
+        return None
+
+    def _on_accept(self, params: dict[str, Any]) -> None:
+        """Hook fired once per *accepted* proposal.
+
+        Anything that counts campaign trials belongs here rather than in
+        ``_propose``: a rejected draw must not burn budget.
+        """
 
     # ── Abstract methods ────────────────────────────────────────────
 
     @abc.abstractmethod
-    def suggest(self) -> dict[str, Any] | None:
-        """Return the next parameter set to evaluate, or ``None`` if exhausted."""
+    def _propose(self) -> dict[str, Any] | None:
+        """One candidate point, unfiltered, or ``None`` if genuinely exhausted."""
 
     @abc.abstractmethod
     def tell(self, params: dict[str, Any], result: float) -> None:
@@ -201,11 +332,19 @@ class BaseOptimizer(abc.ABC):
         """Restore what :meth:`_rng_state` produced."""
 
     def _state_extra(self) -> dict[str, Any]:
-        """Subclass configuration/counters worth checkpointing."""
-        return {}
+        """Subclass configuration/counters worth checkpointing.
+
+        Subclasses extend this (``{**super()._state_extra(), ...}``) rather than
+        replacing it, so the feasibility counters survive every backend's resume
+        — the hook itself is rebuilt from the spec, but "how much of this space
+        was refused" is history and cannot be recomputed.
+        """
+        return {"n_rejected": self._n_rejected, "n_unchecked": self._n_unchecked}
 
     def _restore_extra(self, extra: dict[str, Any]) -> None:
         """Apply what :meth:`_state_extra` produced."""
+        self._n_rejected = int(extra.get("n_rejected", 0))
+        self._n_unchecked = int(extra.get("n_unchecked", 0))
 
 
 #: Name → class, for :meth:`BaseOptimizer.from_dict` dispatch. Populated by

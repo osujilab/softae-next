@@ -39,7 +39,7 @@ class RandomSearchOptimizer(BaseOptimizer):
         self._rng = _random.Random(seed)
         self._n_suggested = 0
 
-    def suggest(self) -> dict[str, Any] | None:
+    def _propose(self) -> dict[str, Any] | None:
         if self._n_suggested >= self._budget:
             return None
         params: dict[str, Any] = {}
@@ -51,8 +51,13 @@ class RandomSearchOptimizer(BaseOptimizer):
                 params[name] = self._rng.randint(spec["low"], spec["high"])
             else:  # categorical
                 params[name] = self._rng.choice(spec["choices"])
-        self._n_suggested += 1
         return params
+
+    def _on_accept(self, params: dict[str, Any]) -> None:
+        # The budget counts trials the campaign will actually run, so it moves
+        # on acceptance, not on the draw: a point the twin refused was never a
+        # trial and must not spend one.
+        self._n_suggested += 1
 
     def tell(self, params: dict[str, Any], result: float) -> None:
         self._history.append((params, result))
@@ -85,8 +90,13 @@ class RandomSearchOptimizer(BaseOptimizer):
     def _state_extra(self) -> dict[str, Any]:
         # n_suggested is the exhaustion counter: without it a resumed run gets a
         # fresh budget and would overrun the campaign's trial count.
-        return {"budget": self._budget, "n_suggested": self._n_suggested}
+        return {
+            **super()._state_extra(),
+            "budget": self._budget,
+            "n_suggested": self._n_suggested,
+        }
 
     def _restore_extra(self, extra: dict[str, Any]) -> None:
+        super()._restore_extra(extra)
         self._budget = int(extra.get("budget", self._budget))
         self._n_suggested = int(extra.get("n_suggested", 0))

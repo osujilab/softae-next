@@ -146,6 +146,50 @@ def test_random_search_budget_is_not_reset_by_resume():
     assert restored.suggest() is None    # still exhausted, not refreshed
 
 
+def test_grid_search_resume_continues_from_its_saved_index():
+    """A resumed grid must not silently re-walk from index 0 at the default width.
+
+    ``GridSearchOptimizer`` defined neither ``_construct_from`` nor
+    ``_state_extra``, so a checkpoint round-trip rebuilt it with the *default*
+    ``n_points=5`` and a fresh cursor — a resumed campaign then re-cast points it
+    had already measured, on a grid of a different shape, with nothing red.
+    """
+    from softae.optimizers.grid import GridSearchOptimizer
+
+    o = GridSearchOptimizer(SPACE, objective="maximize", n_points=3)   # 3x3 = 9
+    for i in range(4):
+        p = o.suggest()
+        o.tell(p, float(i))
+
+    restored = BaseOptimizer.from_dict(json.loads(json.dumps(o.to_dict())))
+
+    assert isinstance(restored, GridSearchOptimizer)
+    assert restored._n_points == 3                    # width survives
+    rest = []
+    while (p := restored.suggest()) is not None:
+        rest.append(p)
+    assert len(rest) == 5                             # 9 - 4 already walked
+    assert rest[0] == o._grid[4]                      # cursor survives
+
+
+def test_feasibility_counters_survive_a_resume():
+    """So a resumed run can still report that the space was mostly infeasible."""
+    calls = {"n": 0}
+
+    def _refuse_the_first_three(params):
+        calls["n"] += 1
+        return calls["n"] > 3
+
+    o = RandomSearchOptimizer(SPACE, seed=1, n_trials=4)
+    o.feasibility_fn = _refuse_the_first_three
+    o.suggest()
+    assert o._n_rejected == 3
+
+    restored = BaseOptimizer.from_dict(json.loads(json.dumps(o.to_dict())))
+    assert restored._n_rejected == o._n_rejected
+    assert restored._n_unchecked == o._n_unchecked
+
+
 def test_resuming_without_a_prior_mean_warns(caplog):
     """A prior is an arbitrary callable; losing it silently changes the surrogate."""
     o = BayesianOptimizer(SPACE, seed=1, prior_mean=lambda p: 0.0)

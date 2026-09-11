@@ -23,7 +23,7 @@ import structlog
 
 from softae.errors import OptimizerError
 from softae.optimizers.acquisitions import make_acquisition
-from softae.optimizers.base import BaseOptimizer
+from softae.optimizers.base import BaseOptimizer, Feasibility
 from softae.optimizers.batch import BatchStrategy, make_batch_strategy
 from softae.optimizers.encoding import OneHotEncoder
 from softae.optimizers.feasibility import (
@@ -158,6 +158,13 @@ class BayesianOptimizer(BaseOptimizer):
         self.last_steered: bool | None = None
         self._last_p_feas: np.ndarray | None = None
 
+        #: The feasibility hook (by identity) that last produced a candidate
+        #: sample with nothing admissible in it. Re-sampling the same
+        #: distribution against the same hook cannot change that answer, and
+        #: letting the template retry 200 times costs ~59 s of GP refits to
+        #: re-derive it. Identity, not a bool, so replacing the hook clears it.
+        self._starved_by: Any | None = None
+
     # ── Serialization (P3.1) ────────────────────────────────────────────
 
     @classmethod
@@ -209,6 +216,7 @@ class BayesianOptimizer(BaseOptimizer):
 
     def _state_extra(self) -> dict[str, Any]:
         return {
+            **super()._state_extra(),
             "n_initial": self._n_initial,
             "acquisition": self._acquisition,
             "kappa": self._kappa,
@@ -232,6 +240,7 @@ class BayesianOptimizer(BaseOptimizer):
         }
 
     def _restore_extra(self, extra: dict[str, Any]) -> None:
+        super()._restore_extra(extra)
         if extra.get("had_prior_mean") and self._prior_mean is None:
             logger.warning(
                 "resumed_without_prior_mean",
@@ -268,43 +277,16 @@ class BayesianOptimizer(BaseOptimizer):
                 params[name] = self._rng.choice(self._encoder.cat_maps[name])
         return params
 
-    def _feasible_random_point(self, max_tries: int = 200) -> dict[str, Any]:
-        """A random point the twin admits, or the last try if none was found.
-
-        Returning an infeasible point after exhausting the budget is deliberate:
-        the campaign should proceed and let the overflow guard refuse the cast,
-        rather than the optimizer hanging or returning ``None`` (which the loop
-        reads as "exhausted" and would end the run).
-        """
-        point = self._random_point()
-        if getattr(self, "feasibility_fn", None) is None:
-            return point
-        for attempt in range(max_tries):
-            if self._is_feasible(point):
-                return point
-            point = self._random_point()
-        logger.warning(
-            "no_feasible_warmup_point", tries=max_tries,
-            msg="proposing an infeasible point — the overflow guard will refuse "
-                "it; the declared bounds are probably wrong",
-        )
-        return point
-
     def _is_feasible(self, params: dict[str, Any]) -> bool:
-        """Whether the twin admits *params*. No hook set → everything is feasible.
+        """Whether *params* may enter the acquisition's candidate domain.
 
-        A raising feasibility function is treated as **feasible**: refusing every
-        point on a bug would silently stall the campaign, which is far worse than
-        proposing one the overflow guard will catch downstream anyway.
+        Admits anything not positively refused, so an :attr:`Feasibility.UNCHECKED`
+        point stays in the pool: a point the filter could not judge is not a
+        proven-bad one, and silently shrinking the search space for a reason
+        nobody can see is the worse failure. The counting of those admissions is
+        the template's job, on the winner it actually returns.
         """
-        fn = getattr(self, "feasibility_fn", None)
-        if fn is None:
-            return True
-        try:
-            return bool(fn(params))
-        except Exception:
-            logger.warning("feasibility_fn_failed", exc_info=True)
-            return True
+        return self.check_feasible(params) is not Feasibility.INFEASIBLE
 
     def _random_candidates(self) -> tuple[list[dict[str, Any]], np.ndarray]:
         """Sample candidate points, returning both the dicts and their encoding.
@@ -332,24 +314,38 @@ class BayesianOptimizer(BaseOptimizer):
                 logger.info("candidates_filtered", feasible=len(feasible),
                             sampled=len(points))
             points = feasible
-        elif getattr(self, "feasibility_fn", None) is not None:
+            self._starved_by = None
+        elif self._feasibility_hook() is not None:
             logger.warning(
                 "no_feasible_candidates", sampled=len(points),
                 msg="proposing unfiltered — the declared space may be entirely "
                     "infeasible for the twin",
             )
+            self._starved_by = self._feasibility_hook()
 
         X = np.array([self._encoder.encode(p) for p in points], dtype=float)
         return points, X
 
+    def _feasibility_hook(self) -> Any | None:
+        return self.check_feasible_fn or self.feasibility_fn
+
     # ── BaseOptimizer interface ─────────────────────────────────────────
 
-    def suggest(self) -> dict[str, Any] | None:
-        # Warm-up: random exploration. Rejection-sampled against the twin, or
-        # the first n_initial trials would be exactly the ones that overflow —
-        # the warm-up is random precisely where the guard matters most.
+    def _propose(self) -> dict[str, Any] | None:
+        # Warm-up: plain random exploration. The rejection sampling that used to
+        # live here (``_feasible_random_point``) is the template's loop now, so
+        # the "gave up after 200 tries and returned a known-infeasible point"
+        # branch is gone: exhaustion is reported as exhaustion.
         if len(self._history) < self._n_initial:
-            return self._feasible_random_point()
+            return self._random_point()
+
+        # A previous sample of n_candidates found nothing this same hook admits.
+        # Report exhaustion rather than refitting the GP 199 more times; the
+        # rejection that produced the flag is already on ``n_rejected``, so the
+        # caller still reads this as an infeasible space, not convergence.
+        hook = self._feasibility_hook()
+        if hook is not None and self._starved_by is hook:
+            return None
 
         # Fit the surrogate on the residual from the prior (homoscedastic — no
         # per-point noise). With no prior model the residual is just ``y``.

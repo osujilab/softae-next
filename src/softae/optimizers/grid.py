@@ -60,15 +60,57 @@ class GridSearchOptimizer(BaseOptimizer):
                 axes.append(list(spec["choices"]))
         return [dict(zip(names, combo)) for combo in itertools.product(*axes)]
 
-    def suggest(self) -> dict[str, Any] | None:
+    def _propose(self) -> dict[str, Any] | None:
+        """Walk the cursor forward one point.
+
+        No rejection loop of its own: the template retries, and because the
+        cursor always advances a refused point is never revisited. ``None`` here
+        means the grid is walked out — whether that is convergence or a space the
+        filter refused is read off :attr:`n_rejected`.
+        """
         if self._grid_index >= len(self._grid):
             return None
         point = self._grid[self._grid_index]
         self._grid_index += 1
         return point
 
+    @property
+    def n_grid_points(self) -> int:
+        """Total points in the grid, so a caller can compare against
+        :attr:`n_rejected` and tell rejection from convergence."""
+        return len(self._grid)
+
     def tell(self, params: dict[str, Any], result: float) -> None:
         self._history.append((params, result))
 
     def best(self) -> tuple[dict[str, Any], float] | None:
         return self._find_best()
+
+    # ── Serialization (P3.1) ────────────────────────────────────────
+
+    @classmethod
+    def _construct_from(cls, state: dict[str, Any]) -> "GridSearchOptimizer":
+        """Rebuild from a checkpoint.
+
+        Without this the base default rebuilt the grid at ``n_points=5`` whatever
+        the campaign declared, and with a cursor at 0 — so a resumed grid run
+        silently re-walked, on a differently shaped grid, and nothing went red.
+        """
+        extra = state.get("extra") or {}
+        return cls(
+            state["parameter_space"],
+            state.get("objective", "maximize"),
+            state.get("seed"),
+            n_points=int(extra.get("n_points", 5)),
+        )
+
+    def _state_extra(self) -> dict[str, Any]:
+        return {
+            **super()._state_extra(),
+            "n_points": self._n_points,
+            "grid_index": self._grid_index,
+        }
+
+    def _restore_extra(self, extra: dict[str, Any]) -> None:
+        super()._restore_extra(extra)
+        self._grid_index = int(extra.get("grid_index", 0))

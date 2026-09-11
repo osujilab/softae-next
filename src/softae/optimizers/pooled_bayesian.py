@@ -25,7 +25,7 @@ import numpy as np
 
 from softae.errors import CampaignError, OptimizerError
 from softae.optimizers.acquisitions import make_acquisition
-from softae.optimizers.base import BaseOptimizer
+from softae.optimizers.base import BaseOptimizer, Feasibility
 from softae.optimizers.encoding import OneHotEncoder
 from softae.optimizers.surrogates import SurrogateBackend, make_backend
 
@@ -91,7 +91,7 @@ class PooledBayesianOptimizer(BaseOptimizer):
         self.use_alpha = use_alpha
 
         #: Per-candidate aleatoric variance aligned to the last scored candidate
-        #: matrix; read by acquisition strategies.  Set during :meth:`suggest`.
+        #: matrix; read by acquisition strategies.  Set during :meth:`_propose`.
         self.candidate_variance: np.ndarray | None = None
 
     # ── encoding (delegates to the shared OneHotEncoder) ─────────────────
@@ -107,6 +107,31 @@ class PooledBayesianOptimizer(BaseOptimizer):
 
     def _remaining_points(self) -> list[dict[str, Any]]:
         return [p for p, k in zip(self._pool, self._pool_keys) if k in self._remaining]
+
+    def _admissible_points(self) -> list[dict[str, Any]]:
+        """Remaining pool points the feasibility filter does not refuse (W2).
+
+        Filtering the pool *before* the argmax rather than post-checking its
+        winner is what makes the template's outer loop terminate here: this
+        optimizer's selection is deterministic, so a rejected winner would be
+        re-proposed identically until the retry budget ran out. An
+        :attr:`Feasibility.UNCHECKED` point stays in — same rule as the
+        continuous path.
+        """
+        remaining = self._remaining_points()
+        if self.check_feasible_fn is None and self.feasibility_fn is None:
+            return remaining
+        admissible = [
+            p for p in remaining
+            if self.check_feasible(p) is not Feasibility.INFEASIBLE
+        ]
+        if remaining and not admissible:
+            # Terminal: points are left but every one is refused. Counted here
+            # (once — the next call finds the same empty list and the pool has
+            # not changed) so a caller reading ``n_rejected`` beside a ``None``
+            # sees "the rest of the pool is infeasible", not "converged".
+            self._n_rejected = max(self._n_rejected, len(remaining))
+        return admissible
 
     def _alpha_for_history(self) -> np.ndarray | float | None:
         """Per-observation variance array aligned to ``_history`` (or None)."""
@@ -126,8 +151,8 @@ class PooledBayesianOptimizer(BaseOptimizer):
 
     # ── BaseOptimizer interface ──────────────────────────────────────────
 
-    def suggest(self) -> dict[str, Any] | None:
-        remaining = self._remaining_points()
+    def _propose(self) -> dict[str, Any] | None:
+        remaining = self._admissible_points()
         if not remaining:
             return None  # pool exhausted
 
