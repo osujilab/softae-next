@@ -78,7 +78,7 @@ def load_resume_plan(
         :class:`ResumeMismatchError`. Pass ``False`` only for inspection — never
         to force a resume onto a changed spec.
     """
-    from softae.core.autonomous_wiring import campaign_spec_fingerprint
+    from softae.core.autonomous_wiring import _run_plan_digest, campaign_spec_fingerprint
 
     cp = data_store.campaign_checkpoint(spec.name)
     if cp is None:
@@ -131,6 +131,35 @@ def load_resume_plan(
     if requires.get("formulation") and spec.formulation is None:
         warnings.append(
             "The interrupted run used a formulation context; this spec has none."
+        )
+
+    # `requires["run_plan"]` is a bare bool, so it cannot see a plan that changed
+    # in *content*. `serialize_campaign_spec` records a digest of the plan's
+    # behaviour alongside it; comparing that is what makes a re-tuned anneal
+    # visible — while a field merely ADDED to `RunPhase` leaves it unmoved.
+    #
+    # **Warns, never raises, regardless of `strict`.** `run_plan` is deliberately
+    # outside `_SPEC_IDENTITY_FIELDS` (adding it there would rehash every
+    # in-flight checkpoint), and a stricter gate here would reinstate it as an
+    # identity field by the back door. Only the fingerprint check may refuse.
+    #
+    # The guard is on the *key*, not on the values — unlike the two checks above,
+    # and not by oversight. Theirs are one-directional: a checkpoint that needed a
+    # prior against a spec that has none is a loss, while gaining one is not, so
+    # `requires.get(...) and spec.x is None` is correct for them. A run-plan
+    # difference is material in *both* directions — plan -> none and none -> plan
+    # each change what the rig will do — so the digests are simply compared. That
+    # leaves exactly one case to special-case: a checkpoint written before this
+    # field existed carries no key, cannot answer, and must not be made to warn.
+    # A key holding `None` is a recorded "that run had no plan" and compares
+    # normally against a spec that now has one.
+    fields = stored.get("fields") or {}
+    if ("run_plan_digest" in fields
+            and fields["run_plan_digest"] != _run_plan_digest(spec.run_plan)):
+        warnings.append(
+            "The interrupted run's plan differs from this spec's (a different "
+            "anneal, hold time, or phase). Resuming will apply the CURRENT plan, "
+            "not the one that was checkpointed."
         )
 
     iteration = int(cp.get("iteration") or 0)

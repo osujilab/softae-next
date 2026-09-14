@@ -23,6 +23,7 @@ from softae.core.autonomous_wiring import (
 )
 from softae.core.data_store import DataStore
 from softae.core.measurement_spec import MeasurementSpec
+from softae.core.run_plan import PhaseKind, PhaseScope, RunPhase, RunPlan
 
 
 @pytest.fixture
@@ -40,6 +41,16 @@ def _spec(**kw) -> CampaignSpec:
     )
     base.update(kw)
     return CampaignSpec(**base)
+
+
+def _plan(*, hold_s: float = 600.0, temp_C: float = 150.0) -> RunPlan:
+    """A minimal cast-then-anneal-then-measure plan."""
+    return RunPlan(phases=(
+        RunPhase(kind=PhaseKind.FORMULATE),
+        RunPhase(kind=PhaseKind.ANNEAL, scope=PhaseScope.PER_BATCH,
+                 anneal_params={"target_temp_C": temp_C, "hold_time_s": hold_s}),
+        RunPhase(kind=PhaseKind.MEASURE),
+    ))
 
 
 class TestStore:
@@ -138,6 +149,85 @@ class TestSpecSnapshot:
         with_prior = json.loads(
             serialize_campaign_spec(_spec(prior_mean=lambda p: 0.0)))
         assert with_prior["requires"]["prior_mean"] is True
+
+    def test_snapshot_digest_is_none_when_there_is_no_run_plan(self):
+        """Absent must be spelled differently from present-and-unchanged."""
+        payload = json.loads(serialize_campaign_spec(_spec()))
+        assert payload["fields"]["run_plan_digest"] is None
+        assert payload["requires"]["run_plan"] is False
+
+    def test_identical_run_plans_digest_identically(self):
+        """Positive control: the check must be able to *pass*.
+
+        Without this, a digest that varied run-to-run — a memory address in some
+        nested repr — would look like a working difference detector while
+        warning on every legitimate resume.
+        """
+        one = json.loads(serialize_campaign_spec(_spec(run_plan=_plan())))
+        two = json.loads(serialize_campaign_spec(_spec(run_plan=_plan())))
+        assert one["fields"]["run_plan_digest"] is not None
+        assert one["fields"]["run_plan_digest"] == two["fields"]["run_plan_digest"]
+
+    def test_a_different_anneal_hold_changes_the_run_plan_digest(self):
+        """`requires["run_plan"]` is a bool, so content changes were invisible.
+
+        A campaign resumed against a spec whose anneal holds for a different
+        time is not the same experiment's continuation, and the snapshot has to
+        record enough to say so.
+        """
+        short = json.loads(serialize_campaign_spec(_spec(run_plan=_plan(hold_s=600))))
+        long_ = json.loads(serialize_campaign_spec(_spec(run_plan=_plan(hold_s=28800))))
+
+        assert short["requires"]["run_plan"] == long_["requires"]["run_plan"] is True
+        assert (short["fields"]["run_plan_digest"]
+                != long_["fields"]["run_plan_digest"])
+
+    def test_a_different_anneal_temperature_changes_the_run_plan_digest(self):
+        cool = json.loads(serialize_campaign_spec(_spec(run_plan=_plan(temp_C=85))))
+        hot = json.loads(serialize_campaign_spec(_spec(run_plan=_plan(temp_C=150))))
+        assert cool["fields"]["run_plan_digest"] != hot["fields"]["run_plan_digest"]
+
+    def test_a_different_anneal_task_changes_the_run_plan_digest(self):
+        """The gap `RunPlan.describe()` alone gets wrong — the positive control.
+
+        `RunPhase._anneal_label` folds `anneal_task` into the label **only when
+        neither** a temperature override nor a hold is set; the moment either is
+        present — the common case, since every real anneal states a hold —
+        the task name is dropped from the string entirely. So two plans that
+        cure with genuinely different catalog tasks `describe()` **byte
+        identically**, and a digest built from `describe()` alone would call
+        them the same plan. Hence the digest names `hold_s` / `anneal_task` /
+        `anneal_params` explicitly as well.
+
+        The complementary property — that a field merely *added* to `RunPhase`
+        must NOT move the digest — cannot be exercised here without editing the
+        dataclass. It is guaranteed by construction instead: the digest is built
+        from `describe()` plus three named fields, never from `repr()`, so a new
+        field contributes nothing until something explicitly reads it.
+        """
+        def _task_plan(task: str) -> RunPlan:
+            return RunPlan(phases=(
+                RunPhase(kind=PhaseKind.FORMULATE),
+                RunPhase(kind=PhaseKind.ANNEAL, scope=PhaseScope.PER_BATCH,
+                         anneal_task=task, hold_s=600.0),
+                RunPhase(kind=PhaseKind.MEASURE),
+            ))
+
+        one = _task_plan("anneal_pe")
+        two = _task_plan("anneal_hot")
+        # The premise: the labels really do collide, so this is not a test that
+        # would pass under a `describe()`-only digest.
+        assert one.describe() == two.describe()
+
+        first = json.loads(serialize_campaign_spec(_spec(run_plan=one)))
+        second = json.loads(serialize_campaign_spec(_spec(run_plan=two)))
+        assert (first["fields"]["run_plan_digest"]
+                != second["fields"]["run_plan_digest"])
+
+    def test_the_run_plan_digest_is_not_part_of_the_fingerprint(self):
+        """Deliberate: an identity field rehashes every in-flight checkpoint."""
+        assert campaign_spec_fingerprint(_spec(run_plan=_plan(hold_s=600))) == \
+            campaign_spec_fingerprint(_spec(run_plan=_plan(hold_s=28800)))
 
     def test_snapshot_handles_unserializable_fields_without_raising(self):
         """A live Python object in the spec must not break checkpointing."""

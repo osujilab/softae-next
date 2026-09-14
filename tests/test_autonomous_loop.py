@@ -806,3 +806,118 @@ class TestRoundCheckpointInvariant:
         assert checkpoints == [1, 2]
         assert loop.park_reason is None
         await manager.disconnect_all()
+
+
+# ---------------------------------------------------------------------------
+# `_post_measure`: a failing observation seam is itself reportable
+# ---------------------------------------------------------------------------
+#
+# `_post_measure` catches everything `on_trial_measured` raises — that contract
+# is deliberate and is pinned in `tests/test_feasibility_runtime_seam.py`. What
+# was missing is that the catch was *silent*: only a `logger.warning`, no
+# campaign event. On the campaign path that hook is the entire settle →
+# production-read → gate sequence, so a raise there silently keeps the trial's
+# stale pre-settle sweep and the run looks identical to one that agreed.
+#
+# Loops here are built with `__new__` deliberately, matching the existing
+# `_post_measure` tests: no hardware, and it is also the shape that proves the
+# new attribute is read defensively rather than assumed onto every instance.
+
+class TestPostMeasureReportsItsOwnHookFailing:
+    @pytest.mark.asyncio
+    async def test_a_raising_hook_fires_the_failure_alert_with_the_exception_text(self):
+        loop = AutonomousLoop.__new__(AutonomousLoop)
+        loop._iteration = 3
+        seen: list[str] = []
+        loop.on_trial_measured_hook_failed = seen.append
+
+        async def broken(results):
+            raise RuntimeError("settle exploded")
+
+        loop.on_trial_measured = broken
+
+        # The original results survive untouched — the pre-existing contract.
+        assert await loop._post_measure({"a": 1}) == {"a": 1}
+
+        assert len(seen) == 1
+        assert "RuntimeError" in seen[0]
+        assert "settle exploded" in seen[0]
+        # A string, never the exception object: every other hook here passes
+        # plain strings/numbers.
+        assert isinstance(seen[0], str)
+
+    @pytest.mark.asyncio
+    async def test_a_broken_alert_cannot_break_the_never_fatal_contract(self):
+        """The alert about the failure must not become the failure."""
+        loop = AutonomousLoop.__new__(AutonomousLoop)
+        loop._iteration = 0
+
+        def exploding_alert(error):
+            raise ValueError("the alerter is broken too")
+
+        loop.on_trial_measured_hook_failed = exploding_alert
+
+        async def broken(results):
+            raise RuntimeError("handler bug")
+
+        loop.on_trial_measured = broken
+
+        # Both the hook and its alert raised; neither escapes.
+        assert await loop._post_measure({"a": 1}) == {"a": 1}
+
+    @pytest.mark.asyncio
+    async def test_no_alert_configured_is_the_default_and_stays_non_fatal(self):
+        """A loop built without the attribute at all must not raise here.
+
+        `_post_measure` is exercised on `__new__`-built loops, so reading the new
+        attribute bare would raise `AttributeError` from inside the very `except`
+        that exists to make this seam non-fatal.
+        """
+        loop = AutonomousLoop.__new__(AutonomousLoop)
+        loop._iteration = 0
+        assert not hasattr(loop, "on_trial_measured_hook_failed")
+
+        async def broken(results):
+            raise RuntimeError("handler bug")
+
+        loop.on_trial_measured = broken
+        assert await loop._post_measure({"a": 1}) == {"a": 1}
+
+    @pytest.mark.asyncio
+    async def test_a_hook_that_succeeds_never_fires_the_alert(self):
+        """Positive control: the alert is not simply always called."""
+        loop = AutonomousLoop.__new__(AutonomousLoop)
+        loop._iteration = 0
+        seen: list[str] = []
+        loop.on_trial_measured_hook_failed = seen.append
+        loop.on_trial_measured = lambda results: {**results, "ok": True}
+
+        assert (await loop._post_measure({"a": 1}))["ok"] is True
+        assert seen == []
+
+    @pytest.mark.asyncio
+    async def test_the_new_hook_defaults_to_none_on_a_real_loop(self, store_with_run):
+        """A properly constructed loop has the attribute, and it is unset.
+
+        The `__new__`-built cases above deliberately lack it; this is the other
+        half — `__init__` really does define it, so the wiring layer has
+        something to bind to.
+        """
+        from softae.workflows.workflow_model import Workflow
+
+        store, run_id = store_with_run
+        manager = _make_mock_manager()
+        await manager.connect_all()
+
+        loop = AutonomousLoop(
+            optimizer=GridSearchOptimizer(SIMPLE_SPACE, n_points=2),
+            workflow_template=Workflow(name="empty_trial"),
+            manager=manager,
+            data_store=store,
+            run_id=run_id,
+            objective_extractor=lambda r: 1.0,
+            auto_approve=True,
+        )
+
+        assert loop.on_trial_measured_hook_failed is None
+        await manager.disconnect_all()

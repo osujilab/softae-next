@@ -32,7 +32,7 @@ import os
 import tempfile
 import uuid
 from contextlib import ExitStack
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Sequence
 
 import structlog
@@ -92,8 +92,13 @@ from softae.core.measurement_spec import (
 # module exclusively inside functions, so its module body never reaches back
 # here. Keep it that way — see `modality_registry`'s "Import discipline".
 from softae.core.modality_registry import ObjectiveSpec, get_modality
+# Safe at module scope in this direction only, and for the same reason as
+# `modality_registry` above: `production_read`'s module body imports nothing from
+# here (its `CampaignSpec` reference is annotation-only, and it reaches back for
+# `_stamp_sample_uuids` / `_MEASUREMENT_TAGS_KEY` inside functions).
+from softae.core.production_read import take_production_read
 from softae.core.run_lock import held_run_lock, retitle_run_lock, rig_is_simulated
-from softae.core.run_plan import RunPlan, SettlePlan
+from softae.core.run_plan import PhaseKind, RunPlan, SettlePlan
 from softae.core.alerts import CRITICAL, Alert, raise_alert
 from softae.core.safe_park import safe_park
 from softae.core.shutdown import park_on_shutdown
@@ -772,6 +777,41 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
+def _run_plan_digest(run_plan: "RunPlan | None") -> str | None:
+    """Stable digest of *run_plan*'s content — not of ``RunPhase``'s schema.
+
+    ``str(RunPlan(...))`` (what ``_jsonable``'s object fallback produces) changes
+    every time a field is ADDED to ``RunPhase``, even a defaulted one that
+    changes nothing about what the phase does — so every in-flight checkpoint
+    would warn "plan differs" the day a harmless field landed. This names only
+    the phases' behaviour-relevant content instead: ``RunPlan.describe()``
+    (kind, scope, conditions, measurement, and — through ``_anneal_label`` — an
+    ANNEAL phase's temp/hold when either is set) plus, **explicitly**, each
+    phase's ``hold_s``, ``anneal_task`` and ``anneal_params``. The explicit
+    trio is load-bearing, not redundant with ``describe()``:
+    ``RunPhase._anneal_label`` drops ``anneal_task`` from the label entirely
+    whenever ``hold_s`` or an ``anneal_params["target_temp_C"]`` override is
+    present — the common case — and never surfaces the rest of
+    ``anneal_params``, only ``target_temp_C``/``hold_time_s``.
+
+    ``None`` for no plan, matching the field's prior meaning exactly (a real
+    "that run had no plan", not "never asked" — see ``load_resume_plan``'s own
+    key-presence guard, which this does not change).
+    """
+    if run_plan is None:
+        return None
+    payload = {
+        "describe": run_plan.describe(),
+        "phases": [
+            {"hold_s": p.hold_s, "anneal_task": p.anneal_task,
+             "anneal_params": _jsonable(dict(p.anneal_params or {}))}
+            for p in run_plan.phases
+        ],
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
 def serialize_campaign_spec(spec: "CampaignSpec") -> str:
     """JSON snapshot of a spec for the resume checkpoint.
 
@@ -798,6 +838,14 @@ def serialize_campaign_spec(spec: "CampaignSpec") -> str:
     # `measurement.preset`, kept so a snapshot written after T2.4 still reads the
     # way one written before it did.
     fields["measurement"] = spec.measurement.as_dict()
+    # `requires["run_plan"]` below is a bare bool, so a resume against a spec
+    # whose plan differs in *content* — a different anneal temperature or hold,
+    # a phase added — reads as "a run plan was present, and one is present now".
+    # `_run_plan_digest` names the phases' behaviour instead of their repr, so a
+    # field ADDED to `RunPhase` does not move it. Informational, like `budget`:
+    # deliberately NOT in _SPEC_IDENTITY_FIELDS, since a new identity field
+    # rehashes every in-flight checkpoint and would blame a search nobody changed.
+    fields["run_plan_digest"] = _run_plan_digest(spec.run_plan)
     payload: dict[str, Any] = {
         "fingerprint": campaign_spec_fingerprint(spec),
         "fields": fields,
@@ -1688,7 +1736,9 @@ def settle_round_fits(
                                             thickness_um=thickness))
         out.append(RoundFit(channel=int(channel),
                             sigma=_report_sigma(report),
-                            r1_ohms=_report_r1(report)))
+                            r1_ohms=_report_r1(report),
+                            arc_state=_report_arc_state(report),
+                            n_points_dropped=_report_n_points_dropped(report)))
     return out
 
 
@@ -1715,6 +1765,41 @@ def _report_r1(report: Any) -> float | None:
     except (AttributeError, TypeError, ValueError):
         return None
     return r1 if math.isfinite(r1) else None
+
+
+def _report_arc_state(report: Any) -> str:
+    """``ArcClosure.state`` off the **same** fit :func:`_report_r1` reads.
+
+    No second ``analyze_spectrum`` call and no second fit — ``annotate_arc_closure``
+    has already attached this to ``report.fit`` by the time the report gets here,
+    exactly as ``eis_validate_hold``'s ``_round_fit`` reads it off its own single
+    ``_fitted_r1`` result.
+
+    ``""`` means *never asked* — a report that does not exist, or a fit that was
+    never annotated — and is deliberately the same absence ``RoundFit.arc_state``
+    documents, not a third state alongside ``closed``/``open``/``unknown``.
+    """
+    fit = getattr(report, "fit", None)
+    arc = getattr(fit, "arc_closure", None)
+    return "" if arc is None else str(getattr(arc, "state", "") or "")
+
+
+def _report_n_points_dropped(report: Any) -> int | None:
+    """``FitResult.n_points_dropped`` off the same fit — the **fitter's** mask.
+
+    Deliberately not ``fit.arc_closure.n_dropped``, which counts a different mask
+    (``eis/arc.py``'s ``annotate_arc_closure`` says so outright).
+
+    ``None``, never ``0``, for *never asked*: ``0`` is a real count — a fit that
+    dropped nothing — and "unknown" must not be spelled with the token for
+    "asked, and none" (``SUBAGENT_RULES.md`` §3.1(a)).
+    """
+    fit = getattr(report, "fit", None)
+    dropped = getattr(fit, "n_points_dropped", None)
+    try:
+        return None if dropped is None else int(dropped)
+    except (TypeError, ValueError):
+        return None
 
 
 class RHCeilingEscalation:
@@ -1825,6 +1910,54 @@ def settle_r1_bound_ohms() -> float | None:
     from softae.analysis.equilibration import r1_lower_bound_ohms
 
     return r1_lower_bound_ohms(SETTLE_CIRCUIT_MODEL)
+
+
+def production_measurement_override(spec: CampaignSpec) -> MeasurementSpec | None:
+    """The sweep the post-settle production read takes, if the plan names one.
+
+    ``RunPhase.measurement`` is legal **solely** on a
+    :attr:`~softae.core.run_plan.PhaseKind.MEASURE` phase — ``RunPhase``'s own
+    ``__post_init__`` refuses it anywhere else, *"so a preset named on any other
+    phase would be accepted and never reach the instrument"*. That makes a MEASURE
+    phase the only place a run plan can ask for a different (usually denser) sweep
+    for the reading the campaign actually records, and this is the lookup for it.
+
+    ``None`` — no run plan, no MEASURE phase, or a MEASURE phase that names
+    nothing — leaves :func:`~softae.core.production_read.take_production_read` on
+    ``spec.measurement``, which is the campaign's own block and today's behaviour.
+    The fallback chain is ``_resolve``'s, not restated here.
+
+    **Two MEASURE phases naming different presets is refused, not reconciled**,
+    for exactly the reason :meth:`CampaignSpec.settle_plan` refuses a doubled
+    settle: the campaign path takes *one* production read, and picking one
+    silently is how a run records a sweep nobody wrote down. Resolved at campaign
+    start (beside ``spec.settle_plan()``) so a spec that says it twice fails
+    before a run row exists rather than eight hours into a hold.
+
+    .. note::
+       This is ``RunPhase.measurement``'s **first** consumer. The field has been
+       declared, validated and rendered in :meth:`RunPhase.label` since it landed,
+       but nothing read it — so on the deposition-engine path a MEASURE override
+       is still inert, exactly as an EQUILIBRATE phase is there.
+    """
+    plan = spec.run_plan
+    if plan is None:
+        return None
+    overrides = [p.measurement for p in plan.phases
+                 if p.kind is PhaseKind.MEASURE and p.measurement is not None]
+    if not overrides:
+        return None
+    # Compared by value, never through a set: `MeasurementSpec.overrides` is a
+    # dict, so the block is unhashable and `{...}` would raise TypeError on the
+    # very specs this refusal exists to catch.
+    first = overrides[0]
+    if any(other != first for other in overrides[1:]):
+        raise ValueError(
+            "run_plan carries MEASURE phases naming different measurement "
+            "blocks; the campaign path takes one production read, so say which "
+            "sweep it is once"
+        )
+    return first
 
 
 @dataclass(frozen=True)
@@ -2818,6 +2951,10 @@ async def run_autonomous_campaign(
     # twice, or asks for `"settle"` without a cure time, is a caller bug and must
     # fail before a run row is written rather than eight hours into a hold.
     settle_plan = spec.settle_plan()
+    # And here for the third time: the production read's sweep. A run plan that
+    # names two different MEASURE blocks is a caller bug, and the place to learn
+    # it is now — not after the first trial has already been cast and held.
+    production_measurement = production_measurement_override(spec)
 
     owns_manager = manager is None
     owns_store = data_store is None
@@ -3436,11 +3573,13 @@ async def run_autonomous_campaign(
         # Sited on `on_trial_measured` because that is the one hook where the
         # trial's raw results, the channels they came from and an awaitable
         # context coexist. The trial's own sweep has already run by then and is
-        # kept on record as the pre-equilibration reading; the round the campaign
-        # SCORES is the last settle round, injected below under the trial's own
-        # measure-step name. That injection is the whole point: an optimiser fed
-        # a σ off a still-drying film cannot tell a better formulation from one
-        # that was measured later.
+        # kept on record as the pre-equilibration reading; what the campaign
+        # SCORES is the **production read** — a fresh `measurement="primary"`
+        # sweep taken after the hold — injected below under the trial's own
+        # measure-step name, falling back (labelled) to that channel's last settle
+        # round if it does not complete. That injection is the whole point: an
+        # optimiser fed a σ off a still-drying film cannot tell a better
+        # formulation from one that was measured later.
         settle_verdicts: list[dict[str, Any]] = []
 
         def _primary_channels(step_results: dict[str, Any]) -> dict[int, str]:
@@ -3586,7 +3725,13 @@ async def run_autonomous_campaign(
         )
 
         async def _equilibrate(step_results: dict[str, Any]) -> dict[str, Any]:
-            """Hold until σ stops moving, then hand back the settled reading.
+            """Hold until σ stops moving, then take the reading that counts.
+
+            Three things in order, and the order is the design: hold
+            (:func:`drive_settle_phase`, narrating each round), **then** take the
+            production read, **then** record the verdict. The reading handed back
+            is the production read's — a fresh primary sweep — with that channel's
+            last settle round as a labelled fallback where it did not complete.
 
             **A ``ceiling`` returns normally.** It is an ordinary outcome for a
             slowly-drifting film, not a fault, and nothing here raises, parks or
@@ -3599,6 +3744,27 @@ async def run_autonomous_campaign(
             if not targets:
                 return step_results
             round_channels = sorted(targets)
+
+            def _on_settle_round(round_index: int, check: Any) -> None:
+                """Narrate each round *while* the hold is still happening.
+
+                ``_record_settle`` fires once, at the end, which on a multi-hour
+                hold is all an operator sees until it is over — and a phase that
+                will run to its ceiling is usually diagnosable from round three.
+                The tracker's own per-window verdict, verbatim, is that live view.
+
+                ``check`` is ``SettleCheck | None``: :meth:`SettleTracker.observe`
+                has no window to judge until the trailing one fills, so the first
+                rounds carry no verdict at all. The round still happened and is
+                still narrated — with ``judged=False``, because *"not judged yet"*
+                spelled the same way as *"judged and not settled"* is how a reader
+                concludes a phase was evaluated when it was not.
+                """
+                emit("settle_round", iteration=loop.iteration,
+                     channels=list(round_channels), round=round_index,
+                     judged=check is not None,
+                     **(asdict(check) if check is not None else {}))
+
             outcome, last_raws = await drive_settle_phase(
                 settle_plan,
                 channels=round_channels,
@@ -3607,9 +3773,63 @@ async def run_autonomous_campaign(
                     raws, round_channels, thickness_for=_thickness_for),
                 r1_bound_ohms=settle_r1_bound_ohms(),
                 rh_for_round=_settle_round_rh,
+                on_round=_on_settle_round,
             )
+            # THE reading the campaign records: a real `measurement="primary"`
+            # sweep taken *after* the driver returns, not the last
+            # `measurement="settle"` round recycled under the trial's own step
+            # name. See `production_read`'s module docstring for why the tag a
+            # settle round carries makes that substitution wrong.
+            from softae.workflows.workflow_executor import WorkflowExecutor
+
+            try:
+                raws = await take_production_read(
+                    spec, round_channels, measurement=production_measurement,
+                    executor=WorkflowExecutor(manager, data_store=data_store,
+                                              run_id=run_id),
+                    sample_uuid_by_channel=trial_sample_uuids)
+            except Exception as exc:
+                # A read that RAISES is a failed read, and gets the same answer as
+                # one that returns `None` — per channel, labelled, below. Letting
+                # it propagate would be far worse than it looks: this runs under
+                # `AutonomousLoop._post_measure`, which catches everything and
+                # returns the results untouched, so the trial would keep its stale
+                # pre-settle sweep, `_record_settle` would never run, no verdict
+                # would reach `settle.json`, and `rh_escalation` would never see
+                # this phase — all of it announced by one `trial_measured_hook_
+                # failed` warning in a log nobody reads. `{}` here keeps the whole
+                # tail of this function reachable.
+                raws = {}
+                emit("production_read_failed", channels=list(round_channels),
+                     iteration=loop.iteration, error=f"{type(exc).__name__}: {exc}")
+                logger.warning("production_read_failed", run_id=run_id,
+                               campaign=spec.name, channels=list(round_channels),
+                               exc_info=True)
             for channel, name in targets.items():
-                raw = last_raws.get(channel)
+                raw = raws.get(channel)
+                if raw is None:
+                    # The production read did not complete for this channel. Fall
+                    # back to its own last settle round — the reading taken
+                    # closest to equilibrium, and far closer than the trial's
+                    # stale pre-settle sweep, which is what leaving `step_results`
+                    # untouched would silently keep. Refusing the whole trial over
+                    # one channel's failed re-read is stronger than this path's
+                    # "a ceiling is not a failure" posture warrants for an
+                    # ordinary, recoverable equipment hiccup. But it is a weaker
+                    # reading than the one the campaign asked for, so it is
+                    # **labelled**, never substituted in silence.
+                    raw = last_raws.get(channel)
+                    if raw is not None:
+                        emit("production_read_incomplete", channel=channel,
+                             iteration=loop.iteration,
+                             fell_back_to="last_settle_round")
+                        logger.warning(
+                            "production_read_incomplete", run_id=run_id,
+                            campaign=spec.name, channel=channel,
+                            fell_back_to="last_settle_round",
+                            detail="the post-settle production sweep did not "
+                                   "complete for this channel; the recorded "
+                                   "reading is its last settle round")
                 if raw is not None:
                     step_results[name] = raw
             _record_settle(outcome, round_channels)
@@ -3785,6 +4005,13 @@ async def run_autonomous_campaign(
         )
         loop.on_step_skipped = lambda step, reason: emit(
             "step_skipped", step=step, reason=reason
+        )
+        # The observation seam failing is itself an event. `on_trial_measured` is
+        # the settle → production-read → gate sequence on this path, so a raise
+        # there keeps a stale pre-settle reading; without this the run looks
+        # identical to one where the sequence ran and agreed.
+        loop.on_trial_measured_hook_failed = lambda error: emit(
+            "trial_measured_hook_failed", iteration=loop.iteration, error=error
         )
 
         def _on_park(reason: str) -> None:

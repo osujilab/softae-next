@@ -27,6 +27,7 @@ from softae.core.campaign_resume import (
 from softae.core.data_store import DataStore
 from softae.core.electrode_allocator import ElectrodeAllocator
 from softae.core.measurement_spec import MeasurementSpec
+from softae.core.run_plan import PhaseKind, RunPhase, RunPlan
 from softae.optimizers.bayesian import BayesianOptimizer
 
 SPACE = {"a": {"type": "float", "low": 0.0, "high": 10.0}}
@@ -164,6 +165,106 @@ class TestMismatch:
         plan = load_resume_plan(store, _spec())     # same search, no prior
 
         assert any("prior-mean" in w for w in plan.warnings)
+
+
+# ── A run plan that changed in content ───────────────────────────────────────
+
+def _run_plan(*, temp_C: float = 80.0, hold_s: float = 600.0) -> RunPlan:
+    """A minimal plan whose anneal is easy to vary."""
+    return RunPlan(phases=(
+        RunPhase(kind=PhaseKind.FORMULATE),
+        RunPhase(kind=PhaseKind.ANNEAL,
+                 anneal_params={"target_temp_C": temp_C, "hold_time_s": hold_s}),
+        RunPhase(kind=PhaseKind.MEASURE),
+    ))
+
+
+_PLAN_WARNING = "plan differs from this spec's"
+
+
+class TestRunPlanDrift:
+    """``run_plan`` is not part of the fingerprint, so only a warning sees it.
+
+    ``requires["run_plan"]`` is a bare bool: a resume onto a plan with a
+    different anneal temperature, a different hold, or an added phase reads as
+    "a plan was present, and one is present now". The digest
+    ``serialize_campaign_spec`` records is what makes the difference visible —
+    and it is a *warning*, because putting ``run_plan`` behind a refusal would
+    make it an identity field by the back door and strand every in-flight
+    checkpoint.
+    """
+
+    def test_a_changed_anneal_warns(self, store):
+        _checkpoint(store, _spec(run_plan=_run_plan(temp_C=80.0)))
+
+        plan = load_resume_plan(store, _spec(run_plan=_run_plan(temp_C=120.0)))
+
+        assert any(_PLAN_WARNING in w for w in plan.warnings)
+        assert any("CURRENT plan" in w for w in plan.warnings)
+
+    def test_an_identical_plan_does_not_warn(self, store):
+        """The positive control for the test above: the check must be able to pass."""
+        _checkpoint(store, _spec(run_plan=_run_plan()))
+
+        plan = load_resume_plan(store, _spec(run_plan=_run_plan()))
+
+        assert not any(_PLAN_WARNING in w for w in plan.warnings)
+
+    def test_gaining_a_plan_where_there_was_none_warns(self, store):
+        """Material in both directions, unlike the prior-mean asymmetry above."""
+        _checkpoint(store, _spec())                 # checkpointed with no plan
+
+        plan = load_resume_plan(store, _spec(run_plan=_run_plan()))
+
+        assert any(_PLAN_WARNING in w for w in plan.warnings)
+
+    def test_losing_a_plan_warns_too(self, store):
+        _checkpoint(store, _spec(run_plan=_run_plan()))
+
+        plan = load_resume_plan(store, _spec())
+
+        assert any(_PLAN_WARNING in w for w in plan.warnings)
+
+    def test_a_checkpoint_predating_the_digest_does_not_warn(self, store):
+        """Synthesised as the old code wrote it: no ``run_plan_digest`` key.
+
+        A checkpoint that cannot answer the question must not be read as
+        answering it badly — otherwise every campaign already on disk resumes
+        with a warning about a plan nobody changed.
+        """
+        spec = _spec(run_plan=_run_plan())
+        opt = _optimizer(2)
+        pre_digest = {
+            "fingerprint": campaign_spec_fingerprint(spec),
+            "fields": {"name": "c"},                # no run_plan_digest at all
+            "requires": {"prior_mean": False, "formulation": False,
+                         "run_plan": True},
+        }
+        store.save_campaign_checkpoint(
+            spec.name, iteration=2, run_id="r1", board_id=1,
+            spec_json=json.dumps(pre_digest, sort_keys=True),
+            optimizer_json=json.dumps(opt.to_dict()))
+
+        plan = load_resume_plan(store, spec)
+
+        assert plan is not None and plan.iteration == 2
+        assert not any(_PLAN_WARNING in w for w in plan.warnings)
+
+    def test_strict_mode_still_only_warns(self, store):
+        """The load-bearing one: a changed plan must never refuse the resume.
+
+        Only the fingerprint check raises. If this ever starts raising,
+        ``run_plan`` has become an identity field without being added to
+        ``_SPEC_IDENTITY_FIELDS``, and every checkpoint written before the
+        change becomes unresumable.
+        """
+        _checkpoint(store, _spec(run_plan=_run_plan(hold_s=600.0)))
+
+        plan = load_resume_plan(                    # must not raise
+            store, _spec(run_plan=_run_plan(hold_s=7200.0)), strict=True)
+
+        assert plan is not None and plan.iteration == 3
+        assert any(_PLAN_WARNING in w for w in plan.warnings)
 
 
 # ── T2.4: the measurement block must not break an in-flight resume ───────────

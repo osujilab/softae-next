@@ -350,6 +350,16 @@ class AutonomousLoop:
         # as a bad measurement, and what to do about it, lives in the wiring.
         self.on_trial_measured: (
             Callable[[dict[str, Any]], Any] | None) = None
+        # Fired when ``on_trial_measured`` itself raises. The observation seam
+        # failing is a different event from an ordinary trial result, and without
+        # this the only trace was a log line nobody watches live: on the campaign
+        # path that hook is the whole settle → production-read → gate sequence, so
+        # a raise silently keeps the trial's stale pre-settle sweep and nothing
+        # reaches the event stream to say so.
+        #
+        # Receives ``"TypeName: message"`` as a plain string — never the exception
+        # object — matching every other hook here, which all pass strings/numbers.
+        self.on_trial_measured_hook_failed: Callable[[str], Any] | None = None
 
     # ── Properties ──────────────────────────────────────────────────────
 
@@ -1078,9 +1088,21 @@ class AutonomousLoop:
             if inspect.isawaitable(out):
                 out = await out
             return out if isinstance(out, dict) else results
-        except Exception:
+        except Exception as exc:
             logger.warning("trial_measured_hook_failed",
                            iteration=self._iteration, exc_info=True)
+            # Read through ``getattr``: ``_post_measure`` is exercised on loops
+            # built with ``__new__`` (no ``__init__``, so no attribute), and an
+            # ``AttributeError`` raised *here* would escape the very ``except``
+            # that exists to make this seam non-fatal.
+            alert = getattr(self, "on_trial_measured_hook_failed", None)
+            if alert is not None:
+                try:
+                    alert(f"{type(exc).__name__}: {exc}")
+                except Exception:
+                    # The alert about the failure must not become the failure.
+                    logger.warning("trial_measured_hook_failed_alert_failed",
+                                   iteration=self._iteration, exc_info=True)
             return results
 
     # ── Batch (q-BO) round ──────────────────────────────────────────────
