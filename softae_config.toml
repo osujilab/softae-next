@@ -95,9 +95,10 @@ reset_on_unrecoverable = true   # issue soft-reset on "Unrecoverable" errors
 driver      = "rh_controller"
 trinket_port = "COM11"
 trinket_baud = 115_200
-pid_kp   = 0.007
-pid_ki   = 0.0015
-pid_kd   = 0.05
+pid_kp   = 0.007    # 0.007 original
+pid_ki   = 0.0015    # 0.0015 original
+pid_kd   = 0.035     # 0.05 original
+
 # Sensor soft-reset threshold: consecutive I2C read errors before the RH driver
 # power-cycles the HT sensor. NOT a campaign limit — the autonomous loop's
 # park-on-systematic-fault limit is `AutonomousLoop.park_after_failed_trials`
@@ -666,14 +667,54 @@ max_abs_z        = 1e12    # |Z| at/above this = open circuit
 # confident wrong number ([a97] §3). The fix is the sweep, not the fitter.
 #
 # `engine` and `gates.enabled` stay deliberately separate, the same two-flag
-# design [purge] uses: engine = "gated" with gates.enabled = false runs every
-# check and logs every verdict while removing nothing. That pairing is how
-# gated earns the default — observe the would-reject log across a campaign
-# before giving these thresholds authority over data (the P4 lesson, applied to
-# a strictly larger gate). It is not what ships today; today is legacy with the
-# gates off.
+# design [purge] uses. That pairing is how gated earns the default — observe the
+# would-reject log across a campaign before giving these thresholds authority
+# over data (the P4 lesson, applied to a strictly larger gate).
+#
+# FLIPPED TO "gated" ON THE OPERATOR'S RULING, 2026-09-09, after three waves of a
+# standing "zero blast radius on the legacy path" constraint: see the real
+# behaviour rather than keep predicting it. Everything above is the evidence that
+# held this at "legacy" since the [a98] revert. None of it is retracted — the
+# accuracy question is not settled by this flip, it is put where it can be
+# watched.
+#
+# WHAT THIS TURNS ON, AND WHAT IT DOES NOT:
+#
+#   POINTS DROPPED — yes. This comment used to say the pairing below "runs every
+#     check and logs every verdict while removing nothing." The second half was
+#     FALSE. `run_gates` applies every `block_point` mask REGARDLESS of
+#     `[eis.gates] enabled`; only the REJECT short-circuit reads that flag
+#     (`policy.reduce_gates` downgrades a would-be REJECT to SUSPECT, and
+#     `engine.analyze_spectrum`'s R18 early return is behind the same flag). So
+#     this flip DOES move numbers. Measured read-only beforehand on 515 stored
+#     spectra across 170 runs, gated against legacy in one process: 66.2 % of
+#     spectra lose at least one point, 16.8 % of all points go, R1 is unchanged on
+#     exactly 1 of 426 comparable spectra, median |ΔR1| is 13.1 %, and 8 spectra
+#     move by more than 100×. Legacy-today reproduced the stored legacy R1
+#     bit-identically on 429/429, so that delta is the engines and not drift.
+#
+#   REFUSAL — no. `[eis.gates] enabled` stays false, so no spectrum is discarded;
+#     a would-be REJECT is logged as `eis_gate_would_reject` and recorded SUSPECT.
+#     On the same 515, arming it would reject 442 — but every one of those 442 is
+#     a spectrum legacy's own `grade_fit` already grades reject (and then neither
+#     stores nor acts on), so that number measures the corpus, not new harshness.
+#     `[quality] enabled` is a DIFFERENT gate and also stays false.
+#
+# ATTRIBUTABLE AND REVERSIBLE. `fit_results.engine` is written from the report's
+# own `engine`, not resolved from this key, so every row produced from here is
+# separable from the 3,619 legacy rows that precede it — as are `gate_verdict`,
+# `gate_log_json`, `n_points_used` and `n_points_dropped`, which the legacy path
+# leaves NULL/empty. No stored row is rewritten. Reverting is this one key.
+#
+# KNOWN, MEASURED, AND NOT FIXED BY THIS EDIT: on a spectrum where the gates
+# leave ZERO surviving points, `enabled = false` sends the empty set to the
+# fitter and `analyze_spectrum` RAISES `ValueError` out of `extract_features`
+# (`np.argmin` of an empty sequence) — 5 of the 515. `enabled = true` returns a
+# clean REJECT there instead, because the R18 early return catches it. The
+# observing-only setting is the one that crashes. Four callers do not absorb it:
+# `tab_analysis` (×2), `tab_experiment`, `eis_visualizer_widget`.
 [eis]
-engine = "legacy"          # "legacy" | "gated" — provisional, see [a97] above
+engine = "gated"           # "legacy" | "gated" — flipped 2026-09-09, see above
 
 # What a campaign optimises against. Separate from `engine` on purpose, but NOT
 # in the way this comment used to claim. It said the sigma extractor "forces the
