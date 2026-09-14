@@ -38,6 +38,7 @@ from softae.analysis.equilibration import (
     RATE_SPAN_TOO_SHORT,
     RATE_TOO_FEW_POINTS,
     RATE_UNDETECTABLE,
+    SETTLE_CONSENSUS_DROP_BUCKET,
     SETTLE_MIN_FIT_POINTS,
     RoundFit,
     SettleTracker,
@@ -59,35 +60,55 @@ def _times(n: int, period_s: float = ROUND_PERIOD_S) -> list[float]:
 
 
 # ── The three shapes, in R1 space, exactly as the gate will see them ─────────
+#
+# Each is a function of the round count with a six-round fixture in front of it,
+# because the ARMED rate window is seven rounds (`SETTLE_CONSENSUS_MAX_EXCLUDED`
+# on top of `DEFAULT_SETTLE_MIN_FIT_POINTS`, operator ruling 2026-09-14) while
+# every `rate_check` test below still calls the window directly at six. A
+# hand-appended seventh point would change each fixture's SHAPE, which is the one
+# thing these fixtures are for; generated points do not.
+
+
+def _flat_and_noisy_r1(n: int = 6) -> list[float]:
+    """R1 swinging ~2x about a **constant** mean with no trend at all."""
+    cycle = [5.00e3, 2.60e3, 5.40e3, 2.70e3, 5.20e3, 2.65e3]
+    return [cycle[i % len(cycle)] for i in range(n)]
+
+
+def _decaying_transient_r1(n: int = 6) -> list[float]:
+    """R1 rising toward a plateau -- a film drying, so **sigma falls**."""
+    t = np.asarray(_times(n))
+    return [float(1.0 / s) for s in 1.0e-4 * (1.0 + np.exp(-t / 1500.0))]
+
+
+def _quiet_r1(n: int = 6) -> list[float]:
+    """A settled cell: flat, with ~2 % scatter and no meaningful slope."""
+    cycle = [1.0, -1.0, 0.6, -0.6]
+    swing = np.array([cycle[i % len(cycle)] for i in range(n)])
+    return [float(1.0 / s) for s in 2.0e-4 * (1.0 + 0.02 * swing)]
+
 
 @pytest.fixture
 def ch25_flat_and_noisy_r1() -> list[float]:
-    """R1 swinging ~2x about a **constant** mean with no trend at all.
-
-    Seeded from ch25's 52/88/92/87 % deviations. The mean does not move; the
+    """Seeded from ch25's 52/88/92/87 % deviations. The mean does not move; the
     scatter is enormous. A magnitude test reads this as "still changing" and is
     wrong, and no hold length fixes it.
     """
-    return [5.00e3, 2.60e3, 5.40e3, 2.70e3, 5.20e3, 2.65e3]
+    return _flat_and_noisy_r1()
 
 
 @pytest.fixture
 def ch30_decaying_transient_r1() -> list[float]:
-    """R1 rising toward a plateau -- a film drying, so **sigma falls**.
-
-    Seeded from ch30's 28/14/11/9 %. The sign is load-bearing and is asserted
+    """Seeded from ch30's 28/14/11/9 %. The sign is load-bearing and is asserted
     rather than assumed: a fixture with the sign backwards would still pass a
     magnitude test, which is precisely the failure this module is about.
     """
-    t = np.asarray(_times(6))
-    return [float(1.0 / s) for s in 1.0e-4 * (1.0 + np.exp(-t / 1500.0))]
+    return _decaying_transient_r1()
 
 
 @pytest.fixture
 def quiet_r1() -> list[float]:
-    """A settled cell: flat, with ~2 % scatter and no meaningful slope."""
-    swing = np.array([1.0, -1.0, 0.6, -0.6, 1.0, -1.0])
-    return [float(1.0 / s) for s in 2.0e-4 * (1.0 + 0.02 * swing)]
+    return _quiet_r1()
 
 
 def _window(series: dict[int, list[float]], *, cell_constant: float = 1.0):
@@ -365,7 +386,11 @@ class TestRefusals:
         names = set(inspect.signature(rate_check).parameters)
 
         assert names == {"window", "times_s", "tol_per_hour", "tol_rel",
-                         "min_fit_points", "min_channels", "r1_bound_ohms"}
+                         "min_fit_points", "min_channels", "r1_bound_ohms",
+                         # A switch for the consensus rule, and it names no
+                         # target either: the shape it compares is the WINDOW's
+                         # own mode, so this stays a series compared to itself.
+                         "consensus_exclude"}
         for forbidden in ("setpoint", "target", "command", "_pv", "pv_"):
             assert not any(forbidden in name for name in names), forbidden
 
@@ -606,17 +631,20 @@ class TestCriterionSelector:
         assert _feed(shipped, series) == _feed(named, series)
         assert shipped.criterion == "deviation" and shipped.last_rate is None
 
-    def test_tracker_both_mode_gates_on_deviation_and_reports_the_rate(
-            self, ch30_decaying_transient_r1, quiet_r1):
+    def test_tracker_both_mode_gates_on_deviation_and_reports_the_rate(self):
         """Shadow mode: the verdict is the shipped one, byte for byte, and the
         rate rides beside it with no routing power at all.
 
         This is the configuration a bench run uses to compare the two criteria on
         one board before either is trusted, so the *pair* is the deliverable --
         an identical verdict is not enough if no rate came back with it.
+
+        **Seven rounds, not six**, because the armed consensus rule buys its
+        exclusion budget in observation: see `rate_window_rounds`.
         """
-        series = {30: ch30_decaying_transient_r1,
-                  18: quiet_r1, 19: quiet_r1, 20: quiet_r1}
+        quiet = _quiet_r1(7)
+        series = {30: _decaying_transient_r1(7),
+                  18: quiet, 19: quiet, 20: quiet}
         shipped = SettleTracker(n_rounds=3, min_channels=3, r1_bound_ohms=100.0)
         shadow = SettleTracker(n_rounds=3, min_channels=3, r1_bound_ohms=100.0,
                                criterion="both",
@@ -629,30 +657,31 @@ class TestCriterionSelector:
         assert shadow.last_rate.moving == [30]
         assert shadow.last_rate.pooled_rate_per_hour is not None
 
-    def test_tracker_rate_criterion_routes_on_the_rate_not_on_the_deviation(
-            self, ch30_decaying_transient_r1, quiet_r1):
-        series = {30: ch30_decaying_transient_r1,
-                  18: quiet_r1, 19: quiet_r1, 20: quiet_r1}
+    def test_tracker_rate_criterion_routes_on_the_rate_not_on_the_deviation(self):
+        quiet = _quiet_r1(7)
+        series = {30: _decaying_transient_r1(7),
+                  18: quiet, 19: quiet, 20: quiet}
         tracker = SettleTracker(n_rounds=3, min_channels=3, r1_bound_ohms=100.0,
                                 criterion="rate",
                                 rate_tol_per_hour=RATE_TOL_LN_PER_H)
         seen = _feed(tracker, series)
 
         # No verdict until the RATE window is full -- longer than n_rounds,
-        # because df = 1 at k = 3 makes an interval meaningless.
-        assert tracker.judged_rounds == 6
-        assert seen[:5] == [None] * 5
-        assert seen[5] is not None and not seen[5].settled
+        # because df = 1 at k = 3 makes an interval meaningless, and one longer
+        # again while the consensus rule is armed.
+        assert tracker.judged_rounds == 7
+        assert seen[:6] == [None] * 6
+        assert seen[6] is not None and not seen[6].settled
         # A deviation number would be a number nobody measured.
-        assert seen[5].max_deviation_rel is None
-        assert "still moving" in seen[5].reason
+        assert seen[6].max_deviation_rel is None
+        assert "still moving" in seen[6].reason
 
     def test_tracker_rate_criterion_without_a_time_axis_refuses_rather_than_guessing(
-            self, quiet_r1):
+            self):
         tracker = SettleTracker(n_rounds=3, min_channels=1, r1_bound_ohms=100.0,
                                 criterion="rate",
                                 rate_tol_per_hour=RATE_TOL_LN_PER_H)
-        seen = _feed(tracker, {18: quiet_r1}, with_time=False)
+        seen = _feed(tracker, {18: _quiet_r1(7)}, with_time=False)
 
         assert seen[-1] is not None
         assert not seen[-1].evaluable and not seen[-1].settled
@@ -677,22 +706,22 @@ class TestCriterionSelector:
             SettleTracker(criterion="deviaton")
 
     def test_tracker_rate_criterion_judges_the_room_over_the_window_it_judged_sigma(
-            self, quiet_r1):
+            self):
         """The RH clause spans the SIGMA window, which under the rate criterion
-        is six rounds and not three. A room judged over half the window leaves
+        is seven rounds and not three. A room judged over half the window leaves
         the other half unwatched, and "sigma flat under a moving room is not
         evidence" is a claim about one window or it is not a claim."""
         tracker = SettleTracker(n_rounds=3, min_channels=1, r1_bound_ohms=100.0,
                                 rh_stability_pct=1.5, criterion="rate",
                                 rate_tol_per_hour=RATE_TOL_LN_PER_H)
-        # RH walks 4 %RH across six rounds and 0.6 %RH across the last three, so
-        # only the longer window can see it.
-        for index, r1 in enumerate(quiet_r1):
+        # RH walks 4.8 %RH across seven rounds and 1.6 %RH across the last three,
+        # so only the longer window can see it.
+        for index, r1 in enumerate(_quiet_r1(7)):
             tracker.observe([RoundFit(18, 1.0 / r1, r1)],
                             rh_median_pct=10.0 + 0.8 * index,
                             t_s=index * ROUND_PERIOD_S)
 
-        assert tracker.rh_spread_pct == pytest.approx(4.0)
+        assert tracker.rh_spread_pct == pytest.approx(4.8)
         assert tracker.rh_blocked_settle is True
         assert not tracker.settled
 
@@ -770,3 +799,279 @@ class TestTheFitExcursion:
         assert deviation.max_deviation_rel < 0.10
         assert 18 in rate.unsettleable or 18 in rate.undetectable
         assert rate.by_channel[18].settled is False
+
+
+# ── The physical consensus rule ──────────────────────────────────────────────
+
+#: The armed rate window. Seven and not six, so a channel that spends its one
+#: exclusion still regresses on `DEFAULT_SETTLE_MIN_FIT_POINTS` points.
+ARMED_WINDOW = 7
+
+
+def _shaped(series: dict[int, list[float]],
+            states: dict[int, list[str]] | None = None,
+            dropped: dict[int, list[int | None]] | None = None):
+    """``{channel: [R1]}`` plus the fit SHAPE the consensus rule reads.
+
+    ``arc_state`` defaults to ``closed`` on every round of every channel, which
+    is the ordinary bench shape and the one the rule must never fire on; a test
+    that wants a disagreement says so, per channel, per round.
+    """
+    rounds = max(len(values) for values in series.values())
+    return [
+        [RoundFit(channel=ch, sigma=1.0 / values[i], r1_ohms=values[i],
+                  arc_state=(states or {}).get(ch, ["closed"] * rounds)[i],
+                  n_points_dropped=(dropped or {}).get(ch, [0] * rounds)[i])
+         for ch, values in sorted(series.items())]
+        for i in range(rounds)]
+
+
+def _one_open_round(index: int, n: int = ARMED_WINDOW) -> list[str]:
+    return ["open" if i == index else "closed" for i in range(n)]
+
+
+class TestPhysicalConsensus:
+    """A round taken mid-transient is a different CELL, not a noisier reading.
+
+    The operator ruled against statistical outlier removal by name (`[a243]`), so
+    the discriminator is the shape of the fit -- did the arc close, and did the
+    fitter withhold a materially different part of the sweep -- and never the size
+    of the residual. Every fixture below is a real r6 shape.
+    """
+
+    #: ch18's own failure, moved inside the armed window: flat but for one round
+    #: at 4x, and the fit on that round says why -- the arc did not close.
+    EXCURSION_ROUND = 2
+
+    def _excursion_board(self, *, state_disagrees: bool = True):
+        excursion = _quiet_r1(ARMED_WINDOW)
+        excursion[self.EXCURSION_ROUND] *= 4.0
+        quiet = _quiet_r1(ARMED_WINDOW)
+        series = {18: excursion, 19: list(quiet), 20: list(quiet)}
+        states = ({18: _one_open_round(self.EXCURSION_ROUND)}
+                  if state_disagrees else None)
+        return _shaped(series, states)
+
+    def test_consensus_excludes_one_disagreeing_round_and_certifies(self):
+        """The whole deliverable: five rounds agreed, one did not, and the one
+        that did not leaves ch18's regression -- sigma AND its time point.
+
+        Without it ch18 is `rate_undetectable` on the strength of a round that
+        measured a different cell, the board is two quiet channels short of its
+        minimum, and it then waits for that round to age out of a trailing
+        window it has not finished passing.
+        """
+        window = self._excursion_board()
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3)
+
+        assert check.settled is True
+        assert check.quiet == [18, 19, 20]
+        assert check.consensus_unavailable is False
+        assert [(e.channel, e.round_index) for e in check.excluded_rounds] == [
+            (18, self.EXCURSION_ROUND)]
+        assert check.excluded_rounds[0].reason == \
+            "arc_state open vs consensus closed"
+        # BOTH halves left: six points regressed, over the span the six that
+        # survived actually cover, not the seven-round span.
+        assert check.by_channel[18].n_points == ARMED_WINDOW - 1
+
+    def test_the_same_board_without_the_rule_does_not_certify(self):
+        """**The positive control for the two tests above it.**
+
+        Identical window, identical tolerances, rule disarmed -- and if this ever
+        goes green the exclusion has stopped doing anything and the test that
+        certifies is passing for some other reason.
+        """
+        window = self._excursion_board()
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3,
+                           consensus_exclude=False)
+
+        assert check.settled is False
+        assert 18 not in check.quiet
+        assert check.excluded_rounds == []
+
+    def test_an_excursion_whose_shape_agrees_is_not_excluded(self):
+        """The rule is not an outlier filter, and this is where the two part.
+
+        Same 4x excursion, same everything -- but every round's fit closed, so
+        nothing on the fit says a different cell was measured and the round
+        stays in. A residual-sized rule would drop it; this one must not.
+        """
+        window = self._excursion_board(state_disagrees=False)
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3)
+
+        assert check.excluded_rounds == []
+        assert check.settled is False and 18 not in check.quiet
+
+    def test_alternating_states_exclude_nothing(self):
+        """The r6 ch4/5/6 shape: the arc opens and closes round to round.
+
+        Two or more disagreements is not an outlier, it is a channel that is not
+        consensus-stable, and picking the minority half of a flapping cell would
+        be choosing a verdict rather than measuring one. Left whole, for the
+        survivors mechanism -- so the verdict must be what it is with the rule
+        off, field for field.
+        """
+        flapping = _quiet_r1(ARMED_WINDOW)
+        flapping[2] *= 4.0
+        quiet = _quiet_r1(ARMED_WINDOW)
+        window = _shaped(
+            {4: flapping, 19: list(quiet), 20: list(quiet)},
+            {4: ["closed", "open"] * 3 + ["closed"]})
+
+        armed = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3)
+        off = rate_check(window, _times(ARMED_WINDOW),
+                         tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3,
+                         consensus_exclude=False)
+
+        assert armed.excluded_rounds == []
+        assert armed.by_channel == off.by_channel
+        assert (armed.settled, armed.quiet, armed.reason) == \
+            (off.settled, off.quiet, off.reason)
+        assert 4 not in armed.quiet
+
+    def test_monotone_same_state_trend_is_untouched(self):
+        """The r6 ch12/ch13 shape: a cell genuinely drifting, one shape
+        throughout. No exclusion rule may touch a channel that is moving --
+        there is no round to blame, and blaming one would certify a drying film.
+        """
+        window = _shaped({12: _decaying_transient_r1(ARMED_WINDOW),
+                          19: _quiet_r1(ARMED_WINDOW),
+                          20: _quiet_r1(ARMED_WINDOW)})
+
+        armed = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3)
+        off = rate_check(window, _times(ARMED_WINDOW),
+                         tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3,
+                         consensus_exclude=False)
+
+        assert armed.excluded_rounds == []
+        assert armed.moving == off.moving == [12]
+        assert armed.settled is False and armed.reason == off.reason
+
+    def test_consensus_is_inert_when_no_round_carries_an_arc_state(self):
+        """``SUBAGENT_RULES.md`` §3.1(a), as an assertion.
+
+        A feeder that has not shipped its half sends rounds with no shape at all.
+        The mode is then a unanimous `""`, nothing can ever disagree, and an
+        empty `excluded_rounds` would say "no round disagreed" using the same
+        token as "no round was asked". The two are separate fields, and the
+        second one is the only evidence that the check was even able to run.
+        """
+        bare = _window({18: _quiet_r1(ARMED_WINDOW),
+                        19: _quiet_r1(ARMED_WINDOW),
+                        20: _quiet_r1(ARMED_WINDOW)})
+        check = rate_check(bare, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3)
+
+        assert check.consensus_unavailable is True
+        assert check.excluded_rounds == []
+        # ...and a window that DID carry the shape says so with the other token,
+        # which is what makes the pair readable.
+        shaped = rate_check(
+            _shaped({18: _quiet_r1(ARMED_WINDOW), 19: _quiet_r1(ARMED_WINDOW),
+                     20: _quiet_r1(ARMED_WINDOW)}),
+            _times(ARMED_WINDOW), tol_per_hour=RATE_TOL_LN_PER_H,
+            min_channels=3)
+        assert shaped.consensus_unavailable is False
+        assert shaped.excluded_rounds == []
+
+    # -- the bucket, which exists so mask jitter cannot manufacture a drop ----
+
+    def test_one_masked_point_of_jitter_is_inside_the_bucket(self):
+        """13 and 14 dropped points are the same bucket, and must be.
+
+        `n_points_dropped` moves by +/-1 when one frequency crosses a finiteness
+        or phase test between rounds of an identically behaving cell. Exact
+        equality would exclude a round for that, which is the residual-sized
+        behaviour the operator ruled out.
+        """
+        quiet = _quiet_r1(ARMED_WINDOW)
+        window = _shaped(
+            {18: list(quiet), 19: list(quiet), 20: list(quiet)},
+            dropped={18: [13, 13, 14, 13, 13, 13, 13]})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3)
+
+        assert check.excluded_rounds == []
+        assert SETTLE_CONSENSUS_DROP_BUCKET == 5
+
+    def test_a_whole_decade_withheld_on_one_round_crosses_the_bucket(self):
+        """The case the bucket exists to catch: the state agreed and the fit
+        nonetheless saw a materially different spectrum."""
+        quiet = _quiet_r1(ARMED_WINDOW)
+        window = _shaped(
+            {18: list(quiet), 19: list(quiet), 20: list(quiet)},
+            dropped={18: [0, 0, 13, 0, 0, 0, 0]})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3)
+
+        assert [(e.channel, e.round_index, e.reason)
+                for e in check.excluded_rounds] == [
+            (18, 2, "drop_bucket 2 vs consensus 0")]
+
+    # -- the window the exclusion is paid for out of -------------------------
+
+    def test_the_rate_window_grows_by_one_while_the_rule_is_armed(self):
+        """Operator ruling 2026-09-14, and it is a collision being paid rather
+        than a margin: the shipped window is 6 and `_channel_rate` refuses below
+        6, so a 6-round window plus an exclusion makes the rule a no-op that
+        returns the SAFE answer -- the channel goes non-evaluable instead of
+        quiet, and nothing goes red.
+        """
+        tracker = SettleTracker(criterion="rate", rate_tol_per_hour=0.30)
+
+        assert tracker.min_fit_points == DEFAULT_SETTLE_MIN_FIT_POINTS
+        assert tracker.rate_window_rounds == DEFAULT_SETTLE_MIN_FIT_POINTS + 1
+        assert tracker.judged_rounds == tracker.rate_window_rounds == ARMED_WINDOW
+
+    def test_the_rate_window_is_unchanged_when_the_rule_is_off(self):
+        tracker = SettleTracker(criterion="rate", rate_tol_per_hour=0.30,
+                                settle_consensus_exclude=False)
+
+        assert tracker.rate_window_rounds == DEFAULT_SETTLE_MIN_FIT_POINTS == 6
+        assert tracker.judged_rounds == 6
+
+    def test_an_excluded_channel_still_clears_the_minimum_fit_points(self):
+        """Why the extra round was bought, stated as the thing it buys: the
+        survivors of an exclusion must still be a window worth quoting, or the
+        rule trades a wrong verdict for an absent one."""
+        window = self._excursion_board()
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3,
+                           min_fit_points=DEFAULT_SETTLE_MIN_FIT_POINTS)
+
+        assert check.by_channel[18].refusal != RATE_TOO_FEW_POINTS
+        assert check.by_channel[18].n_points >= DEFAULT_SETTLE_MIN_FIT_POINTS
+
+    # -- the cosmetic defect `[a243]` named ----------------------------------
+
+    def test_the_settled_reason_quotes_the_worst_bound_among_the_certifiers(self):
+        """`[a243]`: "worst 95 % bound 17.12 ln/h is within 0.23 ln/h".
+
+        `bounds` spans every PARTICIPANT, and a participant that came back
+        unjudgeable has a bound above the tolerance by definition -- so the
+        sentence quoted a number that is not within the band it claims to be
+        within, on the only certification in six runs. The number that certified
+        is the worst one over the QUIET channels.
+        """
+        quiet = _quiet_r1(ARMED_WINDOW)
+        window = _window({25: _flat_and_noisy_r1(ARMED_WINDOW),
+                          18: list(quiet), 19: list(quiet), 20: list(quiet)})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3)
+
+        assert check.settled is True and 25 not in check.quiet
+        certifying = max(check.by_channel[ch].upper_bound_per_hour
+                         for ch in check.quiet)
+        assert f"worst 95 % bound {certifying:.4f} ln/h" in check.reason
+        assert certifying <= RATE_TOL_LN_PER_H
+        # The number that used to be printed is still recorded -- it is the
+        # board's worst participant and a real fact -- it is simply not the one
+        # the certifying sentence may quote.
+        assert check.max_upper_bound_per_hour > certifying
+        assert f"{check.max_upper_bound_per_hour:.4f} ln/h is" not in check.reason

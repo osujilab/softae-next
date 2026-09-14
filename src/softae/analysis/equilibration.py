@@ -61,6 +61,7 @@ stand in for a missing σ.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -1117,6 +1118,41 @@ SETTLE_MIN_FIT_POINTS = 4
 #: and this is a floor rather than a target.
 DEFAULT_SETTLE_MIN_FIT_POINTS = 6
 
+# ── The consensus rule: one round can be a different cell ────────────────────
+#
+# A round taken mid-transient is a **physically different** cell, not a noisier
+# measurement of the same one, and the evidence that it was is on the fit itself:
+# the arc closed on five rounds and was open on the sixth, or the fitter withheld
+# a whole decade on one round and none on the others. So the exclusion is decided
+# on the *shape of the fit*, never on the size of the residual — the operator
+# ruled against statistical outlier removal by name (`[a243]`).
+
+#: `n_points_dropped // 5`. The dropped count is the size of ``usable_points``'
+#: mask (``circuit_fitting.py``), and at a mask boundary one frequency crossing a
+#: finiteness or phase test moves it by ±1 between rounds of an identically
+#: behaving cell — book-keeping noise. A swing of ±10 is a whole decade withheld,
+#: which is a different spectrum. Exact equality would exclude a round for one
+#: point of jitter; the bucket is sized so it cannot manufacture an exclusion out
+#: of one. On `20260914T132645Z` it is constant on every cited channel, so
+#: ``arc_state`` is the operative half and this guards the case where the state
+#: agrees and the fit nonetheless saw a materially different spectrum.
+SETTLE_CONSENSUS_DROP_BUCKET = 5
+#: **At most one** round per channel per window. Two or more disagreements is not
+#: an outlier, it is a channel that is not consensus-stable — the alternating
+#: railed/unrailed shape — and nothing is excluded there: that case belongs to the
+#: survivors mechanism, which already has a word for it.
+SETTLE_CONSENSUS_MAX_EXCLUDED = 1
+
+#: Which half of the shape disagreed. Carried as a word beside the rendered
+#: reason so a narrator can re-render it in its own vocabulary without parsing
+#: prose — the ``_exclusion_word`` precedent, one level down.
+CONSENSUS_ARC_STATE = "arc_state"
+CONSENSUS_DROP_BUCKET = "drop_bucket"
+#: How an absent half of the shape is rendered in a reason. ``arc_state`` is
+#: ``""`` on a feeder that never asked, and a reason reading "arc_state  vs
+#: consensus closed" would lose the distinction in whitespace.
+CONSENSUS_UNRECORDED = "unrecorded"
+
 # ── Which criterion a tracker gates on ───────────────────────────────────────
 #
 # :func:`rate_check` is a **sibling** of :func:`settle_check` and never a mode of
@@ -1231,6 +1267,54 @@ class RoundFit:
     #: to read, so keeping it is what makes "did fitting actually buy anything?"
     #: answerable from a run's own record instead of from a second bench run.
     r_raw_ohms: float | None = None
+    #: ``ArcClosure.state`` for the fit this σ came from — ``closed`` / ``open`` /
+    #: ``unknown`` — and ``""`` on a feeder that never asked. Empty on exactly
+    #: ``basis``' stated precedent: an absence of the *question*, not of the
+    #: answer. It is the operative half of the consensus shape, because a round
+    #: whose arc closed and a round whose arc did not are not two measurements of
+    #: the same cell.
+    arc_state: str = ""
+    #: ``FitResult.n_points_dropped`` — the size of the **fitter's** mask, and
+    #: deliberately **not** ``fit.arc_closure.n_dropped``, which counts a
+    #: different mask (``eis/arc.py``'s ``annotate_arc_closure`` says so outright).
+    #:
+    #: ``None``, never ``0``, for "never asked": ``0`` is a real count and
+    #: "unknown" must not be spelled with the token for "asked, and none"
+    #: (``SUBAGENT_RULES.md`` §3.1(a)).
+    n_points_dropped: int | None = None
+
+
+@dataclass(frozen=True)
+class ExcludedRound:
+    """One round dropped from **one channel's** regression by the consensus rule.
+
+    Not a channel-level exclusion: :func:`_exclusion` drops a whole channel out of
+    the window and is a participation rule, while this drops a single (channel,
+    round) cell out of one regression and leaves the channel judged. The two live
+    beside each other on :class:`RateCheck` and must never be read as the same
+    thing.
+
+    ``round_index`` is the index **within the window**, not the run's round
+    number: the window is trailing, so the two differ by however many rounds have
+    aged out, and only the caller knows that offset.
+    """
+
+    channel: int
+    round_index: int
+    #: :data:`CONSENSUS_ARC_STATE` or :data:`CONSENSUS_DROP_BUCKET`.
+    kind: str
+    #: What this round's shape was, and what the rest of the window agreed on.
+    #: Carried apart from :attr:`reason` so a narrator bound to a restricted
+    #: vocabulary can rebuild the sentence rather than edit it.
+    observed: str
+    consensus: str
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.reason:
+            object.__setattr__(
+                self, "reason",
+                f"{self.kind} {self.observed} vs consensus {self.consensus}")
 
 
 @dataclass
@@ -1328,6 +1412,28 @@ class RateCheck:
     span_s: float = 0.0
     n_rounds: int = 0
     reason: str = ""
+    #: `t(0.975, k−2)·SE` at this window's **median** residual, ln/h — the
+    #: narrowest band a *typical* cell on this board could have certified over
+    #: this observation. :func:`_reference_half_width` has always computed it and
+    #: :func:`_channel_rate` has always read it; it was the one input to a
+    #: :data:`RATE_SPAN_TOO_SHORT` verdict that never left the function, so a run
+    #: could hold to its ceiling against a band its own window could not resolve
+    #: and say nothing. ``None`` when no channel produced a fit. Trailing, with a
+    #: default, so every existing construction is unchanged.
+    reference_half_width_per_hour: float | None = None
+    #: Rounds the consensus rule dropped from a **single channel's** regression,
+    #: at most :data:`SETTLE_CONSENSUS_MAX_EXCLUDED` per channel. Empty is the
+    #: ordinary case and means every channel's window was one shape throughout —
+    #: but only when :attr:`consensus_unavailable` is ``False``, which is the
+    #: whole reason the two fields are separate.
+    excluded_rounds: list[ExcludedRound] = field(default_factory=list)
+    #: **No round in the window carried an** ``arc_state`` **at all**, so the mode
+    #: is a unanimous ``""``, nothing can ever disagree, and the rule returns the
+    #: shape of a pass while being structurally unable to fire. Recorded so "no
+    #: round disagreed" and "no round was asked" are never the same token
+    #: (``SUBAGENT_RULES.md`` §3.1(a)). This is the field that catches a feeder
+    #: shipped without its half.
+    consensus_unavailable: bool = False
 
 
 def r1_lower_bound_ohms(circuit_model: str) -> float | None:
@@ -1405,6 +1511,52 @@ def _exclusion(fits: Sequence[RoundFit], bound_ohms: float | None) -> str:
     if not np.isfinite(mean) or mean == 0.0:
         return EXCLUDED_ZERO_MEAN
     return ""
+
+
+def _fit_shape(fit: RoundFit) -> tuple[str, int | None]:
+    """The pair the consensus is taken over: closure state, bucketed mask size."""
+    dropped = fit.n_points_dropped
+    return (str(fit.arc_state),
+            None if dropped is None
+            else int(dropped) // SETTLE_CONSENSUS_DROP_BUCKET)
+
+
+def _consensus_exclusion(
+    channel: int, fits: Sequence[RoundFit]
+) -> ExcludedRound | None:
+    """The one round whose fit shape disagrees with this channel's own mode.
+
+    ``None`` in all three of the cases that are not a single outlier, and they
+    are deliberately not distinguished here because the action is the same:
+
+    - every round agrees — the ordinary window;
+    - **two or more** disagree — the channel is not consensus-stable (the r6
+      ch4/5/6 shape, alternating round to round), and excluding the "minority"
+      would be picking one arbitrary half of a flapping cell. Left whole, for
+      the survivors mechanism to judge;
+    - the mode is not a strict majority — a two-round window splits 1/1 and has
+      no consensus to be an outlier from.
+    """
+    shapes = [_fit_shape(fit) for fit in fits]
+    if not shapes:
+        return None
+    mode, seen = Counter(shapes).most_common(1)[0]
+    dissent = len(shapes) - seen
+    if dissent != SETTLE_CONSENSUS_MAX_EXCLUDED or seen <= dissent:
+        return None
+    index = next(i for i, shape in enumerate(shapes) if shape != mode)
+    state, bucket = shapes[index]
+    mode_state, mode_bucket = mode
+    if state != mode_state:
+        return ExcludedRound(
+            channel=int(channel), round_index=index, kind=CONSENSUS_ARC_STATE,
+            observed=state or CONSENSUS_UNRECORDED,
+            consensus=mode_state or CONSENSUS_UNRECORDED)
+    return ExcludedRound(
+        channel=int(channel), round_index=index, kind=CONSENSUS_DROP_BUCKET,
+        observed=CONSENSUS_UNRECORDED if bucket is None else str(bucket),
+        consensus=(CONSENSUS_UNRECORDED if mode_bucket is None
+                   else str(mode_bucket)))
 
 
 def settle_check(
@@ -1686,6 +1838,7 @@ def rate_check(
     min_fit_points: int = DEFAULT_SETTLE_MIN_FIT_POINTS,
     min_channels: int = DEFAULT_SETTLE_MIN_CHANNELS,
     r1_bound_ohms: float | None = None,
+    consensus_exclude: bool = True,
 ) -> RateCheck:
     """Is σ still *moving*, as distinct from merely noisy? Pure, and per cell.
 
@@ -1715,6 +1868,14 @@ def rate_check(
     exceeds it is named :data:`EXCLUDED_UNSETTLEABLE` — no hold length can
     certify it, so waiting is the wrong instruction. Omit it and the window is
     judged on rate alone.
+
+    *consensus_exclude* arms the **physical** consensus rule: a channel whose
+    fits were one shape on every round but one had that round taken from a
+    different cell, not measured more noisily, so it leaves that channel's
+    regression — σ **and** its time point together, or the regressor is mis-paced.
+    See :func:`_consensus_exclusion` for what it refuses to do, and
+    :attr:`RateCheck.consensus_unavailable` for what it says when it could not
+    look at all.
 
     **Nothing calls this yet, by design.** It ships as a pure unit so that the
     criterion can be measured against real windows before it is given any
@@ -1754,14 +1915,45 @@ def rate_check(
             reason=(f"{len(participating)} participating channel(s) < {needed} "
                     f"required; the criterion cannot be evaluated"))
 
-    series = {channel: [float(fit.sigma) for fit in by_channel[channel]]  # type: ignore[arg-type]
-              for channel in participating}
-    fitted = {channel: log_rate(axis, sigmas)
-              for channel, sigmas in series.items()}
+    # THE CONSENSUS RULE. Per channel, and it may drop at most one round from one
+    # channel's regression -- never a channel from the window, which is
+    # `_exclusion`'s job one block up and a different question.
+    excluded_rounds: list[ExcludedRound] = []
+    consensus_unavailable = False
+    if consensus_exclude:
+        # Asked BEFORE anything is excluded: a window carrying no `arc_state` at
+        # all has a unanimous "" mode, so it can never exclude, and "nothing
+        # disagreed" would then be the same token as "nothing was asked".
+        consensus_unavailable = not any(
+            fit.arc_state for channel in participating
+            for fit in by_channel[channel])
+        if not consensus_unavailable:
+            excluded_rounds = [
+                found for channel in participating
+                if (found := _consensus_exclusion(
+                    channel, by_channel[channel])) is not None]
+    dropped_index = {entry.channel: entry.round_index for entry in excluded_rounds}
+
+    # Per channel, not one shared axis: an excluded round must leave BOTH the σ
+    # and its time point, or the surviving points are regressed against a pacing
+    # they were not measured at.
+    paired = {
+        channel: tuple(zip(*[
+            (t, float(fit.sigma))  # type: ignore[arg-type]
+            for index, (t, fit) in enumerate(zip(axis, by_channel[channel]))
+            if index != dropped_index.get(channel)]))
+        for channel in participating
+    }
+    series = {channel: list(sigmas) for channel, (_t, sigmas) in paired.items()}
+    fitted = {channel: log_rate(list(times), list(sigmas))
+              for channel, (times, sigmas) in paired.items()}
+    # The board-level reference stays on the FULL axis: it is what a *typical*
+    # cell over *this observation* could have certified, and a per-channel
+    # exclusion is a fact about that channel rather than about the window.
     reference = _reference_half_width(axis, fitted.values())
     by_rate = {
         channel: _channel_rate(
-            channel, axis, sigmas, fitted[channel],
+            channel, list(paired[channel][0]), sigmas, fitted[channel],
             tol_per_hour=tol_per_hour, tol_rel=tol_rel,
             min_fit_points=min_fit_points, reference_half_width=reference)
         for channel, sigmas in series.items()
@@ -1785,6 +1977,9 @@ def rate_check(
         "pooled_rate_per_hour": float(np.mean(rates)) if rates else None,
         "max_upper_bound_per_hour": max(bounds) if bounds else None,
         "span_s": span_s, "n_rounds": len(rounds),
+        "reference_half_width_per_hour": reference,
+        "excluded_rounds": excluded_rounds,
+        "consensus_unavailable": consensus_unavailable,
     }
     tol = float(tol_per_hour)
     if grouped[RATE_MOVING]:
@@ -1795,12 +1990,22 @@ def rate_check(
                     + " ".join(f"ch{ch}" for ch in grouped[RATE_MOVING])),
             **common)
     if len(quiet) >= needed:
+        # **The worst bound among the CERTIFYING channels, not among all
+        # participants.** `bounds` spans every participant, including cells that
+        # came back `rate_undetectable` or `unsettleable` — whose bounds are by
+        # definition *above* the tolerance. Quoting that maximum made the settled
+        # sentence read "worst 95 % bound 17.12 ln/h is within 0.23 ln/h", which
+        # is false as written and was the first thing an operator saw on the only
+        # certification in six runs (`20260914T132645Z`). The number that
+        # certified is the worst one over `quiet`.
+        certifying = [by_rate[ch].upper_bound_per_hour for ch in quiet
+                      if by_rate[ch].upper_bound_per_hour is not None]
         return RateCheck(
             evaluable=True, settled=True,
             reason=(f"{len(rounds)} rounds over {span_s:.0f} s, {len(quiet)} "
                     f"quiet channel(s): worst 95 % bound "
-                    f"{max(bounds) if bounds else float('nan'):.4f} ln/h is "
-                    f"within {tol:.4f} ln/h"),
+                    f"{max(certifying) if certifying else float('nan'):.4f} "
+                    f"ln/h is within {tol:.4f} ln/h"),
             **common)
     tally = ", ".join(
         f"{len(grouped[name])} {name}" for name in
@@ -1909,6 +2114,7 @@ class SettleTracker:
         criterion: str = SETTLE_CRITERION_DEVIATION,
         rate_tol_per_hour: float | None = None,
         min_fit_points: int = DEFAULT_SETTLE_MIN_FIT_POINTS,
+        settle_consensus_exclude: bool = True,
     ) -> None:
         self.enabled = bool(enabled)
         self.tol_rel = float(tol_rel)
@@ -1930,6 +2136,12 @@ class SettleTracker:
         self.rate_tol_per_hour = (None if rate_tol_per_hour is None
                                   else float(rate_tol_per_hour))
         self.min_fit_points = max(SETTLE_MIN_FIT_POINTS, int(min_fit_points))
+        #: Arms the physical consensus rule inside :func:`rate_check`, and with
+        #: it the extra round on :attr:`rate_window_rounds`. Read by nothing
+        #: under ``"deviation"``, so the default cannot change a deviation
+        #: verdict; **on** under the two criteria that compute a rate, per the
+        #: operator's 2026-09-14 ruling.
+        self.settle_consensus_exclude = bool(settle_consensus_exclude)
         #: How far the room may move across the judged window and still count as
         #: still. ``None`` — the default — is the gate off, so every existing
         #: caller keeps today's verdicts exactly.
@@ -2046,8 +2258,21 @@ class SettleTracker:
         uniformly paced hold the two windows are the same window; the achieved
         span is reported on every :class:`RateCheck` so a reader can see which
         one they got.
+
+        **One longer while the consensus rule is armed, and that is a collision
+        being paid for rather than a margin.** The shipped window is
+        ``max(n_rounds, min_fit_points)`` = 6 and :func:`_channel_rate` refuses
+        :data:`RATE_TOO_FEW_POINTS` below 6, so excluding one round would leave 5
+        and turn every consensus exclusion into a channel going **non-evaluable**
+        instead of quiet — the rule returning the safe answer, with nothing red.
+        Operator ruling 2026-09-14: buy the exclusion in observation rather than
+        in confidence. The survivors of an excluded channel then regress on 6
+        points at `t(0.975, 4) = 2.776`, and an unexcluded channel is
+        statistically unchanged on 7.
         """
-        return max(self.n_rounds, self.min_fit_points)
+        window = max(self.n_rounds, self.min_fit_points)
+        return window + (SETTLE_CONSENSUS_MAX_EXCLUDED
+                         if self.settle_consensus_exclude else 0)
 
     @property
     def judged_rounds(self) -> int:
@@ -2078,7 +2303,8 @@ class SettleTracker:
             self.rounds[-window:], self.times_s[-window:],
             tol_per_hour=self.rate_tol_per_hour, tol_rel=self.tol_rel,
             min_fit_points=self.min_fit_points,
-            min_channels=self.min_channels, r1_bound_ohms=self.r1_bound_ohms)
+            min_channels=self.min_channels, r1_bound_ohms=self.r1_bound_ohms,
+            consensus_exclude=self.settle_consensus_exclude)
 
     def _apply_rh_clause(self, check: SettleCheck) -> None:
         """Was the room still across this window? Mutates *check* in place.
