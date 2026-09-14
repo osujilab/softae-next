@@ -30,6 +30,7 @@
 21. [Thickness Series](#21-thickness-series)
 22. [Equilibration Characterization](#22-equilibration-characterization)
 23. [Environment Hold — `softae-env`](#23-environment-hold--softae-env)
+24. [Adaptive-Acquisition Validation — `softae-eis-validate`](#24-adaptive-acquisition-validation--softae-eis-validate)
 
 ---
 
@@ -1307,9 +1308,17 @@ high = 30.0
 
 The loader **refuses what it cannot represent faithfully**. An unknown key is an error, not
 a silently-defaulted field, and fields carrying live Python objects (`prior_mean`,
-`formulation`, `run_plan`, `seed_observations`) cannot be set from a file at all — a spec
+`formulation`, `piezo`, `seed_observations`) cannot be set from a file at all — a spec
 that silently ran a different experiment from the one the file describes is the failure this
 prevents. Those campaigns are built in Python or from Tab 10.
+
+Two things that list does **not** refuse, because they are asked about often:
+
+- **`general_formulation` has always been loadable** — only the `formulation` *key* is
+  refused. A fully pinned composition is a first-class file form; see *Casting one fixed
+  recipe N times* below.
+- **`run_plan` is loadable as of this wave**, in the `[[run_plan.phases]]` form described
+  further down. It was on the refusal list until then.
 
 ### Casting one fixed recipe N times
 
@@ -1329,8 +1338,9 @@ axis it does not list. Before this, such a file loaded and cast every well at th
 lower bound — a fixed recipe at the corner of the declared box, reported as a search.
 
 `examples/bench_instance.toml` is the worked example: two pinned axes, `replicate` 1–4,
-`grid`, `budget = 4`. It carries no `[[run_plan.phases]]` block, and so no anneal phase — a
-run plan cannot be written in a file at all yet (above), and that codec is upcoming work.
+`grid`, `budget = 4`. The `[[run_plan.phases]]` block that turns it into a full bench
+instance — cast, cure, equilibrate, read — is described below, and is being added to that
+file in the same wave.
 
 ### What to measure — the `[measurement]` block
 
@@ -1370,6 +1380,93 @@ run from a measurement-block spec.
   contributes nothing to the checkpoint fingerprint, so a campaign checkpointed before the
   block existed still resumes. `preset` / `overrides` / `enabled` are settings, re-tunable
   between sessions, exactly as they were under the old names.
+
+### The run plan — `[[run_plan.phases]]`
+
+A spec can describe the **process** as well as the formulation: the ordered phases a board
+goes through between casting and reading. Each phase is one `[[run_plan.phases]]` table, and
+the array order is the execution order.
+
+```toml
+[[run_plan.phases]]
+kind  = "formulate"
+scope = "per_sample"
+  [run_plan.phases.conditions]
+  name            = "casting"
+  temp_setpoint_C = 25.0
+  rh_setpoint_pct = 40.0
+
+[[run_plan.phases]]
+kind        = "anneal"
+scope       = "per_batch"
+anneal_task = "anneal_85C_8h"
+  [run_plan.phases.conditions]
+  name            = "anneal"
+  temp_setpoint_C = 85.0
+  rh_setpoint_pct = 20.0     # at 85 °C the attainable floor is ~20 %; check advises
+
+[[run_plan.phases]]
+kind  = "equilibrate"
+scope = "per_batch"
+  [run_plan.phases.settle]
+  round_period_s = 240.0
+  min_hold_s     = 1500.0
+  max_hold_s     = 14400.0
+  [run_plan.phases.conditions]
+  name            = "equilibrate"
+  temp_setpoint_C = 25.0
+  rh_setpoint_pct = 50.0
+
+[[run_plan.phases]]
+kind  = "measure"
+scope = "per_batch"
+  [run_plan.phases.measurement]
+  preset = "Extended"
+```
+
+| Key | Where | Required | Meaning |
+|---|---|---|---|
+| `kind` | every phase | **yes** | `formulate` · `anneal` · `equilibrate` · `measure` |
+| `scope` | every phase | **yes** | `per_sample` (once per well) or `per_batch` (once for the round) |
+| `anneal_task` | anneal | no | a task name from `data/tasks.toml` — **this is what sets the cure** |
+| `[…conditions]` | any phase | no | chamber setpoints established at the phase boundary |
+| `[…settle]` | equilibrate | no | the settle loop's timing; the three keys are required **together** |
+| `[…measurement]` | **measure only** | no | a `[measurement]`-shaped block for a denser read |
+
+**`scope` is required on every phase and is never inferred.** It is not derived from `batch`,
+because guessing it silently changes which physical process runs — `per_sample` casts and
+anneals each well on its own, `per_batch` casts all of them and then cures once. A batch
+instance is `formulate ×N → anneal (all) → equilibrate (all) → measure (all)`, and
+`softae-campaign check` prints that resolved order before anything moves.
+
+**`conditions` drives only the axes you name.** An omitted axis is **not driven** — leaving
+out `rh_setpoint_pct` does not mean "0 %RH", it means the humidifier is not commanded at this
+boundary and whatever the previous phase left stands. The block also carries tolerances and
+approach timeouts; they default, and at 85 °C you will want to set the RH approach timeout
+honestly rather than take the default, because the descent to the attainable floor takes far
+longer than a default approach allows. `check` surfaces that as an advisory, never a refusal.
+
+> **`conditions` on an ANNEAL phase is the temperature the chamber RESTS AT after the hold —
+> not the cure temperature.** The cure is set by `anneal_task` and nothing else: the task wins
+> the hold, always. The conditions block writes its setpoint first, the anneal ramps away to
+> the task's target, and on the way out it restores what conditions left — so `conditions`
+> is the *restore target*. **The case to watch is when the two agree.** Write
+> `temp_setpoint_C = 85.0` beside `anneal_85C_8h` and the chamber stays at 85 °C *after* the
+> cure, until some later phase moves it; a MEASURE phase with no conditions of its own then
+> reads a hot board, and nothing warns. Give the phase after an anneal its own `conditions`.
+> (`docs/SubAgent docs/anneal_phase_duration.md` §1–§2 measures this end to end.)
+
+**`settle` is all-or-nothing.** `round_period_s`, `min_hold_s` and `max_hold_s` are required
+together — a partial block is refused rather than half-defaulted, because a settle window with
+one bound taken from a default is a different experiment from the one the file describes.
+
+**`measurement` is legal only on a MEASURE phase**, and it is optional there. The production
+read after settling is authoritative **because of its role, not its parameters**: it always
+runs and is always what the batch result is recorded from. `[run_plan.phases.measurement]`
+only makes that read denser or broader than the campaign's own `[measurement]` block.
+
+`examples/bench_instance.toml` is where the worked four-phase version lands — see *Casting
+one fixed recipe N times* above for the rest of that file.
 
 ### The objective is derived, not chosen
 
@@ -1997,7 +2094,7 @@ before it.
 
 ```bash
 softae-shadow status                                                 # is the rig armed?
-softae-shadow rehearse --dry-run                                     # what will a run cost?
+softae-shadow rehearse --dry-run --run-id <film-run>                 # what will a run cost?
 softae-shadow review shadow_run.log \
     --project ./runs/aug --run-id run_20260810T1400Z                 # what did it see?
 softae-shadow review shadow_run.log --project ./runs/aug \
@@ -2038,10 +2135,17 @@ are only answerable afterwards. **`rehearse` answers both in advance**, by repla
 spectra through the very same gated observe-only engine.
 
 ```bash
-softae-shadow rehearse --dry-run                            # the plan and the projected duration
-softae-shadow rehearse                                      # → logs/rehearsal_<UTC>.log
+softae-shadow rehearse --dry-run --run-id <film-run>        # the plan and the projected duration
+softae-shadow rehearse --run-id <film-run>                  # → logs/rehearsal_<UTC>.log
 softae-shadow review logs/rehearsal_<UTC>.log --project ~/softae_data
 ```
+
+> **Pass `--run-id`, or the pre-flight rehearses nothing.** The default is *the most recent
+> run with spectra*, which is whatever happened to land last — on **2026-09-11** that is
+> `20260903T224007Z_import_reference_r`: **one spectrum, projected 14.92 s.** A dry run that
+> returns in fifteen seconds has not told you the campaign is cheap, it has told you the
+> default picked a reference-resistor import. The plan line names the run it chose, so read
+> that line and the spectrum count before the duration beside them.
 
 It is a **replay, not a simulation**: the same `analyze_spectrum`, the same gates, the same
 structlog stream, so the log it writes is one `softae-shadow review` reads with no special case
@@ -2095,6 +2199,32 @@ interrupted at spectrum 140 still leaves 139 rows of evidence.
 > run at **5 s → 8 min → 20 min** (all-closed floor → measured mix → all-open ceiling). Read the
 > brackets: the mix is a property of the material, and the bench campaign casts something else.
 > Full figures and caveats in `docs/SHADOW_CAMPAIGN.md` §5.
+>
+> **Those are 2026-08-14 rates, and they are now an upper bound.** They predate two changes
+> that both cut fitter cost — the circuit-template cache (measured **3.47×** faster, on
+> 300/300 bitwise-identical fits) and the raised **64 000** `nfev` ceiling. Until the rates are
+> re-measured on a film corpus, treat a projection as a ceiling rather than an estimate.
+
+**The other pre-flight is the calibration state, and it is read, not assumed.**
+`softae-campaign check <spec>` prints an EIS calibration advisory; that line is the fact, and
+any document describing it — this one included — is only as fresh as the day it was written.
+Measured **2026-09-11**, `mux16` is **live**, not stale:
+
+```
+calibration 'mux16' @e7e5c42572387732 [2026-09-10T13:58:43], 9 channel(s) (+30 assumed):
+fixture correction: osl; phase floor measured; |Z| window measured
+```
+
+Two lines of `check` mention fixture correction and **only one is the resolution**. The line
+above states what the calibration set is *capable of*. The separate line under *"EIS
+analysis:"* — `fixture correction: auto — series once fixture 'mux16' has a short blank, none
+until then` — is **static text describing what `auto` means**, not an evaluation against the
+set in front of it, so its *"none until then"* clause is a general statement rather than a
+report about today. The answer is `resolve_mode(configured, capabilities)`: on an `osl`-capable
+set with `mode = "auto"` it returns **`series`** (OSL is licensed by the artifacts and
+deliberately not applied — it corrupted every spectrum on this fixture). **So a shadow run
+today reviews verdicts on series-corrected spectra.** Record which calibration was live when
+you ran, because the review cannot recover it — `fit_results` has no `calibration_id` column.
 
 > **A rehearsal's section 7 is evidence about the recommender, not thresholds for the rig.**
 > Replaying an equilibration corpus tells you whether the rules behave on a real distribution —
@@ -2539,6 +2669,161 @@ with only Task Manager.
 Every path finalizes the run row: `done`, `interrupted`, `aborted` or `error`. An interrupted
 until-signal hold exits 0 and still records `interrupted` — the status says nothing but a person
 decided the end, and the exit code says the tool did its job.
+
+---
+
+## 24. Adaptive-Acquisition Validation — `softae-eis-validate`
+
+Adaptive EIS acquisition ships inert behind `[eis.scout] actuate`. It works
+**scout-then-measure**: the configured baseline sweep runs first and *is* the measurement
+whenever the verdict is `ok`; only an inadequate spectrum earns a second, wider sweep. Whether
+that produces better science on real films is what this tool measures — by taking both arms on
+the same cell seconds apart, at one equilibrated and held condition. It is the only shipped
+route that can say GO or NO-GO on the adaptive path.
+
+### Invocation
+
+```bash
+softae-eis-validate run \
+  --channels 18-32 \
+  --rh-setpoint-pct 20 --temp-setpoint-c 25 \
+  --validation-name adaptive-2026-09 \
+  --settle-criterion both --settle-rate-tol-dec-per-h 0.05
+
+softae-eis-validate report --validation-name adaptive-2026-09
+```
+
+`--channels`, `--rh-setpoint-pct`, `--temp-setpoint-c` and `--validation-name` are **required
+and have no defaults**: an unstated condition is not a condition. `python -m
+softae.tools.eis_validate …` is the exact equivalent. `--dry-run` prints the plan and the
+projection and runs nothing; `--mock` uses a grid-aware synthetic backend that never prompts,
+never arms and never emits a GO.
+
+### The run only resolves anything in a 0.68-decade window
+
+`Extended` reaches 1.351 Hz, so its arc closes only for an apex above ~13.51 Hz; below that its
+`R1` is an extrapolation, measured on this rig at a **+60.9 % median** overestimate. The
+baseline grid (6.475 Hz on the shipped `Quick` preset) returns `ok` for any apex above
+64.75 Hz, and on `ok` the two arms are byte-identical. So the experiment resolves **only apexes
+in 13.5–65 Hz** — above it a cell is CONTROL, below it UNRESOLVED, and neither carries
+information about the decision. The **setpoint is the lever** that decides how many cells land
+inside that window; the channel count is not. The run prints its own apex histogram before
+every refusal.
+
+### A park ends the condition; 10 C means *unheated*
+
+A park drives the heater to its safe setpoint and suspends anti-clog purging, so `--resume`
+**always** re-runs the full approach and settle gate before a single sweep. No flag skips it.
+`--end-state hold` holds temperature and **cannot** hold humidity: the Trinket wants a
+continuous heartbeat with a ~25 s deadman, so the run prints the exact `softae-env` command
+that takes the axis over, and it must be started inside that window or the chamber drifts to
+room RH ([§23](#23-environment-hold--softae-env)).
+
+**A `--temp-setpoint-c` at or below 10 C is a condition, not a target.** This rig has a heater
+and no chiller, so 10 C is the instruction *stop heating*, and whatever ambient gives is the
+condition: the temperature approach is skipped, and the hold watch grades against where the
+board started rather than against a setpoint nothing is driving toward. Do **not** widen
+`--tolerance-c` to get past an unreachable setpoint — that loosens the over-temperature gate
+for the whole run.
+
+### The flag surface, by purpose
+
+| Group | Flags | What it decides |
+|---|---|---|
+| **Condition** | `--rh-setpoint-pct`, `--temp-setpoint-c`, `--rh-tolerance-pct`, `--tolerance-c`, `--rh-approach-timeout-s`, `--temp-approach-timeout-s`, `--approach-dwell-s` | Where the chamber is taken, and when it counts as arrived |
+| **Settling** | `--settle`, `--settle-tol-rel`, `--settle-criterion`, `--settle-rate-tol-dec-per-h`, `--settle-max-rounds`, `--settle-max-hold-s`, `--rh-stability-pct`, `--soak-h` | When the board has stopped moving, and what to do if it has not |
+| **Survivors** | `--survivors`, `--min-treatment`, `--max-consecutive-failures` | Whether a partial board may proceed, and what it is then allowed to conclude |
+| **Measurement** | `--channels`, `--baseline`, `--reference-preset`, `--order`, `--max-follow-ups`, `--drift-check`, `--retries` | Which cells, which grids, and how the pairs are sequenced |
+| **End state** | `--end-state`, `--resume`, `--yes`, `--project`, `--out`, `--dry-run`, `--mock` | Whether hardware moves, and what is left behind |
+
+Defaults worth knowing before the first run:
+
+| Flag | Default | Note |
+|---|---|---|
+| `--settle-criterion` | `deviation` | `both` routes on deviation and reports the rate beside it — the shadow mode, and the only honest way to get the comparison a cutover needs |
+| `--settle-tol-rel` | `0.10` | A relative deviation of sigma from its own window mean — dimensionless, and **not** %RH. 0.20 means a cell swinging ±20 % still certifies. The run refuses above `0.50` |
+| `--settle-rate-tol-dec-per-h` | `0.05` | Decades of sigma per hour. Required by `--settle-criterion rate` and `both`; the run refuses above `0.5` |
+| `--settle-max-rounds` | `14` | The ceiling in **rounds** — the unit every criterion actually reads |
+| `--settle-max-hold-s` | *derived* | From `--settle-max-rounds` × the **achieved** round period (sweep block *plus* sleep). A typed value wins and is announced as an override in the projection |
+| `--rh-stability-pct` | `1.5` | How far the per-round RH **medians** may span across the judged window, compared against themselves. `0` or `off` disables the gate |
+| `--survivors` | `off` | Needs `--settle-criterion rate` or `both` |
+| `--max-consecutive-failures` | *derived* | `3` under `--survivors off`; the **board size** under `--survivors on`, where a dropped cell's failures no longer count at all |
+| `--approach-dwell-s` | `600` | Seconds each axis must stay in band before it counts as arrived; `0` restores the first-in-band-poll behaviour |
+| `--rh-approach-timeout-s` / `--temp-approach-timeout-s` | `5400` / `1800` | A measured RH descent on this chamber took ~5000 s |
+| `--soak-h` | `0` | **Hours**, not seconds. The settle gate proves the *rig* stopped moving; the soak is the *sample's* own equilibration. Settle time counts against it |
+| `--reference-preset` | `Extended` | `longest` widens the resolving window 2.1x for 4.3x the reference cost — the documented escape hatch |
+| `--min-treatment` / `--drift-check` | `6` / `3` | How many cells must land in the resolving window, and how many cells are re-measured at the end of the block |
+| `--end-state` | `park` | `hold` keeps temperature only |
+
+**`--survivors on` changes what the run may conclude**, not how long it waits. At the ceiling it
+partitions instead of refusing: cells the rate criterion certified quiet proceed, cells that
+could not be *judged* are dropped with their reason recorded, and cells **proven** to be moving
+still refuse. Every number a survivor run produces is conditional on settling — fine for "does
+the scout resolve the arc?", wrong for any hold-time or objective number. Read the survivor set
+as a subset, never as the board. Two details are easy to trip over: the RH preroll that holds
+the settle clock until the room is calm runs under `--settle-criterion rate` and under
+`both --survivors on`, but **not** under plain `both`, whose per-round record stays
+field-identical to `deviation`'s; and under `both --survivors on` the detection-floor refusal
+fires only when *no* cell certified quiet, so the window becomes the finding rather than the
+cells the partition exists to rescue.
+
+### Watching one mid-run
+
+The run publishes `events.jsonl` and `conditions.json` beside itself in
+`<project>/runs/<run_id>/`, and the rig claim's `log_path` names that directory. The per-round
+`settle_round` record is where the gate's own state lives — per-channel deviations, which cells
+participate, which left the window and why, the achieved RH spread, and under a rate criterion
+the per-channel standard error, relative residual and upper bound plus the window's own
+detection floor. **Sigma itself is deliberately absent from the stream**, so a round can be
+re-scored against a different band from its bounds but not recomputed from its conductivities;
+the raw settle sweeps are persisted under `eis/` tagged as the `settle` arm and excluded from
+every reader unless asked for.
+
+### Reading the report
+
+`softae-eis-validate report --validation-name <name>` re-evaluates the pre-registered rule over
+whatever has been persisted. Every measurement row carries a `hold_certified` stamp, and the
+outcome turns on it:
+
+| `hold_certified` | Meaning |
+|---|---|
+| `settled` | The whole board was certified quiet before the arms ran |
+| `survivors` | A partitioned settle phase certified *this* cell quiet; others were dropped |
+| `dropped_moving` | This cell was dropped: proven to be still moving |
+| `dropped_unevaluable` | This cell was dropped: it could not be judged either way |
+| `disabled` | `--settle off` — no gate ran |
+| `pre_settle` | A settle sweep, taken before the gate had spoken. Never an experiment arm |
+
+Only a board-level `settled` licenses a verdict. A survivor run is *not* `settled` at board
+level, and under `--settle off` every row is stamped `disabled` and the outcome is **WITHHELD**
+— announced in the projection before the run starts, not discovered afterwards. A `--mock` run
+is WITHHELD for the same reason: a simulated verdict is not a verdict. Uncertified rows keep
+their numbers in every accuracy table, because that metrology is what production limits get
+calibrated from, but they lose their anonymity — marked `(uncertified)` wherever they print,
+counted beside every criterion computed over them, and partitionable offline off
+`payload["cells"][*]["stillness_certified"]`.
+
+### Failure modes seen on the bench
+
+Each row is dated because each is a claim about a specific run. The same table is in `--help`.
+
+| Date | What happened | The flag or default that answers it |
+|---|---|---|
+| 2026-08-20 | The settle band sat below the board's own noise floor, so no hold length could ever clear it | The run says so at the **first** judged window and names a workable `--settle-tol-rel` |
+| 2026-08-20 | One channel carried non-finite points in every sweep, starving the window below the minimum for 64 min | The round names the channel (`NO FIT`) and says the fits, not the film, are why the window is not evaluable |
+| 2026-09-13 | Two cells flipping between fits held eight cells that were quiet at 0.2–2.5 % for eight rounds — `settle_check` takes the **max** over participants | `--settle-criterion rate`, or `--survivors on`: the deviation criterion cannot tell "moving" from "too noisy to judge" |
+| 2026-09-13 | The tool restarts the RH loop at launch and starts the settle clock 30 s later; the room wandered ~70 min and five cells were reported MOVING because of it | `--approach-dwell-s`, and the RH preroll — rounds judged under a moving room are no longer regressed on |
+| 2026-09-13 | The rate band (0.025 dec/h) sat at the window's own detection floor, so every quiet cell came back `rate_undetectable` | `--settle-rate-tol-dec-per-h` now defaults to 0.05, and the run prints the smallest band the window can certify |
+| 2026-09-13 | A setpoint at or below the park temperature is unreachable on a heater-only rig; `--tolerance-c 20` was typed to get past it | State a setpoint at or below 10 C to run **unheated**; leave `--tolerance-c` where it is |
+| 2026-09-13 | Three adjacent dead wells would trip `--max-consecutive-failures` (3) before the first good cell was measured | It defaults to the board size under `--survivors on`, and a dropped cell's failure no longer counts toward it |
+| 2026-09-13 | The ceiling bought 10 rounds where the projection promised 17 | A round is the sweep block **plus** the sleep; the projection quotes the achieved period, and `--settle-max-rounds` states the ceiling in rounds |
+| 2026-09-13 | Four windows were blocked because the per-round RH medians spanned more than 1.5 %RH — and nothing on the console said so | `--rh-stability-pct` names that band (default 1.5, `0` = off). It is **not** `--rh-tolerance-pct`, which judges only the approach, against the setpoint |
+| 2026-09-13 | **Known limitation, not fixed.** The RH preroll is a **one-shot latch**: it releases the first time the trailing window is calm and is never re-armed. A room that starts calm and destabilizes later spends the preroll before the disturbance arrives, and on the 2026-09-13 board a widened band would not have caught the later excursion either | No flag covers this. Watch the achieved RH spread printed on every round, and treat a late excursion as a reason to re-run rather than to widen a band |
+| 2026-09-13 | **Operator note.** `--settle-rate-tol-dec-per-h 0.11` was chosen for one board — "walk further out on the drift/throughput envelope" | Admissible, and a per-board judgement rather than a new default. Over that board's ~50 min block at 12 channels it is ~0.09 dec (~23 % of sigma, ~2x H3's whole-block budget), but the paired reference/baseline sweeps are ~40 s apart (~0.003 dec), so the cost lands on the end-of-block **drift check**, not on the paired metric. Start an uncharacterised board at 0.05 |
+
+> **A run that ends in `ceiling` has measured nothing.** Read the per-round table and the apex
+> histogram before changing any flag: both are printed on every refusal, and both are built
+> from sweeps that were taken anyway.
 
 ---
 
