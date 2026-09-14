@@ -129,6 +129,7 @@ def test_runphase_positional_construction_is_unchanged_by_the_new_fields():
     assert phase.settle is settle
     assert phase.conditions is None
     assert phase.measurement is None
+    assert phase.hold_s is None
 
 
 def test_measurement_on_a_non_measure_phase_is_refused():
@@ -158,7 +159,8 @@ def test_phase_label_renders_the_commanded_conditions():
     phase = RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
                      anneal_params={"target_temp_C": 85, "hold_time_s": 28800},
                      conditions=PhaseSetpoints("anneal", 85.0, 20.0))
-    assert phase.label() == "Anneal (85°C/480min) @ anneal (85 °C, 20 %RH) [per batch]"
+    assert phase.label() == ("Anneal (85°C/8h) → rests at 85 °C "
+                             "@ anneal (85 °C, 20 %RH) [per batch]")
 
 
 def test_phase_label_renders_the_measurement_override():
@@ -203,3 +205,73 @@ def test_factory_defaults_leave_both_new_fields_unset():
     for plan in (RunPlan.pointwise(anneal=True), RunPlan.batch(anneal=True)):
         assert all(p.conditions is None for p in plan.phases)
         assert all(p.measurement is None for p in plan.phases)
+
+
+# ── hold_s: one authority for the cure's duration ────────────────────────────
+#
+# Operator ruling D1 = option (d) in `docs/SubAgent docs/anneal_phase_duration.md`:
+# the catalog task stays the sole authority for the hardware command, and this
+# is the one typed per-run override of its hold.
+
+def test_anneal_hold_s_and_anneal_params_hold_time_refused():
+    """Said twice, in the wording ``settle_plan()`` already uses."""
+    with pytest.raises(ValueError, match="say it once"):
+        RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                 anneal_params={"hold_time_s": 600}, hold_s=3600.0)
+
+
+def test_hold_s_on_non_anneal_phase_refused():
+    """Only ANNEAL holds at temperature, so a hold elsewhere never reaches it."""
+    with pytest.raises(ValueError, match="never reach the chamber"):
+        RunPhase(PhaseKind.MEASURE, PhaseScope.PER_BATCH, hold_s=3600.0)
+
+
+@pytest.mark.parametrize("hold", [0.0, -1.0])
+def test_non_positive_hold_s_refused(hold):
+    """``None`` is how "no hold stated" is spelled; zero is a different claim."""
+    with pytest.raises(ValueError, match="must be positive"):
+        RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH, hold_s=hold)
+
+
+def test_anneal_params_may_still_override_the_temperature_beside_hold_s():
+    """Only the duration is said twice; the rest of the task is untouched."""
+    phase = RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     anneal_params={"target_temp_C": 85}, hold_s=3600.0)
+    assert phase.hold_s == 3600.0
+    assert phase.anneal_params == {"target_temp_C": 85}
+
+
+def test_anneal_label_names_cure_and_restore_temperatures():
+    """Both numbers **and their roles** — the point of the ruling, made visible."""
+    phase = RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     anneal_params={"target_temp_C": 85}, hold_s=28800.0,
+                     conditions=PhaseSetpoints("cooldown", 25.0))
+
+    label = phase.label()
+
+    assert "85" in label and "25" in label
+    assert label.startswith("Anneal (85°C/8h) → rests at 25 °C")
+
+
+def test_anneal_label_without_conditions_names_no_restore_temperature():
+    """The silent half: no conditions, nothing to say about the resting state."""
+    phase = RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH, hold_s=1800.0)
+
+    assert phase.label() == "Anneal (30min) [per batch]"
+
+
+def test_factories_thread_hold_s_onto_the_anneal_phase():
+    for plan in (RunPlan.pointwise(anneal=True, hold_s=3600.0),
+                 RunPlan.batch(anneal=True, hold_s=3600.0)):
+        by_kind = {p.kind: p for p in plan.phases}
+        assert by_kind[PhaseKind.ANNEAL].hold_s == 3600.0
+        assert by_kind[PhaseKind.MEASURE].hold_s is None
+
+
+def test_factories_refuse_a_hold_with_no_anneal_phase():
+    """Otherwise the cure time is accepted and silently dropped on the floor.
+
+    The same shape as ``measurement=`` with ``measure=False`` above.
+    """
+    with pytest.raises(ValueError, match="anneal=False"):
+        RunPlan.batch(anneal=False, hold_s=3600.0)

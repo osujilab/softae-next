@@ -6,13 +6,13 @@ cannot represent faithfully** rather than loading a partial spec that looks
 complete.
 
 That refusal is the whole design. A spec carries live Python objects
-(``formulation`` and ``run_plan`` are rich objects), and a loader that quietly
-dropped them would hand back a spec that runs a *different experiment* from the
-one the file describes — the same failure the resume path refuses by fingerprint.
-An unknown key is an error for the same reason: a typo'd field name would
-otherwise silently take its default.
+(``formulation`` is a rich object), and a loader that quietly dropped them would
+hand back a spec that runs a *different experiment* from the one the file
+describes — the same failure the resume path refuses by fingerprint. An unknown
+key is an error for the same reason: a typo'd field name would otherwise
+silently take its default.
 
-**Refusing is not free, though, and three fields were being refused wrongly.**
+**Refusing is not free, though, and four fields were being refused wrongly.**
 Since a campaign runs in a detached child started *from a file*, a field a file
 cannot carry is a field that cannot be run at all — and ``general_formulation``,
 ``prior_mean`` and ``seed_observations`` are exactly what the Live BO tab's
@@ -20,7 +20,13 @@ composition mode and its Prior-informed group box set. Each of those turned out
 to be representable once asked the right question (declared axes rather than a
 callable; a registry *name* rather than a function object; primitives already),
 so they now cross the boundary through :mod:`softae.core.campaign_spec_fields`.
-Everything genuinely unrepresentable still raises.
+
+``run_plan`` was the fourth and the costliest, because the refusal was
+load-bearing in a way nothing said out loud: a file could not describe an
+anneal or an equilibrate phase, so **every TOML campaign ran pointwise
+formulate→measure**. It crosses through
+:mod:`softae.core.campaign_spec_run_plan`. Everything genuinely unrepresentable
+still raises.
 
 Example::
 
@@ -80,9 +86,14 @@ class SpecLoadError(Exception):
 #: Contrast :data:`~softae.core.campaign_spec_fields.OBJECT_FIELDS`, which are
 #: *conditionally* representable: those load, and are reported field-by-field by
 #: :func:`spec_toml_completeness` when a particular value cannot be written.
+#:
+#: ``run_plan`` sat here until its codec existed, and the consequence was
+#: structural rather than cosmetic: **no file-driven campaign could carry a run
+#: plan, so every TOML campaign ran pointwise formulate→measure with no anneal
+#: phase at all.** It is an ``OBJECT_FIELDS`` entry now
+#: (:mod:`softae.core.campaign_spec_run_plan`).
 _UNSUPPORTED = {
     "formulation": "a FormulationContext object",
-    "run_plan": "a RunPlan object",
     "piezo": "a PiezoPlan object",
 }
 

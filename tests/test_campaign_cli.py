@@ -85,14 +85,20 @@ high = 1.0
         with pytest.raises(SpecLoadError, match="unknown field"):
             spec_from_dict({**MINIMAL, "budgett": 40})
 
-    @pytest.mark.parametrize("field", ["formulation", "run_plan", "piezo"])
+    @pytest.mark.parametrize("field", ["formulation", "piezo"])
     def test_unrepresentable_fields_are_refused_with_a_reason(self, field):
         """Loading one partially would run a different experiment."""
         with pytest.raises(SpecLoadError, match="cannot be set from a file"):
             spec_from_dict({**MINIMAL, field: "whatever"})
 
+    # `run_plan` moved out of this list and into the one below when its codec
+    # landed (`campaign_spec_run_plan.py`): a file can carry one now, so the
+    # refusal it earns is "that is not a run plan", not "not from a file". The
+    # full codec — every phase-level refusal, and the round trip — is in
+    # `test_campaign_spec_run_plan.py`.
     @pytest.mark.parametrize(
-        "field", ["prior_mean", "general_formulation", "seed_observations"])
+        "field", ["prior_mean", "general_formulation", "seed_observations",
+                  "run_plan"])
     def test_a_representable_field_given_nonsense_is_refused_not_defaulted(
         self, field
     ):

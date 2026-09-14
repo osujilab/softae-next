@@ -35,6 +35,8 @@ from typing import Any, Callable
 
 import structlog
 
+from softae.core.campaign_spec_run_plan import field_codec as _run_plan_codec
+
 logger = structlog.get_logger(__name__)
 
 
@@ -361,6 +363,13 @@ def decode_general_formulation(value: Any) -> Any:
 #: The fields this module owns, by spec field name. :mod:`campaign_spec_io`
 #: consults it in both directions, so adding a field here is the whole change.
 OBJECT_FIELDS: dict[str, FieldCodec] = {
+    # The one field whose codec is not written here. It is four nested tables
+    # rather than one, so it has a module — :mod:`campaign_spec_run_plan` — and
+    # registering it is this line. Built through ``field_codec()`` rather than
+    # named directly so that module never has to import this one at module
+    # level: the dependency runs one way, and the import order of the pair
+    # cannot become load-bearing.
+    "run_plan": _run_plan_codec(),
     "general_formulation": FieldCodec(
         encode_general_formulation, decode_general_formulation,
         "a composition context whose targets are a Python callable rather than "

@@ -198,6 +198,15 @@ class RunPhase:
     the catalog task to run (default :data:`DEFAULT_ANNEAL_TASK`) and optional
     per-run overrides (e.g. ``{"target_temp_C": 120, "hold_time_s": 600}``).
 
+    ``hold_s`` is the **typed** per-run spelling of that task's ``hold_time_s``
+    and is legal only on an ANNEAL phase. The catalog task remains the sole
+    authority for the hardware command; this is the one duration a run plan may
+    override, and saying it here *and* in ``anneal_params["hold_time_s"]`` is
+    refused rather than resolved, because picking one silently is how a campaign
+    holds for a duration nobody wrote down. The emitter writes it into the step
+    **before** the ceiling is derived, so
+    :func:`~softae.core.deposition_recipe.anneal_timeout_s` covers it.
+
     ``settle`` applies only to :attr:`PhaseKind.EQUILIBRATE`, where it is
     **required** — an equilibrate phase with no floor and no ceiling is a hold
     with no stopping rule at either end.
@@ -208,6 +217,15 @@ class RunPhase:
     **any** kind: a cast has a casting environment, a cure has a cure
     environment, and an equilibrate hold has its own. ``None`` means the phase
     inherits whatever the previous one established.
+
+    **On an ANNEAL phase it is the temperature the chamber is RESTORED to when
+    the hold ends — not a second spelling of the cure.** ``anneal()`` reads the
+    standing setpoint *after* the conditions block has written it and writes it
+    back in a ``finally``, so the task wins the hold and ``conditions`` wins the
+    resting state after it. Equal values are therefore the trap rather than the
+    agreement: the chamber rests at the cure temperature, and a following phase
+    with no conditions of its own reads a hot film. The deposition engine warns
+    on exactly that case.
 
     ``measurement`` overrides the campaign's own :class:`MeasurementSpec` for
     this phase only, and is legal **solely on** :attr:`PhaseKind.MEASURE`. A
@@ -225,6 +243,7 @@ class RunPhase:
     settle: SettlePlan | None = None
     conditions: "PhaseSetpoints | None" = None
     measurement: "MeasurementSpec | None" = None
+    hold_s: float | None = None
 
     def __post_init__(self) -> None:
         if self.measurement is not None and self.kind is not PhaseKind.MEASURE:
@@ -233,25 +252,33 @@ class RunPhase:
                 f"acquires data, so a preset named on any other phase would be "
                 f"accepted and never reach the instrument"
             )
+        if self.hold_s is None:
+            return
+        if self.kind is not PhaseKind.ANNEAL:
+            raise ValueError(
+                f"{self.kind.name} carries hold_s; only ANNEAL holds at "
+                f"temperature for a stated duration, so a hold named on any "
+                f"other phase would be accepted and never reach the chamber"
+            )
+        if "hold_time_s" in (self.anneal_params or {}):
+            raise ValueError(
+                f"anneal hold is specified twice: hold_s={self.hold_s:g} and "
+                f"anneal_params['hold_time_s']="
+                f"{self.anneal_params['hold_time_s']} — say it once so the "
+                f"hold has one authority"
+            )
+        if self.hold_s <= 0:
+            raise ValueError(
+                f"hold_s must be positive (got {self.hold_s:g}); a hold of no "
+                f"time is not a cure, and 'no hold stated' is spelled None"
+            )
 
     def label(self) -> str:
         """Short human-readable phase label (for :meth:`RunPlan.describe`)."""
         if self.kind is PhaseKind.EQUILIBRATE:
             name = f"Equilibrate ({self.settle.label()})" if self.settle else "Equilibrate"
         elif self.kind is PhaseKind.ANNEAL:
-            over = dict(self.anneal_params or {})
-            temp = over.get("target_temp_C")
-            hold = over.get("hold_time_s")
-            if temp is not None or hold is not None:
-                bits = []
-                if temp is not None:
-                    bits.append(f"{temp}°C")
-                if hold is not None:
-                    bits.append(f"{float(hold) / 60:g}min")
-                detail = "/".join(bits)
-            else:
-                detail = self.anneal_task
-            name = f"Anneal ({detail})"
+            name = self._anneal_label()
         elif self.kind is PhaseKind.FORMULATE:
             name = "Formulate"
         elif self.kind is PhaseKind.MEASURE:
@@ -264,6 +291,29 @@ class RunPhase:
             name = f"{name} @ {self.conditions.label()}"
         scope = "per sample" if self.scope is PhaseScope.PER_SAMPLE else "per batch"
         return f"{name} [{scope}]"
+
+    def _anneal_label(self) -> str:
+        """``'Anneal (85°C/8h) → rests at 25 °C'`` — both numbers, and their roles.
+
+        Renders only what the phase itself knows: the catalog is **not**
+        consulted, because a frozen dataclass reading ``data/tasks.toml`` would
+        make a label depend on a gitignored, machine-local file. So an
+        un-overridden cure still prints the task *name* — the task is where its
+        temperature and hold are written down.
+        """
+        over = dict(self.anneal_params or {})
+        temp = over.get("target_temp_C")
+        hold = self.hold_s if self.hold_s is not None else over.get("hold_time_s")
+        bits = []
+        if temp is not None:
+            bits.append(f"{temp}°C")
+        if hold is not None:
+            bits.append(_minutes(float(hold)))
+        name = f"Anneal ({'/'.join(bits) if bits else self.anneal_task})"
+        # `conditions` is the RESTORE target, not the cure, so the label says
+        # which one it is — visible at `check` time rather than in a docstring.
+        rest = self.conditions.temp_setpoint_C if self.conditions else None
+        return name if rest is None else f"{name} → rests at {rest:g} °C"
 
 
 @dataclass(frozen=True)
@@ -354,6 +404,7 @@ class RunPlan:
         settle: SettlePlan | None = None,
         conditions: "Mapping[PhaseKind, PhaseSetpoints] | None" = None,
         measurement: "MeasurementSpec | None" = None,
+        hold_s: float | None = None,
     ) -> "RunPlan":
         """Everything per-sample: formulate → (anneal) → (equilibrate) → (measure).
 
@@ -363,7 +414,7 @@ class RunPlan:
         return cls._assemble(PhaseScope.PER_SAMPLE, measure=measure, anneal=anneal,
                              anneal_task=anneal_task, anneal_params=anneal_params,
                              settle=settle, conditions=conditions,
-                             measurement=measurement)
+                             measurement=measurement, hold_s=hold_s)
 
     @classmethod
     def batch(
@@ -376,6 +427,7 @@ class RunPlan:
         settle: SettlePlan | None = None,
         conditions: "Mapping[PhaseKind, PhaseSetpoints] | None" = None,
         measurement: "MeasurementSpec | None" = None,
+        hold_s: float | None = None,
     ) -> "RunPlan":
         """Formulate-all → anneal-all → measure-all: cast per-sample, the rest per-batch.
 
@@ -388,7 +440,7 @@ class RunPlan:
         return cls._assemble(PhaseScope.PER_BATCH, measure=measure, anneal=anneal,
                              anneal_task=anneal_task, anneal_params=anneal_params,
                              settle=settle, conditions=conditions,
-                             measurement=measurement)
+                             measurement=measurement, hold_s=hold_s)
 
     @classmethod
     def _assemble(
@@ -402,6 +454,7 @@ class RunPlan:
         settle: SettlePlan | None,
         conditions: "Mapping[PhaseKind, PhaseSetpoints] | None" = None,
         measurement: "MeasurementSpec | None" = None,
+        hold_s: float | None = None,
     ) -> "RunPlan":
         """Cast per-sample, then the optional tail at *scope* — the shared spine.
 
@@ -429,7 +482,12 @@ class RunPlan:
             phases.append(RunPhase(PhaseKind.ANNEAL, scope,
                                    anneal_task=anneal_task,
                                    anneal_params=anneal_params,
-                                   conditions=by_kind.get(PhaseKind.ANNEAL)))
+                                   conditions=by_kind.get(PhaseKind.ANNEAL),
+                                   hold_s=hold_s))
+        elif hold_s is not None:
+            raise ValueError(
+                "hold_s states an anneal hold, but anneal=False builds no "
+                "ANNEAL phase; the hold would be silently dropped")
         if settle is not None:
             phases.append(RunPhase(PhaseKind.EQUILIBRATE, scope, settle=settle,
                                    conditions=by_kind.get(PhaseKind.EQUILIBRATE)))

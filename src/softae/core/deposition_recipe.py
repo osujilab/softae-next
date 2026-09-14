@@ -22,7 +22,7 @@ hardware-validated and the HT tab cuts over.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import structlog
 
@@ -39,6 +39,9 @@ from softae.core.liquid_handling import DeadVolumeCorrection
 from softae.core.run_plan import PhaseKind, PhaseScope, RunPhase, RunPlan
 from softae.core.task_catalog import Task, TaskCatalog
 from softae.workflows.workflow_model import Workflow, WorkflowStep
+
+if TYPE_CHECKING:  # annotation-only, mirroring `run_plan`'s own import of it
+    from softae.core.phase_setpoints import PhaseSetpoints
 
 logger = structlog.get_logger(__name__)
 
@@ -76,6 +79,45 @@ def anneal_timeout_s(params: dict[str, Any], declared: float | None) -> float | 
         return declared
     floor = hold * ANNEAL_TIMEOUT_MARGIN + ANNEAL_RAMP_ALLOWANCE_S
     return max(float(declared or 0.0), floor)
+
+
+def warn_if_resting_at_the_cure_temperature(
+    rp: RunPhase, step: WorkflowStep, channel: int | None,
+) -> None:
+    """Warn when an ANNEAL phase's ``conditions`` restores the *cure* temperature.
+
+    ``conditions`` on an ANNEAL phase is the temperature the chamber returns to
+    when the hold ends, not a second spelling of the cure:
+    :meth:`~softae.drivers.async_temp_controller.AsyncTempController.anneal`
+    reads the standing setpoint *after* the conditions block has written it and
+    writes it back in a ``finally``. Equality is therefore the one combination
+    that is certainly a mis-read of the field — it commands a pre-ramp to the
+    cure temperature and then "restores" to it, so the chamber stays hot and a
+    following phase with no conditions of its own reads a hot film.
+
+    **A warning, not a refusal** (operator ruling D2 in
+    ``docs/SubAgent docs/anneal_phase_duration.md``): a merely redundant plan is
+    still a runnable plan, and refusing would break every plan that names the
+    cure environment twice on purpose. Saying nothing is how the silent case
+    stays silent.
+    """
+    if rp.conditions is None or rp.conditions.temp_setpoint_C is None:
+        return
+    try:
+        cure = float(step.params["target_temp_C"])
+        rest = float(rp.conditions.temp_setpoint_C)
+    except (KeyError, TypeError, ValueError):
+        return
+    if cure != rest:
+        return
+    logger.warning(
+        "anneal_rests_at_cure_temperature",
+        temp_C=cure, task=rp.anneal_task,
+        channel=channel if channel is not None else "all",
+        detail=(f"the chamber will rest at {cure:g} °C when the hold ends — the "
+                f"cure temperature itself, because this phase's conditions are "
+                f"the restore target — so the following phase reads a hot film"),
+    )
 
 
 @dataclass
@@ -480,6 +522,11 @@ def build_recipe_deposition_workflow(
     measure-all".  An inserted ANNEAL phase runs the plan's catalogued anneal task
     on the temperature controller.
 
+    A phase carrying ``conditions`` has its commanded temperature/humidity
+    established at the phase boundary, **once per change**: the chamber holds its
+    last setpoint, so a phase repeating the standing condition emits nothing. The
+    steps are tagged ``phase="conditions"`` with the condition's ``name``.
+
     ``deposit_method`` overrides the deposit phase's method (the HT deposit-method
     selector).  ``eis_step_by_channel`` omitted (and no MEASURE phase) → no EIS
     (formulate-only).  ``time_scale`` (when given) is injected into every
@@ -643,9 +690,16 @@ def build_recipe_deposition_workflow(
             f"anneal_ch{ch}" if ch is not None else "anneal_all")
         if rp.anneal_params:
             step = step.with_params(**dict(rp.anneal_params))
+        if rp.hold_s is not None:
+            # BEFORE the ceiling is derived, and the order is the safety claim:
+            # `anneal_timeout_s` reads the *emitted step's* params, so a hold
+            # written after it would run under the task's hand-set ceiling and
+            # be aborted partway through.
+            step = step.with_params(hold_time_s=float(rp.hold_s))
         # Derive the ceiling from the hold actually requested, so a long anneal
         # cannot be aborted partway by a task's short hand-set timeout.
         step = step.with_timeout(anneal_timeout_s(step.params, step.timeout_s))
+        warn_if_resting_at_the_cure_temperature(rp, step, ch)
         tags = {"phase": "anneal"}
         if ch is not None:
             tags["channel"] = str(ch)
@@ -675,6 +729,46 @@ def build_recipe_deposition_workflow(
             ).with_tags(**tags),
         ]
 
+    # ── Commanded conditions at phase boundaries ─────────────────────────────
+    #
+    # `RunPhase.conditions` is a SETPOINT pair, and the chamber goes on holding
+    # whatever it was last told to hold. So the steps that establish one are
+    # emitted only when the commanded environment actually **changes**: a repeat
+    # setpoint is already established, and re-emitting it would re-wait for an
+    # approach the chamber has already completed. That is not merely idle time —
+    # `PhaseSetpoints.establish_steps` gives the RH wait `raise_on_timeout=True`,
+    # so a needless second wait is a fresh way for a correct run to abort.
+    #
+    # A plan whose phases carry no conditions emits nothing here, which is what
+    # keeps every existing caller's workflow byte-identical.
+    established: "PhaseSetpoints | None" = None
+    condition_keys: set[str] = set()
+
+    def _condition_suffix(name: str, base: str) -> str:
+        """A step-name suffix unique within this workflow, for condition *name*.
+
+        ``establish_steps`` builds its names from the condition name and the
+        suffix, and says in as many words that the caller owns uniqueness: two
+        phases carrying the same condition *name* with different setpoints would
+        otherwise emit two sets of identically-named steps, and ``depends_on``
+        resolves by name.
+        """
+        suffix, n = base, 1
+        while f"{name}/{suffix}" in condition_keys:
+            n += 1
+            suffix = f"{base}_{n}"
+        condition_keys.add(f"{name}/{suffix}")
+        return suffix
+
+    def _condition_steps(rp: RunPhase, base: str) -> list[WorkflowStep]:
+        """Establish *rp*'s conditions — only if they differ from the standing ones."""
+        nonlocal established
+        wanted = rp.conditions
+        if wanted is None or wanted == established:
+            return []
+        established = wanted
+        return wanted.establish_steps(_condition_suffix(wanted.name, base))
+
     def _emit_per_sample(rp: RunPhase, ch: int) -> list[WorkflowStep]:
         if rp.kind is PhaseKind.FORMULATE:
             return _formulate_steps(ch)
@@ -682,6 +776,18 @@ def build_recipe_deposition_workflow(
             return _anneal_steps(rp, ch)
         if rp.kind is PhaseKind.MEASURE:
             return _measure_steps(ch)
+        if rp.kind is PhaseKind.EQUILIBRATE:
+            # An arm, not a fall-through. The phase's conditions have already
+            # been emitted by the caller; the hold itself has no steps because
+            # it terminates on **evidence** — measure, judge, decide — which is a
+            # loop `drive_settle_phase` drives on the campaign path, not a
+            # sequence this engine can lay out. `run_plan`'s module warning says
+            # the consequence out loud: handed straight to the engine (the HT
+            # tab's path) an EQUILIBRATE phase is a no-op. Stating it here means
+            # "no steps" is a decision on the record rather than the silent
+            # default that swallowed every unhandled kind.
+            return []
+        logger.warning("run_phase_not_emitted", kind=rp.kind.value, channel=str(ch))
         return []
 
     # Emit the run plan.  A per-sample segment loops channels so each channel's
@@ -693,6 +799,7 @@ def build_recipe_deposition_workflow(
             seg_has_formulate = any(p.kind is PhaseKind.FORMULATE for p in seg_phases)
             for ch in channels:
                 for rp in seg_phases:
+                    setup.extend(_condition_steps(rp, f"ch{ch}"))
                     setup.extend(_emit_per_sample(rp, ch))
                 # Deposit-scope: disable the piezo after this channel's per-sample
                 # phases (deposit + any adjacent per-sample EIS), mirroring the
@@ -703,11 +810,17 @@ def build_recipe_deposition_workflow(
                         f"piezo_off_ch{ch}").with_tags(channel=str(ch), phase="piezo"))
         else:  # PER_BATCH — whole-plate boundary
             for rp in seg_phases:
+                setup.extend(_condition_steps(rp, "all"))
                 if rp.kind is PhaseKind.ANNEAL:
                     setup.extend(_anneal_steps(rp, None))
                 elif rp.kind is PhaseKind.MEASURE:
                     for ch in channels:
                         setup.extend(_measure_steps(ch))
+                elif rp.kind is PhaseKind.EQUILIBRATE:
+                    pass  # conditions and nothing else — see `_emit_per_sample`
+                else:
+                    logger.warning("run_phase_not_emitted", kind=rp.kind.value,
+                                   channel="all")
 
     teardown: list[WorkflowStep] = []
     if recipe.final_method in catalog:

@@ -1,0 +1,472 @@
+"""The ``[[run_plan.phases]]`` codec — :mod:`softae.core.campaign_spec_run_plan`.
+
+**What this exists to stop.** ``run_plan`` was refused by the spec loader
+outright, so no file-driven campaign could describe an anneal or an equilibrate
+phase and every TOML campaign ran pointwise formulate→measure. The codec lifts
+that, and the risk it introduces is the opposite one: a phase table that decodes
+into *almost* the plan the file describes. Hence the shape of this file — one
+round-trip class that proves nothing is lost, and one refusal class per thing the
+decoder must never guess.
+
+The decoder refusals are the substance. ``scope`` in particular is required on
+every phase rather than inferred, because per-sample and per-batch name two
+different physical processes: cure each well as it is cast, or cure the plate
+once. A default there would silently run the one nobody wrote down.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from softae.core.campaign_spec_io import (
+    SpecLoadError,
+    spec_from_dict,
+    spec_to_dict,
+    spec_toml_completeness,
+)
+from softae.core.campaign_spec_run_plan import (
+    decode_run_plan,
+    encode_run_plan,
+    field_codec,
+)
+from softae.core.measurement_spec import MeasurementSpec
+from softae.core.phase_setpoints import (
+    DEFAULT_RH_APPROACH_TIMEOUT_S,
+    PhaseSetpoints,
+)
+from softae.core.run_plan import (
+    PhaseKind,
+    PhaseScope,
+    RunPhase,
+    RunPlan,
+    SettlePlan,
+)
+
+BENCH_INSTANCE = (Path(__file__).resolve().parents[1]
+                  / "examples" / "bench_instance.toml")
+
+#: A legacy volume-mode spec carrying no run plan — the control for "nothing
+#: changed for the common case".
+MINIMAL = {
+    "name": "c",
+    "parameter_space": {"vol_p0": {"type": "float", "low": 5.0, "high": 30.0}},
+}
+
+FORMULATE = {"kind": "formulate", "scope": "per_sample"}
+
+
+def _phases(*extra: dict) -> dict:
+    """A ``[run_plan]`` table: the mandatory FORMULATE phase, plus *extra*."""
+    return {"phases": [dict(FORMULATE), *[dict(p) for p in extra]]}
+
+
+def _spec(*extra: dict):
+    """A loaded spec whose run plan is FORMULATE plus *extra*."""
+    return spec_from_dict({**MINIMAL, "run_plan": _phases(*extra)})
+
+
+SETTLE_TABLE = {"round_period_s": 240.0, "min_hold_s": 1500.0,
+                "max_hold_s": 14400.0}
+EQUILIBRATE = {"kind": "equilibrate", "scope": "per_batch",
+               "settle": dict(SETTLE_TABLE)}
+
+
+# ── Round trip ───────────────────────────────────────────────────────────────
+
+class TestRoundTrip:
+    """Write → read → the same plan. Anything lost here runs a different run."""
+
+    def test_round_trip_four_phase_batch_plan_is_identical(self):
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE,
+                     conditions=PhaseSetpoints("casting", 25.0, 40.0)),
+            RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     anneal_task="anneal_85C_8h",
+                     conditions=PhaseSetpoints("anneal", 85.0, 20.0,
+                                               rh_approach_timeout_s=14400.0)),
+            RunPhase(PhaseKind.EQUILIBRATE, PhaseScope.PER_BATCH,
+                     settle=SettlePlan(240.0, 1500.0, 14400.0),
+                     conditions=PhaseSetpoints("equilibrate", 25.0, 50.0)),
+            RunPhase(PhaseKind.MEASURE, PhaseScope.PER_BATCH,
+                     measurement=MeasurementSpec(preset="Extended")),
+        ))
+
+        assert decode_run_plan(encode_run_plan(plan)) == plan
+
+    def test_round_trip_undriven_axis_returns_none_not_a_setpoint(self):
+        """THE ONE THAT MATTERS. Absence is how "do not drive it" is spelled."""
+        plan = RunPlan((RunPhase(
+            PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE,
+            conditions=PhaseSetpoints("casting", temp_setpoint_C=25.0)),))
+
+        table = encode_run_plan(plan)
+        back = decode_run_plan(table)
+
+        assert "rh_setpoint_pct" not in table["phases"][0]["conditions"]
+        assert back.phases[0].conditions.rh_setpoint_pct is None
+        assert back.phases[0].conditions.drives_humidity is False
+        assert back == plan
+
+    def test_round_trip_a_disabled_rh_stability_gate_stays_disabled(self):
+        """``None`` switches the gate off; an omitted key switches it back ON."""
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE),
+            RunPhase(PhaseKind.EQUILIBRATE, PhaseScope.PER_BATCH,
+                     settle=SettlePlan(240.0, 1500.0, 14400.0,
+                                       rh_stability_pct=None)),
+        ))
+
+        table = encode_run_plan(plan)
+
+        assert table["phases"][1]["settle"]["explicit_none"] == \
+            ["rh_stability_pct"]
+        assert decode_run_plan(table).phases[1].settle.rh_stability_pct is None
+
+    def test_round_trip_default_approach_timeouts_are_not_written(self):
+        """A file shows what was chosen; the defaults live in the dataclass."""
+        plan = RunPlan((RunPhase(
+            PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE,
+            conditions=PhaseSetpoints("casting", 25.0, 40.0)),))
+
+        table = encode_run_plan(plan)["phases"][0]["conditions"]
+
+        assert "rh_approach_timeout_s" not in table
+        assert decode_run_plan(encode_run_plan(plan)).phases[0].conditions \
+            .rh_approach_timeout_s == DEFAULT_RH_APPROACH_TIMEOUT_S
+
+    def test_spec_toml_completeness_reports_a_run_plan_as_encodable(self):
+        spec = _spec(EQUILIBRATE, {"kind": "measure", "scope": "per_batch"})
+
+        result = spec_toml_completeness(spec)
+
+        assert result.complete, result.explain()
+        assert "run_plan" not in result.missing
+        assert spec_from_dict(spec_to_dict(spec)).run_plan == spec.run_plan
+
+    def test_spec_without_a_run_plan_writes_exactly_what_it_wrote_before(self):
+        """The positive control: nothing changed for the common case."""
+        spec = spec_from_dict(MINIMAL)
+
+        written = spec_to_dict(spec)
+
+        assert written == MINIMAL
+        assert spec.run_plan is None
+        assert spec_toml_completeness(spec).complete
+
+
+# ── Encoder: it may refuse, and it never raises ──────────────────────────────
+
+class TestEncoderRefusals:
+
+    def test_encode_a_non_run_plan_is_unrepresentable_not_an_exception(self):
+        from softae.core.campaign_spec_fields import UNREPRESENTABLE
+
+        assert encode_run_plan(object()) is UNREPRESENTABLE
+
+    def test_encode_anneal_params_is_unrepresentable_rather_than_dropped(self):
+        """A per-run task override has no key in the file shape."""
+        from softae.core.campaign_spec_fields import UNREPRESENTABLE
+
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE),
+            RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     anneal_params={"hold_time_s": 600}),
+        ))
+
+        assert encode_run_plan(plan) is UNREPRESENTABLE
+
+    def test_an_unencodable_run_plan_is_reported_by_the_completeness_check(self):
+        spec = spec_from_dict(MINIMAL)
+        spec.run_plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE),
+            RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     anneal_params={"hold_time_s": 600}),
+        ))
+
+        result = spec_toml_completeness(spec)
+
+        assert result.missing == ("run_plan",)
+        assert "anneal parameter overrides" in result.explain()
+
+
+# ── Decoder: it never guesses ────────────────────────────────────────────────
+
+class TestDecoderRefusals:
+
+    def test_decode_a_phase_without_scope_is_refused(self):
+        """THE DEFECT THIS GUARDS. Inferring it changes which process runs."""
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict({**MINIMAL,
+                            "run_plan": _phases({"kind": "anneal"})})
+
+        assert "does not declare 'scope'" in str(exc.value)
+        assert "per_batch" in str(exc.value)
+
+    def test_decode_an_unknown_kind_is_refused_with_the_legal_values(self):
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict({**MINIMAL, "run_plan": _phases(
+                {"kind": "bake", "scope": "per_batch"})})
+
+        assert "unknown kind 'bake'" in str(exc.value)
+        assert "'anneal'" in str(exc.value)
+
+    def test_decode_an_unknown_scope_is_refused(self):
+        with pytest.raises(SpecLoadError, match="unknown scope 'per_plate'"):
+            spec_from_dict({**MINIMAL, "run_plan": _phases(
+                {"kind": "anneal", "scope": "per_plate"})})
+
+    def test_decode_a_measurement_block_on_a_non_measure_phase_is_refused(self):
+        """``RunPhase`` already refuses it; the codec surfaces its words."""
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict({**MINIMAL, "run_plan": _phases(
+                {"kind": "anneal", "scope": "per_batch",
+                 "measurement": {"preset": "Extended"}})})
+
+        assert "only MEASURE acquires data" in str(exc.value)
+
+    def test_decode_an_anneal_task_on_a_phase_that_does_not_anneal_is_refused(self):
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict({**MINIMAL, "run_plan": _phases(
+                {"kind": "measure", "scope": "per_batch",
+                 "anneal_task": "anneal_85C_8h"})})
+
+        assert "never reach the chamber" in str(exc.value)
+
+    def test_decode_an_unknown_phase_key_is_refused_not_ignored(self):
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict({**MINIMAL, "run_plan": _phases(
+                {"kind": "anneal", "scope": "per_batch", "hold_time_s": 28800})})
+
+        assert "unknown key(s) ['hold_time_s']" in str(exc.value)
+
+    def test_decode_an_unknown_top_level_run_plan_key_is_refused(self):
+        with pytest.raises(SpecLoadError, match="carries only 'phases'"):
+            spec_from_dict({**MINIMAL,
+                            "run_plan": {"phases": [dict(FORMULATE)],
+                                         "scope": "per_batch"}})
+
+    def test_decode_a_run_plan_that_is_not_a_table_is_refused(self):
+        with pytest.raises(SpecLoadError, match="expected a \\[run_plan\\] table"):
+            spec_from_dict({**MINIMAL, "run_plan": "whatever"})
+
+    def test_decode_an_empty_phase_array_is_refused(self):
+        with pytest.raises(SpecLoadError, match="describes no run"):
+            spec_from_dict({**MINIMAL, "run_plan": {"phases": []}})
+
+    def test_decode_an_unknown_conditions_key_is_refused(self):
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict({**MINIMAL, "run_plan": {"phases": [
+                {**FORMULATE, "conditions": {"name": "casting",
+                                             "temp_setpoint_c": 25.0}}]}})
+
+        assert "[conditions] has unknown key(s) ['temp_setpoint_c']" in str(exc.value)
+
+    def test_decode_conditions_without_a_name_is_refused(self):
+        with pytest.raises(SpecLoadError, match="needs a 'name'"):
+            spec_from_dict({**MINIMAL, "run_plan": {"phases": [
+                {**FORMULATE, "conditions": {"temp_setpoint_C": 25.0}}]}})
+
+    def test_decode_a_settle_window_missing_a_duration_is_refused(self):
+        """None of the three has a safe default — min_hold_s is the cure."""
+        table = {k: v for k, v in SETTLE_TABLE.items() if k != "min_hold_s"}
+
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict({**MINIMAL, "run_plan": _phases(
+                {**EQUILIBRATE, "settle": table})})
+
+        assert "missing ['min_hold_s']" in str(exc.value)
+
+    def test_decode_a_required_duration_listed_as_nothing_is_refused(self):
+        """``explicit_none`` says "set to nothing"; a floor cannot be nothing."""
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict({**MINIMAL, "run_plan": _phases(
+                {**EQUILIBRATE,
+                 "settle": {**SETTLE_TABLE,
+                            "explicit_none": ["min_hold_s"]}})})
+
+        assert "only ['rh_stability_pct'] can be set to nothing" in str(exc.value)
+
+    def test_decode_a_settle_field_given_a_value_and_listed_as_nothing_is_refused(self):
+        with pytest.raises(SpecLoadError, match="says two things about one field"):
+            spec_from_dict({**MINIMAL, "run_plan": _phases(
+                {**EQUILIBRATE,
+                 "settle": {**SETTLE_TABLE, "rh_stability_pct": 1.5,
+                            "explicit_none": ["rh_stability_pct"]}})})
+
+    def test_decode_a_non_numeric_duration_is_refused(self):
+        with pytest.raises(SpecLoadError, match="must be a number"):
+            spec_from_dict({**MINIMAL, "run_plan": _phases(
+                {**EQUILIBRATE,
+                 "settle": {**SETTLE_TABLE, "min_hold_s": "twenty"}})})
+
+    def test_decode_an_unknown_measurement_key_is_refused(self):
+        with pytest.raises(SpecLoadError, match="unknown measurement key"):
+            spec_from_dict({**MINIMAL, "run_plan": _phases(
+                {"kind": "measure", "scope": "per_batch",
+                 "measurement": {"presset": "Extended"}})})
+
+    def test_decode_a_plan_with_no_formulate_phase_surfaces_run_plans_refusal(self):
+        with pytest.raises(SpecLoadError, match="must contain a FORMULATE phase"):
+            spec_from_dict({**MINIMAL, "run_plan": {"phases": [
+                {"kind": "measure", "scope": "per_batch"}]}})
+
+    def test_decode_a_per_batch_formulate_phase_surfaces_run_plans_refusal(self):
+        with pytest.raises(SpecLoadError, match="FORMULATE must be per-sample"):
+            spec_from_dict({**MINIMAL, "run_plan": {"phases": [
+                {"kind": "formulate", "scope": "per_batch"}]}})
+
+    def test_decode_a_reserved_arrhenius_phase_is_refused(self):
+        with pytest.raises(SpecLoadError, match="ARRHENIUS phase is reserved"):
+            spec_from_dict({**MINIMAL, "run_plan": _phases(
+                {"kind": "arrhenius", "scope": "per_batch"})})
+
+
+# ── One authority for the settle window ──────────────────────────────────────
+
+class TestSettleSaidTwice:
+    """A file can now spell settle two ways. It still may not spell it both."""
+
+    def test_a_file_carrying_both_spellings_of_settle_is_refused(self):
+        spec = spec_from_dict({**MINIMAL, "equilibration_method": "settle",
+                               "round_period_s": 120.0, "min_hold_s": 600.0,
+                               "max_hold_s": 7200.0,
+                               "run_plan": _phases(EQUILIBRATE)})
+
+        with pytest.raises(ValueError, match="say it once"):
+            spec.settle_plan()
+
+    def test_a_file_carrying_only_the_phase_spelling_resolves_to_that_plan(self):
+        """The control: the refusal must not fire on the one legal spelling."""
+        spec = spec_from_dict({**MINIMAL, "run_plan": _phases(EQUILIBRATE)})
+
+        assert spec.settle_plan() == SettlePlan(240.0, 1500.0, 14400.0)
+
+
+# ── The worked example ───────────────────────────────────────────────────────
+
+class TestBenchInstanceRunPlan:
+    """``examples/bench_instance.toml`` is the file the bench run starts from.
+
+    Loaded through the real loader on purpose — the example's whole job is to be
+    the thing an operator actually runs.
+    """
+
+    @pytest.fixture(scope="class")
+    def plan(self):
+        from softae.core.campaign_spec_io import load_campaign_spec
+
+        return load_campaign_spec(BENCH_INSTANCE).run_plan
+
+    def test_bench_instance_carries_the_four_phase_arc_in_order(self, plan):
+        assert [p.kind for p in plan.phases] == [
+            PhaseKind.FORMULATE, PhaseKind.ANNEAL,
+            PhaseKind.EQUILIBRATE, PhaseKind.MEASURE]
+
+    def test_bench_instance_casts_per_sample_and_cures_the_batch_once(self, plan):
+        """Cast every well, then anneal the plate — not four cure cycles."""
+        assert plan.phases[0].scope is PhaseScope.PER_SAMPLE
+        assert all(p.scope is PhaseScope.PER_BATCH for p in plan.phases[1:])
+        assert [scope for scope, _ in plan.segments()] == [
+            PhaseScope.PER_SAMPLE, PhaseScope.PER_BATCH]
+
+    def test_bench_instance_describes_every_phase_with_its_conditions(self, plan):
+        line = plan.describe()
+
+        assert line.index("Formulate") < line.index("Anneal") \
+            < line.index("Equilibrate") < line.index("Measure")
+        assert "casting (25 °C, 40 %RH) [per sample]" in line
+        assert "anneal (85 °C, 20 %RH) [per batch]" in line
+        assert "Measure EIS (Extended) [per batch]" in line
+
+    def test_bench_instance_allows_four_hours_to_reach_the_anneal_humidity(
+        self, plan
+    ):
+        """1 800 s covers ~2.7 of the 18 %RH this descent needs; 14 400 s does not lie."""
+        assert plan.phases[1].conditions.rh_approach_timeout_s == 14400.0
+        assert plan.phases[1].anneal_task == "anneal_85C_8h"
+
+    def test_bench_instance_settle_window_is_the_campaigns_only_one(self, plan):
+        assert plan.phases[2].settle == SettlePlan(240.0, 1500.0, 14400.0)
+
+
+# ── Registration ─────────────────────────────────────────────────────────────
+
+def test_the_run_plan_codec_is_registered_in_the_shared_field_table():
+    """``spec_from_dict`` reaches it through ``OBJECT_FIELDS``, not a merge."""
+    from softae.core.campaign_spec_fields import OBJECT_FIELDS
+
+    assert OBJECT_FIELDS["run_plan"] is field_codec()
+    assert "run_plan" not in __import__(
+        "softae.core.campaign_spec_io", fromlist=["_UNSUPPORTED"])._UNSUPPORTED
+
+
+# ── The cure's duration crosses the boundary ─────────────────────────────────
+
+class TestHoldS:
+    """``hold_s`` is the file's one per-run override of a catalog anneal task."""
+
+    def test_round_trip_hold_s_on_an_anneal_phase(self):
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE),
+            RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     anneal_task="anneal_85C_8h", hold_s=28800.0),
+        ))
+
+        table = encode_run_plan(plan)
+
+        assert table["phases"][1]["hold_s"] == 28800.0
+        assert decode_run_plan(table) == plan
+
+    def test_a_phase_without_a_hold_writes_no_key(self):
+        """Absence is absence: the task's own hold stands."""
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE),
+            RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH),
+        ))
+
+        assert "hold_s" not in encode_run_plan(plan)["phases"][1]
+        assert decode_run_plan(encode_run_plan(plan)).phases[1].hold_s is None
+
+    def test_decode_a_hold_on_a_phase_that_does_not_anneal_is_refused(self):
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict({**MINIMAL, "run_plan": _phases(
+                {"kind": "measure", "scope": "per_batch", "hold_s": 28800.0})})
+
+        assert "never reach the chamber" in str(exc.value)
+
+    def test_decode_a_non_numeric_hold_is_refused(self):
+        with pytest.raises(SpecLoadError, match="'hold_s' must be a number"):
+            spec_from_dict({**MINIMAL, "run_plan": _phases(
+                {"kind": "anneal", "scope": "per_batch", "hold_s": "8h"})})
+
+    def test_decode_a_hold_said_twice_surfaces_run_phases_refusal(self):
+        """The file can only spell it once, so the second spelling is Python's.
+
+        A spec built in memory can still carry both; the codec surfaces
+        ``RunPhase``'s words rather than restating them.
+        """
+        with pytest.raises(ValueError, match="say it once"):
+            RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     anneal_params={"hold_time_s": 600}, hold_s=28800.0)
+
+    def test_anneal_params_stays_unrepresentable_beside_a_hold(self):
+        """``hold_s`` is typed; the free dict it replaces is still unwritable."""
+        from softae.core.campaign_spec_fields import UNREPRESENTABLE
+
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE),
+            RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     anneal_params={"target_temp_C": 85}, hold_s=28800.0),
+        ))
+
+        assert encode_run_plan(plan) is UNREPRESENTABLE
+
+    def test_a_loaded_file_carries_the_hold_all_the_way_to_the_plan(self):
+        """Through the real loader — the file shape is the point."""
+        spec = spec_from_dict({**MINIMAL, "run_plan": _phases(
+            {"kind": "anneal", "scope": "per_batch",
+             "anneal_task": "anneal_85C_8h", "hold_s": 28800.0})})
+
+        assert spec.run_plan.phases[1].hold_s == 28800.0
