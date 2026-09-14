@@ -42,6 +42,14 @@ from softae.analysis.equilibration import (
 #: only job is to be read alongside the gate's own line.
 TREND_ALPHA = 2.0 / (float(DEFAULT_SETTLE_N_ROUNDS) + 1.0)
 
+#: The note every row carries during the RH preroll. The fits are real -- they
+#: are computed, printed and written to disk -- but the preroll deliberately
+#: withholds them from ``SettleTracker.observe``, so the tracker has no rounds
+#: and a table rendered from ``tracker.rounds`` alone printed ``n/a`` in every
+#: cell of a 12-channel board (``20260914T010938Z``, rounds 1-4). "Unknown" and
+#: "measured but not counted" must not be spelled with the same token.
+PREROLL_NOTE = "preroll, not judged"
+
 
 @dataclass(frozen=True)
 class ChannelTrend:
@@ -96,6 +104,7 @@ def trend_rows(
     excluded: Mapping[int, str] | None = None,
     participating: Sequence[int] | None = None,
     alpha: float = TREND_ALPHA,
+    default_note: str = "",
 ) -> list[ChannelTrend]:
     """One row per channel under study, in the plan's own channel order.
 
@@ -105,6 +114,11 @@ def trend_rows(
     :class:`~softae.analysis.equilibration.SettleCheck`, and ``participating is
     None`` means no window has been judged yet -- which is not the same as "no
     channel participates", so nothing is marked in that case.
+
+    *default_note* fills the note column wherever the gate gave no reason of its
+    own -- :data:`PREROLL_NOTE`, for the rounds that are swept and fitted but
+    deliberately not judged. The gate's own vocabulary still wins where it has
+    something to say.
     """
     history = [list(fits) for fits in rounds]
     wanted = [int(channel) for channel in channels]
@@ -123,7 +137,7 @@ def trend_rows(
             channel=channel, sigma=sigma, ema=ema, n_prior=folded,
             departure_rel=_departure(sigma, ema),
             band=str((bands or {}).get(channel, "")),
-            note=_note(channel, excluded, participating),
+            note=_note(channel, excluded, participating) or default_note,
         ))
     return rows
 
@@ -251,6 +265,6 @@ def _row_text(row: ChannelTrend) -> str:
 
 
 __all__ = [
-    "TREND_ALPHA", "ChannelTrend", "prior_ema", "render_trend_legend",
-    "render_trend_table", "trend_rows",
+    "PREROLL_NOTE", "TREND_ALPHA", "ChannelTrend", "prior_ema",
+    "render_trend_legend", "render_trend_table", "trend_rows",
 ]

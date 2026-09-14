@@ -78,9 +78,65 @@ DEFAULT_RH_APPROACH_TIMEOUT_S = 5400.0
 DEFAULT_TEMP_APPROACH_TIMEOUT_S = 1800.0
 #: A descent takes far longer than a climb, so a cooling leg gets the long bound.
 DEFAULT_TEMP_DESCENT_TIMEOUT_S = 5400.0
+
+#: Seconds an axis must stay IN BAND before it counts as ``reached``, in
+#: :func:`_approach_one`. **One in-band poll is not an arrival**: a PV crossing
+#: the band on its way somewhere else reads identically to one that has settled
+#: there, and ``approach_setpoint`` returns on the first sample inside tolerance.
+#:
+#: A secondary safeguard, and honestly so. It would **not** have caught
+#: 20260913T171305Z, where RH was inside 2 %RH from the first poll and then
+#: wandered for ~70 min: the quantity that separates a restart transient from a
+#: hold is the round-cadence RH **spread**, which only the settle rounds observe,
+#: and that is the RH preroll in :func:`settle_phase`. This one catches the other
+#: shape -- an axis still travelling -- which the preroll cannot see because it
+#: watches spread rather than distance.
+#:
+#: 0 disables it, and every pre-existing caller that names no dwell gets 0 by
+#: parameter default rather than this constant, so no existing approach changes.
+DEFAULT_APPROACH_DWELL_S = 600.0
+#: The settle ceiling in **seconds**, and now only a fallback. The ceiling an
+#: operator actually gets is :data:`DEFAULT_SETTLE_MAX_ROUNDS` multiplied by the
+#: *achieved* round period (:func:`achieved_round_period_s`), because a ceiling
+#: in seconds buys a number of rounds nobody computed. This constant remains the
+#: field default on :class:`ValidationPlan`, so every construction that names
+#: neither flag -- every test, every older caller -- is byte-for-byte unchanged.
 DEFAULT_SETTLE_MAX_HOLD_S = 5400.0
+
+#: How many settle ROUNDS the ceiling buys, when the ceiling is derived rather
+#: than typed. **The unit that matters is rounds, not seconds**: every criterion
+#: in this gate reads a trailing window measured in rounds, so a ceiling stated
+#: in seconds is a promise about a quantity no criterion consumes.
+#:
+#: 14, and each term is separable. A first rate verdict needs 6 rounds
+#: (:attr:`~softae.analysis.equilibration.SettleTracker.rate_window_rounds`);
+#: the RH preroll in :func:`settle_phase` spends 3-5 on a board whose zone hunts;
+#: and a verdict that arrives on the last possible round has no second opinion.
+#: 6 + 5 + 3 = 14.
+#:
+#: **It replaces a fixed 5400 s that bought half what it promised.** On
+#: 20260913T171305Z the projection quoted ~310 s/round and the run achieved
+#: ~625 s/round -- a round is the sweep block PLUS the sleep -- so 5400 s bought
+#: 10 rounds where the table read 17, and the rate criterion could not fill its
+#: 6-round window twice.
+DEFAULT_SETTLE_MAX_ROUNDS = 14
+
 DEFAULT_MIN_TREATMENT = 6
 DEFAULT_DRIFT_CHECK = 3
+
+#: How many *consecutive* cell failures end the run, under ``--survivors off``.
+#: A cascading comms failure is the thing it exists to catch, and three in a row
+#: is the shape that has: one cell failing is a cell, three is the bus.
+#:
+#: **Unchanged, and deliberately so.** What was wrong was not the number but the
+#: denominator -- see :func:`~softae.tools.eis_validate.run_cells`, where a
+#: failure on a cell the survivor partition already DROPPED no longer counts
+#: toward it. ch7 (an empty well), ch9, ch15 and ch16 are adjacent on the
+#: operator's board and would trip a limit of 3 before the first good cell was
+#: measured, which is why ``--max-consecutive-failures 16`` was typed as a
+#: workaround on 2026-09-13 -- disabling the guard for the whole run, including
+#: for the cascading failure it is actually for.
+DEFAULT_MAX_CONSECUTIVE_FAILURES = 3
 
 #: The settle band this harness starts from, and the value ``--settle-tol-rel``
 #: falls back to. A **relative deviation of sigma from its own window mean** --
@@ -124,11 +180,64 @@ SETTLE_TOL_REL_MAX = 0.50
 #: for the reason :data:`DEFAULT_SETTLE_TOL_REL` is, and pinned to
 #: :data:`softae.analysis.equilibration.SETTLE_CRITERION_DEVIATION` by a test.
 DEFAULT_SETTLE_CRITERION = "deviation"
-#: **Unset**, not "no drift permitted". A rate criterion with no tolerance has
-#: nothing to compare against, so 0 is refused at :func:`validate_plan` rather
-#: than taken literally -- a literal zero would make every cell moving and the
-#: run would blame the film for the flag.
-DEFAULT_SETTLE_RATE_TOL_DEC_PER_H = 0.0
+#: H3's whole-block budget over a one-hour block: 0.05 decades of sigma per hour.
+#:
+#: **It used to be 0.0 -- "unset" -- and that default cost a 98.8 min hold.** The
+#: flag's own help taught 0.025 (0.05 dec over a 2 h block), an operator derived
+#: it, and 0.025 dec/h sat *at the detection floor* of the window the run could
+#: actually observe: a cell at the board's median residual could certify no band
+#: tighter than ~0.0251 dec/h over the 3118 s window, so every quiet cell came
+#: back ``rate_undetectable`` and the run reported `ceiling` having measured
+#: nothing (20260913T171305Z_eis_validate). A band that the observation cannot
+#: resolve is not a tighter criterion, it is an absent one.
+#:
+#: The ``<= 0`` refusal in :func:`_validate_criterion` stays exactly as it was.
+#: It now catches a **typed** zero rather than the default, which is what it was
+#: always for.
+#:
+#: **0.05 is the default and stays the default; one board has deliberately moved
+#: off it.** The operator of the 2026-09-13 board chose
+#: ``--settle-rate-tol-dec-per-h 0.11`` -- *"walk further out on the
+#: drift-throughput envelope"* -- and the trade is worth recording in the units
+#: it costs: 0.11 dec/h over that board's ~50 min measurement block at 12
+#: channels is ~0.09 dec, about 23 % of sigma and ~2x H3's whole-block budget.
+#: What makes it defensible there is that the **paired R/B sweeps are ~40 s
+#: apart** (~0.003 dec), so the primary within-cell comparison is untouched and
+#: the cost lands on the end-of-block drift check. It is a per-board judgement,
+#: not a new default: a run on a board that has not been characterised this way
+#: should start at 0.05.
+DEFAULT_SETTLE_RATE_TOL_DEC_PER_H = 0.05
+
+#: The settle gate's RH stability band, in **%RH**, and the value
+#: ``--rh-stability-pct`` falls back to. The **range of the per-round RH
+#: medians** across the judged window, compared against *itself* and never
+#: against a setpoint -- which is what makes it admissible beside the sigma
+#: criterion at all.
+#:
+#: **Restated rather than imported**, for the reason
+#: :data:`DEFAULT_SETTLE_TOL_REL` is, and pinned to
+#: :data:`softae.analysis.equilibration.DEFAULT_RH_STABILITY_PCT` by
+#: ``test_rh_stability_band_defaults_to_the_measured_constant``.
+#:
+#: **It is not** ``--rh-tolerance-pct`` (2.0), which judges the *approach*
+#: against the setpoint, **and it is not** ``[safety] rh_deviation_warn_pct`` /
+#: ``rh_deviation_fault_pct``, which watch the *hold* against the setpoint.
+#: Widening either of those does nothing for this gate, and on 2026-09-13 four
+#: windows were blocked here with the number appearing in no ``--help``, no
+#: console line and no refusal. The one place the two bands do meet is
+#: :func:`_rh_dwell_tolerance`: the approach *dwell* is judged against whichever
+#: of them is wider, because a dwell held to 2.0 refuses runs the 3.0 settle band
+#: was configured to accept.
+#:
+#: **1.5 is a default, and the field says the band is a per-ZONE operator
+#: choice.** The RH loop's limit cycle grows with setpoint -- measured
+#: +/-1.2 %RH at a 20 % setpoint and +/-2.5 %RH at 23 % (2026-09-14,
+#: ``20260914T010938Z``), with the restart overshoot doing the same (+2.4 then
+#: +3.7). So a band that is right at 20 % is roughly half what 23 % needs, and no
+#: single constant here can be right for both. Deliberately **not** a lookup
+#: table: two points is a slope nobody has characterised, and a table would spell
+#: a guess with the same token as a measurement. State the band per run.
+DEFAULT_RH_STABILITY_PCT = 1.5
 
 #: Above this rate band the run refuses to start, on exactly
 #: :data:`SETTLE_TOL_REL_MAX`'s argument and for exactly its reason. At 0.5 dec/h
@@ -258,8 +367,24 @@ class ValidationPlan:
     tolerance_c: float = 2.0
     rh_approach_timeout_s: float = DEFAULT_RH_APPROACH_TIMEOUT_S
     temp_approach_timeout_s: float = DEFAULT_TEMP_APPROACH_TIMEOUT_S
+    #: Seconds each axis must hold IN BAND before it is called ``reached``. See
+    #: :data:`DEFAULT_APPROACH_DWELL_S`; ``0`` restores the first-in-band-poll
+    #: behaviour exactly.
+    approach_dwell_s: float = DEFAULT_APPROACH_DWELL_S
     settle: bool = True
     settle_max_hold_s: float = DEFAULT_SETTLE_MAX_HOLD_S
+    #: The ceiling in the unit the criteria actually read. ``settle_max_hold_s``
+    #: is derived from it and from the ACHIEVED round period unless the operator
+    #: typed a hold directly -- see :data:`DEFAULT_SETTLE_MAX_ROUNDS` and
+    #: :func:`settle_ceiling_s`. Trailing, with a default, so every existing
+    #: positional construction is unchanged.
+    settle_max_rounds: int = DEFAULT_SETTLE_MAX_ROUNDS
+    #: Did the operator type ``--settle-max-hold-s``? Recorded rather than
+    #: inferred: a typed value that happens to equal the derived one is still an
+    #: override, and the projection says so out loud. **Not** in
+    #: :meth:`fingerprint` -- it is a ceiling on waiting for the criterion, on
+    #: exactly ``settle_max_hold_s``'s own side of that method's line.
+    settle_max_hold_typed: bool = False
     #: Seconds of **continuous time at condition** required before the first
     #: spectrum. Set from ``--soak-h``, stored in seconds so it is uniform with
     #: every other duration on this plan. The settle phase runs at condition and
@@ -267,7 +392,7 @@ class ValidationPlan:
     soak_s: float = DEFAULT_SOAK_S
     end_state: str = "park"
     retries: int = 1
-    max_consecutive_failures: int = 3
+    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES
     visit: int = 1
     mock: bool = False
 
@@ -308,6 +433,14 @@ class ValidationPlan:
     #: ``H3_MAX_HOLD_DRIFT_DEC / T_meas``; an operator who computes it computes
     #: decades. 0 means unset and is refused for the criteria that need it.
     settle_rate_tol_dec_per_h: float = DEFAULT_SETTLE_RATE_TOL_DEC_PER_H
+    #: How far the per-round RH **medians** may span across the judged window
+    #: and still count as a still room, in %RH. ``None`` is the gate OFF, and
+    #: that is the only spelling of off: a typed ``0`` maps to ``None`` at the
+    #: CLI rather than to ``0.0``, which would refuse every window ever observed.
+    #: Until this field existed :func:`settle_phase` passed the constant, so an
+    #: RH zone whose control hunts wider than 1.5 %RH could never certify and
+    #: nothing anywhere said which number was blocking it.
+    rh_stability_pct: float | None = DEFAULT_RH_STABILITY_PCT
     #: At the ceiling, partition rather than fail: proceed on the cells the
     #: criterion certified quiet and record the rest with their reasons.
     #: **Off by default**, so every existing verdict is byte-identical, and
@@ -320,6 +453,30 @@ class ValidationPlan:
     def cell_key(self, channel: int) -> str:
         return (f"{int(channel)}:{self.rh_setpoint_pct:g}:"
                 f"{self.temp_setpoint_c:g}:{self.visit}")
+
+    @property
+    def unheated(self) -> bool:
+        """Is this run's temperature setpoint the heater-off one?
+
+        **This rig has a heater and no chiller**, and its park setpoint --
+        :data:`~softae.core.safe_park.DEFAULT_SAFE_TEMP_C`, 10 C -- is below any
+        ambient it has ever been in. So a ``--temp-setpoint-c`` at or below that
+        value is not a condition the chamber approaches; it is the instruction
+        *stop heating*, and whatever ambient gives is the condition.
+
+        Until this existed the tool had no vocabulary for it. The temperature
+        approach judged 10 C against a PV of ~28 C, could never be satisfied, and
+        the only way past it was ``--tolerance-c 20`` -- which widens the same
+        band for a genuine over-temperature excursion, on the gate that is the
+        last thing between the operator and a heater. The condition is a
+        first-class one now and needs no tolerance at all.
+
+        Read rather than stored: it is a function of the setpoint and the park
+        constant, and a field could disagree with both.
+        """
+        from softae.core.safe_park import DEFAULT_SAFE_TEMP_C
+
+        return float(self.temp_setpoint_c) <= float(DEFAULT_SAFE_TEMP_C)
 
     def fingerprint(self) -> str:
         """What a resume must match.
@@ -409,6 +566,13 @@ class ValidationPlan:
             for key, value in vars(self).items()
         }
         payload["fingerprint"] = self.fingerprint()
+        # Derived, like `fingerprint`, and recorded for the same reason: a reader
+        # of this plan a month later cannot re-derive "the heater was off" from
+        # `temp_setpoint_c` alone without also knowing what the park constant was
+        # when the run ran. **Not** in `fingerprint`: it is a function of a field
+        # already hashed there, so hashing it twice would change nothing and
+        # invalidate every checkpoint written before it existed.
+        payload["unheated"] = self.unheated
         return payload
 
 
@@ -419,8 +583,9 @@ def validate_plan(plan: ValidationPlan) -> None:
     least ``DEFAULT_SETTLE_MIN_CHANNELS`` participating channels, so a run on
     fewer than that can never return ``settled`` -- it runs every round to the
     ceiling and then refuses. Caught late that costs the full
-    ``--settle-max-hold-s`` (90 minutes by default) at temperature, and the
-    operator's first evidence is a refusal that names the wrong cause.
+    ``--settle-max-hold-s`` (``--settle-max-rounds`` at the achieved round
+    period, by default) at temperature, and the operator's first evidence is a
+    refusal that names the wrong cause.
 
     The third is ``--settle-tol-rel``, and it is refused in **one** direction
     only. Too tight is left alone on purpose: it is self-correcting, because
@@ -563,6 +728,43 @@ def _validate_criterion(plan: ValidationPlan) -> None:
         )
 
 
+def unreachable_setpoint_refusal(plan: ValidationPlan, first_pv_c: float) -> str:
+    """Why this temperature setpoint can never be reached, or ``""``.
+
+    **The one refusal on this plan that needs a reading**, which is why it sits
+    here as a pure function rather than inside :func:`validate_plan`: that
+    function is called before a port is open and has no PV to judge against.
+    :func:`approach_condition` reads the PV **before the setpoint write** and
+    asks this, so the refusal still lands before anything is heated.
+
+    Two conditions, and both are needed. A setpoint far below the current PV is
+    unreachable on a heater-only rig -- there is no chiller, so the chamber can
+    only fall at whatever rate the room takes it. But a setpoint at or below the
+    **park temperature** is not an unreachable target at all: it is
+    :attr:`ValidationPlan.unheated`, a stated instruction to stop heating, and
+    refusing it would refuse the very condition proposal B exists to name.
+
+    Silent when the PV is not finite: an absent reading is not evidence that a
+    setpoint is unreachable, and the approach's own timeout is the right place
+    for a sensor that says nothing.
+    """
+    from softae.core.safe_park import DEFAULT_SAFE_TEMP_C
+
+    if plan.unheated or not math.isfinite(float(first_pv_c)):
+        return ""
+    shortfall = float(first_pv_c) - float(plan.temp_setpoint_c)
+    if shortfall <= float(plan.tolerance_c):
+        return ""
+    return (
+        f"setpoint {plan.temp_setpoint_c:g} C is {shortfall:g} C below the first "
+        f"PV ({float(first_pv_c):g} C) and above the park temperature "
+        f"{DEFAULT_SAFE_TEMP_C:g} C. This rig has a heater and no chiller: it "
+        f"cannot reach a setpoint below ambient. State a setpoint at or below "
+        f"{DEFAULT_SAFE_TEMP_C:g} C to run UNHEATED at whatever ambient gives, "
+        f"or at or above the current PV."
+    )
+
+
 def loose_band_notice(tol_rel: float) -> str:
     """The line printed when an admissible band is still a generous one.
 
@@ -594,6 +796,65 @@ def suggested_settle_tol_rel(floor_rel: float) -> float | None:
         return None
     suggestion = math.ceil(float(floor_rel) * 1.2 * 100.0) / 100.0
     return None if suggestion > SETTLE_TOL_REL_MAX else suggestion
+
+
+def suggested_rate_tol_dec_per_h(floor_dec_per_h: float) -> float | None:
+    """The narrowest admissible rate band **this window** could have certified.
+
+    :func:`suggested_settle_tol_rel`'s shape, in the rate's unit and against the
+    rate's ceiling, and derived from the run's own measurement for the same
+    reason: the detection floor is a property of the observation -- the residual
+    the board actually carries over the span it was actually watched for -- and a
+    hardcoded suggestion would be advice about somebody else's board.
+
+    ``floor_dec_per_h * 1.2``, rounded up to the nearest 0.001 dec/h. The floor
+    itself is the boundary case and a band exactly on it certifies nothing, so
+    the suggestion carries margin. ``None`` when the answer would exceed
+    :data:`SETTLE_RATE_TOL_DEC_PER_H_MAX` -- a value the run would then refuse is
+    not a suggestion, it is a second trap, and at that detection floor the
+    observation is the finding rather than the flag.
+    """
+    if not (math.isfinite(floor_dec_per_h) and floor_dec_per_h > 0):
+        return None
+    suggestion = math.ceil(float(floor_dec_per_h) * 1.2 * 1000.0) / 1000.0
+    return None if suggestion > SETTLE_RATE_TOL_DEC_PER_H_MAX else suggestion
+
+
+def rate_floor_line(
+    floor_dec_per_h: float, tol_dec_per_h: float, span_s: float
+) -> str:
+    """The detection-floor announcement, and the refusal text, in one place.
+
+    :func:`_announce_rate_floor` prints it during the hold and
+    :func:`_tolerance_clause` quotes the same arithmetic at the ceiling, so the
+    line an operator reads at round 6 and the line the refusal gives them 42
+    minutes later cannot disagree about the same window.
+
+    ``SE`` falls **linearly in the span** and only as ``sqrt(k)`` in the round
+    count, which is why the instruction is a longer round period rather than more
+    rounds -- see :func:`_tolerance_clause` for why "more rounds" is not merely
+    weaker advice here but false.
+    """
+    suggestion = suggested_rate_tol_dec_per_h(floor_dec_per_h)
+    if suggestion is None:
+        advice = ["no admissible",
+                  f"         band clears this floor (--settle-rate-tol-dec-per-h "
+                  f"stops at {SETTLE_RATE_TOL_DEC_PER_H_MAX:g} dec/h), so the",
+                  "         observation is the finding here, not the flag."]
+    else:
+        advice = ["Suggest",
+                  f"         --settle-rate-tol-dec-per-h {suggestion:g} "
+                  f"({suggestion / floor_dec_per_h:.1f}x margin), or a longer "
+                  f"round period: SE",
+                  "         falls linearly in span and only as sqrt(k) in round "
+                  "count."]
+    return "\n".join([
+        f"         rate FLOOR: over this {span_s:.0f} s window a cell at the "
+        f"board's median residual could",
+        f"         certify no band tighter than {floor_dec_per_h:.4f} dec/h. "
+        f"Yours is {tol_dec_per_h:.4f} dec/h. {advice[0]}",
+        *advice[1:],
+    ])
 
 
 def population_thresholds(
@@ -644,6 +905,39 @@ class Projection:
         return self.measurement_low_s + self.follow_up_s
 
 
+def achieved_round_period_s(preset: str, n_channels: int) -> float:
+    """What a settle round **actually costs**: the sweep block plus the sleep.
+
+    ``default_round_period_s`` is documented as *"a round's cost plus a chosen
+    buffer"*, and :func:`settle_phase` sweeps the whole board and *then* sleeps
+    that full period on top -- so the period is charged twice and the projection
+    quoted half the truth. On 20260913T171305Z the table read ~310 s/round
+    against measured round-to-round deltas of 615-630 s, and the 5400 s ceiling
+    bought 10 rounds where the operator had been shown 17.
+
+    **The double charge is not repaired here, deliberately.** ``sleep(period_s -
+    round_elapsed)`` would halve the achieved period, which halves the rate
+    window's span -- and ``SE ~ s_resid*sqrt(12)/(T*sqrt(k))``, so every interval
+    would double and :data:`~softae.analysis.equilibration.RATE_SPAN_TOO_SHORT`
+    would become routine. The period is load-bearing for the criterion. What was
+    wrong was the *number that was printed*, so that is what moves: the
+    projection reports what happens, the ceiling is stated in rounds, and the
+    pacing stays the operator's.
+    """
+    from softae.core.eis_scripts import EISParams
+    from softae.core.preflight import estimate_eis_duration
+    from softae.workflows.equilibration import default_round_period_s
+
+    n = max(1, int(n_channels))
+    sweep_block = estimate_eis_duration(EISParams.from_preset(preset)) * n
+    return float(sweep_block) + float(default_round_period_s(preset, n))
+
+
+def settle_ceiling_s(preset: str, n_channels: int, max_rounds: int) -> float:
+    """The settle ceiling a rounds budget buys, in seconds. One place."""
+    return max(1, int(max_rounds)) * achieved_round_period_s(preset, n_channels)
+
+
 def project(plan: ValidationPlan) -> Projection:
     """From ``preflight``'s measured anchors, quoted as a range.
 
@@ -652,7 +946,6 @@ def project(plan: ValidationPlan) -> Projection:
     """
     from softae.core.eis_scripts import EISParams
     from softae.core.preflight import estimate_eis_duration
-    from softae.workflows.equilibration import default_round_period_s
 
     n = len(plan.channels)
     reference = estimate_eis_duration(EISParams.from_preset(plan.reference_preset))
@@ -664,7 +957,11 @@ def project(plan: ValidationPlan) -> Projection:
         scout_s=baseline * n,
         follow_up_s=follow_up * n,
         drift_s=reference * max(0, int(plan.drift_check)),
-        settle_round_s=default_round_period_s(plan.baseline_preset, n),
+        # The ACHIEVED period, not `default_round_period_s` alone: the sleep is
+        # charged on top of the sweep block, and the ceiling-in-rounds arithmetic
+        # below is computed against what happens rather than against what was
+        # asked for.
+        settle_round_s=achieved_round_period_s(plan.baseline_preset, n),
     )
 
 
@@ -689,6 +986,8 @@ def _next_rung(plan: ValidationPlan) -> str:
 
 def render_projection(plan: ValidationPlan, projection: Projection) -> str:
     """The block printed before the confirmation prompt. ASCII only."""
+    from softae.workflows.equilibration import default_round_period_s
+
     lines: list[str] = []
     add = lines.append
     n = projection.n_channels
@@ -709,8 +1008,16 @@ def render_projection(plan: ValidationPlan, projection: Projection) -> str:
     # saving this table cannot promise. The operator types "yes" against it.
     add(f"  {'approach   RH  (commanded with temperature)':<44}{'0 - 30 min':>14}"
         f"{plan.rh_approach_timeout_s / 60:>7.0f} min")
+    # The ceiling in ROUNDS, beside the period that converts it, because rounds
+    # are the unit every criterion in this gate reads and seconds are not. And
+    # the period quoted is the ACHIEVED one -- sweep block plus sleep -- so the
+    # two numbers multiply to the bound in the right-hand column instead of to
+    # twice it.
+    settle_rounds = max(1, int(plan.settle_max_rounds))
+    round_sleep = default_round_period_s(plan.baseline_preset, n)
+    sweep_block = projection.settle_round_s - round_sleep
     settle_label = (f"settle     {plan.baseline_preset} rounds "
-                    f"(~{projection.settle_round_s:.0f} s/round)")
+                    f"(~{projection.settle_round_s:.0f} s x {settle_rounds})")
     add(f"  {settle_label:<44}{'25 - 45 min':>14}"
         f"{plan.settle_max_hold_s / 60:>7.0f} min")
     # Its own row, always, including at 0. The operator reads this table and
@@ -759,6 +1066,26 @@ def render_projection(plan: ValidationPlan, projection: Projection) -> str:
     add("  the descent the heat absorbs is the chamber's to decide; this table")
     add("  projects no saving for it.")
     add("")
+    add(f"  A SETTLE ROUND IS THE SWEEP BLOCK PLUS THE SLEEP: a ~{sweep_block:.0f} s "
+        f"block of {n}")
+    add(f"  {plan.baseline_preset} sweeps, then the full ~{round_sleep:.0f} s "
+        f"period on top -- ~{projection.settle_round_s:.0f} s a round,")
+    add("  not the period alone. The ceiling is therefore stated in ROUNDS, "
+        "which is")
+    add("  the unit every criterion here reads: the rate criterion regresses a")
+    add("  TRAILING 6-round window, so a ceiling that buys five rounds cannot")
+    add("  produce a single verdict.")
+    if plan.settle_max_hold_typed:
+        add(f"  --settle-max-hold-s {plan.settle_max_hold_s:.0f} was TYPED and "
+            f"OVERRIDES --settle-max-rounds")
+        add(f"  {settle_rounds}: it buys "
+            f"~{plan.settle_max_hold_s / projection.settle_round_s:.1f} rounds at "
+            f"this period.")
+    else:
+        add(f"  --settle-max-rounds {settle_rounds} -> "
+            f"{plan.settle_max_hold_s / 60:.0f} min. Type --settle-max-hold-s to "
+            f"override it.")
+    add("")
     if plan.soak_s > 0:
         add(f"  SOAK {plan.soak_s / 3600:.2f} h: the settle gate proves the RIG "
             "stopped moving; this")
@@ -789,6 +1116,10 @@ class ApproachReport:
     #: bounds. Not the time the axis has been under command; see :attr:`lead_s`.
     elapsed_s: float
     pv_final: float
+    #: ``approach_setpoint`` calls made, which is **not** bounded at two. A
+    #: never-arrived approach still refuses after :data:`_APPROACH_MISS_LIMIT` of
+    #: them; a dwell that breaks and is retried on the remaining budget can spend
+    #: many more, and the count is the honest record of how many it took.
     attempts: int
     #: Seconds this axis was already being driven **before judging began**. Zero
     #: for temperature, which is judged straight off its own setpoint write; the
@@ -797,11 +1128,19 @@ class ApproachReport:
     #: inserted, so every positional construction of this record still reads the
     #: same and the printing loop's shape is unchanged.
     lead_s: float = 0.0
+    #: Seconds spent watching the axis STAY in band after it first entered one,
+    #: i.e. ``--approach-dwell-s`` as actually served. Its own field rather than
+    #: folded into :attr:`elapsed_s`, on :attr:`lead_s`'s precedent and for
+    #: :attr:`lead_s`'s reason: ``elapsed_s`` is defined as the quantity
+    #: ``timeout_s`` bounds, and the dwell is deliberately outside that bound --
+    #: a timeout on "stay here for 600 s" is the 600 s. Appended with a default,
+    #: so every positional construction still reads the same.
+    dwell_s: float = 0.0
 
     @property
     def driven_s(self) -> float:
-        """Total seconds under command: the lead plus the judged window."""
-        return self.lead_s + self.elapsed_s
+        """Total seconds under command: the lead, the judged window, the dwell."""
+        return self.lead_s + self.elapsed_s + self.dwell_s
 
 
 def approach_condition(
@@ -891,6 +1230,14 @@ def approach_condition(
     # write ahead of it means the state a rejected RH setpoint leaves is
     # byte-for-byte the state it left before -- heater commanded, RH loop never
     # started, park in `cmd_run`'s `finally` -- only sooner.
+    # Read BEFORE the setpoint write, so an unreachable setpoint is refused with
+    # nothing yet commanded on either axis. This is the one plan refusal that
+    # needs a reading -- `validate_plan` runs before a port is open -- and it is
+    # the only reason a PV is taken here at all.
+    first_pv_c = _first_pv(lambda: float(temp.get_pv(1)))
+    if (refusal := unreachable_setpoint_refusal(plan, first_pv_c)):
+        raise RefuseToStart(refusal)
+
     temp.write_sp(float(plan.temp_setpoint_c))
     _observe(on_command, _COMMAND_OBSERVER_FAILED,
              "temperature", float(plan.temp_setpoint_c))
@@ -907,12 +1254,25 @@ def approach_condition(
           f"judged after temperature: the floor rises with T.", flush=True)
 
     try:
-        reports.append(_approach_one(
-            approach_setpoint, lambda: float(temp.get_pv(1)),
-            plan.temp_setpoint_c, axis="temperature", instrument=TEMP_CONTROLLER,
-            tolerance=plan.tolerance_c, timeout_s=plan.temp_approach_timeout_s,
-            poll_interval_s=poll_interval_s, sleep=sleep, now=now,
-        ))
+        # UNHEATED is a condition, not an approach. At or below the park
+        # temperature nothing is being driven toward a target -- the setpoint
+        # means *stop heating* -- so the axis is satisfied at the first finite PV
+        # and no tolerance applies. The alternative shipped for months was
+        # `--tolerance-c 20`, which widened the same band for a genuine
+        # over-temperature excursion on the gate that is the last thing between
+        # the operator and a heater.
+        reports.append(
+            _unheated_report(plan, first_pv_c) if plan.unheated and
+            math.isfinite(first_pv_c) else
+            _approach_one(
+                approach_setpoint, lambda: float(temp.get_pv(1)),
+                plan.temp_setpoint_c, axis="temperature",
+                instrument=TEMP_CONTROLLER,
+                tolerance=plan.tolerance_c,
+                timeout_s=plan.temp_approach_timeout_s,
+                poll_interval_s=poll_interval_s, sleep=sleep, now=now,
+                dwell_s=plan.approach_dwell_s,
+            ))
     except RefuseToStart:
         _release_rh(rh)
         raise
@@ -923,12 +1283,71 @@ def approach_condition(
         tolerance=plan.rh_tolerance_pct, timeout_s=plan.rh_approach_timeout_s,
         poll_interval_s=poll_interval_s, sleep=sleep, now=now,
         lead_s=max(0.0, float(clock()) - rh_commanded_at),
+        dwell_s=plan.approach_dwell_s,
+        dwell_tolerance=_rh_dwell_tolerance(plan),
     ))
     return reports
 
 
+def _rh_dwell_tolerance(plan: ValidationPlan) -> float:
+    """The band the RH dwell is judged against: the WIDER of the two bands.
+
+    ``--rh-tolerance-pct`` judges *arrival* against the setpoint;
+    ``--rh-stability-pct`` is the band the settle window will be judged by once
+    the run starts. Leaving the dwell on the narrower of the two makes the wider
+    one unreachable -- a run configured for a 3.0 %RH settle band refused in the
+    approach because the dwell wanted 2.0, which is ``20260914T005931Z``. The
+    max, not the stability band outright, so a run that widens
+    ``--rh-tolerance-pct`` past it is not silently tightened.
+
+    **RH only.** Temperature has no stability-band analogue, so its dwell keeps
+    judging against ``--tolerance-c`` and that call passes nothing.
+    """
+    if plan.rh_stability_pct is None:
+        return float(plan.rh_tolerance_pct)
+    return max(float(plan.rh_tolerance_pct), float(plan.rh_stability_pct))
+
+
 #: One string, because both command observations are the same failure.
 _COMMAND_OBSERVER_FAILED = "eis_validate_approach_command_observer_failed"
+
+
+def _first_pv(read_pv: Callable[[], float]) -> float:
+    """One PV read, or ``nan``. **Never raises**, and never a plausible zero.
+
+    It is asked before anything is commanded, purely so an unreachable setpoint
+    can be refused there; a controller that cannot be read yet is not evidence
+    about the setpoint, so the caller falls through to the ordinary approach and
+    lets the timeout be the thing that speaks.
+    """
+    try:
+        value = float(read_pv())
+    except Exception:                                     # pragma: no cover
+        logger.warning("eis_validate_first_pv_unreadable", exc_info=True)
+        return float("nan")
+    return value if math.isfinite(value) else float("nan")
+
+
+def _unheated_report(plan: ValidationPlan, pv_c: float) -> ApproachReport:
+    """The temperature axis, satisfied at the first finite PV. Nothing waited.
+
+    ``reached=True`` with ``elapsed_s=0`` is the honest record: no approach was
+    judged because none was asked for. The PV is carried so the run's own record
+    says what ambient actually gave, which is the only temperature number an
+    unheated run has.
+    """
+    from softae.core.safe_park import DEFAULT_SAFE_TEMP_C
+
+    logger.info("eis_validate_unheated", target=float(plan.temp_setpoint_c),
+                pv=float(pv_c), park_c=float(DEFAULT_SAFE_TEMP_C))
+    print(f"[approach] temperature UNHEATED: setpoint "
+          f"{plan.temp_setpoint_c:g} C is at or below the park temperature "
+          f"{DEFAULT_SAFE_TEMP_C:g} C, so the heater is OFF and the condition is "
+          f"whatever ambient gives -- PV {pv_c:g} C. No tolerance applies and "
+          f"nothing is waited for; --tolerance-c {plan.tolerance_c:g} still "
+          f"governs the hold watch.", flush=True)
+    return ApproachReport("temperature", float(plan.temp_setpoint_c), True,
+                          0.0, float(pv_c), 1, 0.0)
 
 
 def _release_rh(rh: Any) -> None:
@@ -1003,10 +1422,69 @@ def _report_dry_purge(rh: Any) -> None:
           f"not pay for the descent twice.", flush=True)
 
 
+def _hold_in_band(
+    read_pv: Any, target: float, tolerance: float, dwell_s: float, *,
+    axis: str, poll_interval_s: float, sleep: Any, now: Any,
+) -> tuple[float, float, bool]:
+    """Watch an axis stay in band for *dwell_s*. ``(elapsed, pv, held)``.
+
+    The second half of an arrival. ``approach_setpoint`` returns on the **first**
+    sample inside tolerance, and a PV crossing the band on its way somewhere else
+    produces exactly that sample -- so "reached" has meant "was briefly here" for
+    as long as this tool has existed.
+
+    Bounded by the dwell and by nothing else: a break is reported rather than
+    waited out, and the caller decides what to do about it. **What it does is
+    re-enter the approach on the REMAINING budget** -- a break used to cost one
+    of :func:`_approach_one`'s two attempts, which is what refused
+    ``20260914T005931Z`` after 7 min of a 5400 s bound.
+    ``dwell_s <= 0`` returns immediately with ``held=True``, which is the
+    pre-existing behaviour byte-for-byte.
+
+    *tolerance* here is the **dwell** band, which is not always the arrival band:
+    see :func:`_approach_one`'s ``dwell_tolerance``.
+    """
+    clock = now or time.monotonic
+    wait = sleep or time.sleep
+    pv = float(target)
+    if dwell_s <= 0:
+        return 0.0, pv, True
+    started = float(clock())
+    interval = max(1.0, float(poll_interval_s))
+    while True:
+        wait(interval)
+        try:
+            pv = float(read_pv())
+        except Exception:                                 # pragma: no cover
+            logger.warning("eis_validate_dwell_pv_unreadable", axis=axis,
+                           exc_info=True)
+            return float(clock()) - started, pv, False
+        elapsed = float(clock()) - started
+        if not math.isfinite(pv) or abs(pv - float(target)) > float(tolerance):
+            logger.warning("eis_validate_approach_dwell_broken", axis=axis,
+                           target=float(target), pv=pv, held_s=elapsed,
+                           dwell_s=float(dwell_s))
+            print(f"[approach] {axis} LEFT THE BAND after {elapsed:.0f} s of the "
+                  f"{dwell_s:.0f} s dwell (PV {pv:g}, target {target:g} +/- "
+                  f"{tolerance:g}): one in-band poll was not an arrival.",
+                  flush=True)
+            return elapsed, pv, False
+        if elapsed >= float(dwell_s):
+            return elapsed, pv, True
+
+
+#: Approaches that returned ``reached=False`` before the axis is given up on --
+#: the pre-existing "one bounded retry, then refuse" policy, unchanged. It counts
+#: only the **never got there** shape; a broken dwell is a different event and is
+#: charged in seconds instead. See :func:`_approach_one`.
+_APPROACH_MISS_LIMIT = 2
+
+
 def _approach_one(
     approach_setpoint: Any, read_pv: Any, target: float, *, axis: str,
     instrument: str, tolerance: float, timeout_s: float,
     poll_interval_s: float, sleep: Any, now: Any, lead_s: float = 0.0,
+    dwell_s: float = 0.0, dwell_tolerance: float | None = None,
 ) -> ApproachReport:
     """One axis, one bounded retry, then refuse. **The first policy inversion.**
 
@@ -1022,38 +1500,106 @@ def _approach_one(
     that was descending exactly as measured. The lead is *reported* rather than
     charged -- :attr:`ApproachReport.lead_s`, with
     :attr:`ApproachReport.driven_s` for the total time under command.
+
+    **A BROKEN DWELL IS NOT A CONSUMED ATTEMPT, and this is the second policy
+    inversion.** The two-attempt rule was written for *never got there*; a dwell
+    break is *got there, then wandered off*, and the two differ in what they cost
+    to retry. Charging a break a whole attempt refused ``20260914T005931Z`` after
+    7 min of a 5400 s bound -- the RH loop overshoots on restart (+3.7 %RH at a
+    23 % setpoint) and then limit-cycles, so two breaks a few minutes apart spent
+    both attempts while the budget sat untouched. A break now costs the **time it
+    took** and the approach is re-entered on ``timeout_s`` minus what has been
+    spent, until the dwell holds or the budget is gone. ``reached=False``
+    unchanged: :data:`_APPROACH_MISS_LIMIT` attempts of the full bound, then
+    refuse.
+
+    *dwell_tolerance* is the band the dwell is judged against, defaulting to
+    *tolerance* -- the arrival band -- and widened by the RH caller to the
+    stability band the settle window will use. Judging a 600 s dwell against
+    2 %RH while the run's own settle gate is set to 3 %RH makes the wider band
+    unreachable: the approach refuses before the gate it feeds ever runs.
     """
-    elapsed = 0.0
-    for attempt in (1, 2):
+    dwell_tol = float(tolerance if dwell_tolerance is None else dwell_tolerance)
+    elapsed = 0.0           # judged windows only: the quantity `timeout_s` names
+    dwelled = 0.0
+    spent = 0.0             # judged windows PLUS broken dwells: the retry budget
+    attempts = misses = breaks = 0
+    last_pv = float("nan")
+    break_pvs: list[float] = []
+    while True:
+        before = spent
+        budget = float(timeout_s) - (spent if breaks else 0.0)
+        # `breaks and` so that a nonsensical `timeout_s <= 0` still refuses by
+        # the miss path, in the words it always refused in, rather than by this
+        # one. Before a break, `budget` IS `timeout_s` and nothing is deducted.
+        if breaks and budget <= 0.0:
+            break
         outcome = approach_setpoint(
             read_pv, float(target), axis=axis, instrument=instrument,
-            tolerance=float(tolerance), timeout_s=float(timeout_s),
+            tolerance=float(tolerance), timeout_s=budget,
             poll_interval_s=float(poll_interval_s), sleep=sleep, now=now,
         )
+        attempts += 1
         elapsed += float(outcome.elapsed_s)
+        spent += float(outcome.elapsed_s)
+        last_pv = float(outcome.pv_final)
         if outcome.reached:
-            logger.info("eis_validate_approach_reached", axis=axis,
-                        target=float(target), pv=float(outcome.pv_final),
-                        elapsed_s=elapsed, lead_s=float(lead_s),
-                        attempts=attempt)
-            return ApproachReport(axis, float(target), True, elapsed,
-                                  float(outcome.pv_final), attempt,
-                                  float(lead_s))
+            held_s, pv_held, held = _hold_in_band(
+                read_pv, float(target), dwell_tol, float(dwell_s),
+                axis=axis, poll_interval_s=poll_interval_s, sleep=sleep, now=now)
+            dwelled += held_s
+            if held:
+                logger.info("eis_validate_approach_reached", axis=axis,
+                            target=float(target), pv=float(outcome.pv_final),
+                            elapsed_s=elapsed, lead_s=float(lead_s),
+                            dwell_s=dwelled, attempts=attempts)
+                return ApproachReport(axis, float(target), True, elapsed,
+                                      float(outcome.pv_final), attempts,
+                                      float(lead_s), dwelled)
+            breaks += 1
+            spent += float(held_s)
+            last_pv = float(pv_held)
+            break_pvs.append(float(pv_held))
+            logger.warning("eis_validate_approach_dwell_retry", axis=axis,
+                           target=float(target), pv=float(pv_held),
+                           breaks=breaks, spent_s=spent,
+                           remaining_s=float(timeout_s) - spent)
+            # Liveness, not defensiveness: the budget is only ever spent by the
+            # clock, so a cycle that charged nothing cannot be repeated to any
+            # end. Refuse on the evidence rather than spin.
+            if spent <= before:
+                break
+            continue
+        misses += 1
         logger.warning("eis_validate_approach_timeout", axis=axis,
                        target=float(target), pv=float(outcome.pv_final),
-                       attempt=attempt, timeout_s=float(timeout_s),
+                       attempt=attempts, timeout_s=budget,
                        lead_s=float(lead_s))
+        if misses >= _APPROACH_MISS_LIMIT:
+            break
     # The lead is named in the refusal because it changes what the refusal
     # means: a chamber that missed the band having had the whole heat as a head
     # start is a different diagnosis from one that missed it from a cold write.
     head_start = (f", after already driving for {lead_s / 60:.0f} min during the "
                   "temperature approach" if lead_s > 0 else "")
+    tail = ("A validation run on an unequilibrated cell measures the drying "
+            "transient, not the material -- refusing to start.")
+    if breaks:
+        # Never "two attempts of {timeout_s} s" when no attempt ran anywhere near
+        # that long: the v4 refusal quoted 5400 s having spent 400, and the
+        # operator read it as a chamber that could not get there in 90 minutes.
+        raise RefuseToStart(
+            f"{axis} reached {target:g} but would not HOLD it: {breaks} dwell "
+            f"break(s) across {attempts} approach(es), {spent:.0f} s spent "
+            f"against a {timeout_s:.0f} s budget. The dwell asks for {dwell_s:.0f} s "
+            f"within {dwell_tol:g} of {target:g}; the PV at the breaks ran "
+            f"{min(break_pvs):g} to {max(break_pvs):g} (last {last_pv:g})"
+            f"{head_start}. {tail}"
+        )
     raise RefuseToStart(
         f"{axis} never reached {target:g} within {tolerance:g} after two "
-        f"attempts of {timeout_s:.0f} s (last PV {outcome.pv_final:g})"
-        f"{head_start}. "
-        "A validation run on an unequilibrated cell measures the drying "
-        "transient, not the material -- refusing to start."
+        f"attempts of {timeout_s:.0f} s (last PV {last_pv:g})"
+        f"{head_start}. " + tail
     )
 
 
@@ -1103,6 +1649,28 @@ class SettleOutcome:
     #: Reported and never routed on -- pooling certifies the population and this
     #: gate's endpoints are per cell.
     pooled_rate_per_hour: float | None = None
+    #: Which criterion ROUTED, so a refusal can name the right cause. Defaults to
+    #: the shipped one, which keeps every existing construction -- including
+    #: every test's -- reading exactly as it did.
+    settle_criterion: str = DEFAULT_SETTLE_CRITERION
+    #: The rate band this run was held to, in the operator's unit. ``None`` when
+    #: no rate was computed.
+    rate_tol_dec_per_h: float | None = None
+    #: Span of the **last judged rate window**, seconds. The quantity that is
+    #: pinned by the round period and NOT by the round count, which is the whole
+    #: content of :func:`_tolerance_clause`'s rate branch.
+    rate_span_s: float | None = None
+    #: How many trailing rounds the rate criterion read -- a count, not a span.
+    rate_window_rounds: int = 0
+    #: The last window's detection floor, dec/h: the narrowest band a cell at the
+    #: board's median residual could have certified over it.
+    reference_half_width_dec_per_h: float | None = None
+    #: The RH stability band this run was held to, %RH, or ``None`` for OFF.
+    rh_stability_pct: float | None = None
+    #: Median achieved spread of the per-round RH medians across the judged
+    #: windows, %RH. The number the ceiling refusal suggests a band from, and a
+    #: floor rather than a guarantee -- the worst window was wider than this.
+    rh_spread_median_pct: float | None = None
 
     @property
     def certified(self) -> bool:
@@ -1143,12 +1711,14 @@ def settle_phase(
     from softae.analysis.eis.arc import arc_closure
     from softae.analysis.equilibration import (
         DEFAULT_MIN_HOLD_FIRST_S,
-        DEFAULT_RH_STABILITY_PCT,
+        SETTLE_CRITERION_BOTH,
         SETTLE_CRITERION_DEVIATION,
+        SETTLE_CRITERION_RATE,
         SETTLE_DISABLED,
         SettleTracker,
         r1_lower_bound_ohms,
         rate_tol_ln_per_hour,
+        rh_window_spread,
     )
     from softae.workflows.equilibration import default_round_period_s
 
@@ -1184,9 +1754,16 @@ def settle_phase(
     criterion = str(plan.settle_criterion)
     rate_tol = (None if criterion == SETTLE_CRITERION_DEVIATION
                 else rate_tol_ln_per_hour(plan.settle_rate_tol_dec_per_h))
+    #
+    # `rh_stability_pct` comes from the plan too, and for the same reason: it was
+    # the constant, unnameable from any `--help` and quoted in no console line or
+    # refusal, and an RH zone whose control hunts wider than 1.5 %RH could never
+    # certify while nothing anywhere said which number was blocking it. `None`
+    # here is the gate OFF, which is how a typed `0` arrives -- never `0.0`,
+    # which would refuse every window ever observed.
     tracker = SettleTracker(
         enabled=True, tol_rel=plan.settle_tol_rel,
-        rh_stability_pct=DEFAULT_RH_STABILITY_PCT,
+        rh_stability_pct=plan.rh_stability_pct,
         r1_bound_ohms=r1_lower_bound_ohms(plan.circuit_model),
         criterion=criterion, rate_tol_per_hour=rate_tol)
     if (wide := loose_band_notice(plan.settle_tol_rel)):
@@ -1200,6 +1777,59 @@ def settle_phase(
     endorsed: bool | None = None
     endorsement = ""
     floor_rel: float | None = None
+    #: Every judged window's RH spread, for the ceiling's suggestion. The
+    #: *median*, not the worst, is what gets suggested -- and it is stated as a
+    #: floor rather than a guarantee, exactly as `suggested_settle_tol_rel` is.
+    rh_spreads: list[float] = []
+    #: The harness's OWN list of round RH medians, kept beside the tracker's
+    #: rather than read from it, because during the preroll the tracker has not
+    #: been told about these rounds at all.
+    preroll_medians: list[float | None] = []
+    # THE RH PREROLL. The tool writes the RH setpoint and starts the loop at
+    # launch, then starts the settle clock ~30 s later -- so its own actuation
+    # transient sits inside its own regressor. On 20260913T171305Z five cells
+    # were reported MOVING at -0.02 to -0.047 dec/h while RH fell 22.40 -> 20.0 %
+    # over rounds 6-8: a real slope, caused by the rig, judged as a property of
+    # the film.
+    #
+    # The discrimination is the ROUND-CADENCE RH SPREAD, which only the settle
+    # rounds observe -- `--approach-dwell-s` cannot see it, because RH was inside
+    # 2 %RH of its setpoint the whole time. Rounds taken before that spread
+    # settles are still swept, still narrated and still charged to the ceiling;
+    # what they do not do is enter `tracker.observe`, so the transient never
+    # reaches the regressor.
+    #
+    # Discarded at the HARNESS, never in `SettleTracker`: that class is shared
+    # with `softae.core.autonomous_wiring.drive_settle_phase`, and this is a
+    # property of how *this tool* commands the chamber.
+    #
+    # THE BAND IS THE FLAG'S, NEVER THE CONSTANT'S. In a zone whose control
+    # swings +/-2 %RH a preroll held to the hardcoded 1.5 would never end, and
+    # the whole hold would be spent in rounds that are swept, narrated and never
+    # judged -- the exact failure the band was made nameable to prevent. `None`
+    # (the gate off) therefore means NO preroll, not an unsatisfiable one.
+    #
+    # **Where it applies, and the line is one this module already drew.** The
+    # transient's harm is to a REGRESSED SLOPE; the deviation criterion is a
+    # 3-round scatter about its own window mean, which the RH clause already
+    # refuses on directly. So there is no preroll under `deviation` -- and none
+    # under plain `both` either, because withholding rounds there would shift the
+    # DEVIATION window and `both` is defined as producing a verdict identical to
+    # `deviation`'s (`test_settle_phase_both_mode_verdict_is_identical_to_
+    # deviation` asserts it field by field, on every round). A shadow that moves
+    # the thing it is shadowing is not a shadow, and the comparison a cutover
+    # needs would be between two different windows.
+    #
+    # The spec asked for it "whenever the criterion is not deviation", which
+    # includes plain `both`; that does not survive contact with the shadow
+    # invariant, so the exception is carved exactly where `_announce_rate_floor`
+    # already carves it: under `both --survivors on` the rate DECIDES THE
+    # PARTITION, so keeping the transient out of it is not new power -- it is the
+    # same power the partition already has, exercised on cleaner evidence.
+    rh_window = int(tracker.n_rounds)     # == DEFAULT_SETTLE_N_ROUNDS today
+    rate_routes = (criterion == SETTLE_CRITERION_RATE
+                   or (criterion == SETTLE_CRITERION_BOTH and plan.survivors))
+    in_preroll = plan.rh_stability_pct is not None and rate_routes
 
     while True:
         fits: list[Any] = []
@@ -1224,7 +1854,24 @@ def settle_phase(
         # with `tracker.rounds` the way `rh_medians` already is. A duration since
         # the phase began -- never a target, and no setpoint enters here.
         elapsed = float(now()) - start
-        check = tracker.observe(fits, rh_median_pct=rh_median, t_s=elapsed)
+        preroll_medians.append(rh_median)
+        # Evaluated only over a FULL window: `rh_window_spread` over one or two
+        # medians is a range of one or two numbers, which is small for the wrong
+        # reason and would end the preroll on the first round every time -- the
+        # "unknown spelled like quiet" shape.
+        preroll_spread = (
+            rh_window_spread(preroll_medians[-rh_window:])
+            if len(preroll_medians) >= rh_window else None)
+        if in_preroll and preroll_spread is not None and (
+                preroll_spread <= float(plan.rh_stability_pct)):
+            in_preroll = False
+            print(f"[settle] the room is QUIET: the last {rh_window} round "
+                  f"medians span {preroll_spread:.2f} %RH, inside "
+                  f"--rh-stability-pct {plan.rh_stability_pct:g}. The settle "
+                  f"clock starts HERE -- rounds 1-{rounds - 1} were swept and "
+                  f"recorded but are not in the regressor.", flush=True)
+        check = (None if in_preroll
+                 else tracker.observe(fits, rh_median_pct=rh_median, t_s=elapsed))
         endorsed, endorsement, floor_rel = tracker.endorsement()
         deviations = settle_deviations(
             tracker.rounds[-tracker.n_rounds:],
@@ -1235,7 +1882,8 @@ def settle_phase(
                  if check is not None and check.max_deviation_rel is not None
                  else float("nan"))
         rh_text = "  n/a" if rh_median is None else f"{rh_median:5.1f}"
-        state = "SETTLED" if tracker.settled else "not yet"
+        state = ("PREROLL" if in_preroll
+                 else "SETTLED" if tracker.settled else "not yet")
         n_in = (f"{len(check.participating)}" if check is not None
                 else "-")   # no trailing window yet: not zero channels, no verdict
         # Named, bounded and attributed. `spread 0.130` was read as %RH by an
@@ -1247,13 +1895,31 @@ def settle_phase(
         # named. `settle_check`'s own reason string already formats it this way.
         drift_text = "    n/a" if math.isnan(drift) else f"{drift * 100:6.2f}%"
         worst_text = "n/a " if worst_channel is None else f"ch{worst_channel:<3}"
-        print(f"[settle] round {rounds:<3} RH {rh_text} %RH  "
+        # The SPREAD beside the median, because the spread is the quantity the
+        # gate actually judges and the median is not. Four windows on
+        # 20260913T171305Z were blocked on `rh_moved` and the console printed
+        # `-> not yet` and nothing else: the spread reached the payload, and so
+        # only the stream. Both numbers, and the band, in one place.
+        if tracker.rh_spread_pct is not None:
+            rh_spreads.append(float(tracker.rh_spread_pct))
+        # During the preroll the tracker has seen no rounds, so its spread is
+        # `None` and the harness's own is the only one there is -- and it is the
+        # number the preroll is actually deciding on, so it is what gets shown.
+        shown_spread = (preroll_spread if in_preroll else tracker.rh_spread_pct)
+        band_text = ("off" if plan.rh_stability_pct is None
+                     else f"{plan.rh_stability_pct:.2f}")
+        spread_text = ("  n/a" if shown_spread is None
+                       else f"{shown_spread:5.2f}")
+        print(f"[settle] round {rounds:<3} RH {rh_text} %RH (spread "
+              f"{spread_text} / {band_text})  "
               f"sigma drift {drift_text} (tol {tracker.tol_rel * 100:.2f}%)  "
               f"worst {worst_text} channels {n_in}/{len(plan.channels)}  "
               f"-> {state}", flush=True)
         if check is not None and not check.evaluable:
             print(f"         not evaluable: {check.reason}", flush=True)
+        _announce_rh_moved(tracker, plan, check)
         _announce_rate(tracker, plan)
+        rate_floor_refusal = _announce_rate_floor(tracker, plan, announced)
         _announce_endorsement(tracker, endorsed, endorsement, announced,
                               floor_rel=floor_rel)
         _announce_basis(fits, check, tracker.min_channels, plan.circuit_model,
@@ -1261,13 +1927,28 @@ def settle_phase(
         # Routed through `_observe` for the reason `_observe` exists: the table
         # is a monitoring convenience and must never be why a gate refuses.
         _observe(_print_trend, "eis_validate_trend_render_failed",
-                 tracker.rounds, plan, check, apexes, rounds)
+                 tracker.rounds, plan, check, apexes, rounds,
+                 fits if in_preroll else None)
         _observe(on_round, "eis_validate_settle_observer_failed", {
             "round": rounds,
             "elapsed_s": round(elapsed, 1),
             "rh_median_pct": None if rh_median is None else round(rh_median, 2),
-            "rh_spread_pct": (None if tracker.rh_spread_pct is None
-                              else round(tracker.rh_spread_pct, 3)),
+            "rh_spread_pct": (None if shown_spread is None
+                              else round(shown_spread, 3)),
+            # Was this round SWEPT AND NARRATED BUT NOT JUDGED? Stamped on every
+            # round, including `false`, on `rh_stability_pct`'s own argument: an
+            # absent key would spell "the preroll is not a thing in this run"
+            # with the same token as "this round was judged". Without it a reader
+            # of the stream cannot tell a round that entered the regressor from
+            # one that did not, and the whole point of the preroll is which is
+            # which.
+            "preroll": bool(in_preroll),
+            # Stamped on EVERY round, including when it is `None`, and that is
+            # the point: `null` here means the gate is OFF, and an absent key
+            # would be indistinguishable from a band that was satisfied. The
+            # spread beside it is the achieved value, so the two together say
+            # whether the room was judged at all and against what.
+            "rh_stability_pct": plan.rh_stability_pct,
             "tol_rel": tracker.tol_rel,
             "worst_deviation_rel": None if math.isnan(drift) else round(drift, 5),
             "worst_channel": worst_channel,
@@ -1300,6 +1981,12 @@ def settle_phase(
             **_rate_payload(tracker),
         })
 
+        # AFTER the round reached the stream, never before: the round that
+        # refuses is the one a reader most needs, and raising above this line
+        # would lose it exactly the way console scrollback lost the 2026-08-21
+        # rounds.
+        if rate_floor_refusal:
+            raise RefuseToStart(rate_floor_refusal)
         if tracker.settled and elapsed >= floor_s:
             stopped_early = True
             break
@@ -1315,9 +2002,40 @@ def settle_phase(
         rh_median_pct=_read_rh(rh) if rh is not None else float("nan"),
         tolerance_achievable=endorsed, endorsement=endorsement,
         noise_floor_rel=floor_rel,
+        # Carried onto the outcome so the refusal can name the cause that
+        # actually routed. Without the criterion here `_tolerance_clause` can
+        # only guess, and it guessed "more rounds" -- which is false under the
+        # rate criterion and told the 2026-09-13 operator to wait longer.
+        settle_criterion=criterion,
+        rh_stability_pct=plan.rh_stability_pct,
+        rh_spread_median_pct=(sorted(rh_spreads)[len(rh_spreads) // 2]
+                              if rh_spreads else None),
     )
+    _record_rate_window(outcome, tracker, plan)
     _apply_survivors(outcome, tracker, plan)
     return outcome
+
+
+def _record_rate_window(
+    outcome: SettleOutcome, tracker: Any, plan: ValidationPlan
+) -> None:
+    """The last judged rate window, in the operator's unit, onto the outcome.
+
+    Separate from :func:`_apply_survivors` because it records unconditionally --
+    including under ``both``, where the rate routed nothing -- and survivors is
+    about routing. Silent under ``deviation``, where no rate exists at all.
+    """
+    from softae.analysis.equilibration import LN_PER_DECADE
+
+    rate = tracker.last_rate
+    outcome.rate_window_rounds = int(tracker.rate_window_rounds)
+    if rate is None:
+        return
+    outcome.rate_tol_dec_per_h = float(plan.settle_rate_tol_dec_per_h)
+    outcome.rate_span_s = float(rate.span_s)
+    half_width = getattr(rate, "reference_half_width_per_hour", None)
+    if half_width is not None:
+        outcome.reference_half_width_dec_per_h = float(half_width) / LN_PER_DECADE
 
 
 def _apply_survivors(
@@ -1474,6 +2192,110 @@ def _announce_rate(tracker: Any, plan: ValidationPlan) -> None:
               + " -- a proven slope, which no partition may drop", flush=True)
 
 
+def _announce_rh_moved(tracker: Any, plan: ValidationPlan, check: Any) -> None:
+    """Say, on the round it happens, that the ROOM held the window -- not the film.
+
+    **An addition, not a citation.** The reason string is printed under
+    ``if not check.evaluable``, and :meth:`SettleTracker._apply_rh_clause` clears
+    ``settled`` while leaving ``evaluable`` **True** -- so a window blocked by the
+    RH clause took the one branch that prints nothing. Rounds 3, 5, 6 and 7 of
+    20260913T171305Z printed ``-> not yet`` and no reason at all, and
+    ``RH_MOVED`` appears zero times anywhere in :mod:`softae.tools`.
+
+    The two diagnoses want opposite responses, exactly as
+    :func:`_announce_basis`'s two do: a film still moving wants a longer hold,
+    and a room hunting wider than the band wants a wider band or a different
+    zone. Printed every round it fires rather than once, because unlike an
+    endorsement this is a property of the *window* and not of the board -- it
+    comes and goes, and which rounds it took is the diagnosis.
+    """
+    from softae.analysis.equilibration import RH_MOVED
+
+    if check is None or not check.evaluable or RH_MOVED not in check.reason:
+        return
+    band = plan.rh_stability_pct
+    spread = tracker.rh_spread_pct
+    held = (" -- this window WOULD have certified but for the room"
+            if tracker.rh_blocked_settle else "")
+    print(f"         held by a MOVING ROOM: the per-round RH medians span "
+          f"{spread:.2f} %RH across the judged window, above --rh-stability-pct "
+          f"{band:g}{held}. That is a SPREAD judged against itself, not a "
+          f"distance from the setpoint: --rh-tolerance-pct cannot touch it.",
+          flush=True)
+
+
+def _announce_rate_floor(
+    tracker: Any, plan: ValidationPlan, announced: dict[str, Any]
+) -> str:
+    """The smallest band this window could certify; ``""``, or a refusal to raise.
+
+    **Sticky, and keyed on the comparison rather than on the number.** The floor
+    itself moves a little every round, so announcing on every change would be
+    announcing every round. What matters -- and what an operator acts on -- is
+    whether their band sits *below* it, and that is a boolean that moved exactly
+    once on 20260913T171305Z: true at round 6, false from round 7, with 33 min
+    still to burn. Announced at the first rate-evaluable window whatever the
+    answer, and again whenever the answer changes.
+
+    **Refuse or warn, and the split is about routing power.** Under plain
+    ``both`` the rate is explicitly a SHADOW -- deviation routes -- so letting it
+    end a run would be exactly the "routing power on the strength of an argument"
+    that mode exists to prevent, and the line is a warning. Under ``rate`` it
+    already routes. Under ``both --survivors on`` it already decides the
+    partition, so refusing here is not new power: it is the same power exercised
+    42 minutes earlier, before the ceiling is spent.
+    """
+    from softae.analysis.equilibration import (
+        LN_PER_DECADE,
+        SETTLE_CRITERION_BOTH,
+    )
+
+    rate = tracker.last_rate
+    half_width = None if rate is None else getattr(
+        rate, "reference_half_width_per_hour", None)
+    if half_width is None:
+        return ""
+    floor = float(half_width) / LN_PER_DECADE
+    band = float(plan.settle_rate_tol_dec_per_h)
+    below = floor > band
+    if "rate_floor" in announced and announced["rate_floor"] is below:
+        return ""
+    announced["rate_floor"] = below
+    print(rate_floor_line(floor, band, float(rate.span_s)), flush=True)
+    if not below:
+        return ""
+    # **The floor is a MEDIAN and the criterion is PER CELL, so a board that
+    # certified even one quiet cell has DEMONSTRATED this window can resolve the
+    # band.** The spec recommended refusing on the floor alone under `rate` and
+    # under `both --survivors on`; that does not survive contact with the
+    # survivors feature, which exists precisely for a board where most cells are
+    # unjudgeable and a few are not. On such a board the median residual is a
+    # noisy cell's, the floor exceeds any admissible band, and refusing would
+    # refuse on a statistic about the cells the partition is dropping anyway.
+    # So the refusal needs the second half: nobody certified either, which makes
+    # the window the finding rather than the cells. The WARNING is unconditional
+    # and is where the diagnostic value actually is.
+    if getattr(rate, "quiet", None):
+        return ""
+    if tracker.criterion == SETTLE_CRITERION_BOTH and not plan.survivors:
+        print("         WARNING only: under --settle-criterion both the rate is "
+              "a SHADOW and deviation is what routes, so this does not stop the "
+              "run. Under 'rate', or under 'both --survivors on', it does.",
+              flush=True)
+        return ""
+    # RETURNED, not raised. The caller raises it only after this round has
+    # reached `on_round` -- the refusing round is the single most useful one in
+    # the stream, and a refusal that swallowed it would repeat the failure the
+    # whole `on_round` hook exists to fix.
+    return (
+        f"the rate band is below what this observation can resolve. "
+        f"{rate_floor_line(floor, band, float(rate.span_s)).strip()} "
+        f"Holding to the ceiling would spend the whole block to report "
+        f"`rate_undetectable` on every quiet cell -- which is a statement about "
+        f"the window, not about the film."
+    )
+
+
 def _rate_payload(tracker: Any) -> dict[str, Any]:
     """The rate's share of the ``on_round`` record -- **empty by default**.
 
@@ -1490,15 +2312,38 @@ def _rate_payload(tracker: Any) -> dict[str, Any]:
     rate = tracker.last_rate
     if rate is None:
         return {}
-    per_channel = {
-        str(ch): round(judged.rate_per_hour / LN_PER_DECADE, 6)
-        for ch, judged in sorted(rate.by_channel.items())
-        if judged.rate_per_hour is not None
-    }
+    judged_rates = sorted(rate.by_channel.items())
+
+    def _per_channel(attribute: str, *, decades: bool = True) -> dict[str, float]:
+        return {
+            str(ch): round(value / (LN_PER_DECADE if decades else 1.0), 6)
+            for ch, judged in judged_rates
+            if (value := getattr(judged, attribute, None)) is not None
+        }
+
+    per_channel = _per_channel("rate_per_hour")
     return {
         "rate_evaluable": bool(rate.evaluable),
         "rate_settled": bool(rate.settled),
         "rate_dec_per_h_by_channel": per_channel,
+        # **The three halves of "would a wider band have certified?"**, which the
+        # run that asked it could not answer from its own record. Every per-cell
+        # verdict is `U = |rate| + t(0.975, k-2)*SE`, and the stream carried the
+        # rate and not the SE -- so round 10's ten `rate_undetectable` verdicts
+        # on 20260913T171305Z could not be re-scored against ANY other band
+        # without repeating the 99 minutes.
+        #
+        # Admissible on exactly the line `deviation_rel_by_channel` already sits
+        # on: a standard error, a residual RMS and a one-sided bound are GATE
+        # STATE in per-hour units, not the observable behind them. `sigma` and
+        # `r1` stay out of this stream and out of these names -- the raw-byte
+        # vocabulary assertion in `TestRunNarration` is what holds that line.
+        "stderr_dec_per_h_by_channel": _per_channel("stderr_per_hour"),
+        "upper_bound_dec_per_h_by_channel": _per_channel("upper_bound_per_hour"),
+        # NOT converted: `resid_rel` is a residual RMS in ln units, i.e. already
+        # a dimensionless relative scatter, and dividing it by ln(10) would make
+        # it a per-decade quantity it is not.
+        "resid_rel_by_channel": _per_channel("resid_rel", decades=False),
         "pooled_rate_dec_per_h": (
             None if rate.pooled_rate_per_hour is None
             else round(rate.pooled_rate_per_hour / LN_PER_DECADE, 6)),
@@ -1506,8 +2351,44 @@ def _rate_payload(tracker: Any) -> dict[str, Any]:
         "rate_moving": list(rate.moving),
         "rate_unjudgeable": sorted(rate.undetectable + rate.unsettleable),
         "rate_span_s": round(rate.span_s, 1),
+        # The window's own detection floor -- what a cell at the board's median
+        # residual could have certified over this span. `rate_check` has always
+        # computed it and `_channel_rate` has always read it; it never left the
+        # function, so a reader of the stream could not tell a band the film
+        # failed from a band the OBSERVATION could not resolve. A rate in the
+        # gate's per-hour units, on exactly the line the rates already sit on.
+        "reference_half_width_dec_per_h": (
+            None if getattr(rate, "reference_half_width_per_hour", None) is None
+            else round(rate.reference_half_width_per_hour / LN_PER_DECADE, 6)),
+        # Which (channel, round) pairs the physical consensus rule took out of a
+        # regression, and -- separately -- whether it could look at all. The two
+        # must never collapse: an empty list beside `false` says every channel's
+        # window was one shape, and an empty list beside `true` says no round
+        # carried a shape to compare, which is a feeder that has not shipped its
+        # half rather than a clean board.
+        "rate_excluded_rounds": [
+            {"channel": int(entry.channel), "round": int(entry.round_index),
+             "reason": _excluded_round_word(entry)}
+            for entry in getattr(rate, "excluded_rounds", ())],
+        "rate_consensus_unavailable": bool(
+            getattr(rate, "consensus_unavailable", False)),
         "rate_reason": rate.reason,
     }
+
+
+def _excluded_round_word(entry: Any) -> str:
+    """One :class:`ExcludedRound`, in the vocabulary a stream may carry.
+
+    ``_narrated_exclusions``' rule, one level down and for a sharper reason: the
+    raw-byte assertion in ``TestRunNarration`` forbids ``arc_state`` by name, and
+    :data:`CONSENSUS_ARC_STATE` **is** that string. So the reason is rebuilt from
+    the entry's parts rather than edited, which is why ``ExcludedRound`` carries
+    ``observed`` and ``consensus`` beside the prose.
+    """
+    from softae.analysis.equilibration import CONSENSUS_ARC_STATE
+
+    noun = "arc" if entry.kind == CONSENSUS_ARC_STATE else "masked-point band"
+    return f"{noun} {entry.observed} vs consensus {entry.consensus}"
 
 
 def _announce_survivors(outcome: SettleOutcome, min_channels: int) -> None:
@@ -1525,10 +2406,12 @@ def _announce_survivors(outcome: SettleOutcome, min_channels: int) -> None:
             f"{census.get(UNRESOLVED, 0)}; the gate's minimum is "
             f"{int(min_channels)}.", flush=True)
     print("         Every number this run reports is now CONDITIONAL ON "
-          "SETTLING. Dropped cells are still swept and are stamped so the "
-          "population filter excludes them, and the reason for each is in the "
-          "run's event stream -- read the survivor set as a subset, never as "
-          "the board.", flush=True)
+          "SETTLING. Dropped cells are still swept and their numbers are KEPT "
+          "in the accuracy tables -- nothing filters them out -- so each one is "
+          "stamped instead, counted in the report's RETAINED UNCERTIFIED note "
+          "and partitionable offline on stillness_certified, with the reason in "
+          "the run's event stream -- read the survivor set as a subset, never "
+          "as the board.", flush=True)
 
 
 def _announce_basis(
@@ -1780,6 +2663,7 @@ def band_by_channel(
 def _print_trend(
     history: list[Any], plan: ValidationPlan, check: Any,
     apexes: dict[int, float], round_index: int,
+    preroll_fits: Sequence[Any] | None = None,
 ) -> None:
     """The per-channel signed table, under the round's ``[settle]`` line.
 
@@ -1796,18 +2680,30 @@ def _print_trend(
     passed through because the operator has been correlating drift against it by
     hand -- and it is marked provisional in the legend, because ``apexes`` is
     read off pre-equilibration sweeps.
+
+    **A PREROLL round renders its own fits, marked.** *preroll_fits* is
+    non-``None`` exactly on the rounds the preroll withholds from
+    :meth:`~softae.analysis.equilibration.SettleTracker.observe`, and it is
+    appended to a **copy** of the history: the tracker is not touched, nothing
+    here reaches a judged statistic, and the EMA folds only the rounds that were
+    genuinely judged (none, during the preroll -- so `n` reads 0, which is true).
+    Without it a 12-channel board printed ``n/a`` in every cell for four rounds
+    while its fits were being written to disk.
     """
     from softae.tools.eis_validate_trend import (
+        PREROLL_NOTE,
         render_trend_legend,
         render_trend_table,
         trend_rows,
     )
 
     rows = trend_rows(
-        history, plan.channels,
+        history if preroll_fits is None else [*history, list(preroll_fits)],
+        plan.channels,
         bands=band_by_channel(apexes, plan),
         excluded=None if check is None else check.excluded,
         participating=None if check is None else check.participating,
+        default_note="" if preroll_fits is None else PREROLL_NOTE,
     )
     if round_index <= 1:
         print(render_trend_legend(), flush=True)
@@ -1879,7 +2775,19 @@ def _tolerance_clause(outcome: SettleOutcome) -> str:
     Silent when the question was never answerable -- an absent endorsement is
     not an endorsement, and appending "unknown" to a refusal adds nothing an
     operator can act on.
+
+    **The rate branch exists because the deviation sentence is FALSE when the
+    rate routed.** "More rounds were the missing ingredient" is sound advice
+    about the deviation criterion, whose window is three rounds of a growing
+    series. The rate criterion reads a **trailing count** over a fixed cadence
+    (:attr:`~softae.analysis.equilibration.SettleTracker.rate_window_rounds`), so
+    its span is pinned at the round period times the count however many rounds
+    run -- round 20's interval is exactly as wide as round 10's. On 2026-09-13
+    the refusal told the operator that waiting was the fix, and waiting could not
+    have been.
     """
+    if _rate_routed(outcome):
+        return _rate_clause(outcome)
     if outcome.tolerance_achievable is None or not outcome.endorsement:
         return ""
     verdict = ("The tolerance WAS achievable on this run's own scatter, so more "
@@ -1888,6 +2796,64 @@ def _tolerance_clause(outcome: SettleOutcome) -> str:
                "The tolerance was NEVER achievable on this run's own scatter, "
                "so no hold length would have cleared it: ")
     return f" {verdict}{outcome.endorsement}"
+
+
+def _rate_routed(outcome: SettleOutcome) -> bool:
+    """Did the RATE criterion produce the window this refusal is about?
+
+    Both halves are needed. A criterion selector alone is not enough -- under
+    ``deviation`` no rate exists, and under ``both`` a run that never filled the
+    rate window has nothing to quote -- and a computed rate alone is not enough
+    either, since ``both`` computes one it did not route on. Under ``both`` the
+    rate branch still fires, because it is the one that is *true*: the deviation
+    sentence's claim about more rounds is about the deviation window, and a
+    reader looking at a rate band needs the rate window's arithmetic.
+    """
+    return (outcome.settle_criterion != DEFAULT_SETTLE_CRITERION
+            and outcome.rate_span_s is not None)
+
+
+def _rate_clause(outcome: SettleOutcome) -> str:
+    """The trailing-window truth, and the detection floor, in the rate's unit."""
+    span = float(outcome.rate_span_s or 0.0)
+    clause = (
+        f" The RATE criterion was computed on a TRAILING "
+        f"{outcome.rate_window_rounds}-round window whose span stayed at "
+        f"~{span:.0f} s for every judged round, so more rounds would NOT have "
+        f"narrowed any interval.")
+    floor = outcome.reference_half_width_dec_per_h
+    band = outcome.rate_tol_dec_per_h
+    if floor is None or band is None:
+        return clause
+    suggestion = suggested_rate_tol_dec_per_h(floor)
+    widen = ("" if suggestion is None
+             else f" (--settle-rate-tol-dec-per-h {suggestion:g})")
+    return clause + (
+        f" At the last window a cell at the board's median residual could "
+        f"certify no band tighter than {floor:.4f} dec/h, against your "
+        f"{band:g} dec/h. Widen the band{widen}, or lengthen the window by "
+        f"raising the ROUND PERIOD -- not by raising --settle-max-rounds.")
+
+
+def _rh_stability_clause(outcome: SettleOutcome) -> str:
+    """What band this zone's own control could have certified under, or ``""``.
+
+    :func:`suggested_settle_tol_rel`'s posture in the RH axis's unit, and stated
+    with its own limitation: the **median** achieved spread is a floor, not a
+    guarantee -- the worst window of 2026-09-13 was 2.29 %RH against a median of
+    1.28. Silent when the gate was off, when nothing was ever measured, or when
+    the spread never exceeded the band, because then RH is not what held it.
+    """
+    band, spread = outcome.rh_stability_pct, outcome.rh_spread_median_pct
+    if band is None or spread is None or spread <= band:
+        return ""
+    return (f" The room was judged against --rh-stability-pct {band:g} %RH and "
+            f"its per-round medians spanned a median {spread:.2f} %RH across "
+            f"the judged windows: pass --rh-stability-pct "
+            f"{math.ceil(spread):g} to certify under this zone's own control "
+            f"band. That is a FLOOR and not a guarantee -- the worst window was "
+            f"wider than the median -- and it is not --rh-tolerance-pct, which "
+            f"judges only the approach, against the setpoint.")
 
 
 def assert_settle_licensed(outcome: SettleOutcome) -> None:
@@ -1919,7 +2885,8 @@ def assert_settle_licensed(outcome: SettleOutcome) -> None:
             f"{outcome.n_rounds} rounds ({outcome.elapsed_s / 60:.1f} min). "
             "The material was never shown to have stopped moving, and "
             "'undeclared is unknown, never empty' -- refusing to start."
-            + _tolerance_clause(outcome) + survivors
+            + _tolerance_clause(outcome) + _rh_stability_clause(outcome)
+            + survivors
         )
     if outcome.verdict == SETTLE_SURVIVORS:
         # Allowed through, and never silently: this is a weaker claim about a
@@ -2111,12 +3078,52 @@ class HoldWatch:
     grace_s: float = 120.0
     rh_thresholds: dict[str, float] = field(default_factory=dict)
     excursion: bool = False
+    #: What the temperature axis is graded against once an UNHEATED run has taken
+    #: its first reading: ambient as this run found it. ``None`` until then, and
+    #: never set on a heated run. See :meth:`_temperature_reference`.
+    ambient_baseline_c: float | None = None
 
     def __post_init__(self) -> None:
         if not self.rh_thresholds:
             from softae.drivers.contracts import rh_watchdog_config
 
             self.rh_thresholds = rh_watchdog_config()
+
+    def _temperature_reference(self, temp_pv: float) -> float:
+        """What the temperature excursion watch compares the PV against.
+
+        The setpoint, on every heated run -- unchanged, and that is the case this
+        watch was built for.
+
+        **Under** :attr:`ValidationPlan.unheated` **the setpoint is not a target
+        and cannot be the reference.** A setpoint at or below the park
+        temperature means the heater is off; the chamber sits at ambient, which
+        on this rig is 15-20 C above it, so grading the PV against the setpoint
+        would raise a sustained-excursion ``SafetyError`` on the first poll of
+        every unheated run -- the watch reporting, as a fault, the exact
+        condition that was asked for.
+
+        Disabling the axis was rejected: an unheated run still has a
+        temperature, the sample still responds to it, and a room that warms 6 C
+        through an overnight hold has moved the condition whether or not anything
+        drove it. So the reference becomes **this run's own first reading**, and
+        the watch keeps its full warn/fault magnitudes and grace window against
+        it. The claim changes from "the chamber held its target" to "the chamber
+        held where it started", which is the only claim an unheated run was ever
+        entitled to make, and it is a real gate rather than an absent one.
+
+        `nan` is never adopted as the baseline -- a sensor that could not be read
+        at the first poll must not become the thing every later poll is judged
+        against -- so the adoption is retried until a finite reading arrives.
+        """
+        if not self.plan.unheated:
+            return float(self.plan.temp_setpoint_c)
+        if self.ambient_baseline_c is None and math.isfinite(temp_pv):
+            self.ambient_baseline_c = float(temp_pv)
+            logger.info("eis_validate_unheated_baseline", pv=float(temp_pv))
+        return (float(self.plan.temp_setpoint_c)
+                if self.ambient_baseline_c is None
+                else float(self.ambient_baseline_c))
 
     def poll(self) -> None:
         """Sample both axes and grade. Raises ``SafetyError`` on a fault."""
@@ -2135,7 +3142,7 @@ class HoldWatch:
         self.temp_series.append((t, temp_pv))
         self.rh_series.append((t, rh_pv))
 
-        target = float(self.plan.temp_setpoint_c)
+        target = self._temperature_reference(temp_pv)
         if sustained_above(self.temp_series, target, self.fault_c, self.grace_s) or \
                 sustained_below(self.temp_series, target, self.fault_c, self.grace_s):
             raise SafetyError(
@@ -2290,15 +3297,19 @@ def _round_fit(
     )
 
     raw = _low_frequency_real(eis)
-    r1 = _fitted_r1(eis, circuit_model)
-    if r1 is None:
+    fit = _fitted_r1(eis, circuit_model)
+    if fit is None:
         return RoundFit(
             channel=int(channel), sigma=None,
             r1_ohms=None if raw is None else float("nan"),
             basis=BASIS_ABSENT if raw is None else BASIS_FIT_FAILED,
             r_raw_ohms=raw)
-    return RoundFit(channel=int(channel), sigma=1.0 / r1, r1_ohms=r1,
-                    basis=BASIS_FITTED, r_raw_ohms=raw)
+    # `arc_state` and `n_points_dropped` come off the SAME fit that produced R1 --
+    # no second call and no second fit; see `_SettleFit`.
+    return RoundFit(channel=int(channel), sigma=1.0 / fit.r1_ohms,
+                    r1_ohms=fit.r1_ohms, basis=BASIS_FITTED, r_raw_ohms=raw,
+                    arc_state=fit.arc_state,
+                    n_points_dropped=fit.n_points_dropped)
 
 
 def _low_frequency_real(eis: Any) -> float | None:
@@ -2310,8 +3321,36 @@ def _low_frequency_real(eis: Any) -> float | None:
     return value if math.isfinite(value) else None
 
 
-def _fitted_r1(eis: Any, circuit_model: str) -> float | None:
+@dataclass(frozen=True)
+class _SettleFit:
+    """R1, plus the two facts about the **same fit** the consensus rule reads.
+
+    A return type rather than a bare float because the alternative shapes are both
+    worse. Refitting to recover ``arc_state`` would pay a second
+    ``analyze_spectrum`` per channel per round for numbers already in hand one
+    frame up, and it would open the possibility of the two fits disagreeing.
+    Reaching into ``report`` from :func:`_round_fit` would give this module two
+    routes to the fitter where user ruling ``[a23]`` allows one.
+
+    ``n_points_dropped`` is the **fitter's** mask and not
+    ``fit.arc_closure.n_dropped``; ``annotate_arc_closure`` says outright that the
+    two count different masks. ``None`` is "the fitter did not say", which is not
+    the same fact as ``0``.
+    """
+
+    r1_ohms: float
+    arc_state: str = ""
+    n_points_dropped: int | None = None
+
+
+def _fitted_r1(eis: Any, circuit_model: str) -> _SettleFit | None:
     """The route's R1 in ohms, or ``None`` if it produced no usable number.
+
+    **Returns a** :class:`_SettleFit`, **not a bare float.** R1 is still the
+    reason this function exists; ``arc_state`` and ``n_points_dropped`` ride along
+    because they are properties of the fit already computed here and discarding
+    them was what made the settle window unable to tell a round taken mid-arc
+    from a noisier round of the same cell.
 
     **Through** :func:`~softae.analysis.eis.engine.analyze_spectrum`, **with
     ``engine`` left unset.** An earlier version of this function called
@@ -2398,12 +3437,21 @@ def _fitted_r1(eis: Any, circuit_model: str) -> float | None:
                        model=str(circuit_model), error=str(fit.error_msg))
         return None
     r1 = float(fit.R1) if fit.R1 is not None else float("nan")
-    return r1 if math.isfinite(r1) and r1 > 0 else None
+    if not (math.isfinite(r1) and r1 > 0):
+        return None
+    arc = getattr(fit, "arc_closure", None)
+    dropped = getattr(fit, "n_points_dropped", None)
+    return _SettleFit(
+        r1_ohms=r1,
+        arc_state="" if arc is None else str(arc.state),
+        n_points_dropped=None if dropped is None else int(dropped))
 
 
 __all__ = [
-    "DEFAULT_DRIFT_CHECK", "DEFAULT_MIN_TREATMENT",
-    "DEFAULT_RH_APPROACH_TIMEOUT_S", "DEFAULT_SETTLE_MAX_HOLD_S",
+    "DEFAULT_DRIFT_CHECK", "DEFAULT_MAX_CONSECUTIVE_FAILURES",
+    "DEFAULT_MIN_TREATMENT",
+    "DEFAULT_RH_APPROACH_TIMEOUT_S", "DEFAULT_RH_STABILITY_PCT",
+    "DEFAULT_SETTLE_MAX_HOLD_S",
     "DEFAULT_SOAK_S", "DEFAULT_TEMP_APPROACH_TIMEOUT_S",
     "DEFAULT_TEMP_DESCENT_TIMEOUT_S", "SETTLE_CIRCUIT_MODEL",
     "SOAK_CEILING_FACTOR",
@@ -2413,5 +3461,6 @@ __all__ = [
     "approach_condition", "assert_settle_licensed", "band_by_channel",
     "classify_apex", "population_thresholds", "project", "render_arc_watch",
     "render_projection", "settle_deviations", "settle_phase", "soak_phase",
+    "suggested_rate_tol_dec_per_h", "unreachable_setpoint_refusal",
     "validate_plan",
 ]

@@ -46,6 +46,33 @@ ARM_SCOUT = "adaptive_scout"
 ARM_FOLLOW_UP = "adaptive_follow_up"
 ARM_REFERENCE_END = "reference_end"
 
+#: The **fifth** arm, and the only one that is not part of the experiment: a
+#: settle-gate sweep, taken before the condition was certified.
+#:
+#: These used not to be persisted at all, on the grounds that recording them
+#: "would put pre-equilibration rows in the same validation the reporter reads".
+#: That objection is true of an **untagged** row and false of a tagged one, so it
+#: is answered here rather than overridden: every reader excludes this arm by
+#: default (:func:`load_records`'s ``include_settle``), and :func:`assemble_cells`
+#: refuses to build a :class:`Cell` out of one even when handed it directly.
+#:
+#: What the rows buy is the thing two ceiling runs could not produce: the gate
+#: decided on spectra nobody could look at afterwards, so "was the film moving or
+#: were the fits failing?" was unanswerable without repeating the hold.
+ARM_SETTLE = "settle"
+
+#: The arms that ARE the experiment. A row outside this set is evidence about the
+#: run, never about the comparison the run exists to make.
+EXPERIMENT_ARMS: frozenset[str] = frozenset(
+    {ARM_REFERENCE, ARM_SCOUT, ARM_FOLLOW_UP, ARM_REFERENCE_END})
+
+#: What a settle sweep's ``hold_certified`` says. **Deliberately not one of
+#: :data:`CERTIFIED_STILL`'s two words**: the row was taken before the gate had
+#: spoken, so stamping the run's still-default ``"settled"`` on it would be
+#: unknown written in the certified word -- and the one reader that ever asks for
+#: these rows is the one diagnosing why the gate did not certify.
+PRE_SETTLE = "pre_settle"
+
 CONTROL = "CONTROL"
 TREATMENT = "TREATMENT"
 UNRESOLVED = "UNRESOLVED"
@@ -299,8 +326,23 @@ class SweepRecord:
         }
 
 
-def load_records(db_path: Path, validation_name: str) -> list[SweepRecord]:
-    """Every sweep of *validation_name*, oldest first. Read-only."""
+def load_records(db_path: Path, validation_name: str, *,
+                 include_settle: bool = False) -> list[SweepRecord]:
+    """Every sweep of *validation_name*, oldest first. Read-only.
+
+    **Settle-gate sweeps are excluded, and the default states the intent.**
+    :data:`ARM_SETTLE` rows are taken *before* the condition is certified, so
+    they are evidence about the gate and never about the comparison; a reporter
+    that silently included them would be quoting pre-equilibration spectra as
+    accuracy. Pass ``include_settle=True`` to ask for them deliberately -- which
+    is what a diagnosis of a ceiling run wants, and what nothing on the reporting
+    path ever wants.
+
+    One filter, in one place: every reader in this package goes through here, so
+    the exclusion cannot be forgotten at a call site. :func:`assemble_cells`
+    refuses these rows a second time, because it is reachable with a record list
+    this function did not produce.
+    """
     conn = _connect_ro(db_path)
     try:
         rows = conn.execute(_SELECT).fetchall()
@@ -313,6 +355,9 @@ def load_records(db_path: Path, validation_name: str) -> list[SweepRecord]:
          gate_verdict, gate_log_json, arc_state) = row
         params = _loads(params_json, {})
         if params.get("eis_validation_name") != validation_name:
+            continue
+        if not include_settle and params.get(
+                "eis_validation_arm") == ARM_SETTLE:
             continue
         records.append(
             SweepRecord(
@@ -443,8 +488,10 @@ class Cell:
         tables -- is wrong twice over: it discards the calibration evidence, and
         it edits a pre-registered criterion after the data arrived, which
         :mod:`softae.tools.eis_validate_rule` exists to forbid. Nothing routes on
-        this property. H1 already withholds the verdict on any certification
-        other than ``settled``, so no false ``GO`` can be emitted either way.
+        this property. H1 still withholds the verdict on any certification other
+        than ``settled`` and the ``dropped_*`` words, and ``settled`` itself must
+        be PRESENT for it to pass -- so a board the gate never certified cannot
+        emit a ``GO``, whatever these per-cell marks say.
 
         **A cell whose rows disagree is not certified.** The stamp is per
         measurement, so disagreement inside one cell is a real possibility, and
@@ -555,11 +602,22 @@ class Cell:
 
 
 def assemble_cells(records: Sequence[SweepRecord]) -> list[Cell]:
-    """Group sweeps into cells by ``eis_validation_cell``, in first-seen order."""
+    """Group sweeps into cells by ``eis_validation_cell``, in first-seen order.
+
+    **A row outside :data:`EXPERIMENT_ARMS` cannot create a cell.** The arm
+    dispatch below has always routed only the four experiment arms into a
+    :class:`Cell`'s slots -- but the ``cells.setdefault`` above it fired on
+    ``eis_validation_cell`` alone, so any tagged row *brought a cell into
+    existence* whose every slot then stayed empty. With settle sweeps persisted
+    that is no longer hypothetical: a board that died in the gate would assemble
+    sixteen empty cells and report them as a population. Filtering in
+    :func:`load_records` closes the reporting path; this closes the function,
+    which is reachable with a record list that function did not produce.
+    """
     cells: dict[str, Cell] = {}
     for row in records:
         key = row.cell
-        if not key:
+        if not key or row.arm not in EXPERIMENT_ARMS:
             continue
         cell = cells.get(key)
         if cell is None:
@@ -637,6 +695,7 @@ __all__ = [
     "ARM_FOLLOW_UP", "ARM_REFERENCE", "ARM_REFERENCE_END", "ARM_SCOUT",
     "CERTIFIED_STILL", "CONTROL", "EXCLUDED", "TREATMENT", "UNRESOLVED",
     "UNSTAMPED",
+    "ARM_SETTLE", "EXPERIMENT_ARMS", "PRE_SETTLE",
     "Cell", "SweepRecord", "assemble_cells", "checkpoint_campaign",
     "load_checkpoint", "load_records",
 ]

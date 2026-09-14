@@ -37,6 +37,20 @@ def _args(tmp_path, **overrides):
     return V.build_parser().parse_args(argv)
 
 
+def _run_subparser():
+    """The `run` subparser itself, for tests that assert on its flag surface."""
+    import argparse
+
+    parser = V.build_parser()
+    sub = [a for a in parser._actions
+           if isinstance(a, argparse._SubParsersAction)][0]
+    return sub.choices["run"]
+
+
+def _run_parser_help():
+    return _run_subparser().format_help()
+
+
 def _manager(apexes=None, drift=0.0):
     from softae.drivers.factory import create_manager
 
@@ -62,9 +76,16 @@ def _plan(tmp_path, **overrides):
     return V.build_plan(_args(tmp_path, **overrides))
 
 
-def _rows(tmp_path, name="t"):
+def _rows(tmp_path, name="t", *, include_settle=False):
+    """The rows a READER sees. `include_settle` asks for the gate's own sweeps.
+
+    Settle sweeps are persisted and tagged, and every reader excludes them by
+    default -- so a test counting *what was written to the store* has to ask for
+    them, while a test counting *what the reporter reads* must not.
+    """
     db = R.resolve_db(Path(tmp_path))
-    return R.load_records(db, name) if db.exists() else []
+    return (R.load_records(db, name, include_settle=include_settle)
+            if db.exists() else [])
 
 
 # ── H-series: hold and safety ────────────────────────────────────────────────
@@ -152,21 +173,42 @@ def test_mock_run_commands_the_rh_loop_before_the_temperature_approach(
     per read and nothing reads RH during the heat -- so a mock run cannot show
     the saving. It can and must show that the same early `start` ran on the same
     code path, with no branch on `plan.mock` anywhere near it.
+
+    **The probe moved, and the claim did not.** It used to be "`rh.start`
+    precedes the FIRST `temp.get_pv`", which worked only while the first PV read
+    was the approach's own. Proposal B takes one read BEFORE any write, so an
+    unreachable setpoint is refused with nothing commanded on either axis -- so
+    the first read is now that pre-flight one, and the approach's polling starts
+    after it. The assertion is therefore against the approach's reads rather
+    than against every read: exactly one may precede `rh.start`, and it must be a
+    read rather than a write.
     """
     order: list[str] = []
-    real_start, real_pv = M.FastMockRHController.start, M.FastMockTempController.get_pv
+    real_start = M.FastMockRHController.start
+    real_pv = M.FastMockTempController.get_pv
+    real_sp = M.FastMockTempController.write_sp
 
     monkeypatch.setattr(M.FastMockRHController, "start",
                         lambda self: order.append("rh.start") or real_start(self))
     monkeypatch.setattr(
         M.FastMockTempController, "get_pv",
         lambda self, n_avg=1: order.append("temp.get_pv") or real_pv(self, n_avg))
+    monkeypatch.setattr(
+        M.FastMockTempController, "write_sp",
+        lambda self, value: order.append("temp.write_sp") or real_sp(self, value))
 
     assert V.main(["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
                    "--temp-setpoint-c", "25", "--validation-name", "ovl",
                    "--project", str(tmp_path), "--mock", "--min-treatment", "1",
                    "--drift-check", "0"]) == V.EXIT_OK
-    assert order.index("rh.start") < order.index("temp.get_pv")
+
+    # One read, then the heater write, then the loop -- and only then the
+    # approach's own polling. The heater write stays AHEAD of `rh.start` so the
+    # state a rejected RH setpoint leaves is byte-for-byte what it was.
+    assert order[:3] == ["temp.get_pv", "temp.write_sp", "rh.start"]
+    # The loop is live before the approach's own polling, which is the claim.
+    assert order.count("temp.get_pv") > 1
+    assert order.index("rh.start") < order.index("temp.get_pv", 1)
 
 
 def test_mock_run_reports_a_nonzero_lead_for_the_rh_axis(tmp_path):
@@ -705,13 +747,257 @@ class TestApproachOverlap:
         temp, rh = self._run(tmp_path, monkeypatch, log, clock)
         capsys.readouterr()
 
+        # `elapsed_s` is untouched by `--approach-dwell-s`, and that is the whole
+        # point of giving the dwell its own field: the number the timeout bounds
+        # and the number the operator reads stay the same clock.
         assert temp.elapsed_s == pytest.approx(600.0)
-        assert temp.lead_s == 0.0 and temp.driven_s == pytest.approx(600.0)
-        # The RH loop ran for the whole heat, and none of it is charged to the
-        # judged window.
+        assert temp.dwell_s == pytest.approx(600.0)        # the default dwell
+        assert temp.lead_s == 0.0 and temp.driven_s == pytest.approx(1200.0)
+        # The RH loop ran for the whole heat -- INCLUDING the temperature dwell,
+        # which is real time the humidifier spent under command -- and none of it
+        # is charged to the judged window.
         assert rh.elapsed_s == pytest.approx(60.0)
-        assert rh.lead_s == pytest.approx(600.0)
-        assert rh.driven_s == pytest.approx(660.0)
+        assert rh.lead_s == pytest.approx(1200.0)
+        assert rh.dwell_s == pytest.approx(600.0)
+        assert rh.driven_s == pytest.approx(1860.0)
+
+    def test_one_in_band_poll_is_not_an_arrival(self, tmp_path, monkeypatch,
+                                                capsys):
+        """`approach_setpoint` returns on the FIRST sample inside tolerance.
+
+        A PV crossing the band on its way somewhere else produces exactly that
+        sample, so "reached" has meant "was briefly here". `--approach-dwell-s`
+        is the second half of an arrival: the axis has to still be there.
+
+        A SECONDARY safeguard, and the docstring says so -- it would not have
+        caught 2026-09-13, where RH was in band from the first poll and then
+        wandered for ~70 min. That shape is the RH preroll's.
+        """
+        log, clock = [], H.VirtualClock()
+        # A rig whose temperature walks straight out of the band once the
+        # approach has declared victory, which is the shape under test.
+        walked = {"n": 0}
+
+        class _Drifting:
+            def write_sp(self, value):
+                log.append(("temp.write_sp", value))
+
+            def get_pv(self, _channel=1):
+                walked["n"] += 1
+                log.append(("temp.get_pv",))
+                return 25.0 if walked["n"] <= 2 else 40.0
+
+        rig = self._rig(log)
+        instruments = {H.TEMP_CONTROLLER: _Drifting(),
+                       H.RH_CONTROLLER: rig.get(H.RH_CONTROLLER)}
+        rig.get = instruments.__getitem__
+
+        import softae.workflows.equilibration as EQ
+
+        monkeypatch.setattr(EQ, "approach_setpoint",
+                            self._fake_approach(log, clock))
+        with pytest.raises(H.RefuseToStart, match="would not HOLD"):
+            H.approach_condition(rig, _plan(tmp_path), sleep=clock.sleep,
+                                 now=clock)
+        out = capsys.readouterr().out
+
+        assert "LEFT THE BAND" in out
+        assert "one in-band poll was not an arrival" in out
+        # An axis that enters the band and walks straight out of it is retried on
+        # what is LEFT of the budget, not on a fresh copy of it: 1800, then 1800
+        # minus the 630 s the first cycle cost, then minus the second's. The run
+        # refuses when the budget is gone -- not after an arbitrary two breaks,
+        # which is what refused 20260914T005931Z after 7 min of 5400 s.
+        assert [e for e in log if e[0] == "judge"] == [
+            ("judge", "temperature", 1800.0),
+            ("judge", "temperature", 1170.0),
+            ("judge", "temperature", 540.0)]
+
+        # ...and `--approach-dwell-s 0` restores the first-in-band-poll
+        # behaviour exactly, which is what makes the flag a decision rather than
+        # a fact of life.
+        clock2 = H.VirtualClock()
+        monkeypatch.setattr(EQ, "approach_setpoint",
+                            self._fake_approach(log, clock2))
+        reports = H.approach_condition(
+            self._rig(log), _plan(tmp_path, approach_dwell_s=0),
+            sleep=clock2.sleep, now=clock2)
+        capsys.readouterr()
+        assert all(r.reached and r.dwell_s == 0.0 for r in reports)
+
+    # -- a broken dwell costs TIME, not an attempt ----------------------------
+
+    def test_approach_a_broken_dwell_retries_on_the_remaining_budget(
+            self, tmp_path, monkeypatch, capsys):
+        """**The v4 defect.** A break used to spend one of two attempts.
+
+        `20260914T005931Z` refused after 7 min quoting "two attempts of 5400 s",
+        having made no attempt longer than a few minutes: the RH loop overshoots
+        on restart and limit-cycles, so two breaks a few minutes apart consumed
+        the whole policy while the budget sat untouched. A break is *got there,
+        then wandered off* -- it costs the time it took, and the approach is
+        re-entered on what is left.
+
+        The rig here breaks the dwell once and then holds, which is the shape the
+        old code could not survive twice and the new code survives indefinitely.
+        """
+        log, clock = [], H.VirtualClock()
+        reads = {"n": 0}
+
+        class _Blip:
+            def write_sp(self, value):
+                log.append(("temp.write_sp", value))
+
+            def get_pv(self, _channel=1):
+                # 1 = the pre-flight read, 2 = the first approach's own, 3 = the
+                # first dwell poll (out of band), and in band from there on.
+                reads["n"] += 1
+                log.append(("temp.get_pv",))
+                return 40.0 if reads["n"] == 3 else 25.0
+
+        rig = self._rig(log)
+        instruments = {H.TEMP_CONTROLLER: _Blip(),
+                       H.RH_CONTROLLER: rig.get(H.RH_CONTROLLER)}
+        rig.get = instruments.__getitem__
+
+        import softae.workflows.equilibration as EQ
+
+        monkeypatch.setattr(EQ, "approach_setpoint",
+                            self._fake_approach(log, clock))
+        temp, _rh = H.approach_condition(rig, _plan(tmp_path),
+                                         sleep=clock.sleep, now=clock)
+        out = capsys.readouterr().out
+
+        assert "LEFT THE BAND" in out
+        assert temp.reached and temp.attempts == 2
+        # THE CLAIM: the retry was handed 1170 s -- 1800 minus the 600 s the
+        # first approach spent plus the 30 s the broken dwell spent -- and NOT a
+        # second full 1800 s bound.
+        assert [e for e in log if e[0] == "judge" and e[1] == "temperature"] == [
+            ("judge", "temperature", 1800.0), ("judge", "temperature", 1170.0)]
+        # `elapsed_s` still counts only the judged windows; the broken dwell and
+        # the held one are both dwell, which is the split `dwell_s` exists for.
+        assert temp.elapsed_s == pytest.approx(1200.0)
+        assert temp.dwell_s == pytest.approx(630.0)
+
+    def test_approach_a_dwell_exhaustion_refusal_quotes_what_actually_happened(
+            self, tmp_path, monkeypatch, capsys):
+        """Never "two attempts of {timeout_s} s" when no attempt ran that long.
+
+        The v4 refusal quoted 5400 s having spent ~400, and the operator read it
+        as a chamber that could not get there in ninety minutes. The elapsed, the
+        break count and the PV extremes are what the next person needs.
+
+        The OTHER refusal -- the axis that never arrived at all -- is unchanged,
+        and asserted here beside it so a future edit cannot quietly merge them.
+        """
+        log, clock = [], H.VirtualClock()
+        walked = {"n": 0}
+
+        class _Drifting:
+            def write_sp(self, value):
+                log.append(("temp.write_sp", value))
+
+            def get_pv(self, _channel=1):
+                walked["n"] += 1
+                log.append(("temp.get_pv",))
+                return 25.0 if walked["n"] <= 2 else 40.0
+
+        rig = self._rig(log)
+        instruments = {H.TEMP_CONTROLLER: _Drifting(),
+                       H.RH_CONTROLLER: rig.get(H.RH_CONTROLLER)}
+        rig.get = instruments.__getitem__
+
+        import softae.workflows.equilibration as EQ
+
+        monkeypatch.setattr(EQ, "approach_setpoint",
+                            self._fake_approach(log, clock))
+        with pytest.raises(H.RefuseToStart) as excinfo:
+            H.approach_condition(rig, _plan(tmp_path), sleep=clock.sleep,
+                                 now=clock)
+        capsys.readouterr()
+        text = str(excinfo.value)
+
+        assert "3 dwell break(s) across 3 approach(es)" in text
+        assert "1890 s spent against a 1800 s budget" in text
+        assert "600 s within 2 of 25" in text          # what the dwell asked for
+        assert "the PV at the breaks ran 40 to 40" in text
+        # The false claim, gone: no attempt ran anywhere near the bound.
+        assert "two attempts of" not in text
+
+        # ...and the axis that genuinely never arrived still refuses in exactly
+        # the words it always did.
+        log2, clock2 = [], H.VirtualClock()
+        with pytest.raises(H.RefuseToStart) as missed:
+            self._run(tmp_path, monkeypatch, log2, clock2, reached=("rh",))
+        capsys.readouterr()
+        assert str(missed.value).startswith(
+            "temperature never reached 25 within 2 after two attempts of "
+            "1800 s (last PV 25)")
+
+    def test_approach_the_rh_dwell_is_judged_against_the_stability_band(
+            self, tmp_path, monkeypatch, capsys):
+        """RH only, and the WIDER of the two bands -- never the narrower.
+
+        A run configured with `--rh-stability-pct 3.0` has told the settle gate
+        what the room does. Judging its approach dwell against `--rh-tolerance-pct
+        2.0` makes that 3.0 unreachable: the approach refuses before the gate it
+        feeds ever runs, which is `20260914T005931Z`. Temperature has no
+        stability-band analogue and its dwell is untouched.
+        """
+        seen: list[tuple[str, float]] = []
+        real_hold = H._hold_in_band
+
+        def _spy(read_pv, target, tolerance, dwell_s, *, axis, **kw):
+            seen.append((axis, float(tolerance)))
+            return real_hold(read_pv, target, tolerance, dwell_s, axis=axis, **kw)
+
+        monkeypatch.setattr(H, "_hold_in_band", _spy)
+        log, clock = [], H.VirtualClock()
+        # The room sits 2.5 %RH off the setpoint: OUTSIDE the 2.0 approach band
+        # and inside the 3.0 stability band the run was configured with.
+        import softae.workflows.equilibration as EQ
+
+        monkeypatch.setattr(EQ, "approach_setpoint",
+                            self._fake_approach(log, clock))
+        _temp, rh = H.approach_condition(
+            self._rig(log, rh_pv=32.5), _plan(tmp_path, rh_stability_pct=3.0),
+            sleep=clock.sleep, now=clock)
+        capsys.readouterr()
+
+        assert seen == [("temperature", 2.0), ("rh", 3.0)]
+        assert rh.reached and rh.dwell_s == pytest.approx(600.0)
+
+        # Positive control: the SAME room with the gate off falls back to the
+        # approach band, breaks the dwell, and spends the budget refusing.
+        seen.clear()
+        log2, clock2 = [], H.VirtualClock()
+        monkeypatch.setattr(EQ, "approach_setpoint",
+                            self._fake_approach(log2, clock2))
+        with pytest.raises(H.RefuseToStart, match="rh reached 30 but would not"):
+            H.approach_condition(
+                self._rig(log2, rh_pv=32.5),
+                _plan(tmp_path, rh_stability_pct=0), sleep=clock2.sleep,
+                now=clock2)
+        capsys.readouterr()
+        assert seen[-1] == ("rh", 2.0)
+
+    def test_approach_rh_dwell_tolerance_never_narrows_the_approach_band(
+            self, tmp_path):
+        """`max`, not the stability band outright.
+
+        An operator who widens `--rh-tolerance-pct` past the stability band has
+        said something about the approach, and the dwell must not silently
+        tighten back onto the narrower number.
+        """
+        assert H._rh_dwell_tolerance(
+            _plan(tmp_path, rh_stability_pct=3.0)) == 3.0
+        assert H._rh_dwell_tolerance(
+            _plan(tmp_path, rh_stability_pct=1.0)) == 2.0
+        # `0` is the gate OFF, which arrives as `None` -- not a zero-width band.
+        off = _plan(tmp_path, rh_stability_pct=0)
+        assert off.rh_stability_pct is None
+        assert H._rh_dwell_tolerance(off) == 2.0
 
     def test_approach_condition_rh_timeout_is_not_reduced_by_the_lead(
             self, tmp_path, monkeypatch, capsys):
@@ -841,8 +1127,10 @@ class TestApproachOverlap:
         assert ("rh.safe_dry",) not in log
         assert ("rh.safe_off",) not in log
         assert ("rh.stop",) not in log
-        # The lead IS named, because it changes what the refusal means.
-        assert "already driving for 10 min" in str(excinfo.value)
+        # The lead IS named, because it changes what the refusal means. 20 min,
+        # not 10: the loop drove through the temperature DWELL as well as the
+        # temperature approach, and both are real time under command.
+        assert "already driving for 20 min" in str(excinfo.value)
 
     def test_approach_condition_release_failure_does_not_mask_the_refusal(
             self, tmp_path, monkeypatch, capsys):
@@ -967,6 +1255,129 @@ def test_too_few_channels_is_refused_before_anything_is_heated(tmp_path):
                    "--temp-setpoint-c", "25", "--validation-name", "few",
                    "--project", str(tmp_path), "--mock"]) == V.EXIT_FAILED
     assert _rows(tmp_path, "few") == []
+
+
+def test_a_setpoint_at_the_park_temperature_is_unheated_and_needs_no_tolerance(
+        tmp_path, capsys):
+    """**UNHEATED is a condition, not a failed approach.**
+
+    This rig has a heater and no chiller, and its park setpoint (10 C) is below
+    any ambient it has been in. So `--temp-setpoint-c 10` is not a target the
+    chamber approaches; it is the instruction *stop heating*, and whatever
+    ambient gives is the condition. The tool had no vocabulary for it: the
+    approach judged 10 C against a ~28 C PV, could never be satisfied, and the
+    only way past was `--tolerance-c 20` -- which widens the same band for a
+    genuine over-temperature excursion, on the gate that is the last thing
+    between the operator and a heater.
+
+    `--tolerance-c` stays 2.0. What changed is that 10 C no longer needs 20 C of
+    it to be reachable.
+    """
+    from softae.core.campaign_events import read_events
+    from softae.core.safe_park import DEFAULT_SAFE_TEMP_C
+
+    assert DEFAULT_SAFE_TEMP_C == 10.0
+    plan = _plan(tmp_path, temp_setpoint_c=DEFAULT_SAFE_TEMP_C)
+    assert plan.unheated is True
+    assert plan.tolerance_c == 2.0, "the tolerance is NOT what was widened"
+    assert plan.as_dict()["unheated"] is True
+    assert _plan(tmp_path).unheated is False       # 25 C is an ordinary target
+
+    # `confirm_thermal`'s banner says THIS DRIVES THE STAGE HEATER TO 10 C, which
+    # is false when nothing is driven -- and it is the last screen before an
+    # unattended run. Corrected through the existing `plan_overrides` channel,
+    # with no change to that shared function's signature.
+    assert V._confirm(plan, H.project(plan), assume_yes=True) is True
+    banner = capsys.readouterr().out
+    assert "NOTHING DRIVES THE HEATER" in banner
+    assert "whatever ambient gives" in banner
+    assert V._confirm(_plan(tmp_path), H.project(_plan(tmp_path)),
+                      assume_yes=True) is True
+    assert "NOTHING DRIVES THE HEATER" not in capsys.readouterr().out
+
+    assert V.main(["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
+                   "--temp-setpoint-c", "10", "--validation-name", "cold",
+                   "--project", str(tmp_path), "--mock", "--min-treatment", "1",
+                   "--drift-check", "0"]) == V.EXIT_OK
+    out = capsys.readouterr().out
+    assert "temperature UNHEATED" in out
+    # Satisfied at the FIRST finite PV: nothing was waited for, and the approach
+    # is recorded as the zero-length judgement it was.
+    run_dir = next((Path(tmp_path) / "runs").iterdir())
+    events, _cursor = read_events(run_dir)
+    started = [e for e in events if e["type"] == "run_started"][0]
+    approach = {e["axis"]: e for e in events
+                if e["type"] == "progress" and e["phase"] == "approach"}
+
+    assert started["unheated"] is True
+    assert approach["temperature"]["elapsed_s"] == 0.0
+    assert _rows(tmp_path, "cold"), "an unheated run still measures"
+
+
+def test_a_setpoint_below_ambient_but_above_park_is_refused_before_anything_is_heated(
+        tmp_path, monkeypatch):
+    """The half that is still a refusal, and it is refused BEFORE the write.
+
+    A setpoint the chamber cannot fall to and which is not the heater-off
+    instruction either is unreachable on this rig, and the operator's answer is
+    a number rather than a wider tolerance. The PV is read before
+    `temp.write_sp`, so nothing has been commanded on either axis when this
+    fires.
+    """
+    from softae.core.safe_park import DEFAULT_SAFE_TEMP_C
+
+    wrote: list[float] = []
+    monkeypatch.setattr(M.FastMockTempController, "write_sp",
+                        lambda self, value: wrote.append(float(value)))
+    # The mock starts at 22 C; 15 C is 7 C below it and 5 C above the park.
+    assert V.main(["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
+                   "--temp-setpoint-c", "15", "--validation-name", "chill",
+                   "--project", str(tmp_path), "--mock",
+                   "--min-treatment", "1"]) == V.EXIT_FAILED
+
+    assert wrote == [], "the setpoint was written before the refusal"
+    assert _rows(tmp_path, "chill") == []
+    refusal = H.unreachable_setpoint_refusal(
+        _plan(tmp_path, temp_setpoint_c=15.0), 22.0)
+    assert "heater and no chiller" in refusal
+    assert f"at or below {DEFAULT_SAFE_TEMP_C:g} C to run UNHEATED" in refusal
+    # Silent in the three cases it must be: unheated, within tolerance, and a
+    # setpoint ABOVE the PV, which is what a heater is for.
+    for plan, pv in ((_plan(tmp_path, temp_setpoint_c=10.0), 22.0),
+                     (_plan(tmp_path, temp_setpoint_c=21.0), 22.0),
+                     (_plan(tmp_path, temp_setpoint_c=40.0), 22.0),
+                     (_plan(tmp_path, temp_setpoint_c=15.0), float("nan"))):
+        assert H.unreachable_setpoint_refusal(plan, pv) == ""
+
+
+def test_an_unheated_hold_watch_grades_against_ambient_not_against_the_setpoint(
+        tmp_path):
+    """**Found while building B, and it would have made B unusable.**
+
+    `HoldWatch` compares the temperature PV to `plan.temp_setpoint_c` with its
+    own fault band of 5 C -- a band `--tolerance-c` never touched. Under an
+    unheated setpoint the chamber sits 15-20 C above it by design, so the watch
+    would have raised a sustained-excursion `SafetyError` on the first poll of
+    the measurement block, reporting the requested condition as a fault.
+
+    Disabling the axis was rejected: an unheated run still has a temperature and
+    a room that warms 6 C overnight has moved the condition whether or not
+    anything drove it. The reference becomes this run's own first reading, so the
+    claim weakens from "held its target" to "held where it started" -- the only
+    claim an unheated run was entitled to -- and stays a real gate.
+    """
+    manager = _manager()
+    cold = H.HoldWatch(manager=manager, plan=_plan(tmp_path, temp_setpoint_c=10.0))
+    for _ in range(6):
+        cold.poll()                                # would raise on the setpoint
+
+    assert cold.ambient_baseline_c is not None
+    assert cold.ambient_baseline_c > 15.0, "the mock sits at ambient, not at 10"
+    assert cold.excursion is False
+    # A heated run is untouched: the setpoint is still what it is graded against.
+    warm = H.HoldWatch(manager=_manager(), plan=_plan(tmp_path))
+    warm.poll()
+    assert warm.ambient_baseline_c is None
 
 
 # ── P-series: populations and the arc-capture watch ──────────────────────────
@@ -1113,6 +1524,91 @@ def test_settle_line_names_the_quantity_the_threshold_and_the_worst_channel(
     assert "spread 0.130" not in line              # the old, unitless, anonymous form
 
 
+def test_the_round_line_prints_the_rh_spread_beside_the_median_and_the_band(
+        tmp_path, capsys):
+    """The SPREAD is the quantity the gate judges; the median is not.
+
+    Until this line the round printed the median alone and the spread reached
+    only the `settle_round` payload -- so the stream, and nothing a person
+    watching a 98-minute hold could see. All three numbers now sit together, in
+    the same unit, which is `--settle-tol-rel`'s own lesson applied to the other
+    axis.
+    """
+    _plan_used, _outcome = _scripted_settle(
+        tmp_path, {18: [10_000.0], 19: [10_000.0], 20: [10_000.0]})
+    rounds = [ln for ln in capsys.readouterr().out.splitlines()
+              if ln.startswith("[settle] round")]
+
+    assert rounds
+    assert all("(spread" in ln and "%RH" in ln for ln in rounds)
+    # The band beside the achieved value, so neither can be read without the
+    # other. 1.50 is the shipped default and this run did not change it.
+    assert all("/ 1.50)" in ln for ln in rounds)
+
+
+def test_rh_stability_off_is_stamped_on_every_round_rather_than_omitted(tmp_path):
+    """`null` must mean OFF, and never be spelled like "the band was satisfied".
+
+    `_rate_payload`'s own rule, in the RH axis: a key that disappears when the
+    gate is off is indistinguishable, to every reader of the stream, from a key
+    that was never written -- and 3.1(a) is the failure shape where "unknown"
+    and "checked and clean" share a token. So the key is stamped on EVERY round
+    under both settings, and its value is what differs.
+    """
+    board = _partitionable_board(rounds=4)
+    on_payloads, off_payloads = [], []
+    _survivor_settle(tmp_path, board, rounds=4, on_round=on_payloads.append)
+    _survivor_settle(tmp_path, board, rounds=4, on_round=off_payloads.append,
+                     rh_stability_pct=0)
+
+    assert on_payloads and off_payloads
+    assert all(p["rh_stability_pct"] == pytest.approx(1.5) for p in on_payloads)
+    assert all("rh_stability_pct" in p for p in off_payloads)
+    assert all(p["rh_stability_pct"] is None for p in off_payloads)
+    # ...and the round line says `off` rather than printing a number nobody set.
+    assert all("rh_spread_pct" in p for p in off_payloads)
+
+
+def test_a_window_held_by_a_moving_room_says_so_on_the_round_it_holds(
+        tmp_path, monkeypatch, capsys):
+    """**An addition, not a citation: this reason reached no console, ever.**
+
+    The reason string prints under `if not check.evaluable`, and
+    `_apply_rh_clause` clears `settled` while leaving `evaluable` TRUE -- so a
+    window blocked by the RH clause took the one branch that prints nothing.
+    Rounds 3, 5, 6 and 7 of 20260913T171305Z printed `-> not yet` and no reason,
+    and `RH_MOVED` appears zero times anywhere in `softae.tools`.
+
+    Here sigma is flat -- the film is still -- and the room walks 20 -> 26 %RH,
+    which is exactly the case the two diagnoses want opposite responses to.
+    """
+    from softae.analysis.equilibration import RH_MOVED
+
+    walk = iter([20.0, 22.0, 24.0, 26.0, 26.0, 26.0, 26.0, 26.0])
+    monkeypatch.setattr(M.FastMockRHController, "get_H",
+                        lambda self: next(walk, 26.0))
+    payloads = []
+    _plan_used, outcome = _scripted_settle(
+        tmp_path, {18: [10_000.0], 19: [10_000.0], 20: [10_000.0]},
+        on_round=payloads.append)
+    lines = capsys.readouterr().out.splitlines()
+    held = [ln for ln in lines if "MOVING ROOM" in ln]
+    judged = [p for p in payloads if p["evaluable"]]
+
+    # The gate did refuse on the room, and the sigma criterion had said yes.
+    assert judged and any(RH_MOVED in p["reason"] for p in judged)
+    assert not outcome.certified
+    assert held, "the reason reached the payload and not the console"
+    assert "WOULD have certified but for the room" in held[0]
+    # Named as a SPREAD judged against itself, so nobody reaches for the flag
+    # that cannot touch it.
+    assert "--rh-tolerance-pct cannot touch it" in held[0]
+    assert "--rh-stability-pct 1.5" in held[0]
+    # ...and the window stayed EVALUABLE, which is why the existing print could
+    # never have carried it.
+    assert all(p["evaluable"] for p in judged if RH_MOVED in p["reason"])
+
+
 def test_settle_deviations_agree_with_the_gates_own_maximum(tmp_path):
     """The per-channel numbers are `settle_check`'s arithmetic, restated.
 
@@ -1173,6 +1669,142 @@ def test_settle_phase_endorsement_is_announced_at_the_first_judged_window(
     assert outcome.tolerance_achievable is True and outcome.endorsement
 
 
+def test_settle_phase_announces_the_smallest_band_this_window_could_certify(
+        tmp_path, capsys):
+    """The rate criterion's half of `_announce_endorsement`, and it was missing.
+
+    `rate_check` has always computed `_reference_half_width` -- what a cell at
+    the board's MEDIAN residual could have certified over this window -- and
+    spent it inside `_channel_rate` on a `rate_span_too_short` verdict that never
+    left the function. So a run could hold to its ceiling against a band its own
+    observation could not resolve, report `rate_undetectable` on every quiet
+    cell, and say nothing about which of the two it was.
+
+    Announced ONCE here rather than once per round: the floor barely moves over a
+    uniformly paced hold, so the thing worth announcing is the COMPARISON, and
+    that boolean is constant across this board's three judged windows.
+    """
+    payloads = []
+    _plan_used, outcome = _survivor_settle(
+        tmp_path, _noisy_board(), settle_criterion="both",
+        settle_rate_tol_dec_per_h=0.1, on_round=payloads.append)
+    out = capsys.readouterr().out
+    announced = [ln for ln in out.splitlines() if "rate FLOOR" in ln]
+    judged = [p for p in payloads if "rate_settled" in p]
+
+    assert len(announced) == 1, "sticky: announced on change, not every round"
+    assert len(judged) >= 3, "the board must produce several judged windows"
+    # The floor reaches the STREAM too, on every judged round -- without it the
+    # run that asked "is this band achievable here?" cannot answer it from its
+    # own record, which is what made 2026-09-13 unre-scorable.
+    assert all(p["reference_half_width_dec_per_h"] > 0 for p in judged)
+    assert outcome.reference_half_width_dec_per_h == pytest.approx(
+        judged[-1]["reference_half_width_dec_per_h"], rel=1e-3)
+    # ...and the announcement quotes it, with the span it was measured over and
+    # a band derived from this board rather than hardcoded.
+    assert f"{outcome.reference_half_width_dec_per_h:.4f} dec/h" in out
+    assert f"{outcome.rate_span_s:.0f} s window" in out
+    suggestion = H.suggested_rate_tol_dec_per_h(
+        outcome.reference_half_width_dec_per_h)
+    assert f"--settle-rate-tol-dec-per-h {suggestion:g}" in out
+    # The instruction is a longer ROUND PERIOD, never more rounds: SE falls
+    # linearly in the span and only as sqrt(k) in the count, and the rate window
+    # is a count over a fixed cadence.
+    assert "falls linearly in span and only as sqrt(k) in round count" in out
+
+
+def test_a_rate_band_below_the_windows_floor_warns_under_both_and_refuses_under_rate(
+        tmp_path, capsys):
+    """The split, and it is about ROUTING POWER rather than about severity.
+
+    Under plain `both` the rate is explicitly a SHADOW -- deviation routes -- so
+    ending the run on it would be the "routing power on the strength of an
+    argument" that mode exists to prevent. Under `rate` it already routes, and
+    under `both --survivors on` it already decides the partition, so refusing
+    there is not new power: it is the same power exercised before the ceiling is
+    spent rather than after.
+    """
+    tiny = {"settle_rate_tol_dec_per_h": 0.001}
+
+    _plan_used, outcome = _survivor_settle(
+        tmp_path, _noisy_board(), settle_criterion="both", **tiny)
+    warned = capsys.readouterr().out
+    assert outcome.verdict == "ceiling"            # the run finished its ceiling
+    assert "rate FLOOR" in warned and "WARNING only" in warned
+
+    for flags in ({"settle_criterion": "rate"},
+                  {"settle_criterion": "both", "survivors": "on"}):
+        payloads = []
+        with pytest.raises(H.RefuseToStart) as excinfo:
+            _survivor_settle(tmp_path, _noisy_board(), on_round=payloads.append,
+                             **flags, **tiny)
+        message = str(excinfo.value)
+        capsys.readouterr()
+        assert "certify no band tighter than" in message
+        assert "not about the film" in message
+        # The REFUSING round reached the stream before the raise. A refusal that
+        # swallowed it would lose the single most useful record in the run --
+        # the same loss that made the 2026-08-21 rounds undiagnosable.
+        assert payloads and "rate_settled" in payloads[-1]
+        assert payloads[-1]["reference_half_width_dec_per_h"] > 0.001
+
+
+def test_an_excluded_round_reaches_the_stream_with_channel_round_and_reason():
+    """A consensus exclusion that never leaves `rate_check` is not auditable.
+
+    The rule silently drops a (channel, round) cell out of one regression, and a
+    verdict that changed because of it is indistinguishable in the surviving
+    record from one that did not -- which is the whole failure the settle stream
+    already exists to prevent. Asserted at `_rate_payload`, the one place the
+    `RateCheck` becomes bytes, and asserted against the stream's own vocabulary:
+    `arc_state` is a FORBIDDEN substring in `events.jsonl`
+    (`test_the_stream_carries_no_scientific_value`) and it is also the literal
+    value of `ExcludedRound.kind`, so the narrated reason has to be rebuilt from
+    the entry's parts rather than copied out of it.
+    """
+    from softae.analysis.equilibration import RoundFit, SettleTracker
+
+    quiet = [1.0e4, 1.02e4, 1.0e4, 0.98e4, 1.0e4, 1.02e4, 1.0e4]
+    tracker = SettleTracker(criterion="rate", rate_tol_per_hour=0.30,
+                            min_channels=1)
+    for index, r1 in enumerate(quiet):
+        # ch18's arc closes on every round but the third, where it does not --
+        # and that round measured 4x, which is a cell rather than a number.
+        scale = 4.0 if index == 2 else 1.0
+        tracker.observe(
+            [RoundFit(channel=18, sigma=1.0 / (r1 * scale), r1_ohms=r1 * scale,
+                      arc_state="open" if index == 2 else "closed",
+                      n_points_dropped=0)],
+            t_s=index * 562.5)
+
+    payload = H._rate_payload(tracker)
+
+    assert payload["rate_consensus_unavailable"] is False
+    assert payload["rate_excluded_rounds"] == [
+        {"channel": 18, "round": 2, "reason": "arc open vs consensus closed"}]
+    # ...and the whole record still says nothing an observable is spelled with.
+    text = json.dumps(payload).lower()
+    for forbidden in ("r1", "sigma", "fit", "ohms", "arc_state", "spectrum"):
+        assert forbidden not in text, forbidden
+
+
+def test_a_stream_with_no_shape_says_the_rule_could_not_look():
+    """`SUBAGENT_RULES.md` §3.1(a) at the stream: the campaign feeder has not
+    shipped its half yet, so every campaign window is this case, and an empty
+    `rate_excluded_rounds` beside no other key would read as a clean board."""
+    from softae.analysis.equilibration import RoundFit, SettleTracker
+
+    tracker = SettleTracker(criterion="rate", rate_tol_per_hour=0.30,
+                            min_channels=1)
+    for index in range(7):
+        tracker.observe([RoundFit(channel=18, sigma=1.0e-4, r1_ohms=1.0e4)],
+                        t_s=index * 562.5)
+
+    payload = H._rate_payload(tracker)
+    assert payload["rate_consensus_unavailable"] is True
+    assert payload["rate_excluded_rounds"] == []
+
+
 def test_settle_phase_unachievable_tolerance_names_the_channel(tmp_path, capsys):
     """Wiring the board-level endorsement in is necessary and NOT sufficient.
 
@@ -1225,6 +1857,61 @@ def test_settle_tol_rel_default_is_the_shipped_criterions_own(tmp_path):
 
     assert H.DEFAULT_SETTLE_TOL_REL == DEFAULT_SETTLE_TOL_REL
     assert _plan(tmp_path).settle_tol_rel == pytest.approx(DEFAULT_SETTLE_TOL_REL)
+
+
+def test_settle_rate_tol_default_is_the_h3_block_band(tmp_path):
+    """0.05 dec/h -- H3's whole-block budget over a one-hour block -- not 0.
+
+    The old default was 0, "unset", which refused for the two criteria that read
+    it and sent the operator to the flag's own help. That help teaches 0.025
+    (0.05 dec over a 2 h block), and on 20260913T171305Z 0.025 dec/h sat AT the
+    detection floor of the window the run could observe, so every quiet cell came
+    back `rate_undetectable` and 98.8 min bought nothing. A band the observation
+    cannot resolve is not a tighter criterion; it is an absent one.
+    """
+    assert H.DEFAULT_SETTLE_RATE_TOL_DEC_PER_H == pytest.approx(0.05)
+    plan = _plan(tmp_path, settle_criterion="rate")
+    assert plan.settle_rate_tol_dec_per_h == pytest.approx(0.05)
+    # It clears the ceiling that refuses a band too loose, so the default is not
+    # itself a value the run would refuse.
+    assert H.DEFAULT_SETTLE_RATE_TOL_DEC_PER_H < H.SETTLE_RATE_TOL_DEC_PER_H_MAX
+    H.validate_plan(plan)
+
+
+def test_rh_stability_band_defaults_to_the_measured_constant(tmp_path):
+    """The restated constant, pinned to the criterion's home -- and it is a
+    MEASURED number (106 three-round windows on the reference run), which is why
+    the default is 1.5 and not a round figure somebody liked."""
+    from softae.analysis.equilibration import DEFAULT_RH_STABILITY_PCT
+
+    assert H.DEFAULT_RH_STABILITY_PCT == DEFAULT_RH_STABILITY_PCT == 1.5
+    assert _plan(tmp_path).rh_stability_pct == pytest.approx(1.5)
+    # The flag reaches the plan, and 0/off reach it as OFF rather than as 0.0 --
+    # a zero band is a spread no window has ever satisfied, so it would hold
+    # every run to its ceiling and blame the room.
+    assert _plan(tmp_path, rh_stability_pct=3.0).rh_stability_pct == 3.0
+    assert _plan(tmp_path, rh_stability_pct=0).rh_stability_pct is None
+    assert _plan(tmp_path, rh_stability_pct="off").rh_stability_pct is None
+    with pytest.raises(H.RefuseToStart, match="no such thing as a negative one"):
+        _plan(tmp_path, rh_stability_pct=-1.0)
+
+
+def test_the_three_rh_numbers_are_named_together_so_none_is_mistaken_for_another(
+        tmp_path):
+    """`--rh-tolerance-pct` is the flag an operator reaches for, and it CANNOT
+    touch this gate: one is a distance from the setpoint judged only during the
+    approach, the other is a spread of the per-round medians judged against
+    itself. The help says so in one place rather than leaving the reader to
+    discover it over 98 minutes."""
+    help_text = _run_parser_help()
+
+    assert "--rh-stability-pct" in help_text
+    assert "--rh-tolerance-pct" in help_text
+    assert "rh_deviation_warn_pct" in help_text
+    assert "only this one is a spread" in help_text
+    # Different quantities, different defaults, and both are stated.
+    assert _plan(tmp_path).rh_tolerance_pct == 2.0
+    assert _plan(tmp_path).rh_stability_pct == 1.5
 
 
 def test_settle_phase_without_the_flag_judges_at_the_shipped_band(tmp_path, capsys):
@@ -1532,6 +2219,34 @@ def test_round_fit_uses_the_fitted_r1_not_the_raw_low_frequency_point():
     assert fit.r_raw_ohms != pytest.approx(fit.r1_ohms)
 
 
+def test_round_fit_carries_the_shape_of_the_same_fit_that_produced_r1():
+    """The consensus rule's two inputs, and they must come off THIS fit.
+
+    `SUBAGENT_RULES.md` §3.2: a rule that discriminates perfectly on a branch
+    real data never enters is not a rule. The feeder is what decides whether the
+    branch is entered at all -- a `RoundFit` with an empty `arc_state` makes every
+    window `consensus_unavailable`, and the rule then returns the shape of a pass
+    forever. So this asserts on a POPULATED state rather than on the field's
+    existence.
+
+    `n_points_dropped` is the FITTER's mask and must not be
+    `fit.arc_closure.n_dropped`; `annotate_arc_closure` says outright that the two
+    count different masks, and the arc's count is the one that is usually
+    non-zero on these cells.
+    """
+    from softae.analysis.eis.engine import analyze_spectrum
+
+    eis = _sweep_at(10_000.0)
+    fit = H._round_fit(20, eis)
+    oracle = analyze_spectrum(eis, cell=None, model_name="simpleSalt",
+                              blocking=True).fit
+
+    assert fit.arc_state == oracle.arc_closure.state != ""
+    assert fit.n_points_dropped == oracle.n_points_dropped is not None
+    # `None` is "never asked" and 0 is "asked, and none" -- a real count here.
+    assert fit.n_points_dropped == 0
+
+
 def test_round_fit_an_unfittable_spectrum_yields_no_sigma_and_keeps_the_raw_point():
     """The documented fallback is EXCLUSION, and it is wired rather than described.
 
@@ -1738,6 +2453,90 @@ def test_settle_refusal_quotes_whether_the_tolerance_was_ever_achievable():
     with pytest.raises(H.RefuseToStart) as excinfo:
         H.assert_settle_licensed(H.SettleOutcome("not_evaluable", 9, 5400.0))
     assert "achievable" not in str(excinfo.value)
+
+
+def test_settle_refusal_under_the_rate_criterion_does_not_blame_the_round_count():
+    """**The deviation sentence is FALSE when the rate routed, and it shipped.**
+
+    "More rounds were the missing ingredient" is sound advice about the deviation
+    criterion, whose window is three rounds of a growing series. The rate
+    criterion reads a trailing COUNT over a fixed cadence, so its span is pinned
+    at the round period times the count however many rounds run -- round 20's
+    interval is exactly as wide as round 10's. On 2026-09-13 the refusal told the
+    operator to wait longer, and waiting could not have worked.
+    """
+    outcome = H.SettleOutcome(
+        "ceiling", 10, 5930.0, tolerance_achievable=True,
+        endorsement="tol_rel 10.00% is above the measured noise floor 1.04%",
+        settle_criterion="both", rate_tol_dec_per_h=0.025, rate_span_s=3118.0,
+        rate_window_rounds=6, reference_half_width_dec_per_h=0.0251)
+    with pytest.raises(H.RefuseToStart) as excinfo:
+        H.assert_settle_licensed(outcome)
+    message = str(excinfo.value)
+
+    assert "more rounds were the missing ingredient" not in message
+    assert "TRAILING 6-round window" in message
+    assert "~3118 s for every judged round" in message
+    assert "more rounds would NOT have narrowed any interval" in message
+    assert "no band tighter than 0.0251 dec/h, against your 0.025 dec/h" in message
+    assert "raising the ROUND PERIOD" in message
+    assert "not by raising --settle-max-rounds" in message
+    # The band it suggests is this window's own, not a literal.
+    assert (f"--settle-rate-tol-dec-per-h "
+            f"{H.suggested_rate_tol_dec_per_h(0.0251):g}") in message
+
+
+def test_a_deviation_routed_refusal_keeps_the_sentence_it_always_had():
+    """The rate branch is an addition, not a replacement: when deviation is what
+    routed, "more rounds" is true and stays."""
+    outcome = H.SettleOutcome(
+        "ceiling", 9, 5400.0, tolerance_achievable=True,
+        endorsement="tol_rel 10.00% is above ...")
+    with pytest.raises(H.RefuseToStart) as excinfo:
+        H.assert_settle_licensed(outcome)
+
+    assert "more rounds were the missing ingredient" in str(excinfo.value)
+    assert "TRAILING" not in str(excinfo.value)
+    # ...and `both` with no rate ever computed also keeps it: the rate branch
+    # needs a window to quote, and an absent one is not a window.
+    quiet = H.SettleOutcome("ceiling", 9, 5400.0, tolerance_achievable=True,
+                            endorsement="e", settle_criterion="both")
+    with pytest.raises(H.RefuseToStart) as excinfo:
+        H.assert_settle_licensed(quiet)
+    assert "TRAILING" not in str(excinfo.value)
+
+
+def test_a_ceiling_under_a_hunting_rh_zone_suggests_a_band_it_could_certify_under():
+    """`suggested_settle_tol_rel`'s posture on the RH axis, and its limitation.
+
+    The band the gate refused on appeared in no --help, no console line and no
+    refusal, so four blocked windows on 2026-09-13 were undiagnosable. The
+    suggestion is the MEDIAN achieved spread rounded up, stated as a floor rather
+    than a guarantee -- the worst window was 2.29 %RH against a median of 1.28.
+    """
+    outcome = H.SettleOutcome("ceiling", 10, 5930.0,
+                              rh_stability_pct=1.5, rh_spread_median_pct=1.9)
+    with pytest.raises(H.RefuseToStart) as excinfo:
+        H.assert_settle_licensed(outcome)
+    message = str(excinfo.value)
+
+    assert "--rh-stability-pct 1.5" in message
+    assert "median 1.90 %RH" in message
+    assert "pass --rh-stability-pct 2 " in message
+    assert "FLOOR and not a guarantee" in message
+    assert "not --rh-tolerance-pct" in message
+    # Silent when the room is not what held it: a spread inside the band adds a
+    # sentence an operator cannot act on.
+    inside = H.SettleOutcome("ceiling", 10, 5930.0,
+                             rh_stability_pct=3.0, rh_spread_median_pct=1.9)
+    with pytest.raises(H.RefuseToStart) as excinfo:
+        H.assert_settle_licensed(inside)
+    assert "--rh-stability-pct" not in str(excinfo.value)
+    # ...and silent when the gate was off, where there is no band to widen.
+    off = H.SettleOutcome("ceiling", 10, 5930.0, rh_spread_median_pct=1.9)
+    with pytest.raises(H.RefuseToStart) as excinfo:
+        H.assert_settle_licensed(off)
+    assert "--rh-stability-pct" not in str(excinfo.value)
 
 
 def test_arc_watch_lists_each_cell_and_bounds_the_listing(tmp_path):
@@ -2146,6 +2945,57 @@ def test_resume_reuses_the_run_id_skips_complete_cells_and_bumps_the_epoch(tmp_p
     assert spec["hold_epoch"] == 2                  # a park ended the condition
 
 
+def test_a_settle_row_is_excluded_from_every_assembled_cell(tmp_path):
+    """**The settle sweeps are on disk now, and no reader may see them.**
+
+    Two runs died in this gate and left an EMPTY `eis/` directory, so "was the
+    film moving or were the fits failing?" could not be asked without repeating
+    the hold. Persisting them answers that -- and the objection it overturns
+    ("pre-equilibration rows in the same validation the reporter reads") is
+    answered by the TAG, so the tag has to actually hold.
+
+    TWO gaps, and closing either alone leaves the other open. `load_records`
+    filters the arm, which closes the reporting path; and `assemble_cells` used
+    to create a `Cell` for ANY row carrying `eis_validation_cell`, so a settle
+    row handed to it directly still produced a cell -- an empty one, reported as
+    a population.
+    """
+    argv = ["run", "--channels", "18,19,20", "--rh-setpoint-pct", "30",
+            "--temp-setpoint-c", "25", "--validation-name", "st",
+            "--project", str(tmp_path), "--mock", "--min-treatment", "1",
+            "--drift-check", "0"]
+    assert V.main(argv) == V.EXIT_OK
+
+    db = R.resolve_db(Path(tmp_path))
+    # They really were persisted -- otherwise every assertion below is vacuous.
+    everything = R.load_records(db, "st", include_settle=True)
+    settle_rows = [r for r in everything if r.arm == R.ARM_SETTLE]
+    assert settle_rows, "the settle sweeps must reach the store"
+    # ...and they are marked as what they are: taken before the gate spoke.
+    assert {r.params["eis_validation_hold_certified"] for r in settle_rows} == {
+        R.PRE_SETTLE}
+    assert R.PRE_SETTLE not in R.CERTIFIED_STILL
+
+    # The default excludes them, in the one place every reader goes through.
+    default = R.load_records(db, "st")
+    assert all(r.arm != R.ARM_SETTLE for r in default)
+    assert len(default) == len(everything) - len(settle_rows)
+
+    # ...and the second gap: handed the rows DIRECTLY, `assemble_cells` still
+    # will not build a cell out of one.
+    assert R.assemble_cells(settle_rows) == []
+    assert {c.key for c in R.assemble_cells(everything)} == {
+        c.key for c in R.assemble_cells(default)}
+
+    # The reporter, which reads through `load_records`, never sees them.
+    payload = R.generate(db, "st", min_treatment=1)
+    assert payload["completeness"]["n_sweeps"] == len(default)
+    # And `n_recorded` stays the answer to "did this run measure anything?".
+    finished = [e for e in _stream(_only_run_dir(tmp_path))
+                if e["type"] == "run_finished"][0]
+    assert finished["n_recorded"] == len(default)
+
+
 def test_resume_rediscards_a_partial_cell(tmp_path):
     """Half a pair yields no deviation, so the cell is re-run in full."""
     manager = _manager()
@@ -2354,6 +3204,71 @@ def test_fifteen_channel_projection_matches_the_measured_anchors(tmp_path):
     assert projection.drift_s == pytest.approx(120.42 * 3)
     assert projection.measurement_low_s / 60 == pytest.approx(40.5, abs=0.1)
     assert projection.measurement_high_s / 60 == pytest.approx(49.8, abs=0.1)
+
+
+def test_the_projected_round_period_is_the_sweep_block_plus_the_sleep(tmp_path):
+    """**The ceiling bought 10 rounds where the projection promised 17.**
+
+    `default_round_period_s` is documented as "a round's cost plus a chosen
+    buffer" -- and `settle_phase` sweeps the whole board and THEN sleeps that
+    full period on top, so a round costs the block twice. The projection quoted
+    the sleep alone, which is why 5400 s read as 17 rounds and delivered 10.
+
+    The pacing is deliberately NOT repaired: shortening the sleep would halve the
+    rate window's span and double every interval. What moves is the number that
+    is printed.
+    """
+    from softae.workflows.equilibration import default_round_period_s
+
+    plan = _plan(tmp_path, channels=V.EXAMPLE_CHANNELS)
+    projection = H.project(plan)
+    n = len(plan.channels)
+    sleep_s = default_round_period_s(plan.baseline_preset, n)
+
+    # The sweep block is exactly the scout column of this same projection: the
+    # settle rounds sweep the baseline preset on every channel.
+    assert projection.settle_round_s == pytest.approx(projection.scout_s + sleep_s)
+    assert projection.settle_round_s > sleep_s * 1.5
+    # And the helper agrees with the projection, since the ceiling is derived
+    # from it and a second derivation would be a second answer.
+    assert H.achieved_round_period_s(plan.baseline_preset, n) == pytest.approx(
+        projection.settle_round_s)
+
+
+def test_the_ceiling_is_stated_in_rounds_and_derived_from_the_period(
+        tmp_path, capsys):
+    """A ceiling in seconds is a promise about a quantity no criterion consumes.
+
+    Every gate here reads a TRAILING window measured in rounds -- six of them for
+    the rate criterion -- so the budget is stated in rounds and converted at the
+    achieved period. A typed `--settle-max-hold-s` still wins, and the run says
+    it is an override rather than silently discarding the rounds budget.
+    """
+    plan = _plan(tmp_path, channels=V.EXAMPLE_CHANNELS)
+    assert plan.settle_max_rounds == H.DEFAULT_SETTLE_MAX_ROUNDS == 14
+    assert plan.settle_max_hold_typed is False
+    assert plan.settle_max_hold_s == pytest.approx(
+        14 * H.project(plan).settle_round_s)
+    # ...which is not the fixed number it replaced, and is bigger than it.
+    assert plan.settle_max_hold_s > H.DEFAULT_SETTLE_MAX_HOLD_S
+
+    fewer = _plan(tmp_path, channels=V.EXAMPLE_CHANNELS, settle_max_rounds=6)
+    assert fewer.settle_max_rounds == 6
+    assert fewer.settle_max_hold_s == pytest.approx(
+        6 * H.project(fewer).settle_round_s)
+
+    typed = _plan(tmp_path, channels=V.EXAMPLE_CHANNELS, settle_max_hold_s=3600)
+    assert typed.settle_max_hold_typed is True
+    assert typed.settle_max_hold_s == pytest.approx(3600.0)
+
+    # The projection names the rounds, and names the override when there is one.
+    text = H.render_projection(plan, H.project(plan))
+    assert "SWEEP BLOCK PLUS THE SLEEP" in text
+    assert "--settle-max-rounds 14" in text
+    assert "TYPED and OVERRIDES" not in text
+    override = H.render_projection(typed, H.project(typed))
+    assert "TYPED and OVERRIDES" in override
+    capsys.readouterr()
 
 
 def test_longest_reference_widens_the_window_and_costs_more(tmp_path):
@@ -3656,7 +4571,19 @@ class TestRunNarration:
         assert [e["round"] for e in rounds] == list(range(1, len(rounds) + 1))
         assert set(rounds[-1]) == {
             "ts", "seq", "type", "round", "elapsed_s", "rh_median_pct",
-            "rh_spread_pct", "tol_rel", "worst_deviation_rel", "worst_channel",
+            "rh_spread_pct",
+            # The BAND the spread was judged against, beside the spread itself.
+            # Unconditional, and `null` when the gate is off: an absent key would
+            # spell OFF with the same token as "the band was satisfied", which is
+            # the one thing this record must never do.
+            "rh_stability_pct",
+            # Was this round swept and narrated but NOT judged? Unconditional
+            # for `rh_stability_pct`'s reason: an absent key would spell "no
+            # preroll in this run" with the same token as "this round was
+            # judged", and which rounds entered the regressor is the whole
+            # content of the preroll.
+            "preroll",
+            "tol_rel", "worst_deviation_rel", "worst_channel",
             "deviation_rel_by_channel", "participating", "n_channels",
             "evaluable", "settled", "reason",
             # Was the tolerance reachable at all on this board's own scatter?
@@ -3736,7 +4663,12 @@ class TestRunNarration:
                     if e["type"] == "progress" and e["phase"] == "approach"]
         assert [e["axis"] for e in approach] == ["temperature", "rh"]
         assert all(set(e) == {"ts", "seq", "type", "phase", "done", "total",
-                              "axis", "elapsed_s", "lead_s", "attempts"}
+                              # `dwell_s` beside `elapsed_s` and not inside it:
+                              # `elapsed_s` is the window `timeout_s` bounds, and
+                              # the dwell is deliberately outside that bound. All
+                              # three are DURATIONS -- no PV joins them.
+                              "axis", "elapsed_s", "lead_s", "dwell_s",
+                              "attempts"}
                    for e in approach)
 
     # -- conditions.json ------------------------------------------------------
@@ -3759,8 +4691,12 @@ class TestRunNarration:
             lambda manager: reads.append(1) or real(manager))
 
         assert self._run(tmp_path, "cap") == V.EXIT_OK
-        # No soak, so every read is a `persist` read: exactly one per sweep.
-        assert len(reads) == len(_rows(tmp_path, "cap"))
+        # No soak, so every read is a `persist` read: exactly one per sweep --
+        # counted over EVERY persisted sweep, settle rounds included, because
+        # `persist` is one function and the settle rounds now go through it.
+        # That is the invariant: one read per sweep, the sidecar adds none.
+        assert len(reads) == len(_rows(tmp_path, "cap", include_settle=True))
+        assert len(reads) > len(_rows(tmp_path, "cap"))    # the gate swept too
 
         payload = json.loads(
             (_only_run_dir(tmp_path) / "conditions.json").read_text(
@@ -3858,7 +4794,7 @@ class TestRunNarration:
             lambda self: watch_polls.append(1) or real_poll(self))
 
         assert self._run(tmp_path, "sksee", "--soak-h", "1") == V.EXIT_OK
-        sweeps = len(_rows(tmp_path, "sksee"))
+        sweeps = len(_rows(tmp_path, "sksee", include_settle=True))
         # `run_cells` polls once per channel and `drift_check` once per recheck;
         # everything else the watch saw was the soak's own cadence.
         soak_polls = len(watch_polls) - 3 - 1
@@ -3966,12 +4902,274 @@ def _alternating(rounds, values=_R_UNJUDGEABLE):
     return [values[index % 2] for index in range(rounds)]
 
 
-def _survivor_settle(tmp_path, series, *, rounds=8, on_round=None, **flags):
+class _ScriptedRH:
+    """An RH controller whose per-round median is written down, not simulated."""
+
+    last_safe_dry_error = ""
+    last_safe_dry_duty = 0.01
+
+    def __init__(self, medians):
+        self.medians = [float(v) for v in medians]
+        self.reads = 0
+
+    def get_H(self):
+        value = self.medians[min(self.reads, len(self.medians) - 1)]
+        self.reads += 1
+        return value
+
+
+def _preroll_settle(tmp_path, series, rh_medians, *, rounds=10, **flags):
+    """`settle_phase` over a scripted board AND a scripted room.
+
+    The preroll decides on the round-cadence RH spread, so the room has to be
+    scriptable independently of the films -- which the fast mock, whose RH
+    converges monotonically toward its setpoint, cannot express.
+    """
+    rh = _ScriptedRH(rh_medians)
+
+    class _Manager:
+        def get(self, name):
+            assert name == H.RH_CONTROLLER
+            return rh
+
+    plan = _plan(tmp_path, channels=",".join(str(c) for c in series), **flags)
+    period_s = 90.0
+    plan.settle_max_hold_s = period_s * (rounds - 1)
+    index = {"n": -1}
+    swept: list[tuple[int, int]] = []
+
+    def measure(channel):
+        if channel == plan.channels[0]:
+            index["n"] += 1
+        swept.append((index["n"] + 1, channel))
+        values = series[channel]
+        return _sweep_at(values[min(index["n"], len(values) - 1)])
+
+    payloads: list[dict] = []
+    clock = H.VirtualClock()
+    outcome = H.settle_phase(_Manager(), plan, measure, sleep=clock.sleep,
+                             now=clock, min_hold_first_s=0.0,
+                             round_period_s=period_s, on_round=payloads.append)
+    return plan, outcome, payloads, swept
+
+
+#: A room that restarts noisy and goes quiet: the trailing 3-round spread first
+#: falls inside 1.5 %RH at round 6, which is where the settle clock may start.
+_RH_RESTART_TRANSIENT = [30.0, 26.0, 22.0, 20.5, 20.4, 20.3] + [20.2] * 8
+
+
+def test_the_round_record_carries_the_interval_that_produced_the_verdict(
+        tmp_path, capsys):
+    """**The run that asked "is 0.025 dec/h achievable here?" could not answer it
+    from its own record.**
+
+    Every per-cell verdict is `U = |rate| + t(0.975, k-2)*SE`, and the stream
+    carried the rate and not the SE -- so round 10's ten `rate_undetectable`
+    verdicts on 20260913T171305Z could not be re-scored against any other band
+    without repeating the 99 minutes.
+
+    Admissible on exactly `deviation_rel_by_channel`'s line: a standard error, a
+    residual RMS and a one-sided bound are gate state in per-hour units, not the
+    observable behind them. Absent under `deviation`, exactly as the rest of the
+    rate payload already is.
+    """
+    series = {18: _flat(_R_CONTROL, 14), 19: _flat(_R_TREATMENT, 14),
+              20: _flat(_R_TREATMENT_B, 14)}
+    _p, _o, payloads, _s = _preroll_settle(
+        tmp_path, series, [20.0] * 16, rounds=10,
+        settle_criterion="rate", settle_rate_tol_dec_per_h=0.05)
+    capsys.readouterr()
+
+    judged = [e for e in payloads if "rate_dec_per_h_by_channel" in e]
+    assert judged, "the rate criterion must have reached a window"
+    last = judged[-1]
+    for key in ("stderr_dec_per_h_by_channel", "resid_rel_by_channel",
+                "upper_bound_dec_per_h_by_channel"):
+        assert set(last[key]) == set(last["rate_dec_per_h_by_channel"]), key
+        assert all(value >= 0.0 for value in last[key].values()), key
+    # The window's own detection floor, beside the per-cell intervals it is the
+    # median of: together they are what "would a wider band have certified?"
+    # needs, and neither alone is.
+    assert last["reference_half_width_dec_per_h"] is not None
+    # The bound IS |rate| + t*SE, so it cannot sit below either term.
+    for channel, bound in last["upper_bound_dec_per_h_by_channel"].items():
+        assert bound >= abs(last["rate_dec_per_h_by_channel"][channel])
+        assert bound >= last["stderr_dec_per_h_by_channel"][channel]
+
+    # Absent, not null, under `deviation`: "this run computed no rate" must stay
+    # distinguishable from "this round's rate was unavailable".
+    _p2, _o2, dev, _s2 = _preroll_settle(
+        tmp_path, series, [20.0] * 16, rounds=6, name="devkeys")
+    capsys.readouterr()
+    for entry in dev:
+        assert "stderr_dec_per_h_by_channel" not in entry
+        assert "resid_rel_by_channel" not in entry
+        assert "upper_bound_dec_per_h_by_channel" not in entry
+
+
+def test_the_settle_clock_does_not_start_until_the_room_is_quiet(
+        tmp_path, capsys):
+    """**The tool's own actuation was entering its own regressor.**
+
+    `approach_condition` writes the RH setpoint and starts the loop at launch,
+    and the settle clock starts ~30 s later. On 20260913T171305Z the room then
+    wandered for ~70 min and five cells were reported MOVING at -0.02 to -0.047
+    dec/h -- a real slope, caused by the rig, judged as a property of the film.
+
+    The discriminator is the ROUND-CADENCE spread of the RH medians, which only
+    the settle rounds observe: `--approach-dwell-s` cannot see it, because RH was
+    inside 2 %RH of its setpoint from the first poll.
+
+    Withheld at the HARNESS and not in `SettleTracker`, which is shared with
+    `autonomous_wiring.drive_settle_phase`.
+    """
+    series = {18: _flat(_R_CONTROL, 14), 19: _flat(_R_TREATMENT, 14),
+              20: _flat(_R_TREATMENT_B, 14)}
+    _plan_, outcome, payloads, _swept = _preroll_settle(
+        tmp_path, series, _RH_RESTART_TRANSIENT,
+        settle_criterion="rate", settle_rate_tol_dec_per_h=0.05)
+    capsys.readouterr()
+
+    # Rounds 1-5 saw a room spanning 8.0, 5.5 and 1.6 %RH across its trailing
+    # window; round 6's spans 0.2. The band is the FLAG's 1.5, never the
+    # constant's -- a zone that hunts wider is given a wider band, not an
+    # endless preroll.
+    assert [e["round"] for e in payloads if e["preroll"]] == [1, 2, 3, 4, 5]
+    assert all(e["preroll"] is False for e in payloads[5:])
+    # A preroll round reached no verdict at all, which is not the same as a
+    # verdict of "not yet".
+    for entry in payloads[:5]:
+        assert entry["evaluable"] is None
+        assert entry["participating"] == []
+        assert entry["settled"] is False
+    # ...and the spread each preroll round was held on is in the record, beside
+    # the band it was held against -- OFF is not spelled like SATISFIED here
+    # either. Round 3's trailing window spans 30->22 and round 5's 22->20.4;
+    # round 6's 0.2 is what releases the clock.
+    assert payloads[2]["rh_spread_pct"] == pytest.approx(8.0)
+    assert payloads[4]["rh_spread_pct"] == pytest.approx(1.6)
+    assert all(e["rh_stability_pct"] == pytest.approx(1.5) for e in payloads)
+    assert outcome.n_rounds >= 6
+
+
+def test_a_preroll_round_is_swept_and_narrated_but_not_judged(tmp_path, capsys):
+    """Three separable properties, and dropping any one of them loses something.
+
+    SWEPT, because the sweep is what measures the room in the first place, and
+    because the apex histogram is built from it. NARRATED, because the rounds a
+    run spent waiting for its own chamber are the diagnosis when it ends at a
+    ceiling. CHARGED TO THE CEILING, because a preroll that bought free time
+    would let a hunting zone spend an unbounded hold.
+    """
+    series = {18: _flat(_R_CONTROL, 14), 19: _flat(_R_TREATMENT, 14),
+              20: _flat(_R_TREATMENT_B, 14)}
+    plan, outcome, payloads, swept = _preroll_settle(
+        tmp_path, series, _RH_RESTART_TRANSIENT, rounds=6,
+        settle_criterion="rate", settle_rate_tol_dec_per_h=0.05)
+    out = capsys.readouterr().out
+
+    preroll_rounds = [e["round"] for e in payloads if e["preroll"]]
+    assert preroll_rounds, "this fixture exists to produce a preroll"
+    for index in preroll_rounds:
+        # SWEPT: every channel, on every preroll round.
+        assert {ch for n, ch in swept if n == index} == set(plan.channels)
+        # NARRATED: the round is in the stream with its own record.
+        assert [e for e in payloads if e["round"] == index]
+    # CHARGED: the ceiling counted them, so the phase stopped at the ceiling
+    # rather than running on until the room happened to co-operate.
+    assert outcome.n_rounds == len(payloads) == 6
+    assert "PREROLL" in out
+    assert "the room is QUIET" in out
+
+    # OFF is off: `--rh-stability-pct 0` is the gate off, and an off gate is no
+    # preroll at all rather than an unsatisfiable one.
+    _p, _o, off_payloads, _s = _preroll_settle(
+        tmp_path, series, _RH_RESTART_TRANSIENT, rounds=6, name="off",
+        settle_criterion="rate", settle_rate_tol_dec_per_h=0.05,
+        rh_stability_pct=0)
+    capsys.readouterr()
+    assert all(e["preroll"] is False for e in off_payloads)
+
+    # And the shipped criterion is untouched: the transient's harm is to a
+    # regressed SLOPE, and `deviation` is a scatter about its own window mean
+    # that the RH clause already refuses on directly.
+    _p2, _o2, dev_payloads, _s2 = _preroll_settle(
+        tmp_path, series, _RH_RESTART_TRANSIENT, rounds=6, name="dev")
+    capsys.readouterr()
+    assert all(e["preroll"] is False for e in dev_payloads)
+    # Its window is judged from round 3, which the preroll would have withheld.
+    assert dev_payloads[2]["evaluable"] is not None
+
+    # **And plain `both` is a SHADOW, so it does not preroll either.** Withholding
+    # rounds there would shift the DEVIATION window, and `both` is defined as
+    # returning a verdict identical to `deviation`'s -- a shadow that moves the
+    # thing it shadows is not a shadow. Under `both --survivors on` the rate
+    # decides the partition, which is where `_announce_rate_floor` already draws
+    # the same line, so there the preroll applies.
+    _p3, _o3, shadow, _s3 = _preroll_settle(
+        tmp_path, series, _RH_RESTART_TRANSIENT, rounds=6, name="shadow",
+        settle_criterion="both", settle_rate_tol_dec_per_h=0.1)
+    capsys.readouterr()
+    assert all(e["preroll"] is False for e in shadow)
+
+
+def test_the_trend_table_shows_preroll_fits_marked_rather_than_n_a(
+        tmp_path, capsys):
+    """**"Unknown" was being spelled with the same token as "measured".**
+
+    The preroll withholds `observe`, so `tracker.rounds` is empty and a table
+    rendered from it printed `n/a` in every cell of a 12-channel board for four
+    rounds (`20260914T010938Z`) -- while the fits behind those cells were being
+    computed, counted (`n_modelled 12`) and written to disk. The numbers are
+    printed, and marked as what they are.
+
+    **Display only.** The tracker is not fed, the EMA folds only judged rounds
+    (none yet, so `n` reads 0), and the verdict is untouched -- which
+    `test_trend_table_leaves_every_settle_verdict_bit_identical` is the standing
+    assertion for.
+    """
+    series = {18: _flat(_R_CONTROL, 14), 19: _flat(_R_TREATMENT, 14),
+              20: _flat(_R_TREATMENT_B, 14)}
+    plan, _outcome, payloads, _swept = _preroll_settle(
+        tmp_path, series, _RH_RESTART_TRANSIENT, rounds=6,
+        settle_criterion="rate", settle_rate_tol_dec_per_h=0.05)
+    out = capsys.readouterr().out
+
+    preroll = [e["round"] for e in payloads if e["preroll"]]
+    assert preroll, "this fixture exists to produce a preroll"
+    marked = [ln for ln in out.splitlines() if T.PREROLL_NOTE in ln]
+    assert len(marked) == len(plan.channels) * len(preroll)
+    for line in marked:
+        fields = line.split()
+        # Flagged, because the gate really is not counting this channel...
+        assert fields[0] == "!"
+        # ...but the fit is a number rather than an absence.
+        assert fields[2] != "n/a"
+        # No baseline yet, and that one IS an absence: nothing has been judged.
+        assert fields[3] == "n/a" and fields[4] == "0"
+
+    # Positive control for the assertion above: the pre-fix render -- the whole
+    # table off an empty tracker history -- is `n/a` in exactly the column this
+    # test reads, so a regression that stopped passing the fits would redden it.
+    H._print_trend([], plan, None, {}, 2)
+    blank = [ln for ln in capsys.readouterr().out.splitlines()
+             if ln.startswith(" " * 9) and " ch" not in ln]
+    assert blank and all(ln.split()[1] == "n/a" for ln in blank)
+
+    _p4, _o4, routed, _s4 = _preroll_settle(
+        tmp_path, series, _RH_RESTART_TRANSIENT, rounds=6, name="routed",
+        settle_criterion="both", settle_rate_tol_dec_per_h=0.1, survivors="on")
+    capsys.readouterr()
+    assert [e["round"] for e in routed if e["preroll"]] == [1, 2, 3, 4, 5]
+
+
+def _survivor_settle(tmp_path, series, *, rounds=9, on_round=None, **flags):
     """`settle_phase` over a scripted board long enough for a RATE window.
 
-    Six rounds is the fewest at which a rate interval is worth quoting, so every
-    test here runs eight: the deviation criterion's window is three and the
-    difference between them is the thing under test.
+    Six rounds is the fewest at which a rate interval is worth quoting and the
+    armed consensus rule buys a seventh (`rate_window_rounds`), so every test
+    here runs nine: the deviation criterion's window is three and the difference
+    between them is the thing under test.
 
     Every *flag* goes in through the real CLI, on `_scripted_settle`'s
     precedent, so a test asserting on the criterion is asserting on the whole
@@ -3994,11 +5192,37 @@ def _survivor_settle(tmp_path, series, *, rounds=8, on_round=None, **flags):
                                 round_period_s=period_s, on_round=on_round)
 
 
-def _partitionable_board(rounds=8):
+def _partitionable_board(rounds=9):
     """Two quiet CONTROL cells, two quiet TREATMENT cells, one unjudgeable."""
     return {
         18: _flat(_R_CONTROL, rounds), 19: _flat(_R_CONTROL, rounds),
         20: _flat(_R_TREATMENT, rounds), 21: _flat(_R_TREATMENT_B, rounds),
+        22: _alternating(rounds),
+    }
+
+
+def _wobble(base, rounds, pct):
+    """A cell jittering +/-*pct* about a stable mean, round to round."""
+    return [float(base) * (1.0 + pct * ((index % 2) * 2 - 1))
+            for index in range(rounds)]
+
+
+def _noisy_board(rounds=9):
+    """A board with a NON-ZERO median residual, which is what a floor needs.
+
+    `_partitionable_board`'s four quiet cells are exactly flat, so the median
+    residual across the window is 0 and `_reference_half_width` is 0 -- a
+    detection floor no band can sit below, which makes every floor assertion
+    vacuous. Here every cell carries ~1 % of round-to-round scatter, so the
+    median residual is a real number, and ch22 keeps its 2.6x alternation so the
+    DEVIATION criterion never certifies and the phase runs long enough for a
+    rate window to exist at all.
+    """
+    return {
+        18: _wobble(_R_CONTROL, rounds, 0.010),
+        19: _wobble(_R_CONTROL, rounds, 0.012),
+        20: _wobble(_R_TREATMENT, rounds, 0.011),
+        21: _wobble(_R_TREATMENT_B, rounds, 0.013),
         22: _alternating(rounds),
     }
 
@@ -4113,6 +5337,71 @@ def test_settle_phase_survivors_partitions_at_the_ceiling_with_reasons(
     assert announced and "ch22 (unsettleable)" in announced[0]
     # The bias is named where a reader meets it, not only in a docstring.
     assert any("CONDITIONAL ON SETTLING" in ln for ln in lines)
+
+
+def test_a_dropped_cells_failure_does_not_count_toward_the_consecutive_limit(
+        tmp_path, monkeypatch, capsys):
+    """The guard is for a CASCADING COMMS FAILURE, and a dropped cell is not one.
+
+    Three failures in a row is the bus, not the cells -- but a cell the settle
+    gate already declined to speak for is not evidence about the board's health.
+    On the operator's board ch7 (an empty well), ch9, ch15 and ch16 are adjacent
+    and never carried a value in ten rounds, so a limit of 3 would end the run
+    before the first good cell was measured, which is why
+    `--max-consecutive-failures 16` was typed -- disabling the guard for the whole
+    run including for the failure it exists to catch.
+
+    The sweep is UNCHANGED: a dropped cell is still swept and still stamped.
+    Only the denominator moves.
+    """
+    plan = _plan(tmp_path, channels="18,19,20", max_consecutive_failures=2)
+    ctx = _context(tmp_path, _manager(), plan)
+    ctx.dropped = {18: "dropped_unevaluable", 19: "dropped_unevaluable"}
+    swept: list[int] = []
+
+    def _fail(context, channel, arm):
+        swept.append(int(channel))
+        raise RuntimeError(f"ch{channel} dead")
+
+    monkeypatch.setattr(V, "measure_reference", _fail)
+    # Two dropped cells fail first and must NOT arm the limit; ch20 is the only
+    # cell whose failure counts, and one is below the limit of two.
+    V.run_cells(ctx, object(), [18, 19, 20])
+
+    assert swept == [18, 19, 20], "a dropped cell is still SWEPT"
+    assert ctx.consecutive_failures == 1
+    out = capsys.readouterr().out
+    assert "ch18 failed" in out and "is DROPPED, so it does not count" in out
+    assert "ch20 failed" in out and "1 consecutive" in out
+
+    # ...and without the partition the same three failures end the run, which is
+    # what keeps this from being a guard that no longer guards.
+    plain = _context(tmp_path, _manager(), plan)
+    with pytest.raises(RuntimeError, match="consecutive cell failures"):
+        V.run_cells(plain, object(), [18, 19, 20])
+    capsys.readouterr()
+
+
+def test_max_consecutive_failures_defaults_to_the_board_under_survivors(tmp_path):
+    """The default depends on the PLAN, so it is resolved where the plan is.
+
+    Under `--survivors on` the run has already said some cells may not be
+    speakable for; holding it to three consecutive failures across a board it
+    expects to partition is the same mismatch in the other direction. A typed
+    value still wins in either mode -- the flag is not being taken away.
+    """
+    survivors = {"settle_criterion": "rate", "settle_rate_tol_dec_per_h": 0.05,
+                 "survivors": "on", "min_treatment": 1}
+
+    assert _plan(tmp_path, channels="18-32").max_consecutive_failures == 3
+    assert H.DEFAULT_MAX_CONSECUTIVE_FAILURES == 3
+    board = _plan(tmp_path, channels="18-32", **survivors)
+    assert board.max_consecutive_failures == len(board.channels) == 15
+    # A typed value wins in both modes.
+    assert _plan(tmp_path, channels="18-32", max_consecutive_failures=4
+                 ).max_consecutive_failures == 4
+    assert _plan(tmp_path, channels="18-32", max_consecutive_failures=4,
+                 **survivors).max_consecutive_failures == 4
 
 
 def test_settle_phase_survivors_never_drops_a_cell_proven_to_be_moving(tmp_path):
@@ -4253,6 +5542,87 @@ def test_a_survivor_stamp_withholds_h1_and_does_not_yet_exclude_the_dropped_row(
     # ...and all three cells, the dropped one included, are still USABLE. That
     # is the gap: the stamp is recorded and nothing acts on it.
     assert "3 usable" in h2.observed
+    # THE REGRESSION GUARD for the 2026-09-14 H1 widening: `settled` beside a
+    # `dropped_*` word now passes H1, and `survivors` beside one deliberately
+    # does NOT -- a rescue is a conditioned board, and H1 speaks for boards.
+    assert any("hold was not certified" in reason for reason in verdict.reasons)
+
+
+def test_evaluate_h1_pass_settled_with_dropped_unjudgeable_channels():
+    """**The `20260914T132645Z_eis_validate` defect, pinned.**
+
+    H1 is a BOARD-level check, and `--survivors on` stamps the partition onto
+    every cell the rate criterion could not individually judge -- whether or not
+    the board needed the partition to certify. So the first board this rig ever
+    certified `settled` outright carried `{settled, dropped_unevaluable}` across
+    its rows, and H1's old literal `certifications <= {"settled"}` reported
+    INSUFFICIENT on a hold that held.
+
+    A `dropped_*` stamp answers "was THIS cell part of what the verdict rests
+    on", never "is the verdict itself compromised", so it does not withhold.
+    """
+    from softae.tools import eis_validate_rule as RULE
+
+    cells = [_stamped_cell(18, "settled"), _stamped_cell(19, "settled"),
+             _stamped_cell(20, "dropped_unevaluable")]
+    verdict = RULE.evaluate(cells, min_treatment=1)
+    h1 = [c for c in verdict.criteria if c.name.startswith("H1")][0]
+
+    assert h1.status == "PASS"
+    assert "settled" in h1.observed and "dropped_unevaluable" in h1.observed
+    # The routing reached the criteria BELOW H1 -- which is the whole claim.
+    # (These synthetic cells carry no TREATMENT band, so the run still lands on
+    # INSUFFICIENT; what matters is that H1 is no longer the reason.)
+    assert not any("hold was not certified" in reason
+                   for reason in verdict.reasons)
+    # ...and the drop is still visible, still counted, still not a filter.
+    h2 = [c for c in verdict.criteria if c.name.startswith("H2")][0]
+    assert "3 usable" in h2.observed
+
+
+def test_evaluate_h1_fail_all_dropped_no_settled_member():
+    """No vacuous pass: a board with nothing but drop stamps was never certified
+    at all, so widening H1 to tolerate `dropped_*` must still require the
+    board-level `settled` word to be PRESENT."""
+    from softae.tools import eis_validate_rule as RULE
+
+    cells = [_stamped_cell(18, "dropped_unevaluable"),
+             _stamped_cell(19, "dropped_moving"),
+             _stamped_cell(20, "dropped_unevaluable")]
+    verdict = RULE.evaluate(cells, min_treatment=1)
+    h1 = [c for c in verdict.criteria if c.name.startswith("H1")][0]
+
+    assert h1.status == "FAIL"
+    assert verdict.outcome == RULE.OUTCOME_INSUFFICIENT
+    assert any("hold was not certified" in reason for reason in verdict.reasons)
+
+
+def test_evaluate_h1_fail_disabled_unchanged():
+    """`--settle disabled` is the one certification that WITHHOLDS rather than
+    reports INSUFFICIENT, and the widening leaves both halves alone."""
+    from softae.tools import eis_validate_rule as RULE
+
+    cells = [_stamped_cell(ch, "disabled") for ch in (18, 19, 20)]
+    verdict = RULE.evaluate(cells, min_treatment=1)
+    h1 = [c for c in verdict.criteria if c.name.startswith("H1")][0]
+
+    assert h1.status == "FAIL"
+    assert verdict.outcome == RULE.OUTCOME_WITHHELD
+
+
+def test_evaluate_h1_pass_settled_with_no_drops_at_all():
+    """The baseline the widening may not move: an unpartitioned board still
+    passes H1 on `{settled}` alone, exactly as it did."""
+    from softae.tools import eis_validate_rule as RULE
+
+    cells = [_stamped_cell(ch, "settled") for ch in (18, 19, 20)]
+    verdict = RULE.evaluate(cells, min_treatment=1)
+    h1 = [c for c in verdict.criteria if c.name.startswith("H1")][0]
+
+    assert h1.status == "PASS"
+    assert h1.observed == "settled"
+    assert not any("hold was not certified" in reason
+                   for reason in verdict.reasons)
 
 
 def test_survivor_row_stamp_separates_a_moving_cell_from_an_unjudgeable_one():
@@ -4312,9 +5682,20 @@ def test_the_survivor_reasons_carry_no_observable_vocabulary():
 # ── S6b: the plan-level refusals, before anything is heated ──────────────────
 
 def test_validate_plan_a_rate_criterion_without_a_band_is_refused(tmp_path):
-    plan = _plan(tmp_path, settle_criterion="rate")
+    """A TYPED zero, which is what the `<= 0` refusal was always for.
+
+    It used to be the default as well, and that is what changed: an operator who
+    stated `--settle-criterion rate` and nothing else got this refusal, read the
+    flag's help, derived 0.025 from H3 over a 2 h block, and set a band their own
+    window could not resolve. The default is now 0.05 and the refusal is
+    unchanged -- it catches the zero somebody meant.
+    """
+    plan = _plan(tmp_path, settle_criterion="rate", settle_rate_tol_dec_per_h=0)
     with pytest.raises(H.RefuseToStart, match="needs --settle-rate-tol-dec-per-h"):
         H.validate_plan(plan)
+    # ...and the same plan at the default is admissible, which is the half that
+    # would otherwise be asserted nowhere.
+    H.validate_plan(_plan(tmp_path, settle_criterion="rate"))
 
 
 def test_validate_plan_a_rate_band_above_the_maximum_is_refused(tmp_path):
@@ -4348,6 +5729,43 @@ def test_validate_plan_survivors_without_headroom_is_refused(tmp_path):
         H.validate_plan(plan)
 
 
+def test_the_epilog_names_every_bench_failure_mode_and_its_flag():
+    """**Both 2026-08-20 failures were written down in nobody's `--help`.**
+
+    They live in source docstrings, and the operator who ran 2026-09-13 then
+    typed two workaround flags this table would have named. The table is dated
+    because each row is a claim about a specific run.
+
+    Every flag it names is asserted to be a real `dest` on the `run` parser, so
+    a rename reddens the table instead of leaving it quietly wrong -- which is
+    the whole failure mode a help text has: it cannot be tested by reading it.
+    """
+    import re
+
+    dests = {action.dest for action in _run_subparser()._actions}
+    named = sorted(set(re.findall(r"--[a-z][a-z0-9-]+", V.BENCH_FAILURE_MODES)))
+
+    assert len(named) >= 6, "a table naming no flags answers nothing"
+    for flag in named:
+        assert flag[2:].replace("-", "_") in dests, flag
+    # The flags each proposal in the 2026-09-13 spec turns on are all present.
+    for flag in ("--settle-tol-rel", "--settle-rate-tol-dec-per-h",
+                 "--tolerance-c", "--max-consecutive-failures",
+                 "--rh-stability-pct", "--survivors", "--settle-criterion"):
+        assert flag in V.BENCH_FAILURE_MODES, flag
+    # ...and it reaches the actual `--help`, not merely the constant.
+    assert "FAILURE MODES SEEN ON THE BENCH" in V.build_parser().format_help()
+    # ASCII only: `render_projection`'s rule, and this text goes to a Windows
+    # console whose code page is not the one anybody assumes.
+    V.BENCH_FAILURE_MODES.encode("ascii")
+    # Proposals C and E have shipped, so their two placeholder rows are gone and
+    # name the real flags -- which the loop above has already proved are real
+    # `dest`s on the parser. Nothing in the table is unfixed any more.
+    assert "NOT YET FIXED" not in V.BENCH_FAILURE_MODES
+    for flag in ("--approach-dwell-s", "--settle-max-rounds"):
+        assert flag in V.BENCH_FAILURE_MODES, flag
+
+
 def test_validation_plan_fingerprint_covers_the_criterion_and_the_survivor_flag(
         tmp_path):
     """A `--resume` that switched criterion mid-run is exactly the after-the-fact
@@ -4379,9 +5797,11 @@ def test_validation_plan_fingerprint_covers_the_criterion_and_the_survivor_flag(
 
 def test_run_context_stamps_a_dropped_cell_apart_from_a_surviving_one(tmp_path):
     """`hold_certified` is per CHANNEL under a partition, because the run
-    proceeded and this cell is not one the gate could speak for. The rule module
-    already filters populations on this column, so the exclusion costs no new
-    machinery while the data survives on disk."""
+    proceeded and this cell is not one the gate could speak for. The stamp is
+    PROVENANCE and not a filter -- the rule module never selects on this column
+    (`test_a_survivor_stamp_withholds_h1_and_does_not_yet_exclude_the_dropped_row`
+    pins that) -- so the dropped cell's numbers survive on disk and in the
+    accuracy tables, marked."""
     from softae.analysis.equilibration import DROPPED_UNEVALUABLE
 
     ctx = _context(tmp_path, _manager(), _plan(tmp_path))
@@ -4455,6 +5875,7 @@ def test_the_dropped_set_and_its_reasons_reach_the_run_artifact(
     assert records[0]["dropped"] == {"20": "unsettleable"}
     assert records[0]["floors_ok"] is True
     assert records[0]["pooled_rate_dec_per_h"] == pytest.approx(0.01, abs=1e-3)
-    # ...and the drop reached the row stamps, so the population filter sees it.
+    # ...and the drop reached the row stamps, which is what makes the cell's
+    # provenance readable downstream -- it does not remove it from anything.
     assert ctx.certification(20) == "dropped_unevaluable"
     assert ctx.certification(18) == "survivors"

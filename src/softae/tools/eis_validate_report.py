@@ -70,9 +70,12 @@ from softae.tools.eis_validate_records import (
     ARM_REFERENCE,
     ARM_REFERENCE_END,
     ARM_SCOUT,
+    ARM_SETTLE,  # noqa: F401  -- re-export; the arm every reader excludes
     CERTIFIED_STILL,
     CONTROL,
     EXCLUDED,
+    EXPERIMENT_ARMS,  # noqa: F401  -- re-export; the four that are the experiment
+    PRE_SETTLE,  # noqa: F401  -- re-export; what a settle row's certification says
     TREATMENT,
     UNRESOLVED,
     UNSTAMPED,  # noqa: F401  -- re-export; the word an unstamped cell carries
@@ -288,8 +291,10 @@ def _certification_block(
             "accuracy table and in D1-D4, unchanged: that metrology is what "
             "production limits get calibrated from, and a row dropped here "
             "would have to be re-earned on the rig. The mark is provenance, "
-            "not a failure. H1 withholds the verdict on any certification "
-            "other than `settled`, so no GO can be emitted off them."
+            "not a failure. H1 is a BOARD-level check and withholds the "
+            "verdict unless the board itself was certified `settled`; these "
+            "per-cell marks do not withhold it, so a GO is possible with them "
+            "counted and the counts here are how you tell."
         ),
     }
 
@@ -498,8 +503,8 @@ def _add_certification_roster(add: Any, payload: dict[str, Any]) -> None:
         "KEPT in sections 4-8 ON PURPOSE -- that metrology is what production "
         "limits get calibrated from, and a row dropped here would have to be "
         "re-earned on the rig. NOT a failure and NOT an exclusion; H1 "
-        "withholds the verdict on any certification but 'settled', so nothing "
-        "is licensed by them.", 70
+        "certifies the BOARD and not these cells, so a board the gate DID "
+        "certify reaches its verdict with them counted.", 70
     ):
         add(f"  {line}")
     for entry in block.get("uncertified_cells", []):
@@ -668,9 +673,10 @@ def _wrap(text: str, width: int) -> list[str]:
 
 __all__ = [
     "ARM_FOLLOW_UP", "ARM_REFERENCE", "ARM_REFERENCE_END", "ARM_SCOUT",
+    "ARM_SETTLE", "PRE_SETTLE",
     "CERTIFIED_STILL", "CONTROL", "D1_MIN_MEDIAN_IMPROVEMENT_DEC",
     "D2_MIN_POSITIVE_FRACTION",
-    "D3_MAX_CONTROL_DEVIATION_DEC", "EXCLUDED", "FAIL",
+    "D3_MAX_CONTROL_DEVIATION_DEC", "EXCLUDED", "EXPERIMENT_ARMS", "FAIL",
     "H3_MAX_HOLD_DRIFT_DEC", "INSUFFICIENT", "OUTCOME_CONDITIONAL_GO",
     "OUTCOME_GO", "OUTCOME_INSUFFICIENT", "OUTCOME_MECHANISM_LIMITED",
     "OUTCOME_NO_GO", "OUTCOME_WITHHELD", "PASS", "REPORT_SCHEMA",

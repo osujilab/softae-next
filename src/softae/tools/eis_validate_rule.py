@@ -48,8 +48,10 @@ Four rules govern everything below:
    so that "median over 11 cells, 3 of them uncertified" cannot be read as
    "median over 11 certified cells". A criterion whose note grew is still the
    same criterion: no ``*_ok`` boolean, no population and no threshold reads the
-   stamp. H1 already withholds the verdict on any certification but ``settled``,
-   which is what makes keeping the rows safe.
+   stamp. H1 still withholds the verdict on any certification but ``settled``
+   and the ``dropped_*`` words, which is what makes keeping the rows safe: the
+   board-level claim has to be there, and a per-cell drop beside it says which
+   rows the note is about rather than that the hold failed.
 
 Rendered by :mod:`softae.tools.eis_validate_report`, which is also the single
 import surface these names are re-exported through.
@@ -201,7 +203,9 @@ def _retained_uncertified(contributors: Sequence[Cell]) -> str:
         "numbers are counted here ON PURPOSE and this is not a failure -- "
         "metrology on more channels is what production limits get calibrated "
         "from, and a row dropped here would have to be re-earned on the rig. "
-        "H1 withholds the verdict regardless, so nothing is licensed by them."
+        "H1 certifies the BOARD and not these cells, so a run whose board WAS "
+        "certified reaches its verdict with them counted -- read the count "
+        "beside the median, never the median alone."
     )
 
 
@@ -306,7 +310,21 @@ def evaluate(
         if row is not None and row.hold_certified
     }
     del by_pop[EXCLUDED]  # not a population: cells adaptive declines to act on
-    h1_ok = bool(certifications) and certifications <= {"settled"}
+    # H1 is a BOARD-level fact -- "did the hold hold" -- and `certifications` is
+    # a set of PER-ROW stamps, so literal uniformity is not the same question.
+    # Under `--survivors on` the partition is stamped onto every cell the rate
+    # criterion could not individually judge, whether or not the board needed the
+    # partition to certify; a board the gate certified `settled` outright then
+    # carries `{"settled", "dropped_unevaluable"}` and used to route to
+    # INSUFFICIENT on H1 alone (`20260914T132645Z_eis_validate`). A `dropped_*`
+    # stamp answers "was THIS cell part of what the verdict rests on", never "is
+    # the verdict itself compromised", so it does not withhold. `"settled"` must
+    # still be PRESENT -- an all-dropped board has no board-level certification
+    # to pass on -- and `"survivors"` still fails, which keeps the deliberate
+    # rule that a survivors-rescue never passes H1 outright.
+    h1_ok = bool(certifications) and "settled" in certifications and all(
+        c == "settled" or c.startswith("dropped_") for c in certifications
+    )
     criteria.append(Criterion(
         "H1 settle certified before the first reference sweep",
         "settled", ", ".join(sorted(certifications)) or "no rows carry one",

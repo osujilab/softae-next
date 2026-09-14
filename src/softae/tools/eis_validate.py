@@ -111,11 +111,15 @@ from softae.tools import (
     use_utf8_console,
 )
 from softae.tools.eis_validate_hold import (
+    DEFAULT_APPROACH_DWELL_S,
     DEFAULT_DRIFT_CHECK,
+    DEFAULT_MAX_CONSECUTIVE_FAILURES,
     DEFAULT_MIN_TREATMENT,
     DEFAULT_RH_APPROACH_TIMEOUT_S,
+    DEFAULT_RH_STABILITY_PCT,
     DEFAULT_SETTLE_CRITERION,
     DEFAULT_SETTLE_MAX_HOLD_S,
+    DEFAULT_SETTLE_MAX_ROUNDS,
     DEFAULT_SETTLE_RATE_TOL_DEC_PER_H,
     DEFAULT_SETTLE_TOL_REL,
     DEFAULT_SOAK_S,
@@ -135,6 +139,7 @@ from softae.tools.eis_validate_hold import (
     project,
     render_arc_watch,
     render_projection,
+    settle_ceiling_s,
     settle_phase,
     soak_phase,
     validate_plan,
@@ -156,6 +161,8 @@ from softae.tools.eis_validate_report import (
     ARM_REFERENCE,
     ARM_REFERENCE_END,
     ARM_SCOUT,
+    ARM_SETTLE,
+    PRE_SETTLE,
     TREATMENT,
     checkpoint_campaign,
     resolve_db,
@@ -174,6 +181,67 @@ EXIT_INTERRUPTED = 130
 #: (``pico2_range = [17, 32]``, remapped by ``mod_channel_restart`` to pico2's
 #: 2-16). Channel 18 is the one bench-verified for segmented scripts.
 EXAMPLE_CHANNELS = "18-32"
+
+#: The ``--help`` epilog's failure table. **Dated, because each row is a claim
+#: about a specific run**, and ASCII only, matching :func:`render_projection`'s
+#: own rule -- this text goes to a Windows console whose code page is not the
+#: one anybody assumes.
+#:
+#: It exists because both 2026-08-20 failures were written down in source
+#: docstrings and in nobody's ``--help``, and the operator who ran 2026-09-13
+#: then typed two workaround flags this table would have named.
+#: ``test_the_epilog_names_every_bench_failure_mode_and_its_flag`` asserts every
+#: flag here is a real ``dest`` on the ``run`` parser, so a renamed flag reddens
+#: the table rather than leaving it quietly wrong.
+BENCH_FAILURE_MODES = """\
+FAILURE MODES SEEN ON THE BENCH (each one cost a real hold)
+
+  date        what happened                              the flag or default that answers it
+  ----------  -----------------------------------------  -----------------------------------
+  2026-08-20  the settle band was below the board's own   the run now says so at the FIRST
+  (183625Z)   noise floor, so no hold length could ever   judged window and names a workable
+              clear it; the run held to its ceiling       value: --settle-tol-rel
+  2026-08-20  ch22 carried non-finite points in every     the round now names the channel
+  (164634Z)   sweep, starved the window below the         ("NO FIT") and says the FITS are why
+              minimum, and read as "not yet" for 64 min   the window is not evaluable
+  2026-09-13  two cells flipping between fits (ch4, ch8)  --settle-criterion rate, or
+              held eight cells that were quiet at 0.2-    --survivors on: the deviation
+              2.5 % for eight rounds. settle_check takes  criterion cannot tell "moving" from
+              the MAX over participants                   "too noisy to judge"
+  2026-09-13  the tool restarts the RH loop at launch     --approach-dwell-s, and the RH
+              and starts the settle clock 30 s later;     preroll: the settle clock waits for
+              the room wandered for ~70 min and five      the room, and rounds judged under a
+              cells were reported MOVING because of it    moving room are not regressed on
+  2026-09-13  the rate band (0.025 dec/h) sat at the      --settle-rate-tol-dec-per-h now
+              window's own detection floor, so every      defaults to 0.05 (H3 over a 1 h
+              quiet cell came back rate_undetectable      block), and the run prints the
+                                                          smallest band the window can certify
+  2026-09-13  a setpoint at or below the park             state a setpoint at or below 10 C to
+              temperature is unreachable on a heater-     run UNHEATED. Do not widen
+              only rig; --tolerance-c 20 was typed to     --tolerance-c to get there: that
+              get past it                                 loosens the gate for the whole run
+  2026-09-13  three adjacent dead wells would trip        --max-consecutive-failures defaults
+              --max-consecutive-failures (3) before the   to the board size under --survivors
+              first good cell was measured                on, and a DROPPED cell's failure no
+                                                          longer counts toward it
+  2026-09-13  the ceiling bought 10 rounds where the      the projection now quotes the
+              projection promised 17: a round is the      ACHIEVED period (sweeps + sleep), and
+              sweep block PLUS the sleep, not the sleep   --settle-max-rounds states the
+                                                          ceiling in rounds
+  2026-09-13  the settle gate refuses a window whose      --rh-stability-pct names that band
+              per-round RH MEDIANS span more than         (default 1.5, 0 = off). It is NOT
+              1.5 %RH, which an RH zone that hunts        --rh-tolerance-pct, which judges only
+              +/-2 %RH can never satisfy                  the approach, against the setpoint
+  2026-09-14  the RH loop OVERSHOOTS on restart (+2.4 at  the dwell now RETRIES on the
+  (005931Z)   20 %, +3.7 at 23 %) and then limit-cycles;  REMAINING budget instead of
+              a dwell judged against the approach band    spending one attempt per break, and
+              alone refused after 7 min of a 5400 s bound is judged against the WIDER of
+                                                          --rh-tolerance-pct and
+                                                          --rh-stability-pct
+
+A run that ends in `ceiling` has measured nothing. Read the per-round table and the arc
+histogram above the refusal before changing any flag: both are printed on every refusal
+and both are built from sweeps that were taken anyway."""
 
 #: ``<kind>:<name>:<run_id>`` -- the grammar ``core.rig_session`` documents,
 #: whose shipped siblings are ``campaign:<name>:<run_id>`` and
@@ -251,21 +319,76 @@ def resolve_baseline(explicit: str | None) -> tuple[str, str]:
                             "--baseline to match a campaign that overrides it")
 
 
+def parse_rh_stability_pct(value: Any) -> float | None:
+    """``--rh-stability-pct`` as the gate reads it: a band, or ``None`` for OFF.
+
+    ``0`` and ``"off"`` both mean off, and both map to ``None``. **Never to
+    ``0.0``**: a zero band is a spread requirement no window has ever satisfied,
+    so it would hold every run to its ceiling and name the room -- the same trap
+    :data:`~softae.tools.eis_validate_hold.DEFAULT_SETTLE_RATE_TOL_DEC_PER_H`'s
+    old zero was, wearing the other axis's clothes.
+    :mod:`softae.core.campaign_spec_run_plan` draws exactly this distinction for
+    exactly this key, under the name ``explicit_none``; this is the CLI's
+    spelling of it.
+
+    Refused rather than clamped for a negative or non-finite value, on
+    ``--soak-h``'s precedent: the operator who typed it meant something, and
+    silently meaning "off" is the reading least likely to be it.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in ("off", "none", ""):
+        return None
+    try:
+        band = float(text)
+    except ValueError:
+        raise RefuseToStart(
+            f"--rh-stability-pct {value!r} is neither a number nor 'off'. It is "
+            "the %RH span the per-round RH MEDIANS may cover across the judged "
+            "window; state a band, or 0/off to disable the gate."
+        ) from None
+    if band == 0.0:
+        return None
+    if not math.isfinite(band) or band < 0:
+        raise RefuseToStart(
+            f"--rh-stability-pct {band:g} is not a usable band. It is a SPREAD "
+            "in %RH -- the range of the per-round RH medians across the judged "
+            "window, compared against itself and never against a setpoint -- so "
+            "there is no such thing as a negative one. State 0 or 'off' to "
+            "disable the gate."
+        )
+    return band
+
+
 def build_plan(args: argparse.Namespace) -> ValidationPlan:
     from softae.analysis.eis.scout import scout_settings
     from softae.core.channel_spec import parse_channel_spec
     from softae.core.eis_scripts import EISParams
 
     baseline, source = resolve_baseline(args.baseline)
+    channels = tuple(parse_channel_spec(args.channels))
+    survivors = (getattr(args, "survivors", "off") == "on")
     band = scout_settings().band_below_apex_min_decades
     ref_close, baseline_ok = population_thresholds(
         EISParams.from_preset(baseline).f_lo_mHz / 1000.0,
         EISParams.from_preset(args.reference_preset).f_lo_mHz / 1000.0,
         band,
     )
+    # The ceiling, in the unit the criteria read, converted once. A typed
+    # `--settle-max-hold-s` wins -- it is the more specific instruction -- and is
+    # RECORDED as typed rather than inferred, because a typed value that happens
+    # to equal the derived one is still an override and the projection says so.
+    settle_max_rounds = int(getattr(args, "settle_max_rounds", None)
+                            or DEFAULT_SETTLE_MAX_ROUNDS)
+    typed_hold = getattr(args, "settle_max_hold_s", None)
+    settle_max_hold_typed = typed_hold is not None
+    settle_max_hold_s = (
+        float(typed_hold) if settle_max_hold_typed
+        else settle_ceiling_s(baseline, len(channels), settle_max_rounds))
     return ValidationPlan(
         validation_name=args.validation_name,
-        channels=tuple(parse_channel_spec(args.channels)),
+        channels=channels,
         rh_setpoint_pct=float(args.rh_setpoint_pct),
         temp_setpoint_c=float(args.temp_setpoint_c),
         baseline_preset=baseline,
@@ -279,8 +402,15 @@ def build_plan(args: argparse.Namespace) -> ValidationPlan:
         tolerance_c=float(args.tolerance_c),
         rh_approach_timeout_s=float(args.rh_approach_timeout_s),
         temp_approach_timeout_s=float(args.temp_approach_timeout_s),
+        approach_dwell_s=float(getattr(args, "approach_dwell_s",
+                                       DEFAULT_APPROACH_DWELL_S)),
         settle=(args.settle == "on"),
-        settle_max_hold_s=float(args.settle_max_hold_s),
+        # ROUNDS first, seconds derived. `getattr` on the same discipline as the
+        # bands below: a namespace built by a caller older than the flag keeps
+        # the shipped budget rather than raising.
+        settle_max_rounds=settle_max_rounds,
+        settle_max_hold_typed=settle_max_hold_typed,
+        settle_max_hold_s=settle_max_hold_s,
         # `getattr`, on `softae.tools.equilibration`'s precedent: a namespace
         # built by a caller older than the flag keeps the shipped band rather
         # than raising.
@@ -293,13 +423,27 @@ def build_plan(args: argparse.Namespace) -> ValidationPlan:
         settle_rate_tol_dec_per_h=float(
             getattr(args, "settle_rate_tol_dec_per_h",
                     DEFAULT_SETTLE_RATE_TOL_DEC_PER_H)),
-        survivors=(getattr(args, "survivors", "off") == "on"),
+        # `0` and `off` both mean the GATE IS OFF, and both arrive as `None` --
+        # never as `0.0`, which is a band no window can satisfy and would hold
+        # every run to its ceiling blaming the room. The same `explicit_none`
+        # distinction `campaign_spec_run_plan` already draws for this exact key.
+        rh_stability_pct=parse_rh_stability_pct(
+            getattr(args, "rh_stability_pct", DEFAULT_RH_STABILITY_PCT)),
+        survivors=survivors,
         # Hours in, seconds on the plan: the flag is in the operator's unit and
         # every field beside it is in the arithmetic's.
         soak_s=float(args.soak_h) * 3600.0,
         end_state=args.end_state,
         retries=int(args.retries),
-        max_consecutive_failures=int(args.max_consecutive_failures),
+        # The BOARD under a partition, and the shipped 3 otherwise. Under
+        # `--survivors on` the run has already said that some cells may not be
+        # speakable for, and three adjacent dead wells -- ch7, ch9, ch15, ch16 on
+        # the operator's board -- would otherwise trip the guard before the first
+        # good cell was measured. A typed value always wins, in either mode.
+        max_consecutive_failures=int(
+            len(channels) if survivors else DEFAULT_MAX_CONSECUTIVE_FAILURES
+        ) if getattr(args, "max_consecutive_failures", None) is None
+        else int(args.max_consecutive_failures),
         mock=bool(args.mock),
         ref_close_hz=ref_close,
         baseline_ok_hz=baseline_ok,
@@ -348,9 +492,16 @@ class RunContext:
         Per channel and not per run, because under a survivor partition the two
         differ and the difference is the whole point: the run proceeded, and this
         cell is not one the gate could speak for.
-        :func:`~softae.tools.eis_validate_rule` already filters populations on
-        this column, so a dropped cell's rows are excluded from every statistic
-        by machinery that exists -- while its data survives on disk, which is
+
+        **The stamp marks the row's provenance; it selects nothing.**
+        :func:`~softae.tools.eis_validate_rule` does *not* filter populations on
+        this column -- D1-D4 pick their cells by BAND, and a dropped cell's
+        numbers are counted there exactly as any other cell's, deliberately
+        (that module's docstring, principle 4). What the stamp buys is that the
+        rows are no longer anonymous: they reach
+        :attr:`~softae.tools.eis_validate_records.Cell.stillness_certified`, the
+        report's ``RETAINED UNCERTIFIED`` note, and the JSON an offline
+        calibration partitions on -- while the data survives on disk, which is
         what makes the drop auditable.
         """
         return self.dropped.get(int(channel), self.hold_certified)
@@ -439,7 +590,14 @@ def persist(ctx: RunContext, eis: Any, arm: str) -> int:
         "eis_validation_rh_sp_pct": ctx.plan.rh_setpoint_pct,
         "eis_validation_temp_sp_C": ctx.plan.temp_setpoint_c,
         "eis_validation_hold_epoch": ctx.hold_epoch,
-        "eis_validation_hold_certified": ctx.certification(channel),
+        # A settle sweep is taken BEFORE the gate has said anything, so
+        # `ctx.hold_certified` still holds its optimistic default and stamping it
+        # here would write "settled" onto a pre-equilibration row -- unknown
+        # spelled with the certified word. `PRE_SETTLE` is outside
+        # `CERTIFIED_STILL`, so even a reader that deliberately asks for these
+        # rows sees them marked uncertified.
+        "eis_validation_hold_certified": (
+            PRE_SETTLE if arm == ARM_SETTLE else ctx.certification(channel)),
         "eis_validation_hold_excursion": bool(
             ctx.watch.excursion if ctx.watch else False),
         "eis_validation_seq": ctx.next_seq(cell),
@@ -493,7 +651,14 @@ def persist(ctx: RunContext, eis: Any, arm: str) -> int:
     except Exception as exc:                              # pragma: no cover
         logger.warning("eis_validate_conditions_failed", error=str(exc))
 
-    ctx.n_recorded += 1
+    # **A settle sweep is not a measurement, and this counter is what says so.**
+    # `n_recorded: 0` on `run_finished` is the one-glance answer to "did this run
+    # measure anything?", and 20260913T171305Z's zero -- after 98.8 min at
+    # condition -- is precisely the finding. Counting the 160 settle rows that
+    # hold now persists would turn that zero into a three-figure number and
+    # retire the diagnostic on the runs that most need it.
+    if arm != ARM_SETTLE:
+        ctx.n_recorded += 1
     return measurement_id
 
 
@@ -563,7 +728,23 @@ def measure_adaptive(ctx: RunContext, planner: Any, channel: int) -> tuple[Any, 
 
 
 def run_cells(ctx: RunContext, planner: Any, channels: list[int]) -> None:
-    """Interleaved per channel: R then B, before moving to the next."""
+    """Interleaved per channel: R then B, before moving to the next.
+
+    **A DROPPED cell's failure is logged, narrated, and does not count.** The
+    limit exists to catch a cascading comms failure -- three failures in a row is
+    the bus, not the cells -- and a cell the settle gate already declined to
+    speak for is not evidence about the board's health. On the operator's board
+    ch7 (an empty well), ch9, ch15 and ch16 are adjacent and never carried a
+    value in ten rounds, so a limit of 3 would end the run before the first good
+    cell was measured; ``--max-consecutive-failures 16`` was typed to get past
+    it, which disables the guard for the whole run including for the failure it
+    is actually for.
+
+    **The sweep is unchanged.** A dropped cell is still swept and still stamped
+    (:meth:`RunContext.certification`) -- that is the cheaper half of the
+    survivor argument and it buys the evidence to audit the drop. What changes is
+    only the denominator the guard counts against.
+    """
     total = len(channels)
     for index, channel in enumerate(channels, start=1):
         if ctx.watch is not None:
@@ -595,14 +776,19 @@ def run_cells(ctx: RunContext, planner: Any, channels: list[int]) -> None:
             # say what it means.
             ctx.narration.progress(PHASE_CELLS, index, total, channel=channel)
         except Exception as exc:
-            ctx.consecutive_failures += 1
+            dropped = int(channel) in ctx.dropped
+            if not dropped:
+                ctx.consecutive_failures += 1
             logger.warning("eis_validate_cell_failed", channel=channel,
-                           error=str(exc),
+                           error=str(exc), dropped=dropped,
                            consecutive=ctx.consecutive_failures)
-            print(f"  ! ch{channel} failed ({exc}); "
-                  f"{ctx.consecutive_failures} consecutive", flush=True)
+            tally = ("and is DROPPED, so it does not count toward "
+                     f"--max-consecutive-failures ({ctx.consecutive_failures} "
+                     f"consecutive)" if dropped
+                     else f"{ctx.consecutive_failures} consecutive")
+            print(f"  ! ch{channel} failed ({exc}); {tally}", flush=True)
             ctx.narration.progress(PHASE_CELLS, index, total, channel=channel,
-                                   failed=True,
+                                   failed=True, dropped=dropped,
                                    consecutive=ctx.consecutive_failures)
             if ctx.consecutive_failures >= ctx.plan.max_consecutive_failures:
                 raise RuntimeError(
@@ -691,7 +877,8 @@ def build_parser() -> argparse.ArgumentParser:
             f"  {CONSOLE_SCRIPT} run --channels {EXAMPLE_CHANNELS} "
             f"--rh-setpoint-pct 30 --temp-setpoint-c 25 "
             f"--validation-name adaptive-2026-08\n"
-            f"  {CONSOLE_SCRIPT} report --validation-name adaptive-2026-08"
+            f"  {CONSOLE_SCRIPT} report --validation-name adaptive-2026-08\n"
+            f"\n{BENCH_FAILURE_MODES}"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -730,9 +917,49 @@ def build_parser() -> argparse.ArgumentParser:
                           "~5000 s")
     run.add_argument("--temp-approach-timeout-s", type=float,
                      default=DEFAULT_TEMP_APPROACH_TIMEOUT_S)
+    # ONE IN-BAND POLL IS NOT AN ARRIVAL. `approach_setpoint` returns on the
+    # first sample inside tolerance, and a PV crossing the band on its way
+    # somewhere else produces exactly that sample.
+    run.add_argument("--approach-dwell-s", dest="approach_dwell_s", type=float,
+                     default=DEFAULT_APPROACH_DWELL_S,
+                     help=f"seconds each axis must stay IN BAND before it counts "
+                          f"as reached. Default {DEFAULT_APPROACH_DWELL_S:g}; 0 "
+                          f"restores the first-in-band-poll behaviour. A "
+                          f"SECONDARY safeguard: it catches an axis still "
+                          f"travelling, and would NOT have caught 2026-09-13, "
+                          f"where RH was in band from the first poll and then "
+                          f"wandered for ~70 min. The RH PREROLL before the "
+                          f"settle clock is what answers that -- see "
+                          f"--rh-stability-pct")
     run.add_argument("--settle", choices=("on", "off"), default="on")
-    run.add_argument("--settle-max-hold-s", type=float,
-                     default=DEFAULT_SETTLE_MAX_HOLD_S)
+    # `None`, not a number, for `--max-consecutive-failures`'s reason and with a
+    # second one on top: the derived value depends on the CHANNEL COUNT and the
+    # BASELINE PRESET, neither known until both are parsed, and a typed value has
+    # to stay distinguishable from a coincidental match so the projection can say
+    # OVERRIDE out loud. Resolved in `build_plan`, the one place that has all
+    # three.
+    run.add_argument("--settle-max-hold-s", type=float, default=None,
+                     help=f"the settle ceiling in SECONDS. Default: derived from "
+                          f"--settle-max-rounds and the ACHIEVED round period "
+                          f"(sweep block + sleep), not the fixed "
+                          f"{DEFAULT_SETTLE_MAX_HOLD_S:g} s this used to be. A "
+                          f"typed value WINS and is announced as an override in "
+                          f"the projection")
+    # ROUNDS, because rounds are the unit every criterion in this gate reads. A
+    # ceiling in seconds is a promise about a quantity nothing consumes, and on
+    # 20260913T171305Z it promised 17 rounds and bought 10.
+    run.add_argument("--settle-max-rounds", dest="settle_max_rounds", type=int,
+                     default=DEFAULT_SETTLE_MAX_ROUNDS,
+                     help=f"the settle ceiling in ROUNDS -- the unit the "
+                          f"criteria actually read. Default "
+                          f"{DEFAULT_SETTLE_MAX_ROUNDS}: a first RATE verdict "
+                          f"needs a trailing 6-round window, the RH preroll "
+                          f"spends 3-5 rounds on a board whose zone hunts, and a "
+                          f"verdict arriving on the last possible round has no "
+                          f"second opinion. Converted to --settle-max-hold-s at "
+                          f"the ACHIEVED period (the board's sweep block PLUS "
+                          f"the sleep), so the number of rounds it names is the "
+                          f"number it buys")
     # Spelled exactly as `softae.tools.equilibration` spells it, because it is
     # the same quantity feeding the same `SettleTracker`; two tools spelling one
     # concept differently is how an operator learns that a flag means whatever
@@ -792,6 +1019,34 @@ def build_parser() -> argparse.ArgumentParser:
                           f"above {SETTLE_RATE_TOL_DEC_PER_H_MAX:g} dec/h, which "
                           "would certify a cell whose conductivity changes "
                           "threefold every hour")
+    # THREE numbers on this rig carry a %RH, and only this one is a SPREAD.
+    # Naming all three in one help text is the point: the flag sitting next to it
+    # -- `--rh-tolerance-pct` -- is the one an operator will widen, and it cannot
+    # touch this gate. Four windows on 20260913T171305Z were blocked here with
+    # the band appearing in no --help, no console line and no refusal.
+    #
+    # A string, not a float, because `0` and `off` must both reach
+    # `parse_rh_stability_pct` as themselves: argparse's `type=float` would turn
+    # `off` into an unhelpable error and would give 0 no way to mean None.
+    run.add_argument("--rh-stability-pct", dest="rh_stability_pct",
+                     default=f"{DEFAULT_RH_STABILITY_PCT:g}",
+                     help=f"the settle gate's RH STABILITY band, in %%RH: how "
+                          f"far the per-ROUND RH MEDIANS may span across the "
+                          f"judged window. Compared against ITSELF, never "
+                          f"against the setpoint. Default "
+                          f"{DEFAULT_RH_STABILITY_PCT:g} (measured, not assumed); "
+                          f"0 or 'off' disables the gate. THREE different %%RH "
+                          f"numbers exist and only this one is a spread: (1) "
+                          f"--rh-tolerance-pct is the APPROACH band, distance "
+                          f"from the setpoint, judged only until the first "
+                          f"in-band read; (2) [safety] rh_deviation_warn_pct / "
+                          f"rh_deviation_fault_pct watch the HOLD against the "
+                          f"setpoint and are config, not flags; (3) this one. "
+                          f"Widening (1) or (2) does nothing for (3). A zone "
+                          f"that hunts +/-2 %%RH can never certify at "
+                          f"{DEFAULT_RH_STABILITY_PCT:g} -- the run now prints "
+                          f"the achieved spread on every round and suggests a "
+                          f"band at its ceiling")
     # Off by default, and it stays off unless it is typed: it changes what the
     # run is allowed to conclude, not merely how long it waits.
     run.add_argument("--survivors", choices=("off", "on"), default="off",
@@ -825,7 +1080,17 @@ def build_parser() -> argparse.ArgumentParser:
                           "equilibration. Settle time counts against it")
     run.add_argument("--end-state", choices=("park", "hold"), default="park")
     run.add_argument("--retries", type=int, default=1)
-    run.add_argument("--max-consecutive-failures", type=int, default=3)
+    # `None`, not a number, because the default DEPENDS ON THE PLAN: under
+    # `--survivors on` it is the board size, and the board is not known until
+    # `--channels` is parsed. Resolved in `build_plan`, which is the one place
+    # that has both.
+    run.add_argument("--max-consecutive-failures", type=int, default=None,
+                     help=f"end the run after this many CONSECUTIVE cell "
+                          f"failures. Default {DEFAULT_MAX_CONSECUTIVE_FAILURES} "
+                          f"under --survivors off, and the BOARD SIZE under "
+                          f"--survivors on -- where a partition has already "
+                          f"declined to speak for some cells and their failures "
+                          f"no longer count toward this limit at all")
     run.add_argument("--resume", action="store_true",
                      help="re-enter an existing validation; ALWAYS "
                           "re-equilibrates, because a park ended the condition")
@@ -1051,6 +1316,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             "run_started", run_id=ctx.run_id, validation=plan.validation_name,
             channels=len(plan.channels), rh_setpoint_pct=plan.rh_setpoint_pct,
             temp_setpoint_C=plan.temp_setpoint_c, soak_s=plan.soak_s,
+            # A CONDITION, not a derived convenience: "the heater was off and
+            # the chamber sat at whatever ambient gave" is the whole description
+            # of an unheated run, and a reader who has only `temp_setpoint_C`
+            # cannot recover it without also knowing what the park constant was
+            # on the day. Stamped here and in `plan.as_dict()`.
+            unheated=plan.unheated,
             hold_epoch=ctx.hold_epoch, resume=bool(args.resume),
             mock=bool(plan.mock))
         claim.enter_context(
@@ -1247,6 +1518,23 @@ def _confirm(plan: ValidationPlan, projection: Any, *, assume_yes: bool) -> bool
             f"{plan.soak_s / 3600:.2f} h",
             f"{plan.soak_s * SOAK_CEILING_FACTOR / 3600:.2f} h",
         ))
+    # `confirm_thermal`'s own banner says THIS DRIVES THE STAGE HEATER TO <x> C,
+    # which is FALSE when nothing is driven -- and it is the last screen before
+    # an unattended run, so a false sentence there is the worst place for one.
+    # Corrected through the existing `plan_overrides` channel rather than by
+    # changing that function's signature: it is shared with the equilibration
+    # tool and this is this caller's fact, not that function's.
+    if plan.unheated:
+        from softae.core.safe_park import DEFAULT_SAFE_TEMP_C
+
+        disclosures.append((
+            "UNHEATED -- the setpoint is at or below the park temperature "
+            f"{DEFAULT_SAFE_TEMP_C:g} C, so NOTHING DRIVES THE HEATER and the "
+            "condition is whatever ambient gives; the line above is the "
+            "setpoint, not a target",
+            "heater off",
+            f"{plan.temp_setpoint_c:g} C setpoint",
+        ))
     return confirm_thermal(config, assume_yes=assume_yes,
                            plan_overrides=disclosures)
 
@@ -1364,14 +1652,21 @@ def _establish_condition(ctx: RunContext, plan: ValidationPlan,
         # twenty seconds.
         lead = (f"  (+{report.lead_s / 60:.1f} min commanded during the heat)"
                 if report.lead_s > 0 else "")
+        # The dwell beside the judged window rather than inside it: an operator
+        # reading "35.0 min" needs to know which part was travelling and which
+        # part was the axis proving it had stopped.
+        dwell = (f"  (+{report.dwell_s / 60:.1f} min held IN BAND)"
+                 if report.dwell_s > 0 else "")
         print(f"[approach] {report.axis:<12} -> {report.target:g}  "
-              f"PV {report.pv_final:g}  {report.elapsed_s / 60:.1f} min{lead}")
+              f"PV {report.pv_final:g}  {report.elapsed_s / 60:.1f} min"
+              f"{dwell}{lead}")
         # The axis and how long it took, not the PV it reached. A PV is a
         # reading, and readings belong in `conditions` rows and in
         # `conditions.json` -- both of which this run already writes.
         narration.progress(PHASE_APPROACH, index, len(reports),
                            axis=report.axis, elapsed_s=round(report.elapsed_s, 1),
                            lead_s=round(report.lead_s, 1),
+                           dwell_s=round(report.dwell_s, 1),
                            attempts=report.attempts)
 
     # THE MOMENT THE CONDITION EXISTS, and so the moment the soak clock starts.
@@ -1571,21 +1866,43 @@ def _soak_restart(ctx: RunContext) -> Any:
 
 
 def _settle_sweep(ctx: RunContext, channel: int) -> Any:
-    """One baseline-preset sweep for the settle gate. **Not persisted.**
+    """One baseline-preset sweep for the settle gate. **Persisted, and tagged.**
 
     These spectra decide whether the material has stopped moving and supply the
-    apex histogram; they are not measurements of the condition under test, and
-    recording them would put pre-equilibration rows in the same validation the
-    reporter reads.
+    apex histogram; they are not measurements of the condition under test.
+
+    **The objection that kept them off disk is answered, not overridden.** It
+    said recording them "would put pre-equilibration rows in the same validation
+    the reporter reads" -- true of an *untagged* row, and false of one stamped
+    :data:`~softae.tools.eis_validate_records.ARM_SETTLE`. Every reader now
+    excludes that arm by default (``load_records(include_settle=False)``), and
+    :func:`~softae.tools.eis_validate_records.assemble_cells` refuses to build a
+    cell from one even if handed it directly, so there is no path by which a
+    settle row reaches an accuracy table.
+
+    What the rows buy is what two ceiling runs could not produce: 20260820T183625Z
+    and 20260913T171305Z both spent an hour and a half in this gate and left an
+    **empty** ``eis/`` directory, so whether the gate was watching a moving film
+    or a failing fit could not be asked again without repeating the hold.
+    ~3.8 kB a sweep: a 16-channel, 10-round phase is ~608 kB.
     """
     from softae.core.eis_scripts import EISParams
     from softae.drivers.mscr_library import eis_run_mscrbuild
 
     grid = EISParams.from_preset(ctx.plan.baseline_preset)
-    path = ctx.script_path(channel, "settle")
+    path = ctx.script_path(channel, ARM_SETTLE)
     eis_run_mscrbuild(path, mux_ch=channel, mVac=grid.mv_ac, f_hi=grid.f_hi,
                       f_lo=grid.f_lo_mHz, npts=grid.npts, mVdc=grid.mv_dc)
-    return acquire(ctx, channel, {"eis_preset": ctx.plan.baseline_preset}, path)
+    eis = acquire(ctx, channel, {"eis_preset": ctx.plan.baseline_preset}, path)
+    # Best-effort, and deliberately so: a settle round must never fail because a
+    # diagnostic row could not be written. The gate's verdict comes from the
+    # returned spectrum, which is in hand either way.
+    try:
+        persist(ctx, eis, ARM_SETTLE)
+    except Exception as exc:                              # pragma: no cover
+        logger.warning("eis_validate_settle_persist_failed",
+                       channel=channel, error=str(exc))
+    return eis
 
 
 def _write_report(store: Any, plan: ValidationPlan,

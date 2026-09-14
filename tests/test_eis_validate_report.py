@@ -522,9 +522,17 @@ def test_cell_mixed_certifications_within_one_cell_are_not_certified():
 
 def test_uncertified_cells_enter_d1_to_d4_exactly_as_certified_ones_do():
     """**The anti-regression test.** A marker may not move a pre-registered
-    verdict, so every criterion's threshold, observed value and status is
-    identical with three TREATMENT cells uncertified -- and only H1, which read
-    the stamp long before any of this marking existed, differs at all."""
+    verdict, so every criterion's threshold, status and observed value is
+    identical with three TREATMENT cells uncertified -- and only H1's
+    ``observed``, which merely LISTS the certification words the rows carry,
+    differs at all.
+
+    H1's *status* used to differ too, and that was the defect
+    ``20260914T132645Z_eis_validate`` found: H1 is a BOARD-level check, so a
+    board the settle gate certified ``settled`` outright stays certified when a
+    few of its cells also carry a per-cell ``dropped_*`` stamp. Before the fix
+    this run reported INSUFFICIENT off H1 alone, on a hold that held.
+    """
     settled = _passing_run()
     marked = _stamp(_passing_run(), "dropped_unevaluable",
                     channels={10, 11, 12})
@@ -532,10 +540,9 @@ def test_uncertified_cells_enter_d1_to_d4_exactly_as_certified_ones_do():
     b = R.evaluate(_cells(marked), min_treatment=6)
     assert [c.name for c in a.criteria] == [c.name for c in b.criteria]
     for x, y in zip(a.criteria, b.criteria):
-        if x.name.startswith("H1"):
-            continue
-        assert (x.threshold, x.observed, x.status) == (
-            y.threshold, y.observed, y.status), x.name
+        assert (x.threshold, x.status) == (y.threshold, y.status), x.name
+        if not x.name.startswith("H1"):
+            assert x.observed == y.observed, x.name
     assert a.vetoes == b.vetoes
     # ...and the numbers themselves: every cell still counted, both populations.
     certified = R.build_payload(settled, _cells(settled), {}, a)
@@ -544,10 +551,13 @@ def test_uncertified_cells_enter_d1_to_d4_exactly_as_certified_ones_do():
     assert payload["noise_floor"] == certified["noise_floor"]
     assert payload["populations"] == certified["populations"]
     assert payload["deviation"]["improvement"]["n"] == 6
-    # H1's withhold is untouched: no false GO off the marked run, and no new
-    # refusal on the certified one either.
+    # The mark reaches the report and nothing else: H1 passes on both runs, and
+    # the drop word shows up only where H1 says WHAT the rows carried.
+    assert _status(a, "H1") == R.PASS and _status(b, "H1") == R.PASS
+    h1_b = next(c for c in b.criteria if c.name.startswith("H1"))
+    assert "dropped_unevaluable" in h1_b.observed and "settled" in h1_b.observed
     assert a.outcome == R.OUTCOME_GO
-    assert b.outcome == R.OUTCOME_INSUFFICIENT
+    assert b.outcome == R.OUTCOME_GO
 
 
 def test_survivor_run_marks_only_the_cells_the_gate_dropped():
