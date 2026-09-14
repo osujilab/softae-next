@@ -204,6 +204,16 @@ def create_manager(
             logger.info("mock_driver_fallback", instrument=name)
             mgr.register(fallback_cls(name, cfg))
 
+    # An anneal hold watches humidity as well as temperature, and the %RH it
+    # watches is the *sibling* rh_controller's — so the temperature controller
+    # gets the registry, exactly as the liquid handler does below. Without this
+    # the hold's RH watchdog is production-dead: `run_anneal_hold` accepts an
+    # `rh_reader`, nothing supplied one, and "drift announced and recorded"
+    # described machinery no run had ever reached. Set unconditionally because
+    # both drivers accept the attribute and only the real one reads it — the
+    # mock's hold is instant by design and never opens a watch.
+    mgr.get("temp_controller").manager = mgr
+
     # Coordinator instrument — drives whatever stage + syringe were registered
     # above (real or mock fallback). Registered last so both exist.
     from softae.drivers.async_liquid_handler import AsyncLiquidHandler

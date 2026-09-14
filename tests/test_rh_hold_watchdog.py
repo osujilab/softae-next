@@ -42,7 +42,10 @@ from softae.core.alerts import (
     clear_alert_sinks,
     register_alert_sink,
 )
+from softae.core.conditions_capture import read_environment
 from softae.core.data_store import DataStore
+from softae.drivers import contracts as _contracts
+from softae.drivers.async_temp_controller import AsyncTempController
 from softae.drivers.contracts import (
     ALERT_RH_FAULT,
     ALERT_RH_OFF_SETPOINT,
@@ -746,3 +749,239 @@ class TestFloorReporter:
         direct = rh_floor_by_temperature(
             resolve_db_path(floor_store.project_dir))
         assert direct == rh_floor_by_temperature(floor_store.project_dir)
+
+
+# ── The driver end of the watch: who actually supplies the reader (F2) ───────
+#
+# Everything above tests `run_anneal_hold` *given* an `rh_reader`. Nothing in
+# production ever gave it one: `AsyncTempController.anneal` called
+# `run_anneal_hold(self, hold_time_s, target_temp_C)` and stopped there, so
+# "drift announced and recorded" described machinery no run had reached. The
+# reader has to come from the *sibling* rh_controller, drivers carry no registry
+# back-reference of their own, and `drivers/factory.build_instruments` is where
+# `AsyncLiquidHandler` already takes exactly that back-reference.
+
+CHAMBER_C = 85.0
+
+
+class _FakeRH:
+    """The three reads `_rh_watch_source` and `read_environment` make of it."""
+
+    name = "rh_controller"
+
+    def __init__(self, rh: float = OFF_SP_PV, setpoint: float | None = SP) -> None:
+        self.rh = rh
+        self.setpoint = setpoint
+
+    def get_TH(self) -> tuple[float, float]:
+        return (CHAMBER_C, self.rh)
+
+    def get_T(self) -> float:
+        return CHAMBER_C
+
+    def get_H(self) -> float:
+        return self.rh
+
+    def status(self) -> dict:
+        return {"setpoint": self.setpoint, "running": True}
+
+
+class _FakeManager:
+    """The registry surface `conditions_capture` uses: ``names`` and ``get``."""
+
+    def __init__(self, **instruments) -> None:
+        self._by_name = dict(instruments)
+
+    @property
+    def names(self) -> list[str]:
+        return list(self._by_name)
+
+    def get(self, name: str):
+        return self._by_name[name]
+
+
+class _StubbedTempController(AsyncTempController):
+    """The real ``anneal``/``_rh_watch_source``, with the Modbus surface stubbed.
+
+    Subclassed rather than faked whole, because the thing under test *is* the
+    real driver's anneal path — a stand-in with its own ``anneal`` would be a
+    mutation audit that certifies the stand-in.
+    """
+
+    def __init__(self, **kw) -> None:
+        super().__init__(name="temp_controller", config={})
+        self.sp = 25.0
+        self.pv = 85.0
+        self.__dict__.update(kw)
+
+    def get_sp(self) -> float:
+        return self.sp
+
+    def get_pv(self) -> float:
+        return self.pv
+
+    def write_sp(self, T_SP: float, print_flag: int = 1) -> None:
+        self.sp = float(T_SP)
+
+    def wait(self, within: float, equilibration_time: float = 0,
+             timeout: float = 900) -> None:
+        return None
+
+
+@pytest.fixture
+def fast_hold(monkeypatch):
+    """Run the **real** ``run_anneal_hold`` on a virtual clock.
+
+    Only the clock is injected — the reader, the setpoint and the store all come
+    from the driver, which is the wiring under test. `anneal` imports the symbol
+    from ``softae.drivers.contracts`` at call time, so patching the module
+    attribute is what the driver will see.
+    """
+    calls: list[dict] = []
+
+    def _fast(controller, hold_time_s, target_C, **kw):
+        calls.append(dict(kw))
+        clock = _Clock()
+        return run_anneal_hold(controller, hold_time_s, target_C,
+                               sleep=clock.sleep, now=clock.now, **kw)
+
+    monkeypatch.setattr(_contracts, "run_anneal_hold", _fast)
+    return calls
+
+
+class TestTheAnnealResolvesItsHumidityWatch:
+    """``_rh_watch_source`` needs **both** halves or it yields neither: a reader
+    with no setpoint has nothing to classify against, and a setpoint with no
+    reader has nothing to classify."""
+
+    def test_a_controller_with_no_registry_resolves_nothing(self):
+        assert _StubbedTempController()._rh_watch_source() == (None, None)
+
+    def test_an_attached_registry_resolves_the_reader_and_the_setpoint(self):
+        rh = _FakeRH()
+        controller = _StubbedTempController()
+        controller.manager = _FakeManager(rh_controller=rh)
+
+        reader, setpoint = controller._rh_watch_source()
+
+        assert reader == rh.get_TH
+        assert setpoint == pytest.approx(SP)
+
+    def test_the_setpoint_is_the_one_read_environment_reports(self):
+        """``rh_sp_pct`` has no public getter — it lives inside
+        ``status()["setpoint"]`` — and ``conditions_capture`` is the single place
+        that knows so. A second spelling here would let the hold's verdict and
+        the ``conditions`` row disagree about what was asked for."""
+        manager = _FakeManager(rh_controller=_FakeRH(setpoint=33.0))
+        controller = _StubbedTempController()
+        controller.manager = manager
+
+        _, setpoint = controller._rh_watch_source()
+        assert setpoint == read_environment(manager)["rh_sp_pct"]
+
+    def test_a_rig_with_no_rh_controller_resolves_nothing(self):
+        controller = _StubbedTempController()
+        controller.manager = _FakeManager()
+        assert controller._rh_watch_source() == (None, None)
+
+    def test_an_rh_controller_that_cannot_report_a_setpoint_resolves_nothing(self):
+        """Half a watch is not a conservative watch — it is a classifier with no
+        reference, which would grade every hold against ``None``."""
+        controller = _StubbedTempController()
+        controller.manager = _FakeManager(rh_controller=_FakeRH(setpoint=None))
+        assert controller._rh_watch_source() == (None, None)
+
+    def test_a_registry_that_raises_costs_the_watch_and_not_the_hold(self):
+        """Losing the *secondary* variable's watchdog must not cost a board."""
+        class _Broken:
+            @property
+            def names(self):
+                raise RuntimeError("registry unavailable")
+
+        controller = _StubbedTempController()
+        controller.manager = _Broken()
+        assert controller._rh_watch_source() == (None, None)
+
+
+class TestTheAnnealWiresTheWatchIntoTheHold:
+    def test_the_reader_and_setpoint_reach_run_anneal_hold(self, fast_hold, alerts):
+        controller = _StubbedTempController()
+        controller.manager = _FakeManager(rh_controller=_FakeRH())
+
+        controller.anneal(85.0, 7200.0)
+
+        assert len(fast_hold) == 1
+        assert fast_hold[0]["rh_reader"] is not None
+        assert fast_hold[0]["rh_setpoint_pct"] == pytest.approx(SP)
+
+    def test_the_store_and_run_id_ride_along_when_a_host_sets_them(
+            self, fast_hold, alerts):
+        """The alert row is the durable half of the record. The verdict is
+        announced either way — ``raise_alert`` logs with no store — but it is
+        only *persisted* with one."""
+        controller = _StubbedTempController()
+        controller.manager = _FakeManager(rh_controller=_FakeRH())
+        sentinel = object()
+        controller.data_store = sentinel
+        controller.run_id = "run-7"
+
+        controller.anneal(85.0, 7200.0)
+
+        assert fast_hold[0]["data_store"] is sentinel
+        assert fast_hold[0]["run_id"] == "run-7"
+
+    def test_an_rh_excursion_through_a_real_anneal_raises_the_alert(
+            self, fast_hold, alerts):
+        """End to end through the driver: the humidity sits off command for the
+        whole hold, and the finding reaches the alert path."""
+        controller = _StubbedTempController()
+        controller.manager = _FakeManager(rh_controller=_FakeRH(rh=OFF_SP_PV))
+
+        controller.anneal(85.0, 7200.0)
+
+        assert [a.kind for a in alerts] == [ALERT_RH_OFF_SETPOINT]
+        assert alerts[0].severity == WARNING
+
+    def test_a_humidity_fault_through_the_driver_still_does_not_park(
+            self, fast_hold, alerts):
+        """The ruling is unchanged by this wiring: no humidity verdict stops the
+        hold. It alerts at CRITICAL and the cure runs to completion."""
+        controller = _StubbedTempController()
+        controller.manager = _FakeManager(rh_controller=_FakeRH(rh=FAULT_PV))
+
+        controller.anneal(85.0, 28800.0)         # returns, does not raise
+
+        assert [(a.kind, a.severity) for a in alerts] == [(ALERT_RH_FAULT, CRITICAL)]
+        assert controller.sp == pytest.approx(25.0), "prior setpoint restored"
+
+    def test_without_a_registry_the_hold_is_exactly_the_thermal_one(
+            self, fast_hold, alerts):
+        """The positive control for the two above. An unattached controller must
+        behave precisely as it did before this wiring existed — including
+        raising no humidity alert on a PV that would certainly have earned one."""
+        controller = _StubbedTempController()
+
+        controller.anneal(85.0, 7200.0)
+
+        assert fast_hold[0]["rh_reader"] is None
+        assert fast_hold[0]["rh_setpoint_pct"] is None
+        assert alerts == []
+
+
+class TestTheFactoryIsWhereTheRegistryIsHandedOver:
+    def test_the_temperature_controller_gets_the_registry(self):
+        """Without this line the resolver above always answers ``(None, None)``
+        in production, and every test of the watch is a test of a branch no run
+        visits. ``config={}`` so no port is opened: drivers are constructed, not
+        connected, and an unavailable one falls back to its mock."""
+        from softae.drivers.factory import create_manager
+
+        manager = create_manager(mock=None, config={})
+        assert getattr(manager.get("temp_controller"), "manager", None) is manager
+
+    def test_the_liquid_handler_still_gets_it_too(self):
+        """The back-reference this one was modelled on, unchanged beside it."""
+        from softae.drivers.factory import create_manager
+
+        manager = create_manager(mock=None, config={})
+        assert manager.get("liquid_handler").manager is manager

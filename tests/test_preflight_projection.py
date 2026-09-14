@@ -9,18 +9,32 @@ from __future__ import annotations
 
 import pytest
 
+from softae.analysis.rh_floor import TemperatureBin
 from softae.config import loader
 from softae.core.autonomous_wiring import CampaignSpec
 from softae.core.eis_scripts import EISParams
+from softae.core.measurement_spec import MeasurementSpec
+from softae.core.phase_setpoints import CONDITIONS_PHASE_TAG, PhaseSetpoints
 from softae.core.preflight import (
+    CONDITIONS_PHASE,
     CampaignProjection,
+    approach_ceiling_s,
+    commanded_conditions,
     estimate_eis_duration,
     estimate_step_duration,
     estimate_workflow_duration,
     per_iteration_draw,
     project_campaign,
+    rh_floor_advisories,
 )
 from softae.core.reservoir import ReservoirLedger
+from softae.core.run_plan import (
+    PhaseKind,
+    PhaseScope,
+    RunPhase,
+    RunPlan,
+    SettlePlan,
+)
 from softae.core.task_catalog import TaskCatalog
 from softae.workflows.workflow_model import WorkflowStep
 
@@ -317,3 +331,418 @@ class TestSummary:
             per_iteration_s=60.0, per_iteration_draw_uL={0: 10.0}, budget=10)
         text = p.describe().lower()
         assert "at most" in text and "sooner" in text
+
+
+# ── Run-plan costs the built workflow cannot price (B4) ──────────────────────
+#
+# `project_campaign` used to time a cast. A plan carrying an 8 h cure spends its
+# time in three places the old projection either missed entirely or billed at
+# zero, and the three are bounded from different directions — which is why the
+# summary now says which is which.
+
+ANNEAL_HOLD_S = 28800.0        # data/tasks.toml: anneal_85C_8h
+SETTLE_CEILING_S = 14400.0
+SETTLE_FLOOR_S = 1500.0
+RH_APPROACH_S = 6000.0         # the ~5000 s descent, plus margin, per phase
+
+
+def _conditions(name, temp, rh, **over) -> PhaseSetpoints:
+    return PhaseSetpoints(name=name, temp_setpoint_C=temp,
+                          rh_setpoint_pct=rh, **over)
+
+
+def _bench_plan() -> RunPlan:
+    """The four-phase bench instance: cast, cure, equilibrate, measure."""
+    return RunPlan((
+        RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE,
+                 conditions=_conditions("casting", 25.0, 40.0)),
+        RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                 anneal_task="anneal_85C_8h",
+                 conditions=_conditions("anneal", 85.0, 20.0,
+                                        rh_approach_timeout_s=RH_APPROACH_S)),
+        RunPhase(PhaseKind.EQUILIBRATE, PhaseScope.PER_BATCH,
+                 settle=SettlePlan(round_period_s=240.0,
+                                   min_hold_s=SETTLE_FLOOR_S,
+                                   max_hold_s=SETTLE_CEILING_S),
+                 conditions=_conditions("equilibrate", 25.0, 50.0)),
+        RunPhase(PhaseKind.MEASURE, PhaseScope.PER_BATCH,
+                 conditions=_conditions("equilibrate", 25.0, 50.0)),
+    ))
+
+
+class TestAWaitIsEitherADwellOrACeiling:
+    """Two different things share the method name ``wait``, and they bound the
+    duration from opposite sides.
+
+    The ceiling case used to return **0.0** — not ``None``, so it was not even
+    counted unknown. ``workflows/equilibration.py`` routes its own projection
+    around this function specifically because of that, and says so in a comment.
+    """
+
+    def test_a_commanded_dwell_bills_its_duration(self):
+        assert estimate_step_duration(
+            _step("wait", duration_s=90.0)) == pytest.approx(90.0)
+
+    def test_an_approach_bills_its_timeout_as_a_ceiling(self):
+        assert estimate_step_duration(
+            _step("wait", within=2.0, timeout=1800.0)) == pytest.approx(1800.0)
+
+    def test_an_approach_is_not_billed_as_free(self):
+        """The defect, stated directly: an 8 h cure's approach entered the
+        projection as zero seconds and was not flagged unknown either."""
+        assert estimate_step_duration(_step("wait", within=2.0, timeout=1800.0)) != 0.0
+
+    def test_a_dwell_wins_over_a_timeout_when_both_are_present(self):
+        """A dwell is what the step *will* take; a timeout is only its ceiling."""
+        assert estimate_step_duration(
+            _step("wait", duration_s=60.0, timeout=1800.0)) == pytest.approx(60.0)
+
+    def test_a_wait_with_neither_is_still_free_rather_than_unknown(self):
+        assert estimate_step_duration(_step("wait")) == 0.0
+
+    def test_the_phase_tag_matches_the_one_the_emitter_stamps(self):
+        """``preflight`` restates the tag rather than importing the emitter; the
+        two must not fork, so they are pinned equal here."""
+        assert CONDITIONS_PHASE == CONDITIONS_PHASE_TAG
+
+
+class TestARunPlanIsProjectedHonestly:
+    def _spec_with_plan(self, **over):
+        return _spec(run_plan=_bench_plan(), batch=True, **over)
+
+    def test_the_anneal_hold_is_billed(self, catalog):
+        p = project_campaign(self._spec_with_plan(), catalog=catalog)
+        assert p.workflow_s > ANNEAL_HOLD_S
+
+    def test_the_condition_approaches_are_billed_at_their_ceilings(self, catalog):
+        """Three distinct conditions, two axes each; the anneal's RH approach
+        carries the phase's own 6000 s rather than the driver's 120 s default."""
+        p = project_campaign(self._spec_with_plan(), catalog=catalog)
+        assert p.approach_ceiling_s == pytest.approx(
+            1800.0 * 5 + RH_APPROACH_S)          # 5 default waits + the anneal's
+
+    def test_the_settle_window_is_added_from_the_spec_not_the_workflow(self, catalog):
+        """The equilibrate phase emits no steps -- it terminates on evidence --
+        so its ceiling cannot be read off the built workflow."""
+        p = project_campaign(self._spec_with_plan(), catalog=catalog)
+        assert p.settle_ceiling_s == pytest.approx(SETTLE_CEILING_S)
+        assert p.settle_floor_s == pytest.approx(SETTLE_FLOOR_S)
+        assert p.per_iteration_s == pytest.approx(p.workflow_s + SETTLE_CEILING_S)
+
+    def test_the_projection_exceeds_the_cure_plus_the_settle_ceiling(self, catalog):
+        """The headline: ``check`` must stop reporting a cast when a plan carries
+        an 8 h cure and a 4 h equilibrate ceiling."""
+        p = project_campaign(self._spec_with_plan(), catalog=catalog)
+        assert p.per_iteration_s > ANNEAL_HOLD_S + SETTLE_CEILING_S
+
+    def test_the_summary_names_both_ceilings_as_ceilings(self, catalog):
+        text = project_campaign(self._spec_with_plan(), catalog=catalog).describe()
+        assert "approaching commanded conditions" in text
+        assert "a ceiling, not a dwell" in text
+        assert "equilibrate window of at most" in text
+        assert "may end sooner" in text
+
+    def test_approach_ceiling_reads_the_tag_not_the_step_name(self):
+        """Condition step names carry an operator-chosen label; the tag is the
+        contract. A wait tagged for another phase must not be counted."""
+        class _WF:
+            def resolve_steps(self):
+                return [
+                    _step("wait", timeout=300.0).with_tags(phase=CONDITIONS_PHASE),
+                    _step("wait", timeout=900.0).with_tags(phase="anneal"),
+                ]
+
+        assert approach_ceiling_s(_WF()) == pytest.approx(300.0)
+
+
+class TestACampaignWithNoRunPlanIsUnchanged:
+    """The byte-identity pin, and **its exact boundary**.
+
+    Everything B4 added is additive and zero-valued for a campaign that neither
+    commands conditions nor settles, so nothing such an operator already reads
+    may move. Verified module-against-module against ``HEAD``'s own
+    ``preflight``: 11 spec shapes — budgets, recipes, presets, overrides, a
+    broken PCB, stock, a shortfall, purge billing — identical on every field,
+    ``describe()`` included.
+
+    The twelfth shape is **not** identical and must not be, which is why the
+    boundary is stated as *settling* rather than as *carrying a run plan*: see
+    :class:`TestASettleSpelledInTheFlatFieldsIsBilledToo`.
+    """
+
+    def test_the_three_new_totals_are_zero(self, catalog):
+        p = project_campaign(_spec(), catalog=catalog)
+        assert (p.approach_ceiling_s, p.settle_ceiling_s, p.settle_floor_s) == (
+            0.0, 0.0, 0.0)
+
+    def test_the_iteration_time_is_still_exactly_the_workflow_time(self, catalog):
+        p = project_campaign(_spec(), catalog=catalog)
+        assert p.per_iteration_s == p.workflow_s
+
+    def test_the_summary_grows_no_new_lines(self, catalog):
+        text = project_campaign(_spec(), catalog=catalog).describe()
+        for phrase in ("approaching commanded conditions",
+                       "equilibrate window", "RH-floor", "commands"):
+            assert phrase not in text
+
+    def test_a_default_projection_carries_no_rh_advisory(self, catalog):
+        """No run plan means no commanded humidity, so there is nothing to
+        advise about -- and, critically, no "not consulted" note either."""
+        p = project_campaign(_spec(), catalog=catalog)
+        assert not any("humidity" in w for w in p.warnings)
+
+
+class TestASettleSpelledInTheFlatFieldsIsBilledToo:
+    """**Operator-visible, and deliberate.** A campaign can ask to settle in two
+    ways — an EQUILIBRATE phase in a ``run_plan``, or the flat
+    ``equilibration_method = "settle"`` fields — and ``settle_plan()`` is the one
+    authority over both. The window is the same rig time either way, so the
+    projection bills it either way.
+
+    Every ``equilibration_method = "settle"`` campaign that exists today
+    therefore projects **longer** than it did before, by exactly the
+    ``max_hold_s`` per trial it was already spending and never reporting. That
+    is the under-report being fixed, not a new cost.
+    """
+
+    def _spec(self, **over):
+        return _spec(equilibration_method="settle", round_period_s=240.0,
+                     min_hold_s=600.0, max_hold_s=3600.0, **over)
+
+    def test_the_flat_spelling_gets_the_same_ceiling(self, catalog):
+        p = project_campaign(self._spec(), catalog=catalog)
+        assert p.settle_ceiling_s == pytest.approx(3600.0)
+        assert p.settle_floor_s == pytest.approx(600.0)
+        assert p.per_iteration_s == pytest.approx(p.workflow_s + 3600.0)
+
+    def test_a_campaign_that_does_not_settle_keeps_its_old_number(self, catalog):
+        """The boundary, stated as the pair: settling is what adds the window,
+        not the presence of a run plan."""
+        assert project_campaign(_spec(), catalog=catalog).settle_ceiling_s == 0.0
+
+    def test_no_conditions_are_commanded_so_no_approach_is_billed(self, catalog):
+        """The flat spelling carries setpoints for nothing, so the *other* new
+        window stays zero — the two are independent."""
+        p = project_campaign(self._spec(), catalog=catalog)
+        assert p.approach_ceiling_s == 0.0
+        assert not any("RH-floor" in w for w in p.warnings)
+
+
+class TestTheRHFloorAdvisory:
+    """Advisory, never a refusal -- ``analysis/rh_floor.py``'s own warning
+    forbids fitting a threshold to these numbers, so the wording is quoted from
+    it."""
+
+    @staticmethod
+    def _bin(temp, floor, asked, n=12) -> TemperatureBin:
+        return TemperatureBin(temperature_C=temp, rh_floor_pct=floor,
+                              rh_setpoint_min_pct=asked, n_rows=n)
+
+    def _plan(self, *, temp=85.0, rh=20.0) -> RunPlan:
+        return RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE),
+            RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     conditions=_conditions("anneal", temp, rh)),
+        ))
+
+    def test_a_setpoint_below_a_probed_floor_is_advised(self):
+        # asked 15, delivered 22.0 -> saturated: the floor bounds observation.
+        lines = rh_floor_advisories(self._plan(rh=20.0),
+                                    [self._bin(85.0, 22.0, 15.0)])
+        assert len(lines) == 1
+        assert "do not command below this" in lines[0]
+        assert "Advisory only" in lines[0]
+
+    def test_the_advisory_quotes_the_modules_own_numbers_not_a_literal(self):
+        """No constant may be baked in here: what the chamber reaches is read
+        from its own history, per bin, at projection time. The 19.5-23.2 %RH
+        figure that circulated as "the floor at 85 C" is an *approach window* --
+        the same block later held at 14.9 -- so a literal would have been wrong
+        as well as unmaintainable."""
+        lines = rh_floor_advisories(self._plan(rh=10.0),
+                                    [self._bin(85.0, 14.9, 12.0)])
+        assert "14.9 %RH" in lines[0]
+        assert "19.5" not in lines[0] and "23.2" not in lines[0]
+
+    def test_an_unprobed_bin_says_so_in_the_modules_words(self):
+        """Delivered 22 when asked for 22: the setpoint was met, so the real
+        minimum is unknown and the line must not read as a limit."""
+        lines = rh_floor_advisories(self._plan(rh=20.0),
+                                    [self._bin(85.0, 22.0, 22.0)])
+        assert len(lines) == 1
+        assert "floor not probed" in lines[0]
+
+    def test_a_setpoint_at_or_above_the_observed_floor_is_silent(self):
+        assert rh_floor_advisories(self._plan(rh=30.0),
+                                   [self._bin(85.0, 22.0, 15.0)]) == []
+
+    def test_a_temperature_in_no_observed_bin_says_the_chamber_was_never_watched(self):
+        """A floor seen at 25 C says nothing about 85 C — so it is not quoted at
+        85 C, *and* the fact that nothing was observed there is stated. Silence
+        would be the same sentence as "checked, and fine"."""
+        lines = rh_floor_advisories(self._plan(temp=85.0),
+                                    [self._bin(25.0, 22.0, 15.0)])
+        assert len(lines) == 1
+        assert "never been observed" in lines[0]
+        assert "22.0" not in lines[0], "the 25 C bin must not be quoted at 85 C"
+
+    def test_the_three_outcomes_are_three_distinguishable_strings(self):
+        """Below a probed floor / below an unprobed minimum / never watched —
+        the whole point is that a reader can tell which one they have."""
+        below_probed = rh_floor_advisories(
+            self._plan(rh=20.0), [self._bin(85.0, 22.0, 15.0)])[0]
+        below_unprobed = rh_floor_advisories(
+            self._plan(rh=20.0), [self._bin(85.0, 22.0, 22.0)])[0]
+        unwatched = rh_floor_advisories(self._plan(rh=20.0), [])[0]
+        assert len({below_probed, below_unprobed, unwatched}) == 3
+
+    def test_a_phase_driving_humidity_but_not_temperature_gets_nothing(self):
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE),
+            RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     conditions=PhaseSetpoints("anneal", rh_setpoint_pct=20.0)),
+        ))
+        assert rh_floor_advisories(plan, [self._bin(85.0, 22.0, 15.0)]) == []
+
+    def test_no_observed_bins_at_all_is_still_reported_per_condition(self):
+        """An empty history is "never watched" for every commanded condition,
+        not a clean bill for any of them."""
+        lines = rh_floor_advisories(self._plan(), [])
+        assert len(lines) == 1
+        assert "never been observed on this project" in lines[0]
+
+
+    def test_a_repeated_condition_is_advised_once(self):
+        """The engine establishes a repeated setpoint once, so advising twice
+        would misrepresent what the run does."""
+        conditions = _conditions("anneal", 85.0, 20.0)
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE),
+            RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH, conditions=conditions),
+            RunPhase(PhaseKind.MEASURE, PhaseScope.PER_BATCH, conditions=conditions),
+        ))
+        assert len(commanded_conditions(plan)) == 1
+        assert len(rh_floor_advisories(plan, [self._bin(85.0, 22.0, 15.0)])) == 1
+
+
+class TestNotConsultedIsNotACleanBill:
+    """The failure shape this guards: a plan that commands humidity and a
+    projection that read no history produce the same silence as a plan checked
+    and found clean. "Unknown" must not be spelled the way "clean" is."""
+
+    def test_a_humidity_commanding_plan_with_no_project_dir_says_so(self, catalog):
+        p = project_campaign(_spec(run_plan=_bench_plan(), batch=True),
+                             catalog=catalog)
+        assert any("no RH-floor history was consulted" in w for w in p.warnings)
+
+    def test_an_advisory_reaches_the_operator_through_warnings_and_describe(
+            self, catalog, monkeypatch):
+        """The whole delivery seam, end to end, without a DataStore.
+
+        ``describe()`` renders every warning as a ``Note:`` line, and both
+        surfaces that project a campaign already print ``describe()`` — so the
+        advisory needs no new display path anywhere. That is the property being
+        pinned: computing the advisory and then dropping it on the floor would
+        otherwise look exactly like finding nothing to say.
+        """
+        import softae.core.preflight as preflight
+
+        monkeypatch.setattr(
+            preflight, "_rh_floor_bins",
+            lambda _dir: [TemperatureBin(temperature_C=85.0, rh_floor_pct=22.0,
+                                         rh_setpoint_min_pct=15.0, n_rows=9)])
+
+        p = project_campaign(_spec(run_plan=_bench_plan(), batch=True),
+                             catalog=catalog, project_dir="anywhere")
+
+        assert any("do not command below this" in w for w in p.warnings)
+        assert "Note: condition 'anneal' commands 20 %RH at 85 °C" in p.describe()
+
+    def test_a_history_that_was_read_and_holds_nothing_says_that_instead(
+            self, catalog, monkeypatch):
+        """``None`` and ``[]`` are different answers and must not share a line:
+        nobody looked, versus looked and the chamber has never been watched."""
+        import softae.core.preflight as preflight
+
+        monkeypatch.setattr(preflight, "_rh_floor_bins", lambda _dir: [])
+        p = project_campaign(_spec(run_plan=_bench_plan(), batch=True),
+                             catalog=catalog, project_dir="anywhere")
+
+        assert any("never been observed on this project" in w for w in p.warnings)
+        assert not any("was consulted" in w for w in p.warnings)
+
+    def test_the_advisory_changes_no_verdict_and_no_duration(
+            self, catalog, monkeypatch):
+        """It is a note, never a gate. The same list carries the stock
+        shortfall, which *is* a gate (``_project`` prompts on
+        ``stock_sufficient is False``), so the two must be shown not to be
+        coupled: the worst possible advisory and none at all must produce the
+        same numbers and the same verdict."""
+        import softae.core.preflight as preflight
+
+        led = ReservoirLedger()
+        led.refill(0, 1000.0)
+        led.refill(1, 1000.0)
+        spec = _spec(run_plan=_bench_plan(), batch=True, budget=50)
+
+        quiet = project_campaign(spec, catalog=catalog, ledger=led)
+        monkeypatch.setattr(
+            preflight, "_rh_floor_bins",
+            lambda _dir: [TemperatureBin(temperature_C=85.0, rh_floor_pct=99.0,
+                                         rh_setpoint_min_pct=1.0, n_rows=9)])
+        loud = project_campaign(spec, catalog=catalog, ledger=led,
+                                project_dir="anywhere")
+
+        assert any("do not command below this" in w for w in loud.warnings)
+        assert (loud.per_iteration_s, loud.settle_ceiling_s,
+                loud.approach_ceiling_s) == (
+            quiet.per_iteration_s, quiet.settle_ceiling_s,
+            quiet.approach_ceiling_s)
+        assert loud.stock_sufficient == quiet.stock_sufficient is False
+        assert loud.iterations_supported() == quiet.iterations_supported()
+
+    def test_a_plan_that_drives_no_humidity_is_silent(self, catalog):
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE,
+                     conditions=PhaseSetpoints("cast", temp_setpoint_C=25.0)),
+            RunPhase(PhaseKind.MEASURE, PhaseScope.PER_BATCH),
+        ))
+        p = project_campaign(_spec(run_plan=plan, batch=True), catalog=catalog)
+        assert not any("RH-floor" in w for w in p.warnings)
+
+
+class TestAdvisoriesNeverRefuse:
+    def test_a_settle_spelled_twice_warns_rather_than_raising(self, catalog):
+        """``settle_plan()`` refuses a spec that names settle twice. That refusal
+        belongs to the launch path; a projection that cannot run is not a
+        preflight, it is an outage."""
+        spec = _spec(run_plan=_bench_plan(), batch=True,
+                     equilibration_method="settle")
+        p = project_campaign(spec, catalog=catalog)
+        assert any("Equilibrate window not projected" in w for w in p.warnings)
+        assert p.settle_ceiling_s == 0.0
+        assert p.per_iteration_s > 0
+
+    def test_an_unreadable_project_dir_is_a_missing_advisory_not_a_failure(
+            self, catalog, tmp_path):
+        p = project_campaign(_spec(run_plan=_bench_plan(), batch=True),
+                             catalog=catalog, project_dir=tmp_path / "nothing-here")
+        assert p.per_iteration_s > 0
+        assert any("no RH-floor history was consulted" in w for w in p.warnings)
+
+
+class TestMeasurementBlockOnTheMeasurePhase:
+    def test_a_denser_production_preset_does_not_change_the_projection_shape(
+            self, catalog):
+        """A per-phase preset changes the *sweep*, not which windows exist.
+        Pinned because the projection reads ``spec.eis_preset``, and a reader
+        could reasonably expect the phase override to be picked up here too --
+        it is not, and that is a known gap rather than an accident."""
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE),
+            RunPhase(PhaseKind.MEASURE, PhaseScope.PER_BATCH,
+                     measurement=MeasurementSpec(preset="Extended")),
+        ))
+        p = project_campaign(_spec(run_plan=plan, batch=True), catalog=catalog)
+        assert p.settle_ceiling_s == 0.0
+        assert p.per_iteration_s == p.workflow_s

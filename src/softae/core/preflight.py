@@ -16,17 +16,43 @@ presentation is: time per iteration, time to the configured budget framed as an
 **upper** bound, and the stock/waste runway in the same units. With purging
 active (P8) the runway usually binds long before the budget does.
 
-Every estimate here is a **lower bound on duration and a lower bound on draw**:
+The **timed work** here is a lower bound on duration and a lower bound on draw:
 it counts the dwells the workflow declares and ignores comms overhead, stage
 travel, and ramp time. Stated plainly rather than padded with a fudge factor,
 because an operator can reason about "at least this long" and cannot reason about
 an unexplained multiplier.
+
+**Two windows are the exception, and they are billed at their ceilings.** A run
+plan carrying commanded conditions and an equilibrate phase spends time that is
+bounded from *above* rather than from below, and there is no lower bound worth
+quoting for either:
+
+* a **condition approach** ends when the chamber arrives, and all the phase
+  declares is the ``approach_timeout_s`` it will wait before giving up. Billing
+  the ceiling overstates a normal approach; billing anything else understates a
+  saturated one. Before this it was billed **zero** — a
+  ``wait(within=…, timeout=…)`` step matched neither dwell key, so an 8 h cure's
+  approach entered the projection as free *and* was not counted unknown either;
+* an **equilibrate phase** terminates on evidence, so only ``max_hold_s`` is
+  knowable in advance. It is not in the built workflow at all (the phase emits
+  no steps — see :mod:`softae.core.run_plan`), so it is added from the spec's
+  :class:`~softae.core.run_plan.SettlePlan` and named as a ceiling that may stop
+  sooner.
+
+:meth:`CampaignProjection.describe` says which of the two directions each part
+of the number came from, because "at least 8 h" and "at most 12 h" are different
+sentences and an operator planning a night needs to know which one they have.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, Sequence
+
+if TYPE_CHECKING:  # annotation-only: `core` must not import `analysis` to run.
+    from pathlib import Path
+
+    from softae.analysis.rh_floor import TemperatureBin
 
 import structlog
 
@@ -301,9 +327,58 @@ def estimate_step_duration(step: Any, *, eis_params: Any = None) -> float | None
         return _f(params, "hold_time_s") * scale
 
     if method == "wait":
-        return (_f(params, "duration_s") or _f(params, "seconds")) * scale
+        # Two different things share this method name, and they bound the
+        # duration from opposite sides.
+        #
+        # `duration_s` / `seconds` are a **commanded dwell**: the step takes
+        # exactly that long, and it is the number to bill.
+        #
+        # `timeout` is an **approach ceiling**: the driver returns as soon as the
+        # chamber is inside tolerance, so the real cost is anywhere from seconds
+        # to the whole timeout. The ceiling is the only defensible figure —
+        # understating it is how an 8 h cure's approach becomes invisible — and
+        # it is what `PhaseSetpoints.establish_steps` emits for both axes.
+        #
+        # Until this branch read `timeout`, such a step returned **0.0**: not
+        # `None`, so it was not even counted as unknown. That is the failure
+        # shape where "not measured" wears "measured and free"'s clothes, and
+        # `workflows/equilibration.py` routes its own projection around this
+        # function specifically because of it.
+        dwell = _f(params, "duration_s") or _f(params, "seconds")
+        return (dwell or _f(params, "timeout")) * scale
 
     return None
+
+
+#: ``tags["phase"]`` on the steps that establish a phase's commanded conditions.
+#: Mirrors :data:`softae.core.phase_setpoints.CONDITIONS_PHASE_TAG`; restated
+#: rather than imported so this module stays free of the workflow-model layer
+#: that ``phase_setpoints`` pulls in. ``test_preflight_projection.py`` pins the
+#: two equal.
+CONDITIONS_PHASE = "conditions"
+
+
+def approach_ceiling_s(wf: Any) -> float:
+    """Total time *wf* may spend waiting for commanded conditions to arrive.
+
+    The upper-bound half of :func:`estimate_workflow_duration`'s total, split out
+    so :meth:`CampaignProjection.describe` can say which part of the number is a
+    floor and which is a cap. Reads the phase **tag**, not the step name: the
+    names carry an operator-chosen condition label and a disambiguating suffix,
+    and neither is a contract.
+    """
+    total = 0.0
+    try:
+        steps = list(wf.resolve_steps())
+    except Exception:
+        return 0.0
+    for step in steps:
+        if (getattr(step, "tags", None) or {}).get("phase") != CONDITIONS_PHASE:
+            continue
+        if str(getattr(step, "method", "")) != "wait":
+            continue
+        total += estimate_step_duration(step) or 0.0
+    return total
 
 
 def estimate_workflow_duration(wf: Any, *, eis_params: Any = None) -> DurationEstimate:
@@ -429,7 +504,15 @@ def waste_per_iteration_uL(wf: Any) -> float:
 
 @dataclass
 class CampaignProjection:
-    """What a campaign will cost in time and stock, with its limits named."""
+    """What a campaign will cost in time and stock, with its limits named.
+
+    :attr:`per_iteration_s` is the one number every consumer already reads, and
+    it stays the whole cost — now including the two ceiling-bounded windows the
+    module docstring describes. The four trailing fields decompose it so the
+    summary can say which direction each part is bounded from; all four are
+    defaulted, so a campaign with no run plan constructs and describes exactly
+    as it did before.
+    """
 
     per_iteration_s: float
     per_iteration_draw_uL: dict[int, float]
@@ -440,6 +523,19 @@ class CampaignProjection:
     #: Idle/in-run purge consumption, once P8 exists. ``0`` until then.
     purge_uL_per_day: dict[int, float] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    #: Of :attr:`per_iteration_s`, how much the **built workflow** declares —
+    #: casts, dwells, the anneal hold, the sweeps. A lower bound.
+    workflow_s: float = 0.0
+    #: Of :attr:`workflow_s`, how much is condition-approach **ceiling** rather
+    #: than timed work. Included in the total, reported separately because it is
+    #: bounded from the other side.
+    approach_ceiling_s: float = 0.0
+    #: The equilibrate phase's ``max_hold_s``, which is **not** in the workflow —
+    #: the phase emits no steps and terminates on evidence. ``0`` when the
+    #: campaign does not settle.
+    settle_ceiling_s: float = 0.0
+    #: That phase's ``min_hold_s`` — the floor it cannot stop before.
+    settle_floor_s: float = 0.0
 
     @property
     def time_to_budget_s(self) -> float:
@@ -478,6 +574,19 @@ class CampaignProjection:
         if not self.duration_complete:
             lines.append(
                 "  (Some steps could not be timed, so this is a lower bound.)")
+        if self.approach_ceiling_s > 0:
+            lines.append(
+                f"  Includes up to {_fmt_duration(self.approach_ceiling_s)} "
+                f"approaching commanded conditions — a ceiling, not a dwell: "
+                f"each wait ends when the chamber arrives."
+            )
+        if self.settle_ceiling_s > 0:
+            lines.append(
+                f"  Plus an equilibrate window of at most "
+                f"{_fmt_duration(self.settle_ceiling_s)} (at least "
+                f"{_fmt_duration(self.settle_floor_s)}) — the phase stops when "
+                f"the measurement stops moving, so it may end sooner."
+            )
 
         lines.append(
             f"At most {_fmt_duration(self.time_to_budget_s)} to reach the "
@@ -521,18 +630,189 @@ def _fmt_duration(seconds: float) -> str:
     return f"{s / 86400:.1f} days"
 
 
+# ── The RH-floor advisory ────────────────────────────────────────────────────
+
+def commanded_conditions(run_plan: Any) -> list[Any]:
+    """Every distinct :class:`PhaseSetpoints` a run plan commands, in plan order.
+
+    Deduplicated on the object itself, because the deposition engine emits a
+    condition's steps **only when the setpoint changes** — two consecutive
+    phases carrying the same conditions establish them once, and advising twice
+    about one approach would misrepresent what the run does.
+    """
+    seen: list[Any] = []
+    for phase in getattr(run_plan, "phases", ()) or ():
+        conditions = getattr(phase, "conditions", None)
+        if conditions is not None and conditions not in seen:
+            seen.append(conditions)
+    return seen
+
+
+def _bin_for(
+    bins: "Sequence[TemperatureBin] | None", temperature_C: float, width: float
+) -> "TemperatureBin | None":
+    """The observed bin covering *temperature_C*, or ``None`` if none does.
+
+    ``None`` rather than the nearest bin: a floor observed at 25 °C says nothing
+    about 85 °C, and quoting it would be the advisory answering a question
+    nobody asked.
+    """
+    for candidate in bins or ():
+        if abs(float(candidate.temperature_C) - float(temperature_C)) <= width / 2.0:
+            return candidate
+    return None
+
+
+def rh_floor_advisories(
+    run_plan: Any,
+    bins: "Sequence[TemperatureBin] | None",
+    *,
+    bin_width_C: float | None = None,
+) -> list[str]:
+    """Advisories for commanded humidities below what this chamber has reached.
+
+    **Advisory, never a refusal, and the wording is not ours.** The attainable
+    minimum %RH is a property of the chamber's *state* — basin fill is
+    uninstrumented, and :mod:`softae.analysis.rh_floor`'s own warning forbids
+    fitting an absolute threshold to these numbers — so no setpoint can be
+    rejected on this evidence. Each line therefore quotes
+    :meth:`~softae.analysis.rh_floor.TemperatureBin.describe` verbatim, which
+    already distinguishes the two cases that matter: a bin that was *asked for
+    less than it delivered* ("do not command below this") from one whose lowest
+    command was simply met ("floor not probed").
+
+    **Three outcomes per condition, and they are three different strings.** The
+    setpoint is below an observed floor; it is at or above one (silence); or the
+    chamber has never been watched near that temperature at all — which is *not*
+    the same as clean, and so is said rather than passed over.
+
+    A phase that drives humidity but **not** temperature gets nothing: the bins
+    are keyed on chamber temperature, and without one there is no bin to compare
+    against and no honest sentence to write.
+    """
+    from softae.analysis.rh_floor import DEFAULT_BIN_WIDTH_C
+
+    width = float(DEFAULT_BIN_WIDTH_C if bin_width_C is None else bin_width_C)
+    lines: list[str] = []
+    for conditions in commanded_conditions(run_plan):
+        rh = getattr(conditions, "rh_setpoint_pct", None)
+        temp = getattr(conditions, "temp_setpoint_C", None)
+        name = getattr(conditions, "name", "?")
+        if rh is None or temp is None:
+            continue
+        observed = _bin_for(bins, float(temp), width)
+        if observed is None:
+            lines.append(
+                f"condition '{name}' commands {float(rh):g} %RH at "
+                f"{float(temp):g} °C, and no conditions rows have been recorded "
+                f"near that temperature — the floor there has never been "
+                f"observed on this project, so nothing here says whether the "
+                f"setpoint is reachable."
+            )
+            continue
+        if float(rh) >= float(observed.rh_floor_pct):
+            continue
+        lines.append(
+            f"condition '{name}' commands {float(rh):g} %RH at {float(temp):g} °C, "
+            f"below the driest this chamber has been observed at that "
+            f"temperature — {observed.describe()}. Advisory only: what the "
+            f"chamber can reach depends on its state (the basin's fill is not "
+            f"instrumented), so this is an observation, not a limit."
+        )
+    return lines
+
+
+def _rh_floor_bins(
+    project_dir: "Path | str | None",
+) -> "list[TemperatureBin] | None":
+    """The observed floor bins for *project_dir*, or ``None`` if not consulted.
+
+    ``None`` and ``[]`` are deliberately different answers: ``None`` means
+    nobody looked, ``[]`` means the history was read and holds nothing. A single
+    token for both is how "unknown" comes to wear "checked and clean"'s clothes.
+    """
+    if project_dir is None:
+        return None
+    try:
+        from softae.analysis.rh_floor import rh_floor_by_temperature
+
+        return rh_floor_by_temperature(project_dir)
+    except Exception as exc:  # a read-only history is never a reason to refuse
+        logger.warning("rh_floor_unavailable", error=str(exc))
+        return None
+
+
+def _settle_window(spec: Any, warnings: list[str]) -> tuple[float, float]:
+    """``(max_hold_s, min_hold_s)`` for this campaign's equilibrate phase.
+
+    ``(0.0, 0.0)`` when it does not settle. The phase emits **no steps** — it
+    terminates on evidence, which is a loop and not a sequence — so this is the
+    one part of a run plan's cost that cannot be read off the built workflow and
+    has to come from the spec.
+
+    :meth:`CampaignSpec.settle_plan` refuses a spec that names settle twice; that
+    refusal must not become a reason a projection cannot run, so it is caught and
+    reported as a warning here. A campaign in that state will fail at launch on
+    the same message, from the authority that owns it.
+    """
+    try:
+        plan = spec.settle_plan()
+    except AttributeError:
+        return 0.0, 0.0
+    except Exception as exc:
+        warnings.append(f"Equilibrate window not projected: {exc}")
+        return 0.0, 0.0
+    if plan is None:
+        return 0.0, 0.0
+    return float(plan.max_hold_s), float(plan.min_hold_s)
+
+
+def _rh_floor_warnings(spec: Any, project_dir: "Path | str | None") -> list[str]:
+    """RH-floor advisories for *spec*'s run plan, or a note that none were read.
+
+    The second half is the point. A plan that commands humidity and a projection
+    that consulted no history produce the same *silence* as a plan checked and
+    found clean, and silence is what lets an unreachable setpoint walk into an
+    8 h cure. So the absence is stated.
+    """
+    run_plan = getattr(spec, "run_plan", None)
+    if run_plan is None or not any(
+        getattr(c, "rh_setpoint_pct", None) is not None
+        for c in commanded_conditions(run_plan)
+    ):
+        return []
+
+    bins = _rh_floor_bins(project_dir)
+    if bins is None:
+        return ["This plan commands humidity, but no RH-floor history was "
+                "consulted (no project directory was supplied), so a setpoint "
+                "below what this chamber can reach would not be flagged here."]
+    # An empty history needs no separate branch: with no bins, every commanded
+    # humidity falls in no bin, and `rh_floor_advisories` says so per condition —
+    # which is the more specific sentence, naming the temperature that was never
+    # watched rather than only that the project has no rows at all.
+    return rh_floor_advisories(run_plan, bins)
+
+
 def project_campaign(
     spec: Any,
     *,
     catalog: Any,
     ledger: Any = None,
     purge_uL_per_day: dict[int, float] | None = None,
+    project_dir: "Path | str | None" = None,
 ) -> CampaignProjection:
     """Project one campaign's per-iteration time and stock draw.
 
     Builds a **representative trial** at the midpoint of the parameter space —
     a single trial is what a projection can honestly be based on, since the
     optimizer chooses the rest.
+
+    *project_dir* is the DataStore project directory the RH-floor history is
+    read from (read-only; :mod:`softae.analysis.rh_floor` opens SQLite in
+    ``mode=ro``). It is optional and defaulted so every existing caller is
+    unchanged — but a run plan that commands humidity with no directory supplied
+    says so in the warnings rather than reporting silence as a clean bill.
     """
     from softae.core.autonomous_wiring import build_trial_workflow
     from softae.core.eis_scripts import EISParams
@@ -582,6 +862,13 @@ def project_campaign(
             f"{est.n_unknown} of {est.n_steps} steps could not be timed; the "
             f"duration is a lower bound.")
 
+    # ── The two windows the built workflow cannot price ──────────────────────
+    approach_s = approach_ceiling_s(wf)
+    settle_ceiling, settle_floor = _settle_window(spec, warnings)
+    per_iteration_s = est.total_s + settle_ceiling
+
+    warnings.extend(_rh_floor_warnings(spec, project_dir))
+
     stock: dict[int, float | None] = {}
     if ledger is not None:
         for pid in draw:
@@ -605,7 +892,7 @@ def project_campaign(
             (s.tags or {}).get("phase") == "anneal"
             for s in (list(wf.setup) + list(getattr(wf, "teardown", []) or []))
         ):
-            per_it_min = est.total_s / 60.0
+            per_it_min = per_iteration_s / 60.0
             warnings.append(
                 f"No anneal phase, so no in-run purge opportunity: the "
                 f"background purge defers for as long as a run holds the rig. "
@@ -616,13 +903,17 @@ def project_campaign(
             )
 
     projection = CampaignProjection(
-        per_iteration_s=est.total_s,
+        per_iteration_s=per_iteration_s,
         per_iteration_draw_uL=draw,
         budget=int(getattr(spec, "budget", 0)),
         duration_complete=est.is_complete,
         stock_uL=stock,
         purge_uL_per_day=purge,
         warnings=warnings,
+        workflow_s=est.total_s,
+        approach_ceiling_s=approach_s,
+        settle_ceiling_s=settle_ceiling,
+        settle_floor_s=settle_floor,
     )
 
     if projection.stock_sufficient is False:
@@ -635,7 +926,10 @@ def project_campaign(
 
     logger.info(
         "campaign_projected", campaign=getattr(spec, "name", "?"),
-        per_iteration_s=round(est.total_s, 1),
+        per_iteration_s=round(per_iteration_s, 1),
+        workflow_s=round(est.total_s, 1),
+        approach_ceiling_s=round(approach_s, 1),
+        settle_ceiling_s=round(settle_ceiling, 1),
         draw_uL=round(sum(draw.values()), 1),
         iterations_supported=projection.iterations_supported(),
     )

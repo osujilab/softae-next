@@ -221,12 +221,26 @@ def list_modalities() -> tuple[str, ...]:
 
 # ── The built-in EIS modality, composed from the existing pieces ─────────────
 
-def _eis_build_measure_step(channel: int, spec: "MeasurementSpec") -> "WorkflowStep":
+def _eis_build_measure_step(
+    channel: int, spec: "MeasurementSpec"
+) -> "WorkflowStep | None":
     """The existing ``eis_measure_step``, named the way the campaign names it.
 
     Composed, not reimplemented: the step carries the T1.5 loop-closure tags
     (``channel`` + ``measurement=primary``) that the objective extractors select
     on, and a second builder here would be a second place for those to drift.
+
+    ``enabled=False`` — *formulate and cast, but do not measure* — returns
+    ``None``, the same contract :func:`_eis_prepare_run` has always honoured and
+    the one the camera modality's own step builder cites as EIS's. Without it the
+    two halves disagreed: ``_eis_prepare_run`` deliberately wrote no ``.mscr``
+    for a disabled campaign, while this builder went on emitting steps that named
+    those files, so ``build_settle_round_workflow`` produced a full round of
+    sweeps pointing at scripts nobody wrote. The trial builder never saw it
+    because it checks ``spec.measurement.enabled`` before calling here; the
+    settle and confirmation paths do not, and both already handle ``None`` —
+    ``build_settle_round_workflow`` returns ``None`` for it, because *"a phase
+    that cannot observe must not pretend to have waited"*.
 
     ``spec`` decides **which sweep the step reads**. It used to be accepted and
     dropped on the floor, which made ``settle_measure_step(..., measurement=...)``
@@ -242,6 +256,9 @@ def _eis_build_measure_step(channel: int, spec: "MeasurementSpec") -> "WorkflowS
     prepared — returns the step **untouched**, so the path is the one
     ``eis_measure_step`` builds for itself and today's behaviour is unchanged.
     """
+    if not spec.enabled:
+        return None
+
     from softae.core.autonomous_wiring import measure_step_name
     from softae.core.deposition_steps import eis_measure_step
     from softae.core.eis_scripts import (

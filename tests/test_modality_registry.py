@@ -560,3 +560,58 @@ class TestTheMeasurementSpecDecidesWhichSweepTheStepReads:
         after = modality.build_measure_step(21, dense_spec).params["mscrpath"]
         assert after == base_step.params["mscrpath"]
         assert after != stale
+
+
+# ── enabled=False must stop at the builder, not only at prepare_run (F1) ─────
+
+class TestADisabledCampaignBuildsNoMeasurementStep:
+    """``enabled=False`` means *formulate and cast, but do not measure*.
+
+    ``_eis_prepare_run`` has always honoured that by writing **no** ``.mscr``
+    files. ``_eis_build_measure_step`` did not: it went on emitting steps naming
+    those files. The trial builder never showed it — ``_build_deposition_workflow``
+    checks ``spec.measurement.enabled`` before it calls the modality at all — but
+    the settle and confirmation paths call straight through, so a disabled
+    campaign's settle round was a full sweep per channel pointed at scripts
+    nobody wrote.
+
+    Both callers already handled ``None`` from the builder, which is what makes
+    this a one-line fix rather than a contract change: ``Modality`` declares the
+    return as ``WorkflowStep | None``, and ``analysis.image.build_image_step``
+    cites this very guard as *"the same contract EIS honours in prepare_run"*.
+    """
+
+    def test_a_disabled_spec_builds_no_measure_step(self):
+        assert get_modality("eis").build_measure_step(
+            21, MeasurementSpec(enabled=False)) is None
+
+    def test_an_enabled_spec_still_builds_one(self):
+        """Positive control: the guard must not be the reason nothing measures."""
+        assert get_modality("eis").build_measure_step(
+            21, MeasurementSpec()) is not None
+
+    def test_a_disabled_specs_settle_round_workflow_has_no_eis_step(self):
+        """The defect, stated as the behaviour that was wrong.
+
+        ``build_settle_round_workflow`` returns ``None`` for an empty round —
+        *"a phase that cannot observe must not pretend to have waited"* — so the
+        assertion is on the workflow, not on a step list.
+        """
+        from softae.core.autonomous_wiring import build_settle_round_workflow
+
+        spec = _spec(measurement=MeasurementSpec(enabled=False))
+        assert build_settle_round_workflow(spec, [21, 22], 0) is None
+
+    def test_an_enabled_specs_settle_round_still_measures_every_channel(self):
+        from softae.core.autonomous_wiring import build_settle_round_workflow
+
+        wf = build_settle_round_workflow(_spec(), [21, 22], 0)
+        assert wf is not None
+        assert len(wf.setup) == 2
+
+    def test_a_disabled_spec_builds_no_confirmation_step(self):
+        """The third caller through the same builder, and the same conclusion."""
+        from softae.core.autonomous_wiring import confirmation_measure_step
+
+        assert confirmation_measure_step(
+            21, 1, MeasurementSpec(enabled=False)) is None

@@ -17,12 +17,19 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # WHY THIS SPEC IS VOLUME MODE, AND WHY THAT IS THE POINT
 #
-# A TOML spec cannot carry a `formulation` — `campaign_spec_io._UNSUPPORTED`
-# refuses it rather than load a spec that would run a different experiment from
-# the one the file describes.  So a file-driven campaign is always *volume
-# mode*, and `resolve_objective` therefore resolves the metric to **mean |Z|**.
+# Only the `formulation` KEY is refused at file load: `_UNSUPPORTED` in
+# `campaign_spec_io` declines to load a spec that would run a different
+# experiment from the one the file describes.  It does NOT follow that a file-driven
+# campaign must be volume mode: `general_formulation` has always had a codec,
+# and since `dfe635d` a fully PINNED composition is a first-class spec form
+# (examples/bench_instance.toml is one).  This comment used to claim otherwise;
+# corrected 2026-09-11 alongside docs/SHADOW_CAMPAIGN.md §2.
 #
-# That is not a limitation here, it is the safety property.  mean |Z| is
+# Volume mode here is therefore a DECISION, not a limitation — and the decision
+# is the whole point.  This spec declares no formulation context at all, so
+# `resolve_objective` resolves the metric to **mean |Z|**.
+#
+# That choice is the safety property.  mean |Z| is
 # computed from the raw sweep arrays by `_scalar_from_eis_raw` and never passes
 # through `analyze_spectrum`, so flipping `[eis] engine` **cannot steer the
 # search**.  The gated engine still runs on every spectrum — it decides the

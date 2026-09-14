@@ -60,6 +60,29 @@ class AsyncTempController(BaseInstrument):
         # Set by ArrheniusSweep.abort() to interrupt an in-progress wait() /
         # _with_retry() immediately without waiting for retries to exhaust.
         self._stop_wait: threading.Event = threading.Event()
+        #: The instrument registry, set at registration by
+        #: :func:`softae.drivers.factory.create_manager` — the same
+        #: back-reference ``AsyncLiquidHandler`` takes there, and for the same
+        #: reason: a driver that must reach a *sibling* instrument gets the
+        #: registry rather than opening a second connection of its own. An
+        #: anneal hold watches humidity as well as temperature, and the %RH it
+        #: watches belongs to ``rh_controller``. ``None`` — a controller
+        #: constructed directly, as every test does — means the hold is exactly
+        #: the thermal-only hold it has always been.
+        #:
+        #: ``create_manager(mock=True)`` short-circuits to ``create_mock_manager``
+        #: and does not set this, which costs nothing: ``MockTempController``'s
+        #: hold is instant by design and never calls ``run_anneal_hold`` at all,
+        #: so there is no watch for a mock rig to open.
+        self.manager: Any = None
+        #: Optional destination for the hold's humidity alert row and the run it
+        #: belongs to. The verdict is announced through
+        #: :func:`softae.core.alerts.raise_alert` either way — it logs at
+        #: WARNING/CRITICAL with no store — but it is only *persisted* with one.
+        #: Set by whichever host owns the run, as ``autonomous_wiring`` already
+        #: sets ``syringe.purge_runner``.
+        self.data_store: Any = None
+        self.run_id: str | None = None
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -279,11 +302,15 @@ class AsyncTempController(BaseInstrument):
             logger.info("anneal_hold_start", target=target_temp_C, duration_s=hold_time_s)
             from softae.drivers.contracts import run_anneal_hold
 
-            report = run_anneal_hold(self, hold_time_s, target_temp_C)
-            # ``rh`` is always None on this path today: the call above passes no
-            # ``rh_reader``, so the humidity watchdog is production-dead until that
-            # wiring lands as its own task.  Logged anyway -- this line is what
-            # makes the verdict observable the day it does.
+            rh_reader, rh_setpoint_pct = self._rh_watch_source()
+            report = run_anneal_hold(
+                self, hold_time_s, target_temp_C,
+                rh_reader=rh_reader, rh_setpoint_pct=rh_setpoint_pct,
+                data_store=self.data_store, run_id=self.run_id,
+            )
+            # ``rh`` is None when no reader could be resolved -- a controller with
+            # no registry attached, or a rig with no RH controller on it -- and in
+            # that case this is exactly the thermal-only hold it has always been.
             logger.info(
                 "anneal_hold_done", held_s=round(report.held_s, 1),
                 n_samples=report.n_samples, excursion_C=report.excursion_C,
@@ -293,6 +320,54 @@ class AsyncTempController(BaseInstrument):
         finally:
             logger.info("anneal_return", original_sp=original_sp)
             self.write_sp(original_sp, print_flag=0)
+
+    def _rh_watch_source(self) -> tuple[Any, float | None]:
+        """``(reader, commanded %RH)`` for the hold's humidity watch, or two ``None``.
+
+        Both halves are required by :func:`~softae.drivers.contracts.run_anneal_hold`
+        and neither can be invented: a reader with no setpoint has nothing to
+        classify against, and a setpoint with no reader has nothing to classify.
+        Either missing yields ``(None, None)`` and the hold is thermal-only —
+        which is what a bare controller, or a rig with no humidity control, gets.
+
+        **The setpoint is read through**
+        :func:`softae.core.conditions_capture.read_environment`, not off the RH
+        driver directly, and that is deliberate: ``rh_sp_pct`` has no public
+        getter (it lives inside ``status()["setpoint"]``), and that function is
+        already the single place that knows so. Reading it anywhere else would
+        put a second spelling of the setpoint beside the one every ``conditions``
+        row is written from, and the whole point of watching humidity through a
+        cure is that the verdict and the record agree about what was asked for.
+
+        Never raises and never actuates: every read is best-effort, and a hold
+        that cannot resolve a humidity watch proceeds as a thermal hold rather
+        than failing. Losing the *secondary* variable's watchdog must not cost a
+        board.
+        """
+        manager = self.manager
+        if manager is None:
+            return None, None
+        try:
+            from softae.core.conditions_capture import RH_CONTROLLER, read_environment
+
+            if RH_CONTROLLER not in manager.names:
+                return None, None
+            rh = manager.get(RH_CONTROLLER)
+            # `get_TH` returns (chamber_air_C, %RH) in one transaction, and the
+            # chamber air is the right thermometer for a claim about enclosure
+            # humidity — `contracts._read_rh` says so and unpacks that shape.
+            reader = getattr(rh, "get_TH", None) or getattr(rh, "get_H", None)
+            setpoint = read_environment(manager).get("rh_sp_pct")
+        except Exception:
+            logger.warning("anneal_rh_watch_unavailable", exc_info=True)
+            return None, None
+        if reader is None or setpoint is None:
+            logger.info("anneal_rh_watch_absent",
+                        has_reader=reader is not None,
+                        has_setpoint=setpoint is not None)
+            return None, None
+        logger.info("anneal_rh_watch_attached", rh_setpoint_pct=setpoint)
+        return reader, float(setpoint)
 
     # ── Internal ─────────────────────────────────────────────────────────
 

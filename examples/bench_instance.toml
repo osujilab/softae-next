@@ -24,13 +24,12 @@
 # and an empty `parameter_space` is refused by the loader. The int replicate
 # axis is the shape that is legal *and* says what it is.
 #
-# NO `[[run_plan.phases]]` BLOCK HERE, AND THAT IS NOT AN OVERSIGHT.
-# `run_plan` is still in `campaign_spec_io._UNSUPPORTED` — the codec has not
-# been written (it is Wave B2) — so adding a phases block would make this file
-# fail to load, loudly, at the first `softae-campaign check`. This campaign
-# therefore runs the engine's pointwise layout: per-channel deposit + EIS, with
-# no ANNEAL or EQUILIBRATE phase. Do not "fix" this by inventing a block; the
-# fix is the codec.
+# THE `[[run_plan.phases]]` BLOCK AT THE BOTTOM IS WHAT MAKES THIS AN INSTANCE
+# RATHER THAN A CAST. Until `campaign_spec_run_plan.py` existed the loader
+# refused `run_plan` outright, so this file ran the engine's pointwise layout —
+# per-channel deposit + EIS, no anneal and no equilibrate phase at all. It now
+# says the whole arc: cast four wells, cure the plate once, hold until the
+# measurement stops moving, then read.
 # ─────────────────────────────────────────────────────────────────────────────
 
 name     = "bench_instance_pinned"
@@ -118,3 +117,74 @@ enabled  = true
 # frequency this instrument has been shown to hold at 1e4 Ω. `Quick` bottoms out
 # at 20 Hz, which is not enough band for the gated engine to judge a film.
 preset = "Extended"
+
+# ── The run plan: cast all four, cure once, settle, then read ────────────────
+#
+# `scope` is written on EVERY phase and is never inferred — not from `batch`,
+# not from the kind. `per_sample` does the phase to each well as it is cast;
+# `per_batch` does it to the whole plate at once. Those are different physical
+# processes, and a guess here would silently run the one nobody wrote down.
+#
+# FORMULATE is always `per_sample` (`RunPlan.__post_init__` refuses anything
+# else — each sample is cast individually), and the engine runs the whole
+# per-sample segment before opening the per-batch block. That is what makes
+# this "cast every sample, then anneal once" rather than four cure cycles.
+
+[[run_plan.phases]]
+kind  = "formulate"
+scope = "per_sample"
+  # Casting environment. An omitted axis is an axis NOT DRIVEN — there is no
+  # other way to say it in TOML — so both are written here deliberately.
+  [run_plan.phases.conditions]
+  name            = "casting"
+  temp_setpoint_C = 25.0
+  rh_setpoint_pct = 40.0
+
+[[run_plan.phases]]
+kind  = "anneal"
+scope = "per_batch"
+# The cure DURATION lives only here, in the catalog task's name and params
+# (`data/tasks.toml` → `anneal_85C_8h`: 85 °C, hold 28 800 s, timeout 29 400 s).
+# The temperature below therefore states it a second time; which of the two is
+# authoritative is the open question in `docs/SubAgent docs/anneal_phase_duration.md`,
+# and nothing here anticipates that ruling.
+anneal_task = "anneal_85C_8h"
+  [run_plan.phases.conditions]
+  name            = "anneal"
+  temp_setpoint_C = 85.0
+  # ~20 %RH is the attainable floor at 85 °C, not a choice: the flush basin
+  # humidifies the enclosure as it warms, and a commanded 15 returned a PV of
+  # 19.5–23.2. See `analysis/rh_floor.py`, whose own warning forbids fitting an
+  # absolute threshold to this.
+  rh_setpoint_pct = 20.0
+  # 4 h, against the shipped 1 800 s default, and the honest number rather than
+  # a hopeful one: `anneal_phase_duration.md` §4 measures the 85 °C descent at
+  # ~0.0015 %RH/s, so reaching |PV − 20| ≤ 2 from 40 %RH is an 18 %RH descent
+  # ≈ 12 000 s. 14 400 s is that plus ~20 % headroom. At the default this phase
+  # would abort at the anneal boundary with four wet samples already cast —
+  # `rh_wait` carries `raise_on_timeout`, and that refusal is the point.
+  rh_approach_timeout_s = 14400.0
+
+[[run_plan.phases]]
+kind  = "equilibrate"
+scope = "per_batch"
+  # The three durations are REQUIRED and have no defaults: `min_hold_s` is the
+  # cure tail and belongs to the recipe, `max_hold_s` is the ceiling that makes
+  # the phase terminate at all, `round_period_s` is instrument time per sample.
+  [run_plan.phases.settle]
+  round_period_s = 240.0
+  min_hold_s     = 1500.0
+  max_hold_s     = 14400.0
+  [run_plan.phases.conditions]
+  name            = "equilibrate"
+  temp_setpoint_C = 25.0
+  rh_setpoint_pct = 50.0
+
+[[run_plan.phases]]
+kind  = "measure"
+scope = "per_batch"
+  # OPTIONAL. The production read is the authoritative measurement by its ROLE,
+  # not by its parameters — it runs after settling either way. This block only
+  # makes the acquisition denser than the campaign's own `[measurement]`.
+  [run_plan.phases.measurement]
+  preset = "Extended"
