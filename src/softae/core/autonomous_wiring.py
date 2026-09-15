@@ -160,9 +160,16 @@ SETTLE_MEASUREMENT = "settle"
 #: fits in the reference run railed while reporting ``success = 1``.
 SETTLE_CIRCUIT_MODEL = "simpleSalt"
 
-#: The six flat settle fields on :class:`CampaignSpec`, and the three of them
+#: The seven flat settle fields on :class:`CampaignSpec`, and the three of them
 #: that cannot be defaulted. Named once so :meth:`CampaignSpec.settle_plan` and
 #: its refusals cannot drift from the dataclass.
+#:
+#: **Deliberately not** ``criterion``/``rate_tol_dec_per_h``. Those two live only
+#: on :class:`~softae.core.run_plan.SettlePlan`, reachable through the structural
+#: ``[run_plan.phases.settle]`` spelling; :class:`CampaignSpec` has no flat pair,
+#: so growing this tuple would make :meth:`CampaignSpec.settle_plan`'s own
+#: ``getattr(self, f)`` raise ``AttributeError`` on every campaign start. The
+#: ``settle_mode`` emit names them as explicit kwargs instead.
 _SETTLE_FIELDS = (
     "round_period_s", "min_hold_s", "max_hold_s",
     "settle_tol_rel", "settle_n_rounds", "settle_min_channels",
@@ -538,7 +545,7 @@ class CampaignSpec:
         **One authority, two spellings, and it refuses to guess between them.**
         A :class:`~softae.core.run_plan.SettlePlan` may arrive either on an
         EQUILIBRATE phase inside :attr:`run_plan` (the structural spelling, which
-        also fixes the phase's *scope*) or on the six flat fields above (the
+        also fixes the phase's *scope*) or on the seven flat fields above (the
         operator spelling, reachable from a config file). Supplying both raises,
         exactly as :func:`~softae.core.measurement_spec.canonicalize_measurement`
         refuses a spec that names its measurement twice — picking one silently is
@@ -2083,7 +2090,11 @@ async def drive_settle_phase(
     import asyncio
     import time
 
-    from softae.analysis.equilibration import SETTLE_NOT_EVALUABLE, SettleTracker
+    from softae.analysis.equilibration import (
+        SETTLE_NOT_EVALUABLE,
+        SettleTracker,
+        rate_tol_ln_per_hour,
+    )
 
     if plan.rh_stability_pct is not None and rh_for_round is None:
         raise ValueError(
@@ -2106,6 +2117,18 @@ async def drive_settle_phase(
         # on round three, under-conditioning the entire campaign.
         r1_bound_ohms=r1_bound_ohms,
         rh_stability_pct=plan.rh_stability_pct,
+        # Which criterion ROUTES. Without it a plan that says `criterion="rate"`
+        # builds a tracker on the DEVIATION default and can return `settled`
+        # under a criterion it never ran — a silent substitution, and worse than
+        # running to the ceiling because the ceiling is visibly conservative and
+        # this is not. `SettlePlan.__post_init__` has already refused every
+        # invalid criterion/band pair, so there is nothing to re-validate here.
+        criterion=plan.criterion,
+        # decades/hour (the operator's unit, and `SettlePlan`'s) → ln-units/hour
+        # (the tracker's). Two units for one quantity, converted at the one
+        # boundary that crosses them.
+        rate_tol_per_hour=(None if plan.rate_tol_dec_per_h is None
+                           else rate_tol_ln_per_hour(plan.rate_tol_dec_per_h)),
     )
 
     start = now()
@@ -2124,6 +2147,13 @@ async def drive_settle_phase(
             fits_from(raws),
             rh_median_pct=(None if rh_for_round is None
                            else rh_for_round(n_rounds - 1)),
+            # Elapsed seconds since the phase began — the same clock `deadline`
+            # and `remaining` are measured on, so the regressor is paced by the
+            # hold rather than assumed. A duration, never a setpoint. Read by
+            # nothing under the deviation default; under `rate` its absence is
+            # not conservative but fatal — `rate_check` refuses a window with a
+            # missing time and every round reports `not_evaluable`.
+            t_s=now() - start,
         )
         if on_round is not None:
             on_round(n_rounds - 1, check)
@@ -3375,8 +3405,18 @@ async def run_autonomous_campaign(
             emit("batch_mode", q=batch_size, channels=channels)
 
         if settle_plan is not None:
+            # The two criterion keys are named explicitly rather than added to
+            # `_SETTLE_FIELDS`: that tuple is shared with
+            # `CampaignSpec.settle_plan()`, which reads it off a `CampaignSpec`
+            # — and a `CampaignSpec` has no such flat fields. Growing it to
+            # serve this site would raise `AttributeError` at the other one, on
+            # every campaign start. Said here so an operator watching a
+            # `criterion="rate"` run can see that it is actually running the
+            # rate criterion, rather than inferring it from the spec file.
             emit("settle_mode", **{f: getattr(settle_plan, f)
-                                   for f in _SETTLE_FIELDS})
+                                   for f in _SETTLE_FIELDS},
+                 criterion=str(settle_plan.criterion),
+                 rate_tol_dec_per_h=settle_plan.rate_tol_dec_per_h)
             # Said once, at the start, rather than discovered eight hours in: a
             # board narrower than `settle_min_channels` can never make the
             # criterion evaluable, so every trial would run to its ceiling. That

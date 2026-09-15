@@ -24,6 +24,8 @@ import pytest
 from softae.analysis.equilibration import (
     EXCLUDED_RAILED,
     SETTLE_CEILING,
+    SETTLE_CRITERION_DEVIATION,
+    SETTLE_CRITERION_RATE,
     SETTLE_NOT_EVALUABLE,
     SETTLE_SETTLED,
     RoundFit,
@@ -560,3 +562,166 @@ async def test_a_spec_without_the_new_keys_behaves_exactly_as_before(
              for r in store.query_measurements(run_id=result.run_id)]
     assert paths and not any(wiring.SETTLE_STEP in p for p in paths)
     store.close()
+
+
+# ── T11.7: the criterion and the time axis reach the tracker ─────────────────
+#
+# `SettlePlan` has carried `criterion`/`rate_tol_dec_per_h` since T11.2 and
+# `drive_settle_phase` read neither, so a plan asking for the rate criterion
+# built a tracker on the DEVIATION default. That is a *silent substitution*
+# rather than a conservative failure: the phase can return `settled` under a
+# criterion it never ran. These tests pin both kwargs, and each is written so it
+# cannot pass while its kwarg is missing.
+
+#: σ creeping 3 % per round, at a 600 s period. The ratio is chosen so the two
+#: criteria **disagree on this exact series**, which is what makes the pin below
+#: a pin: over a 3-round deviation window the worst deviation is 2.97 %, well
+#: inside the 10 % tolerance, while 3 %/round for 600 s is 0.077 dec/h — half
+#: again the 0.05 dec/h band. A series both criteria refused, or both accepted,
+#: would pass with `criterion` still dropped on the floor.
+CREEP_RATIO = 1.03
+CREEP_PERIOD_S = 600.0
+CREEP_BAND_DEC_PER_H = 0.05
+
+
+def _creeping(channels=(1, 2, 3, 4)):
+    """Geometric creep — a slope with no scatter, so only the gate decides."""
+
+    def fits_from(raws):
+        index = next(iter(raws.values()), 0)
+        return [RoundFit(channel=ch, sigma=1e-4 * (CREEP_RATIO ** index),
+                         r1_ohms=4000.0) for ch in channels]
+
+    return fits_from
+
+
+async def _drive_creep(*, on_round=None, **plan_over):
+    clock = FakeClock()
+    outcome, _last = await drive_settle_phase(
+        _plan(min_hold_s=0.0, round_period_s=CREEP_PERIOD_S,
+              max_hold_s=CREEP_PERIOD_S * 12, **plan_over),
+        channels=[1, 2, 3, 4],
+        measure_round=_rounds(clock, (1, 2, 3, 4)),
+        fits_from=_creeping(),
+        r1_bound_ohms=RAILED_R1_OHMS, sleep=clock.sleep, now=clock.now,
+        on_round=on_round,
+    )
+    return outcome
+
+
+@pytest.mark.asyncio
+async def test_a_rate_plan_routes_on_rate_where_deviation_would_have_settled():
+    """The same rounds, twice: the criterion is the only difference, and it decides.
+
+    Its own positive control, on the ``r1_bound_ohms`` precedent two sections
+    up. With ``criterion`` unwired the rate plan builds a deviation tracker and
+    both runs return ``settled`` — so this test fails on the defect rather than
+    agreeing with it, which an outcome-only assertion on a steeply moving σ
+    would not have done.
+    """
+    deviation = await _drive_creep()
+    rate = await _drive_creep(criterion=SETTLE_CRITERION_RATE,
+                              rate_tol_dec_per_h=CREEP_BAND_DEC_PER_H)
+
+    assert deviation.outcome == SETTLE_SETTLED, (
+        "the deviation criterion should certify a 2.97 % window at 10 % — if it "
+        "does not, the series no longer discriminates and the pin below is void")
+    assert rate.outcome == SETTLE_CEILING
+    assert not rate.settled
+    # Evaluable and said no, which is the finding that separates a criterion
+    # that ran from one that could not be judged at all.
+    assert rate.participating == [1, 2, 3, 4]
+
+
+@pytest.mark.asyncio
+async def test_the_rate_window_is_paced_by_the_clock_not_by_an_assumed_spacing():
+    """``t_s`` is load-bearing under the rate criterion, and fatal by its absence.
+
+    ``rate_check`` refuses a window carrying any unknown round time rather than
+    guessing at the spacing, so an unwired ``t_s`` does not merely degrade the
+    verdict — every round reports "0 of 7 round times are known" and the phase
+    ends ``not_evaluable``, wearing the same word a board with too few channels
+    produces. Asserted on the reason text because that is the surface
+    ``on_round`` actually receives.
+    """
+    reasons: list[str] = []
+    outcome = await _drive_creep(
+        criterion=SETTLE_CRITERION_RATE,
+        rate_tol_dec_per_h=CREEP_BAND_DEC_PER_H,
+        on_round=lambda _i, check: reasons.append(
+            "" if check is None else (check.reason or "")))
+
+    spoken = " ".join(reasons)
+    assert "needs a time axis" not in spoken, (
+        f"the rate criterion never got a clock: {spoken!r}")
+    # A rate verdict quotes a slope in ln/h; the deviation criterion never does.
+    assert "ln/h" in spoken
+    assert outcome.outcome == SETTLE_CEILING
+    # And no deviation was computed, because no deviation window was judged.
+    assert outcome.max_deviation_rel is None
+
+
+# ── T11.7: the campaign says which criterion it is running ───────────────────
+
+async def _settle_mode_event(spec, connected, tmp_path, monkeypatch) -> dict:
+    """Run a campaign far enough to hear ``settle_mode``, without rig time."""
+    monkeypatch.setattr(wiring, "build_settle_round_workflow", lambda *a, **k: None)
+    monkeypatch.setattr(
+        wiring, "settle_round_fits",
+        lambda raws, channels, **_kw: [
+            RoundFit(channel=int(ch), sigma=1e-4, r1_ohms=4000.0)
+            for ch in channels])
+
+    store = DataStore(tmp_path / "proj")
+    events: list[dict] = []
+    try:
+        await wiring.run_autonomous_campaign(
+            spec, manager=connected, data_store=store, on_event=events.append)
+    finally:
+        store.close()
+
+    modes = [e for e in events if e["type"] == "settle_mode"]
+    assert len(modes) == 1, f"expected one settle_mode event, got {len(modes)}"
+    return modes[0]
+
+
+@pytest.mark.asyncio
+async def test_settle_mode_announces_the_deviation_default_and_its_absent_band(
+    connected, tmp_path: Path, monkeypatch
+):
+    event = await _settle_mode_event(
+        _fast_settle_spec(budget=1, rh_stability_pct=None),
+        connected, tmp_path, monkeypatch)
+
+    assert event["criterion"] == SETTLE_CRITERION_DEVIATION
+    # Present and `None`, not absent: a default-criterion plan carries no band —
+    # `SettlePlan` refuses to let it — and "no band" must be readable as such
+    # rather than inferred from a missing key.
+    assert "rate_tol_dec_per_h" in event
+    assert event["rate_tol_dec_per_h"] is None
+    # The seven flat fields still travel, unchanged by the two new kwargs.
+    assert event["settle_min_channels"] == 3
+    assert event["min_hold_s"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_settle_mode_announces_a_rate_plans_criterion_and_band(
+    connected, tmp_path: Path, monkeypatch
+):
+    """An operator watching a rate run can see that it is running the rate gate.
+
+    Reached through the structural ``run_plan`` spelling because that is the
+    *only* spelling that carries a criterion: ``CampaignSpec`` has no flat
+    ``criterion``/``rate_tol_dec_per_h`` pair, which is precisely why these two
+    keys are named as explicit kwargs on the emit rather than added to
+    ``_SETTLE_FIELDS``.
+    """
+    event = await _settle_mode_event(
+        _spec(budget=1, run_plan=RunPlan.pointwise(settle=_plan(
+            min_hold_s=0.0, round_period_s=0.01, max_hold_s=0.2,
+            criterion=SETTLE_CRITERION_RATE,
+            rate_tol_dec_per_h=CREEP_BAND_DEC_PER_H))),
+        connected, tmp_path, monkeypatch)
+
+    assert event["criterion"] == SETTLE_CRITERION_RATE
+    assert event["rate_tol_dec_per_h"] == pytest.approx(CREEP_BAND_DEC_PER_H)
