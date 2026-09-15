@@ -31,6 +31,7 @@ softae-next.code-workspace
 # Real experimental results, instrument logs and plot dumps. These are
 # lab records, not source; they live in the DataStore, not in git.
 # catalogs (tasks.toml, recipes.toml) + chemicals/solutions CSVs
+# BY POLICY, not oversight: each instance develops its own catalog for its own hardware.
 data/
 # real experimental results DB at repo root
 softae_results.db

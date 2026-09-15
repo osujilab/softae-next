@@ -32,12 +32,19 @@ pip install -e ".[dev]"
 softae-gui
 ```
 
+This repository ships **no process catalog**: `data/` — `tasks.toml`, `recipes.toml` and the
+chemicals/solutions CSVs — is gitignored by policy, because each new instance of this system
+needs users to develop their own processes, recipes and workflows that best reflect the
+integrated hardware. A fresh checkout therefore names no tasks and is not green for the
+catalog-loading tests by construction — see the User Guide's *Before you start*.
+
 ## Project Structure
 
 ```
 softae-next/
 ├── pyproject.toml              # Package metadata & dependencies
 ├── softae_config.toml          # Hardware addresses, paths, defaults
+├── data/                       # Process catalog (tasks, recipes) — GITIGNORED, per-instance
 ├── src/
 │   └── softae/
 │       ├── config/             # Configuration loader

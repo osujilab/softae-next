@@ -5,6 +5,14 @@
 
 ---
 
+> **Before you start: this repository ships no process catalog.** `data/` — `tasks.toml`,
+> `recipes.toml` and the chemicals/solutions CSVs — is gitignored **by policy**: each new
+> instance of this system needs users to develop their own processes, recipes and workflows
+> that best reflect the integrated hardware. A fresh checkout therefore has no tasks to name
+> in `anneal_task`, and the catalog-loading tests are **not green on a fresh clone by
+> construction**. Build your own catalog in the Process Studio tab (Tab 13), or copy one from
+> another instance and edit it against your hardware.
+
 ## Table of Contents
 
 1. [Installation](#1-installation)
@@ -1429,6 +1437,7 @@ scope = "per_batch"
 | `kind` | every phase | **yes** | `formulate` · `anneal` · `equilibrate` · `measure` |
 | `scope` | every phase | **yes** | `per_sample` (once per well) or `per_batch` (once for the round) |
 | `anneal_task` | anneal | no | a task name from `data/tasks.toml` — **this is what sets the cure** |
+| `hold_s` | anneal | no | the cure's duration for this run, in seconds — overrides the task's own `hold_time_s`; refused if `anneal_params` spells `hold_time_s` too |
 | `[…conditions]` | any phase | no | chamber setpoints established at the phase boundary |
 | `[…settle]` | equilibrate | no | the settle loop's timing; the three keys are required **together** |
 | `[…measurement]` | **measure only** | no | a `[measurement]`-shaped block for a denser read |
@@ -1442,13 +1451,16 @@ instance is `formulate ×N → anneal (all) → equilibrate (all) → measure (a
 **`conditions` drives only the axes you name.** An omitted axis is **not driven** — leaving
 out `rh_setpoint_pct` does not mean "0 %RH", it means the humidifier is not commanded at this
 boundary and whatever the previous phase left stands. The block also carries tolerances and
-approach timeouts; they default, and at 85 °C you will want to set the RH approach timeout
-honestly rather than take the default, because the descent to the attainable floor takes far
-longer than a default approach allows. `check` surfaces that as an advisory, never a refusal.
+approach timeouts; they default to the *ascending* allowance (1 800 s). Set them explicitly
+wherever the approach is **passive**: this stage has no active cooling, so a descent — in
+temperature, and in the humidity that follows it — is limited by how fast the enclosure loses
+heat, and no cooling time constant has been measured yet. `check` surfaces that as an
+advisory, never a refusal.
 
 > **`conditions` on an ANNEAL phase is the temperature the chamber RESTS AT after the hold —
-> not the cure temperature.** The cure is set by `anneal_task` and nothing else: the task wins
-> the hold, always. The conditions block writes its setpoint first, the anneal ramps away to
+> not the cure temperature.** The cure is set by `anneal_task`, or by a `hold_s` /
+> `anneal_params` override on the phase — `conditions` never sets it. The conditions block
+> writes its setpoint first, the anneal ramps away to
 > the task's target, and on the way out it restores what conditions left — so `conditions`
 > is the *restore target*. **The case to watch is when the two agree.** Write
 > `temp_setpoint_C = 85.0` beside `anneal_85C_8h` and the chamber stays at 85 °C *after* the
@@ -2749,7 +2761,7 @@ Defaults worth knowing before the first run:
 | `--survivors` | `off` | Needs `--settle-criterion rate` or `both` |
 | `--max-consecutive-failures` | *derived* | `3` under `--survivors off`; the **board size** under `--survivors on`, where a dropped cell's failures no longer count at all |
 | `--approach-dwell-s` | `600` | Seconds each axis must stay in band before it counts as arrived; `0` restores the first-in-band-poll behaviour |
-| `--rh-approach-timeout-s` / `--temp-approach-timeout-s` | `5400` / `1800` | A measured RH descent on this chamber took ~5000 s |
+| `--rh-approach-timeout-s` / `--temp-approach-timeout-s` | `5400` / `1800` | One RH descent measured on this chamber at 85 °C took ~5 000 s; treat these as ceilings, not as expected durations |
 | `--soak-h` | `0` | **Hours**, not seconds. The settle gate proves the *rig* stopped moving; the soak is the *sample's* own equilibration. Settle time counts against it |
 | `--reference-preset` | `Extended` | `longest` widens the resolving window 2.1x for 4.3x the reference cost — the documented escape hatch |
 | `--min-treatment` / `--drift-check` | `6` / `3` | How many cells must land in the resolving window, and how many cells are re-measured at the end of the block |

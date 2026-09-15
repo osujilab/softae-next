@@ -34,6 +34,12 @@ fronts and the per-task specs — are deliberately **not** published. They live 
 in-flight decisions rather than the state of the system. The three pages above are the
 committed documentation surface, and `mkdocs.yml`'s nav is limited to the same set.
 
+The process catalog under `data/` is excluded for a different reason than the working
+documents above: it is not in-flight, it is **per-instance**. Each installation develops its
+own processes, recipes and workflows against its own integrated hardware, so no catalog
+shipped here would be correct anywhere else — and a fresh checkout is not green for the
+catalog-loading tests by construction.
+
 Runnable examples ship as files rather than pages: workflow YAML under `workflows/`
 (including `workflows/examples/piezo_assisted_dispense.yaml` for piezo-assisted
 dispense), and Python demos under `examples/`.
