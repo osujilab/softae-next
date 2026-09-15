@@ -124,6 +124,42 @@ class TestRoundTrip:
             ["rh_stability_pct"]
         assert decode_run_plan(table).phases[1].settle.rh_stability_pct is None
 
+    def test_round_trip_carries_the_settle_criterion_and_band(self):
+        """The two halves of a rate gate, across the file boundary."""
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE),
+            RunPhase(PhaseKind.EQUILIBRATE, PhaseScope.PER_BATCH,
+                     settle=SettlePlan(240.0, 1500.0, 14400.0,
+                                       criterion="rate",
+                                       rate_tol_dec_per_h=0.05)),
+        ))
+
+        table = encode_run_plan(plan)
+        settle = table["phases"][1]["settle"]
+
+        assert settle["criterion"] == "rate"
+        assert settle["rate_tol_dec_per_h"] == 0.05
+        assert decode_run_plan(table) == plan
+
+    def test_encoder_omits_a_default_criterion_and_absent_band(self):
+        """A deviation plan writes neither key — and no ``explicit_none``.
+
+        The band's own default is ``None``, so absence already says it. Listing
+        it would put a redundant ``explicit_none`` in every file this encoder
+        touches, which is the opposite of the rule that array exists for.
+        """
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE),
+            RunPhase(PhaseKind.EQUILIBRATE, PhaseScope.PER_BATCH,
+                     settle=SettlePlan(240.0, 1500.0, 14400.0)),
+        ))
+
+        settle = encode_run_plan(plan)["phases"][1]["settle"]
+
+        assert "criterion" not in settle
+        assert "rate_tol_dec_per_h" not in settle
+        assert "explicit_none" not in settle
+
     def test_round_trip_default_approach_timeouts_are_not_written(self):
         """A file shows what was chosen; the defaults live in the dataclass."""
         plan = RunPlan((RunPhase(
@@ -286,7 +322,8 @@ class TestDecoderRefusals:
                  "settle": {**SETTLE_TABLE,
                             "explicit_none": ["min_hold_s"]}})})
 
-        assert "only ['rh_stability_pct'] can be set to nothing" in str(exc.value)
+        assert "can be set to nothing" in str(exc.value)
+        assert "'rh_stability_pct'" in str(exc.value)
 
     def test_decode_a_settle_field_given_a_value_and_listed_as_nothing_is_refused(self):
         with pytest.raises(SpecLoadError, match="says two things about one field"):
@@ -294,6 +331,63 @@ class TestDecoderRefusals:
                 {**EQUILIBRATE,
                  "settle": {**SETTLE_TABLE, "rh_stability_pct": 1.5,
                             "explicit_none": ["rh_stability_pct"]}})})
+
+    def test_decode_an_unknown_criterion_word_is_refused(self):
+        """SettlePlan owns the legal set; the codec surfaces its refusal."""
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict({**MINIMAL, "run_plan": _phases(
+                {**EQUILIBRATE,
+                 "settle": {**SETTLE_TABLE, "criterion": "slope",
+                            "rate_tol_dec_per_h": 0.05}})})
+
+        assert "[settle]" in str(exc.value)
+        assert "'slope' is not one of" in str(exc.value)
+
+    def test_decode_a_rate_criterion_without_a_band_is_refused(self):
+        """The pair that computes no verdict, refused where the file is read."""
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict({**MINIMAL, "run_plan": _phases(
+                {**EQUILIBRATE,
+                 "settle": {**SETTLE_TABLE, "criterion": "rate"}})})
+
+        assert "[settle]" in str(exc.value)
+        assert "needs a rate_tol_dec_per_h band" in str(exc.value)
+
+    def test_decode_a_rate_band_set_to_nothing_round_trips_as_no_band(self):
+        """Value-preserving, not byte-symmetric — and that is the intent.
+
+        ``explicit_none`` on a field whose default is already ``None`` is a
+        permitted statement of intent. It decodes to ``None`` and the encoder
+        does not write it back, so the plan survives and the redundancy does not.
+        """
+        spec = spec_from_dict({**MINIMAL, "run_plan": _phases(
+            {**EQUILIBRATE,
+             "settle": {**SETTLE_TABLE,
+                        "explicit_none": ["rate_tol_dec_per_h"]}})})
+        settle = spec.run_plan.phases[1].settle
+
+        assert settle.rate_tol_dec_per_h is None
+        written = encode_run_plan(spec.run_plan)["phases"][1]["settle"]
+        assert "explicit_none" not in written
+        assert decode_run_plan(encode_run_plan(spec.run_plan)) == spec.run_plan
+
+    def test_decode_a_rate_band_given_a_value_and_listed_as_nothing_is_refused(self):
+        with pytest.raises(SpecLoadError, match="says two things about one field"):
+            spec_from_dict({**MINIMAL, "run_plan": _phases(
+                {**EQUILIBRATE,
+                 "settle": {**SETTLE_TABLE, "rate_tol_dec_per_h": 0.05,
+                            "explicit_none": ["rate_tol_dec_per_h"]}})})
+
+    def test_decode_an_unknown_settle_key_lists_the_new_keys(self):
+        """What proves the two names actually joined the key set."""
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict({**MINIMAL, "run_plan": _phases(
+                {**EQUILIBRATE,
+                 "settle": {**SETTLE_TABLE, "rate_tol_dec_per_hr": 0.05}})})
+
+        message = str(exc.value)
+        assert "unknown key(s) ['rate_tol_dec_per_hr']" in message
+        assert "'criterion'" in message and "'rate_tol_dec_per_h'" in message
 
     def test_decode_a_non_numeric_duration_is_refused(self):
         with pytest.raises(SpecLoadError, match="must be a number"):

@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import pytest
 
+from softae.analysis.equilibration import (
+    SETTLE_CRITERION_BOTH,
+    SETTLE_CRITERION_DEVIATION,
+    SETTLE_CRITERION_RATE,
+)
 from softae.core.measurement_spec import MeasurementSpec
 from softae.core.phase_setpoints import PhaseSetpoints
 from softae.core.run_plan import (
@@ -275,3 +280,69 @@ def test_factories_refuse_a_hold_with_no_anneal_phase():
     """
     with pytest.raises(ValueError, match="anneal=False"):
         RunPlan.batch(anneal=False, hold_s=3600.0)
+
+
+# ── the settle criterion and its band (T11.2) ───────────────────────────────
+
+def _settle_with(**kwargs) -> SettlePlan:
+    """``_settle()`` plus whichever criterion keywords are under test."""
+    return SettlePlan(round_period_s=240.0, min_hold_s=1500.0,
+                      max_hold_s=14400.0, **kwargs)
+
+
+def test_settle_plan_rate_criterion_and_band_are_accepted():
+    """The positive control: this raises ``TypeError`` until the fields exist."""
+    plan = _settle_with(criterion=SETTLE_CRITERION_RATE, rate_tol_dec_per_h=0.05)
+
+    assert plan.criterion == SETTLE_CRITERION_RATE
+    assert plan.rate_tol_dec_per_h == 0.05
+
+
+def test_settle_plan_defaults_are_the_deviation_criterion_with_no_band():
+    """Every plan written before this change keeps every verdict it had."""
+    plan = _settle()
+
+    assert plan.criterion == SETTLE_CRITERION_DEVIATION
+    assert plan.rate_tol_dec_per_h is None
+
+
+def test_settle_plan_unknown_criterion_word_is_refused():
+    with pytest.raises(ValueError, match="criterion"):
+        _settle_with(criterion="slope", rate_tol_dec_per_h=0.05)
+
+
+def test_settle_plan_rate_criterion_without_a_band_is_refused():
+    """A rate gate with no band certifies nothing and burns to the ceiling."""
+    with pytest.raises(ValueError, match="rate_tol_dec_per_h"):
+        _settle_with(criterion=SETTLE_CRITERION_RATE)
+
+
+def test_settle_plan_both_criterion_without_a_band_is_refused():
+    """The silent one: deviation still routes, and the shadow never computes.
+
+    ``SettleTracker._rate_verdict`` returns ``None`` — never a verdict — with no
+    tolerance configured, which is indistinguishable from "the window is not
+    full yet", so ``both`` would look exactly like a working shadow run.
+    """
+    with pytest.raises(ValueError, match="rate_tol_dec_per_h"):
+        _settle_with(criterion=SETTLE_CRITERION_BOTH)
+
+
+@pytest.mark.parametrize("band", [0.0, -0.05])
+def test_settle_plan_non_positive_rate_band_is_refused(band):
+    """``None`` is how "no band" is spelled; zero is a band nothing satisfies."""
+    with pytest.raises(ValueError, match="rate_tol_dec_per_h"):
+        _settle_with(criterion=SETTLE_CRITERION_RATE, rate_tol_dec_per_h=band)
+
+
+def test_settle_plan_label_omits_the_default_criterion():
+    assert _settle().label() == "≤4h, ≥25min, every 4min"
+
+
+@pytest.mark.parametrize(
+    "criterion", [SETTLE_CRITERION_RATE, SETTLE_CRITERION_BOTH])
+def test_settle_plan_label_names_the_criterion_and_band(criterion):
+    label = _settle_with(criterion=criterion, rate_tol_dec_per_h=0.05).label()
+
+    assert label.startswith("≤4h, ≥25min, every 4min, ")
+    assert label.endswith(f"{criterion} ≤0.05 dec/h")

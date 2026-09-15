@@ -62,7 +62,24 @@ for. The same spelling is used here, scoped to the settle table::
       round_period_s = 240.0
       min_hold_s     = 1500.0
       max_hold_s     = 14400.0
+      criterion      = "rate"                  # which gate ROUTES
+      rate_tol_dec_per_h = 0.05                # its band, in DECADES per hour
       explicit_none  = ["rh_stability_pct"]    # the RH stability gate is OFF
+
+``rate_tol_dec_per_h`` is the operator's unit throughout — file, label and log —
+and is converted to the tracker's ln-units at the tracker's own boundary. The two
+keys travel together: :class:`~softae.core.run_plan.SettlePlan` refuses a rate
+criterion with no band, because that pair computes no verdict at all and fails
+looking exactly like a working run. ``rate_tol_dec_per_h`` is nullable on the
+``rh_stability_pct`` precedent, with one difference worth knowing: there, an
+omitted key switches the gate **on**, so ``None`` has to be spelled out; here
+absence already means ``None``, so naming it in ``explicit_none`` is a permitted
+statement of intent that the encoder will not write back.
+
+**New settle capabilities are spelled here and only here.** The flat settle
+fields on ``CampaignSpec`` are the legacy operator spelling; they do not grow, so
+a file that writes ``criterion`` at the top level is refused by
+``campaign_spec_io``'s unknown-field check rather than silently defaulted.
 
 **Why this is a module of its own** rather than three more functions in
 :mod:`softae.core.campaign_spec_fields`, where the other codecs live: a run plan
@@ -135,9 +152,13 @@ _CONDITION_KEYS = frozenset(("name",) + _CONDITION_AXES + _CONDITION_TUNING)
 
 _SETTLE_REQUIRED = ("round_period_s", "min_hold_s", "max_hold_s")
 _SETTLE_OPTIONAL = ("settle_tol_rel", "settle_n_rounds", "settle_min_channels",
-                    "rh_stability_pct")
-#: The only settle field for which ``None`` is a value rather than an absence.
-_SETTLE_NULLABLE = ("rh_stability_pct",)
+                    "rh_stability_pct", "criterion", "rate_tol_dec_per_h")
+#: The settle fields for which ``None`` is a value rather than an absence. They
+#: are not the same statement: an omitted ``rh_stability_pct`` switches its gate
+#: **on**, so ``None`` must be spellable; an omitted ``rate_tol_dec_per_h``
+#: already *is* ``None``, so naming it here is a redundant — and permitted —
+#: statement of intent that the encoder will not write back.
+_SETTLE_NULLABLE = ("rh_stability_pct", "rate_tol_dec_per_h")
 
 #: The same spelling :mod:`softae.core.campaign_spec_io` uses at the top level,
 #: restated rather than imported because that module imports this one.
@@ -147,6 +168,10 @@ _SETTLE_KEYS = frozenset(
     _SETTLE_REQUIRED + _SETTLE_OPTIONAL + (_EXPLICIT_NONE_KEY,))
 
 _INT_SETTLE_KEYS = ("settle_n_rounds", "settle_min_channels")
+#: Settle keys carrying a word rather than a number. The word itself is validated
+#: by :class:`~softae.core.run_plan.SettlePlan` and deliberately not restated
+#: here, so the legal set cannot drift from the one the tracker accepts.
+_STR_SETTLE_KEYS = ("criterion",)
 
 
 class _NotWritable(Exception):
@@ -231,14 +256,24 @@ def _settle_to_table(settle: SettlePlan) -> dict[str, Any]:
     for key in _SETTLE_OPTIONAL:
         value = getattr(settle, key)
         if value is None:
-            # An omitted key would switch the gate back ON — the exact round-trip
-            # silence `explicit_none` exists to stop.
-            nulls.append(key)
+            # Only where an omitted key would switch the gate back ON — the exact
+            # round-trip silence `explicit_none` exists to stop. A field whose own
+            # default is None is already said by absence, and writing it would put
+            # a redundant `explicit_none` in every file this encoder touches.
+            if defaults[key] is not None:
+                nulls.append(key)
         elif value != defaults[key]:
-            table[key] = int(value) if key in _INT_SETTLE_KEYS else float(value)
+            table[key] = _settle_scalar(key, value)
     if nulls:
         table[_EXPLICIT_NONE_KEY] = sorted(nulls)
     return table
+
+
+def _settle_scalar(key: str, value: Any) -> Any:
+    """*value* in the type TOML should carry it for *key*."""
+    if key in _STR_SETTLE_KEYS:
+        return str(value)
+    return int(value) if key in _INT_SETTLE_KEYS else float(value)
 
 
 # ── decode ───────────────────────────────────────────────────────────────────
@@ -382,9 +417,16 @@ def _settle_from_dict(raw: Any, index: int) -> SettlePlan:
     for key in _SETTLE_OPTIONAL:
         if key not in raw:
             continue
-        kwargs[key] = (_integer(raw[key], f"{where} '{key}'")
-                       if key in _INT_SETTLE_KEYS
-                       else _number(raw[key], f"{where} '{key}'"))
+        if key in _STR_SETTLE_KEYS:
+            # Passed through unvalidated on purpose: SettlePlan owns the legal
+            # set, and its refusal surfaces from the constructor below with this
+            # table's prefix already on it. A non-string reaches the same
+            # membership test and is refused as a ValueError, not a TypeError.
+            kwargs[key] = raw[key]
+        else:
+            kwargs[key] = (_integer(raw[key], f"{where} '{key}'")
+                           if key in _INT_SETTLE_KEYS
+                           else _number(raw[key], f"{where} '{key}'"))
     for key in nulls:
         kwargs[key] = None
 

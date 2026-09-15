@@ -44,6 +44,8 @@ from softae.analysis.equilibration import (
     DEFAULT_SETTLE_MIN_CHANNELS,
     DEFAULT_SETTLE_N_ROUNDS,
     DEFAULT_SETTLE_TOL_REL,
+    SETTLE_CRITERIA,
+    SETTLE_CRITERION_DEVIATION,
     settle_tol_rel_refusal,
 )
 
@@ -126,6 +128,15 @@ class SettlePlan:
     ``settle_tol_rel = 0.10``: the measured noise floor on that run was 5.98 %,
     so a 2 % band is unsatisfiable by any hold length.
 
+    ``criterion`` and ``rate_tol_dec_per_h`` are the fifth and sixth, and they
+    travel together: which of the sibling gates in
+    :class:`~softae.analysis.equilibration.SettleTracker` **routes**, and the band
+    the rate one is measured against. They exist only in the structural
+    ``[run_plan.phases.settle]`` spelling — the flat settle fields on
+    :class:`~softae.core.autonomous_wiring.CampaignSpec` are the legacy operator
+    spelling and do not grow, so a new capability is stated in one place rather
+    than two that can disagree.
+
     The fourth, ``rh_stability_pct``, is the only one that judges the *room*
     rather than the sample. It belongs here and not in ``[safety]`` because it is
     a spread over **this window** — a tolerance coupled to ``settle_n_rounds``
@@ -153,6 +164,21 @@ class SettlePlan:
     #: The gate can only ever make settling harder, never earlier, so it cannot
     #: produce the early-measurement hazard that made settle itself opt-in.
     rh_stability_pct: float | None = DEFAULT_RH_STABILITY_PCT
+    #: Which of the sibling settle gates **routes** —
+    #: :data:`~softae.analysis.equilibration.SETTLE_CRITERION_DEVIATION` (the
+    #: default, and every verdict this rig has ever taken),
+    #: ``SETTLE_CRITERION_RATE``, or ``SETTLE_CRITERION_BOTH``, which routes on
+    #: deviation and reports the rate beside it. Imported rather than restated so
+    #: the word this plan carries is the word the tracker accepts.
+    criterion: str = SETTLE_CRITERION_DEVIATION
+    #: The rate band, in **decades per hour** — the operator's unit, the one
+    #: ``--settle-rate-tol-dec-per-h`` and ``H3_MAX_HOLD_DRIFT_DEC`` are written
+    #: in. The tracker's own arithmetic is in ln-units and the conversion belongs
+    #: at *its* boundary (:func:`~softae.analysis.equilibration.rate_tol_ln_per_hour`),
+    #: not here: a plan holding ln-units would put the gate's unit in the
+    #: operator's file. ``None`` means no band is configured, which is the honest
+    #: state of a deviation-only plan.
+    rate_tol_dec_per_h: float | None = None
 
     def __post_init__(self) -> None:
         if self.round_period_s < 0 or self.min_hold_s < 0:
@@ -174,11 +200,54 @@ class SettlePlan:
             raise ValueError("rh_stability_pct must be positive; a zero band can "
                              "never be satisfied — use None to switch the RH "
                              "stability gate off")
+        if (refusal := _criterion_refusal(
+                self.criterion, self.rate_tol_dec_per_h)) is not None:
+            raise ValueError(refusal)
 
     def label(self) -> str:
-        """``'≤2h, ≥30min, every 2min'`` — the three durations, in one glance."""
-        return (f"≤{_minutes(self.max_hold_s)}, ≥{_minutes(self.min_hold_s)}, "
-                f"every {_minutes(self.round_period_s)}")
+        """``'≤2h, ≥30min, every 2min'`` — the three durations, in one glance.
+
+        The criterion joins them only when it is not the default, so every label
+        an operator has already read back is byte-identical. The band is never
+        rendered alone: on a deviation plan a bare ``≤0.05 dec/h`` would read as
+        the gate that is running.
+        """
+        label = (f"≤{_minutes(self.max_hold_s)}, ≥{_minutes(self.min_hold_s)}, "
+                 f"every {_minutes(self.round_period_s)}")
+        if self.criterion == SETTLE_CRITERION_DEVIATION:
+            return label
+        return f"{label}, {self.criterion} ≤{self.rate_tol_dec_per_h:g} dec/h"
+
+
+def _criterion_refusal(criterion: str, rate_tol_dec_per_h: float | None) -> str | None:
+    """Why this criterion/band pair cannot run, or ``None``.
+
+    A function beside :func:`settle_tol_rel_refusal` rather than three more
+    branches inside ``__post_init__``, and separate from the tracker's own
+    construction check because the two refuse at different moments: the tracker
+    refuses when a run is already under way, this refuses when the file is read.
+
+    **The middle refusal is the reason this pair is validated at all.** A rate
+    criterion with no band computes no verdict whatsoever —
+    ``SettleTracker._rate_verdict`` returns ``None`` rather than inventing a
+    tolerance — so under ``rate`` the phase can never certify and burns to
+    ``max_hold_s``, and under ``both`` the shadow half silently never runs while
+    deviation routes exactly as it always did. Both failures wear a working run's
+    clothes.
+    """
+    if str(criterion) not in SETTLE_CRITERIA:
+        return f"criterion {criterion!r} is not one of {SETTLE_CRITERIA}"
+    if criterion != SETTLE_CRITERION_DEVIATION and rate_tol_dec_per_h is None:
+        return (f"criterion={criterion!r} needs a rate_tol_dec_per_h band; with "
+                f"none, no rate verdict is ever computed — the phase would run "
+                f"to max_hold_s under 'rate', and under 'both' the shadow "
+                f"comparison would silently never happen. 0.05 dec/h is what "
+                f"softae-eis-validate defaults to; 'deviation' is how a plan "
+                f"says it wants no rate gate")
+    if rate_tol_dec_per_h is not None and rate_tol_dec_per_h <= 0:
+        return ("rate_tol_dec_per_h must be positive; a zero or negative band "
+                "can never be satisfied — use None to mean no rate band")
+    return None
 
 
 def _minutes(seconds: float) -> str:
