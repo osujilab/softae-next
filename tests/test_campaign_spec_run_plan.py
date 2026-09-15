@@ -33,6 +33,7 @@ from softae.core.campaign_spec_run_plan import (
 )
 from softae.core.measurement_spec import MeasurementSpec
 from softae.core.phase_setpoints import (
+    DEFAULT_APPROACH_TIMEOUT_S,
     DEFAULT_RH_APPROACH_TIMEOUT_S,
     PhaseSetpoints,
 )
@@ -471,7 +472,7 @@ class TestBenchInstanceRunPlan:
         assert line.index("Formulate") < line.index("Anneal") \
             < line.index("Equilibrate") < line.index("Measure")
         assert "casting (25 °C, 40 %RH) [per sample]" in line
-        assert "anneal (85 °C, 20 %RH) [per batch]" in line
+        assert "anneal (25 °C, 20 %RH) [per batch]" in line
         assert "Measure EIS (Extended) [per batch]" in line
 
     def test_bench_instance_allows_four_hours_to_reach_the_anneal_humidity(
@@ -483,6 +484,13 @@ class TestBenchInstanceRunPlan:
 
     def test_bench_instance_settle_window_is_the_campaigns_only_one(self, plan):
         assert plan.phases[2].settle == SettlePlan(240.0, 1500.0, 14400.0)
+
+    def test_bench_instance_rests_below_the_cure_and_budgets_the_cool_down(self, plan):
+        """Heater-only stage: the rest state is 25 °C and the descent gets its own ceiling."""
+        anneal, equilibrate = plan.phases[1], plan.phases[2]
+        assert anneal.conditions.temp_setpoint_C == 25.0
+        assert equilibrate.conditions.temp_setpoint_C == anneal.conditions.temp_setpoint_C
+        assert equilibrate.conditions.approach_timeout_s > DEFAULT_APPROACH_TIMEOUT_S
 
 
 # ── Registration ─────────────────────────────────────────────────────────────

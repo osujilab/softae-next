@@ -213,11 +213,13 @@ def test_defaults_match_the_equilibration_run_that_measured_them():
 def test_rh_approach_timeout_is_a_phase_parameter_not_the_driver_default():
     """The driver's ``timeout=120.0`` is a monitoring poll, not an approach gate.
 
-    The observed descent to ~20 %RH at 85 °C is on the order of 5 000 s, so a
-    phase that inherited the driver default would fail its approach every time
-    while the chamber worked normally — which under ``raise_on_timeout`` aborts a
-    run with the samples already cast. The value has to be settable per phase,
-    and the emitted step has to carry the phase's value rather than the driver's.
+    ONE observed descent to ~20 %RH at 85 °C ran on the order of 5 000 s
+    (2026-08-11 — a single measurement, not a rig constant), so a phase that
+    inherited the driver default would fail its approach every time while the
+    chamber worked normally — which under ``raise_on_timeout`` aborts a run with
+    the samples already cast. The value has to be settable per phase, and the
+    emitted step has to carry the phase's value rather than the driver's. It is a
+    ceiling either way: the approach ends when the chamber arrives.
     """
     import inspect
 

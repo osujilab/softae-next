@@ -59,7 +59,9 @@ CONDITIONS_PHASE_TAG = "conditions"
 # The four tolerance/timeout defaults are the values
 # ``softae.workflows.equilibration`` measured and documents at length
 # (``DEFAULT_TOLERANCE_C`` = 2.0 °C because 0.5 graded a 0.6 °C dip as "hold not
-# met"; ``DEFAULT_APPROACH_TIMEOUT_S`` = 1800 s is the *ascending* allowance).
+# met"; ``DEFAULT_APPROACH_TIMEOUT_S`` = 1800 s is the *ascending* allowance —
+# this stage is heater-only, so a *descending* approach is passive and needs its
+# own, longer, per-phase ceiling; no cooling constant has been measured yet).
 # They are restated here rather than imported because that module is a 2 800-line
 # async workflow pulling in the driver contracts, and this type sits under
 # ``core`` on the deposition engine's import path. ``test_phase_setpoints.py``
@@ -93,10 +95,17 @@ class PhaseSetpoints:
     ``approach_timeout_s`` and ``rh_approach_timeout_s`` belong to the *phase*,
     not to the driver, and that is the whole reason they are fields. The RH
     driver's own defaults are ``tol = 2.0, timeout = 120.0`` — appropriate for a
-    monitoring poll and hopeless as a gate: the observed descent to ~20 %RH at
-    85 °C takes on the order of 5 000 s, so a phase that inherited the driver
-    default would fail its approach every time while the chamber was working
-    normally. A phase that needs longer says so in its own file.
+    monitoring poll and hopeless as a gate: one observed descent to ~20 %RH at
+    85 °C took on the order of 5 000 s (2026-08-11 — a single measurement, not a
+    rig constant), so a phase that inherited the driver default would fail its
+    approach every time while the chamber was working normally. A phase that
+    needs longer says so in its own file.
+
+    These are **ceilings**: an approach ends when the chamber arrives. The stage
+    is heater-only, so a *descending* approach is passive and slower than an
+    ascending one by an unmeasured factor — ``DEFAULT_APPROACH_TIMEOUT_S`` is the
+    ascending allowance (see the module comment above) and a cooling phase states
+    its own.
 
     The attainable RH floor **rises with chamber temperature** (the flush basin
     humidifies the enclosure as it warms): commanded 15 %RH returned a PV of

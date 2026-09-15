@@ -143,26 +143,37 @@ scope = "per_sample"
 [[run_plan.phases]]
 kind  = "anneal"
 scope = "per_batch"
-# The cure DURATION lives only here, in the catalog task's name and params
+# The cure DURATION lives in the catalog task's name and params
 # (`data/tasks.toml` → `anneal_85C_8h`: 85 °C, hold 28 800 s, timeout 29 400 s).
-# The temperature below therefore states it a second time; which of the two is
-# authoritative is the open question in `docs/SubAgent docs/anneal_phase_duration.md`,
-# and nothing here anticipates that ruling.
+# D1 was ruled (d): `hold_s` is the typed per-run spelling of the task's
+# `hold_time_s`, and is refused if `anneal_params` also spells it. This example
+# leaves the hold with the catalog task ON PURPOSE — a choice, not an open
+# question. The `temp_setpoint_C` below is the RESTORE target, not the cure.
 anneal_task = "anneal_85C_8h"
   [run_plan.phases.conditions]
   name            = "anneal"
-  temp_setpoint_C = 85.0
-  # ~20 %RH is the attainable floor at 85 °C, not a choice: the flush basin
-  # humidifies the enclosure as it warms, and a commanded 15 returned a PV of
-  # 19.5–23.2. See `analysis/rh_floor.py`, whose own warning forbids fitting an
+  # The RESTORE target: where the chamber rests when the hold ENDS, not the cure
+  # (`anneal_85C_8h` owns that). 25 °C, not 85 — equal to the cure is the one
+  # combination that is certainly a mis-read of this field, and
+  # `warn_if_resting_at_the_cure_temperature` says so at check time.
+  temp_setpoint_C = 25.0
+  # Bounded by the floor at the CURE temperature, not at the rest setpoint
+  # above: the anneal task drives temperature only and never rewrites the
+  # humidity setpoint, so this value is HELD through the 85 °C hold, where the
+  # warming flush basin humidifies the enclosure and a commanded 15 returned a
+  # PV of 19.5–23.2. Only the DESCENT to reach it now runs at 25 °C, where it is
+  # easy. See `analysis/rh_floor.py`, whose own warning forbids fitting an
   # absolute threshold to this.
   rh_setpoint_pct = 20.0
-  # 4 h, against the shipped 1 800 s default, and the honest number rather than
-  # a hopeful one: `anneal_phase_duration.md` §4 measures the 85 °C descent at
-  # ~0.0015 %RH/s, so reaching |PV − 20| ≤ 2 from 40 %RH is an 18 %RH descent
-  # ≈ 12 000 s. 14 400 s is that plus ~20 % headroom. At the default this phase
-  # would abort at the anneal boundary with four wet samples already cast —
-  # `rh_wait` carries `raise_on_timeout`, and that refusal is the point.
+  # 4 h, against the shipped 1 800 s default, and a CEILING rather than a
+  # budget: the wait ends when the chamber arrives. ONE 85 °C descent was
+  # measured at ~0.0015 %RH/s (2026-08-11), which put an 18 %RH descent near
+  # 12 000 s; 14 400 s is headroom over that single figure, not a rig property.
+  # Since this phase now rests at 25 °C the descent runs at 25 °C, where that
+  # figure does not apply at all — another reason it is a ceiling. At the
+  # default this phase would abort at the anneal boundary with four wet samples
+  # already cast: `rh_wait` carries `raise_on_timeout`, and that refusal is the
+  # point.
   rh_approach_timeout_s = 14400.0
 
 [[run_plan.phases]]
@@ -179,6 +190,14 @@ scope = "per_batch"
   name            = "equilibrate"
   temp_setpoint_C = 25.0
   rh_setpoint_pct = 50.0
+  # 3 h, against the 1 800 s default, because THIS approach is a DESCENT. The
+  # stage is heater-only: cooling from the 85 °C cure to 25 °C is passive and no
+  # time constant has been measured (rung 3 is the first measurement). 10 800 s
+  # is a first-order estimate, and the temperature `wait` RETURNS on timeout
+  # rather than raising — so this is a budget, not a gate. At the default, the
+  # settle phase would begin on a still-cooling board and the rate criterion
+  # would read thermal drift as sample drift.
+  approach_timeout_s = 10800.0
 
 [[run_plan.phases]]
 kind  = "measure"
