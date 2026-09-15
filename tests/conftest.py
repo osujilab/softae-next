@@ -122,3 +122,55 @@ def settle_qt():
         QApplication.processEvents()
 
     return _settle
+
+
+class FakeClock:
+    """A clock that only moves when somebody waits on it.
+
+    Which is the whole reason the settle/hold drivers take ``sleep`` and ``now``
+    as parameters: an eight-hour cure is not a thing a test may spend.
+
+    **What it is a superset of.** Four near-copies of this exist in the suite and
+    no two are the same, so the differences are folded in here rather than
+    averaged away:
+
+    * ``test_campaign_events.py:340`` — its ``sleep`` yields to the event loop so
+      a heartbeat task and a long step interleave as they would in a real run.
+      That yield is kept below: it is inert for a single-task test and
+      load-bearing for that one.
+    * ``test_campaign_settle_phase.py:91`` — carries ``measured_at``, appended to
+      by its ``_rounds`` helper. Kept below; a caller that ignores it pays a list.
+    * ``test_rh_equilibrate_stability_gate.py:98`` — the plain three members, and
+      exactly this class.
+
+    **What it is NOT.** ``test_tool_env_hold.py:180``'s clock has a *synchronous*
+    ``sleep`` that clamps negatives, so it is a different object wearing the same
+    name and this one cannot replace it. Said here because a docstring claiming
+    four when it means three is how the next consolidation gets a red it cannot
+    explain.
+
+    Those four files belong to other sessions and are deliberately untouched;
+    this is the shared copy new modules use, not a migration.
+    """
+
+    def __init__(self) -> None:
+        self.t = 0.0
+        #: When each round was taken, for callers that record it.
+        self.measured_at: list[float] = []
+
+    def now(self) -> float:
+        return self.t
+
+    async def sleep(self, seconds: float) -> None:
+        import asyncio
+
+        self.t += float(seconds)
+        # Yield, so a concurrent task sees the advanced clock before this one
+        # continues. Inert when nothing else is running.
+        await asyncio.sleep(0)
+
+
+@pytest.fixture
+def fake_clock() -> FakeClock:
+    """A fresh :class:`FakeClock` per test."""
+    return FakeClock()
