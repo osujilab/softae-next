@@ -286,7 +286,34 @@ def test_sweep_selects_vft_fitter(simple_config, mock_manager):
 
 
 @pytest.mark.asyncio
-async def test_sweep_run_stores_vft_rows(connected_manager, data_store, run_id):
+async def test_sweep_run_stores_vft_rows(connected_manager, data_store, run_id, monkeypatch):
+    """VFT rows carry B/T0 — fitted on the LEGACY engine, deliberately.
+
+    The mock potentiostat's synthetic spectra are legacy-era fixture debt (T11.13).
+    Under ``[eis] engine = "gated"``, the shipped default since ``744e034``
+    (2026-09-14), the Front-1 gates drop points from these synthetic sweeps and 8 of
+    the 16 ``analyze_spectrum`` calls this run makes die with *"Optimal parameters not
+    found: the maximum number of function evaluations is exceeded"*. One channel then
+    reaches the VFT fitter with fewer than the three sigma points VFT needs, and its
+    row carries ``B = None``. That is the fixture failing the engine, not the fit
+    failing the row, so the pin goes on the engine rather than on the assertion: B is
+    still required below, unconditionally.
+
+    The override is on the loaded config rather than a call argument because
+    ``ArrheniusSweep`` deliberately leaves ``engine`` unset at both of its
+    ``analyze_spectrum`` sites, so ``[eis] engine`` is the only thing that governs the
+    sweep. ``monkeypatch`` puts the shipped value back afterwards. Retire the override
+    when the mock's spectra are rebuilt to survive Front-1 — at which point this test
+    becomes a real gated-engine test and should be allowed to be one.
+    """
+    from softae.analysis.eis.settings import eis_settings
+    from softae.config import loader
+
+    monkeypatch.setitem(loader.load()["eis"], "engine", "legacy")
+    # The override is an instrument, so check that it can fail: without this the test
+    # would simply red on B again and the cause would look like the fitter.
+    assert eis_settings().engine == "legacy"
+
     config = ArrheniusSweepConfig(
         channels=[1, 2],
         T_start=25.0, T_stop=55.0, T_step=10.0,  # 4 temps ≥ 3 for VFT

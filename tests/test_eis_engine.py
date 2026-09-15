@@ -1,8 +1,11 @@
 """The engine entry point (E0) — two engines, one return shape, legacy unchanged.
 
-The hard constraint on this whole overhaul is that the existing EIS path stays intact
-and stays the default until the gated path is validated on the bench. These tests are
-that constraint made mechanical rather than asserted in a comment.
+The hard constraint on this whole overhaul was that the existing EIS path stays intact
+and stays the default until the gated path is observed on the bench. The *default* half
+of that ended with ``744e034`` (2026-09-14), which flipped ``[eis] engine`` to ``gated``.
+The *unchanged* half still holds: ``engine="legacy"`` must go on doing bit-for-bit what
+the rig always did, and these tests are that constraint made mechanical rather than
+asserted in a comment.
 """
 
 from __future__ import annotations
@@ -37,35 +40,40 @@ def _gated(enabled: bool = True) -> EISSettings:
 
 class TestEngineSelection:
     def test_an_unconfigured_rig_selects_the_engine_whose_failure_mode_is_better_understood(self):
-        """The shipped default is ``legacy``. The flip to ``gated`` is PREPARED AND
-        NOT SHIPPED, and this assertion pins what a fresh checkout actually gets.
+        """The shipped default is ``gated``, and this assertion pins what a fresh
+        checkout actually gets.
 
-        The operator's 2026-09-09 ruling is to observe the gated engine on real runs
-        rather than keep predicting it, and the config change that does so is written
-        and held uncommitted. It is held because tier 3 under ``gated`` fails 16 tests
-        — every one of them a test whose synthetic fixture the gated pipeline
-        *correctly* refuses, so the 16 are fixture debt to be paid before the flip, not
-        evidence against the engine. Tier 3 also costs 32:41 on legacy against 1:55:46
-        on gated (2.96×), which is the other half of the bill.
+        The flip landed in ``744e034`` on 2026-09-14, discharging the operator's
+        2026-09-09 ruling: observe the gated engine on real runs rather than keep
+        predicting it.
 
         **The assertion moves when ``softae_config.toml`` moves, in the same commit.**
-        ``[a90]`` §1 said exactly that ("config flips to ``gated`` and the test moves
-        with it") and commit ``3cece23`` did the opposite: it landed this assertion on
-        ``gated`` while the config half stayed behind, so a fresh checkout of that
-        commit fails here. The coupling is a VALUE, not a symbol, which is why a
-        pre-commit symbol check cannot see it — ``eis_settings`` exists on both sides.
+        That rule has now been broken in BOTH directions, and this edit is the second
+        break being repaired. ``3cece23`` landed this assertion on ``gated`` while the
+        config half stayed on ``legacy``, so a fresh checkout of that commit failed
+        here; ``744e034`` did the mirror image — the config moved and the pin stayed —
+        so tier 3 has been red here since. The coupling is a VALUE, not a symbol: no
+        name crosses between the two files, ``eis_settings`` exists on both sides
+        either way, and that is exactly why a pre-commit symbol check cannot see it.
+
+        Tier 3 under ``gated``: Run 4 (2026-09-14) 14 failed / 6758 passed in 2:55:55,
+        against 32:41 for the same suite on legacy; Run 5, after the fit-once change
+        (``05f42c1``), 12 failed / 6767 passed in 45:45, which paid most of that cost
+        back. The 12 are fixture-debt pins — synthetic fixtures the gated pipeline
+        *correctly* refuses, this assertion among them — routed in
+        ``docs/SubAgent docs/TASKS.md`` T11.13.
 
         The evidence that put the default at ``legacy`` on 2026-08-25 (the ``[a98]``
-        revert) is not retracted by the ruling, and is worth
-        keeping in front of whoever reads this next: measured against a numpy-only
-        physics anchor (Kása circle right-intercept plus low-f Re(Y) plateau, no project
-        analysis code) on all ten real probe-3ch-v3 spectra with ``engine`` passed
-        explicitly, legacy was closer on 6/10 — median error 5.54× low vs 8.75×, worst
-        case 17.9× vs 224.3× — the decisive pair being ch32_002/ch32_003, whose arc sits
-        below the sweep floor, where legacy lands 4.06×/4.83× low and gated 224.3×/182.7×
-        ([a97] §1-§2). The ruling does not settle the accuracy question above, and
-        ``fit_results.engine`` records which engine wrote each row so the comparison
-        stays available and the flip stays reversible once it lands.
+        revert) is not retracted by the ruling, and is worth keeping in front of
+        whoever reads this next: measured against a numpy-only physics anchor (Kása
+        circle right-intercept plus low-f Re(Y) plateau, no project analysis code) on
+        all ten real probe-3ch-v3 spectra with ``engine`` passed explicitly, legacy was
+        closer on 6/10 — median error 5.54× low vs 8.75×, worst case 17.9× vs 224.3× —
+        the decisive pair being ch32_002/ch32_003, whose arc sits below the sweep floor,
+        where legacy lands 4.06×/4.83× low and gated 224.3×/182.7× ([a97] §1-§2). The
+        ruling does not settle the accuracy question above, and ``fit_results.engine``
+        records which engine wrote each row, so the comparison stays available and the
+        flip stays reversible now that it has landed.
 
         **The two flags are separate and the second one is the one that refuses.**
         ``[eis.gates] enabled`` stays ``False``, so no spectrum is rejected: a would-be
@@ -79,9 +87,9 @@ class TestEngineSelection:
         points ARE dropped before the fit and R1/σ move accordingly. Measured on 515
         stored spectra across 170 runs before the flip: 66.2 % lose at least one point,
         16.8 % of all points go, and R1 is unchanged on 1. That is the whole reason the
-        flip is worth observing rather than assuming.
+        flip was worth observing rather than assuming.
         """
-        assert eis_settings().engine == "legacy"
+        assert eis_settings().engine == "gated"
         assert eis_settings().gates.enabled is False
 
     def test_an_unknown_engine_name_falls_back_to_legacy_rather_than_raising(self):
@@ -298,7 +306,8 @@ class TestLegacyEngineHonoursTheQualityConfig:
     They did not. ``_legacy_report`` called ``grade_fit`` with neither threshold, so
     it graded against the module defaults — and the shipped config repeats those
     defaults exactly (0.95 / 15.0), so nothing ever looked wrong. An operator editing
-    the file simply saw no effect, on the engine that is still the rig's default.
+    the file simply saw no effect, on the engine that ran every rig fit until ``744e034``
+    moved the default to ``gated`` (2026-09-14) and that ``engine = "legacy"`` still selects.
     """
 
     @staticmethod
