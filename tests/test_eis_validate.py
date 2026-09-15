@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sqlite3
 from pathlib import Path
 
@@ -20,6 +21,178 @@ from softae.tools import eis_validate_mock as M
 from softae.tools import eis_validate_narrate as N
 from softae.tools import eis_validate_report as R
 from softae.tools import eis_validate_trend as T
+
+# ── The canned fit ───────────────────────────────────────────────────────────
+#
+# Almost every test in this file is about plumbing -- which channel drops out,
+# what the console says, which row reaches the store -- and pays a real circuit
+# fit per channel per round for the privilege. Under the shipped
+# `[eis] engine = "gated"` one `analyze_spectrum` costs 0.3-59 s on a real
+# spectrum and ~0.3 s on these synthetic ones, so the file spent minutes
+# re-deriving numbers it designed itself.
+#
+# **The fixture delegates rather than blankets.** It answers only where it can
+# prove which R1 the spectrum was built from, and hands everything else to the
+# real function. A canned fitter that answers every question is a fitter that
+# quietly answers a different one (`SUBAGENT_RULES.md` §3.1), so the two routes
+# in are both provenance, not guesswork:
+#
+#   1. the mock's own register -- `MockRig.designed_r1`, exact, drift included;
+#   2. the ideal-Debye invariant of `_sweep_at`, which is an algebraic identity
+#      rather than an estimate.
+#
+# Anything else -- a perturbed tail, an open arc, an empty object, a real stored
+# sweep -- delegates. `test_the_canned_fit_delegates_rather_than_blanketing` is
+# what keeps that true, and `real_fit` is the opt-out for the tests that are
+# about the fitter itself.
+
+#: Spread of `(Z'^2 + Z''^2) / Z'` above which a spectrum is not an ideal Debye
+#: arc. `_sweep_at` measures 5.5e-16; the scattering fixture 0.50; a MockRig
+#: sweep 2.67. Fourteen orders of margin, so the cut is not delicate.
+_DEBYE_INVARIANT_TOL = 1e-9
+
+
+def _debye_r1(eis):
+    """`R` for an ideal `R0=0` Debye arc, or `None` if that is not what this is.
+
+    `Z = R / (1 + j w t)` gives `|Z|^2 / Z' = R` at **every** point, so the
+    spread of that quantity across the sweep is both the estimate and the proof
+    that the estimate applies.
+    """
+    try:
+        z_real = np.asarray(eis.z_real, dtype=float)
+        z_imag_neg = np.asarray(eis.z_imag_neg, dtype=float)
+    except Exception:
+        return None
+    if z_real.size < 3 or not np.all(np.isfinite(z_real)) or np.any(z_real <= 0):
+        return None
+    k = (z_real ** 2 + z_imag_neg ** 2) / z_real
+    median = float(np.median(k))
+    if not (math.isfinite(median) and median > 0):
+        return None
+    if (float(k.max()) - float(k.min())) / median > _DEBYE_INVARIANT_TOL:
+        return None
+    return median
+
+
+def _eis_from_columns(columns, channel=18):
+    """The mock's `[f, |Z|, phase, Z', -Z'']` array as production builds it.
+
+    `eis_validate.acquire` is the only place this normally happens, so a test
+    holding raw columns has to go the same way round or it is asserting on a
+    different object than the harness sees.
+    """
+    from softae.analysis.eis_data import EISResult
+
+    return EISResult.from_raw(columns, channel=channel, eis_params={})
+
+
+def _canned_report(eis, r1_ohms, model_name):
+    """A real `SpectrumReport`, not a mock: `record_fit` still has to serialise it."""
+    from softae.analysis.circuit_fitting import FitResult
+    from softae.analysis.eis.arc import annotate_arc_closure
+    from softae.analysis.eis.report import SpectrumReport
+
+    n_points = int(np.asarray(eis.frequency, dtype=float).size)
+    fit = FitResult(
+        model_name=str(model_name),
+        parameters=np.asarray([float(r1_ohms)], dtype=float),
+        R0=0.0, R1=float(r1_ohms), R0_guess=0.0, R1_guess=float(r1_ohms),
+        z_indices=[0],
+        success=True, error_msg="",
+        n_points_used=n_points, n_points_dropped=0,
+    )
+    # The REAL closure, off the real spectrum: the consensus rule reads
+    # `arc_state`, and a canned one would make those tests assert on this
+    # fixture's opinion instead of on the arc.
+    annotate_arc_closure(fit, eis)
+    # `SigmaReport()`'s default is already `mode="unavailable"`, which is what
+    # the real route produces here (`cell=None`) -- so it is left alone.
+    return SpectrumReport(engine="canned", fit=fit, fitter="canned")
+
+
+@pytest.fixture(autouse=True)
+def canned_fit(request, monkeypatch):
+    """Answer with the designed R1 where it is known; delegate where it is not.
+
+    **Rule 3 governs the register path too, and it has to.** A register hit says
+    which R1 the mock *designed*, not that the model can represent it: a well
+    commanded to a high apex is designed at 72 ohm against `simpleSalt`'s 100 ohm
+    floor, and the real route answers 136 ohm there. Canning on the register alone
+    would hand the settle gate a successful fit at a resistance the model
+    forbids -- the railing case, wearing a fitted basis -- so a register value
+    that is non-finite or inside the bound delegates exactly like an open arc.
+
+    `SOFTAE_CANNED_FIT=0` in the environment turns the whole fixture off, so the
+    file can be run against the real fitter end to end. That is not a
+    convenience: a fixture that cannot be switched off is a fixture nobody can
+    check, and the before/after cost figures for this change were taken by
+    running the same selection twice across exactly that switch.
+
+    The register is cleared on teardown either way -- including for `real_fit`
+    tests, which never install the patch -- so it cannot grow across a session or
+    carry one test's spectra into the next.
+    """
+    disabled = (os.environ.get("SOFTAE_CANNED_FIT") == "0"
+                or request.node.get_closest_marker("real_fit") is not None)
+    if not disabled:
+        import softae.analysis.eis.engine as engine
+
+        real = engine.analyze_spectrum
+
+        def analyze(eis_result, *, model_name="simpleSalt", **kwargs):
+            from softae.analysis.eis.arc import CLOSED, arc_closure
+
+            r1 = M.MockRig.designed_r1(eis_result)
+            if r1 is not None and not _representable(r1, model_name):
+                # Designed below what the model can hold: the route's answer and
+                # the register's are different numbers, and the route's is the
+                # one under test.
+                return real(eis_result, model_name=model_name, **kwargs)
+            if r1 is None:
+                r1 = _debye_r1(eis_result)
+                if r1 is None:
+                    return real(eis_result, model_name=model_name, **kwargs)
+                # An arc still rising at the sweep floor is the case the real
+                # route refuses on, and refusing is a fitter's judgement.
+                closure = arc_closure(eis_result.frequency,
+                                      eis_result.z_imag_neg,
+                                      getattr(eis_result, "phase", None))
+                if closure.state != CLOSED:
+                    return real(eis_result, model_name=model_name, **kwargs)
+                if not _representable(r1, model_name):
+                    return real(eis_result, model_name=model_name, **kwargs)
+            return _canned_report(eis_result, r1, model_name)
+
+        monkeypatch.setattr(engine, "analyze_spectrum", analyze)
+    try:
+        yield
+    finally:
+        M.MockRig.clear_designed_r1()
+
+
+def _representable(r1_ohms, model_name):
+    """Finite, and clear of the model's `R1` floor.
+
+    Railing is the route's judgement, so a fixture must never simulate a fit that
+    comes to rest on -- or under -- a bound. The margin is an order of magnitude
+    rather than the bound itself: a fit approaching the floor is already the
+    thing `_demote_if_railed` exists to catch.
+    """
+    from softae.analysis.equilibration import r1_lower_bound_ohms
+
+    try:
+        value = float(r1_ohms)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(value) and value > 0):
+        return False
+    try:
+        lower = float(r1_lower_bound_ohms(str(model_name)))
+    except Exception:
+        return True
+    return value > lower * 10.0
+
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -1448,7 +1621,26 @@ _SWEEP_C0_F = 1e-9
 
 
 def _sweep_at(r_ohms: float):
-    """A Debye semicircle whose **fitted** `R1` is *r_ohms* to within ~2 %.
+    """A Debye semicircle built from *r_ohms*. **How close the FIT lands depends
+    on the engine, and the old "~2 %" here was never true of both.**
+
+    Measured 2026-09-14 on the values this file actually uses, fitted `R1`
+    against the `r_ohms` asked for:
+
+    ==========  =================  ================
+    `r_ohms`    `engine=legacy`    `engine=gated`
+    ==========  =================  ================
+    1e4         -1.1 %             -0.08 %
+    2.6e4       -0.4 %             -0.23 %
+    4e6         **-20.2 %**        -0.90 %
+    5.3e6       **-17.3 %**        -0.64 %
+    ==========  =================  ================
+
+    So a test must not assert a fitted `R1` against `r_ohms` on a tolerance
+    tighter than the engine in force. What *is* exact, on every value and
+    independent of any fitter, is the invariant `(Z'^2 + Z''^2) / Z' = r_ohms`
+    at every point -- which is what `_debye_r1` reads and why the canned fit can
+    reproduce this fixture to 1e-9 without fitting anything.
 
     `_round_fit` fits the circuit model now rather than reading `z_real[-1]`, so
     the smallest object that makes one channel's sigma controllable is a spectrum
@@ -1805,6 +1997,7 @@ def test_a_stream_with_no_shape_says_the_rule_could_not_look():
     assert payload["rate_excluded_rounds"] == []
 
 
+@pytest.mark.real_fit
 def test_settle_phase_unachievable_tolerance_names_the_channel(tmp_path, capsys):
     """Wiring the board-level endorsement in is necessary and NOT sufficient.
 
@@ -2196,6 +2389,7 @@ def _scattering_low_frequency_point(scale: float):
     return eis
 
 
+@pytest.mark.real_fit
 def test_round_fit_uses_the_fitted_r1_not_the_raw_low_frequency_point():
     """`sigma = 1/R1_fitted`, and the raw point rides along as a diagnostic.
 
@@ -2219,6 +2413,7 @@ def test_round_fit_uses_the_fitted_r1_not_the_raw_low_frequency_point():
     assert fit.r_raw_ohms != pytest.approx(fit.r1_ohms)
 
 
+@pytest.mark.real_fit
 def test_round_fit_carries_the_shape_of_the_same_fit_that_produced_r1():
     """The consensus rule's two inputs, and they must come off THIS fit.
 
@@ -2247,6 +2442,7 @@ def test_round_fit_carries_the_shape_of_the_same_fit_that_produced_r1():
     assert fit.n_points_dropped == 0
 
 
+@pytest.mark.real_fit
 def test_round_fit_an_unfittable_spectrum_yields_no_sigma_and_keeps_the_raw_point():
     """The documented fallback is EXCLUSION, and it is wired rather than described.
 
@@ -2271,6 +2467,7 @@ def test_round_fit_an_unfittable_spectrum_yields_no_sigma_and_keeps_the_raw_poin
     assert settle_check(window).excluded[20] == EXCLUDED_SIGMA_NULL
 
 
+@pytest.mark.real_fit
 def test_round_fit_a_missing_spectrum_is_absent_rather_than_a_failed_fit():
     """Nothing readable at all is the OTHER absence, and keeps its own name."""
     from types import SimpleNamespace
@@ -2285,6 +2482,7 @@ def test_round_fit_a_missing_spectrum_is_absent_rather_than_a_failed_fit():
     assert settle_check(window).excluded[20] == EXCLUDED_ABSENT
 
 
+@pytest.mark.real_fit
 def test_round_fit_a_railed_fit_is_demoted_by_the_route_before_the_bound_sees_it():
     """MOVED because `_round_fit` now fits through `analyze_spectrum` (P.20/[a23]).
 
@@ -2341,6 +2539,7 @@ def test_round_fit_a_railed_fit_is_demoted_by_the_route_before_the_bound_sees_it
     assert settle_check(stored).participating == [18, 19, 20]   # no bound, no refusal
 
 
+@pytest.mark.real_fit
 def test_settle_phase_a_railed_channel_leaves_the_window_as_an_unusable_fit(tmp_path):
     """MOVED with the test above: the narrated word is `no_value`, not `railed`.
 
@@ -2362,6 +2561,7 @@ def test_settle_phase_a_railed_channel_leaves_the_window_as_an_unusable_fit(tmp_
     assert outcome.verdict == "not_evaluable"
 
 
+@pytest.mark.real_fit
 def test_settle_phase_an_unfittable_channel_is_named_on_the_round_it_drops_out(
         tmp_path, capsys):
     """Announced once per cell, and carried into the one record that survives.
@@ -2385,6 +2585,7 @@ def test_settle_phase_an_unfittable_channel_is_named_on_the_round_it_drops_out(
     assert judged["excluded_by_channel"] == {"20": "no_value"}
 
 
+@pytest.mark.real_fit
 def test_settle_phase_fit_starvation_below_min_channels_says_the_fits_are_why(
         tmp_path, capsys):
     """The failure this stage could have traded one stall for -- named, not silent.
@@ -2406,6 +2607,7 @@ def test_settle_phase_fit_starvation_below_min_channels_says_the_fits_are_why(
     assert "Holding longer cannot fix this" in starved[0]
 
 
+@pytest.mark.real_fit
 def test_round_fit_a_scattering_raw_point_settles_on_the_fitted_basis():
     """ch25, reproduced -- and the two bases disagree about it, which is the point.
 
@@ -5879,3 +6081,177 @@ def test_the_dropped_set_and_its_reasons_reach_the_run_artifact(
     # provenance readable downstream -- it does not remove it from anything.
     assert ctx.certification(20) == "dropped_unevaluable"
     assert ctx.certification(18) == "survivors"
+
+
+# ── Fit once: the settle sweep is fitted by `persist`, and reused ────────────
+
+def test_settle_round_fits_each_spectrum_exactly_once(tmp_path, monkeypatch):
+    """One `analyze_spectrum` per channel per round, not two.
+
+    `persist` fits every sweep it writes, and `_round_fit` used to fit the same
+    spectrum a second time to recover the same `R1`. This is the positive
+    control for that seam: on the unmodified code it reads
+    `2 * rounds * channels`, so a green here proves the reuse is wired rather
+    than that the counter is broken. Counted on the whole production path --
+    `settle_phase` driving `_settle_sweep` -- because that is where the two
+    calls lived, one frame apart.
+    """
+    import softae.analysis.eis.engine as E
+
+    manager = _manager({18: 30.0, 19: 30.0, 20: 30.0})
+    plan = _plan(tmp_path, channels="18,19,20")
+    ctx = _context(tmp_path, manager, plan)
+
+    calls = {"n": 0}
+    real = E.analyze_spectrum
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(E, "analyze_spectrum", counting)
+    clock = H.VirtualClock()
+    outcome = H.settle_phase(manager, plan, lambda ch: V._settle_sweep(ctx, ch),
+                             sleep=clock.sleep, now=clock, min_hold_first_s=0.0)
+
+    assert outcome.n_rounds > 0
+    assert calls["n"] == outcome.n_rounds * len(plan.channels)
+
+
+def test_canned_fit_reproduces_the_designed_resistance_of_a_synthetic_sweep():
+    """`_sweep_at(r)` answers `r`, exactly, without a fitter.
+
+    The invariant is algebraic, so the tolerance is float noise rather than a
+    fit's convergence: an assertion against a fitter here would be an assertion
+    about whichever engine `[eis] engine` names today.
+    """
+    from softae.analysis.eis.engine import analyze_spectrum
+
+    for r_ohms in (1.0e4, 2.6e4, 5.3e6):
+        report = analyze_spectrum(_sweep_at(r_ohms), cell=None,
+                                  model_name="simpleSalt")
+        assert report.engine == "canned"
+        assert report.fit.R1 == pytest.approx(r_ohms, rel=1e-9)
+        assert report.fit.success and report.fit.n_points_dropped == 0
+        # The arc state is the REAL one: the consensus rule reads it, and a
+        # canned state would make those tests assert on this fixture's opinion.
+        assert report.fit.arc_closure.state == "closed"
+
+
+def test_canned_fit_reads_the_mock_rigs_own_designed_r1(tmp_path):
+    """A MockRig sweep is canned from the register, not from a closed form.
+
+    The mock synthesises `R0 + CPE + R1||C0` plus noise, so nothing recovers its
+    `R1` analytically -- which is exactly why `MockRig` records what it built.
+    """
+    from softae.analysis.eis.engine import analyze_spectrum
+    from softae.core.eis_scripts import EISParams
+    from softae.drivers.mscr_library import eis_run_mscrbuild
+
+    grid = EISParams.from_preset("Quick")
+    path = tmp_path / "r.mscr"
+    eis_run_mscrbuild(str(path), mux_ch=18, mVac=grid.mv_ac, f_hi=grid.f_hi,
+                      f_lo=grid.f_lo_mHz, npts=grid.npts, mVdc=grid.mv_dc)
+    rig = M.MockRig(default_apex_hz=30.0)
+    eis = _eis_from_columns(rig.measure(18, path))
+
+    designed = rig.r1_now(18)
+    assert M.MockRig.designed_r1(eis) == pytest.approx(designed, rel=1e-12)
+    report = analyze_spectrum(eis, cell=None, model_name="simpleSalt")
+    assert report.engine == "canned"
+    assert report.fit.R1 == pytest.approx(designed, rel=1e-12)
+
+
+def test_the_canned_fit_delegates_rather_than_blanketing(tmp_path):
+    """Where provenance is absent, the REAL fitter answers. Both routes proved.
+
+    `SUBAGENT_RULES.md` §3.1(e): the two admission rules could be inverted by a
+    later edit and every other test in this file would stay green, because a
+    canned answer and a fitted answer agree on the spectra the fixture is for.
+    They disagree on these.
+    """
+    from softae.analysis.eis.engine import analyze_spectrum
+    from softae.core.eis_scripts import EISParams
+    from softae.drivers.mscr_library import eis_run_mscrbuild
+
+    # 1. A MockRig spectrum whose register entry has been removed: same arrays,
+    #    no provenance, and no closed form -- so it must reach the fitter.
+    grid = EISParams.from_preset("Quick")
+    path = tmp_path / "r.mscr"
+    eis_run_mscrbuild(str(path), mux_ch=19, mVac=grid.mv_ac, f_hi=grid.f_hi,
+                      f_lo=grid.f_lo_mHz, npts=grid.npts, mVdc=grid.mv_dc)
+    columns = M.MockRig(default_apex_hz=30.0).measure(19, path)
+    key = M.MockRig._spectrum_key(columns[:, 0], columns[:, 3])
+    M.MockRig._designed_r1.pop(key, None)
+    unstamped = _eis_from_columns(columns)
+
+    assert M.MockRig.designed_r1(unstamped) is None
+    assert analyze_spectrum(unstamped, cell=None,
+                            model_name="simpleSalt").engine != "canned"
+
+    # 2. An arc still rising at the sweep floor: the invariant holds perfectly
+    #    and the answer is still the fitter's, because refusing is its judgement.
+    assert analyze_spectrum(_open_arc_sweep(), cell=None,
+                            model_name="simpleSalt").engine != "canned"
+
+    # 3. A tail perturbed off the arc: the invariant itself says "not this".
+    assert _debye_r1(_scattering_low_frequency_point(1.5)) is None
+
+
+@pytest.mark.real_fit
+def test_the_real_fit_marker_actually_opts_out():
+    """`real_fit` reaches scipy. Without this the opt-out could be a no-op."""
+    from softae.analysis.eis.engine import analyze_spectrum
+
+    report = analyze_spectrum(_sweep_at(1.0e4), cell=None,
+                              model_name="simpleSalt")
+    assert report.engine != "canned"
+    assert M.MockRig.designed_r1(_sweep_at(1.0e4)) is None
+
+
+def test_a_railed_mock_well_is_not_canned_from_the_register(tmp_path):
+    """A register hit is not a licence: rule 3 applies to it too.
+
+    The rail knob is the one the mock already has -- `apex_hz`. `R1 = 1 / (2 pi
+    C0 f)`, so a high enough commanded apex designs a well *below* `simpleSalt`'s
+    100 Ohm floor, which is the case `_demote_if_railed` exists for and the case
+    the rung-2 rehearsal puts on the board deliberately.
+
+    Without the guard this is a silent wrong answer rather than a loud one: the
+    register would hand back 72 Ohm with `success=True` where the route answers
+    136 Ohm, so the settle gate would read a resistance the model cannot hold,
+    on a `fitted` basis, and every other test in this file would stay green.
+    """
+    from softae.analysis.eis.engine import analyze_spectrum
+    from softae.analysis.equilibration import r1_lower_bound_ohms
+    from softae.core.eis_scripts import EISParams
+    from softae.drivers.mscr_library import eis_run_mscrbuild
+
+    grid = EISParams.from_preset("Quick")
+    path = tmp_path / "rail.mscr"
+    eis_run_mscrbuild(str(path), mux_ch=20, mVac=grid.mv_ac, f_hi=grid.f_hi,
+                      f_lo=grid.f_lo_mHz, npts=grid.npts, mVdc=grid.mv_dc)
+    rig = M.MockRig(apex_hz={20: 2.0e7})
+    eis = _eis_from_columns(rig.measure(20, path), channel=20)
+
+    designed = rig.r1_now(20)
+    assert designed < r1_lower_bound_ohms("simpleSalt"), "the knob must actually rail"
+    # The register DID record it -- so this is the guard being exercised, not a
+    # lookup that happened to miss.
+    assert M.MockRig.designed_r1(eis) == pytest.approx(designed, rel=1e-12)
+
+    report = analyze_spectrum(eis, cell=None, model_name="simpleSalt")
+    assert report.engine != "canned"
+
+    fit = H._round_fit(20, eis)
+    expected_basis = "fitted" if (
+        report.fit is not None and report.fit.success
+        and math.isfinite(float(report.fit.R1))) else "fit_failed"
+    assert fit.basis == expected_basis
+    # The route's number, never the register's.
+    assert fit.r1_ohms != pytest.approx(designed, rel=1e-6)
+
+
+def test_the_designed_r1_register_is_emptied_between_tests():
+    """The autouse fixture's teardown clears it, so it cannot grow or leak."""
+    assert M.MockRig._designed_r1 == {}

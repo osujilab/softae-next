@@ -31,6 +31,17 @@ complaint.
 **This lives in the tool, not in ``mock_espico.py``.** The whole tree shares
 that double; nothing there moves underneath anyone because of this file.
 
+**The** ``MockRig._designed_r1`` **register is a test-only seam.** Every sweep
+:meth:`MockRig.measure` returns is recorded against its own spectrum bytes,
+paired with the ``R1`` it was synthesised from (drift included), and
+:meth:`MockRig.designed_r1` reads it back; :meth:`MockRig.clear_designed_r1`
+empties it. **Nothing in ``src/`` reads it and nothing should** -- it exists so
+``tests/test_eis_validate.py`` can skip a circuit fit whose answer the mock
+already knows, on spectra (``R0 + CPE + R1||C0`` plus noise) that no closed form
+recovers. It is a register rather than an ``eis_params`` stamp because
+``measure`` returns raw columns: the ``EISResult`` is assembled downstream in
+production code, so a stamp would have to be written by the rig's own path.
+
 **Where the apex goes, and why R moves rather than C.** The board's cell
 capacitance is a property of the *board* -- 0.09 nF median over 1152 spectra
 while R moved 109x -- so an apex at a commanded frequency is produced by
@@ -53,12 +64,13 @@ presets rather than hard-coding these numbers.)
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import structlog
@@ -78,6 +90,21 @@ MOCK_R0_OHM = 4.81e4
 #: what puts a floor under the CONTROL population's ``|Delta_scout|`` -- with
 #: noise at 0 the noise floor would measure nothing and D3 would pass vacuously.
 MOCK_NOISE_REL = 0.005
+
+#: The name under which :class:`MockRig` records the ``R1`` it designed into a
+#: spectrum, drift included. **A register key, not an** ``eis_params`` **stamp**,
+#: and the difference is forced by the plumbing rather than chosen:
+#: :meth:`MockRig.measure` returns raw columns, and the ``EISResult`` is built
+#: downstream in production code (``eis_validate.acquire``) from
+#: caller-supplied ``eis_params`` -- so a stamp there would write a mock-only key
+#: into every persisted ``eis_params_json`` row on the real rig's code path. The
+#: register carries the same fact and touches no production module.
+#:
+#: What reads it: the canned-fit fixture in ``tests/test_eis_validate.py``, which
+#: needs the R1 a mock spectrum was built from because no closed form recovers it
+#: (the mock synthesises ``R0 + CPE + R1||C0`` plus noise). Nothing in ``src/``
+#: reads it, and nothing should.
+MOCK_DESIGNED_R1_KEY = "eis_mock_designed_r1_ohms"
 
 #: ``meas_loop_eis <f> <r> <j> <mVac> <f_start> <f_end> <npts> <mVdc>``.
 #: Both emitters -- :func:`~softae.drivers.mscr_library.eis_run_mscrbuild` and
@@ -216,6 +243,55 @@ class MockRig:
     _t0: float | None = field(default=None, repr=False)
     _sweeps: int = field(default=0, repr=False)
 
+    #: Spectrum digest -> the ``R1`` designed into it. Class-level and shared
+    #: across instances because the reader holds no handle on the rig:
+    #: :func:`install_mock_picos` builds one per run, deep inside ``cmd_run``.
+    #: Keyed on the spectrum's own bytes, so a lookup cannot attribute one
+    #: channel's R1 to another's sweep even when both were taken in the same
+    #: round. Bounded by the digest, not by the arrays.
+    _designed_r1: ClassVar[dict[bytes, float]] = {}
+
+    @staticmethod
+    def _spectrum_key(freq: Any, z_real: Any) -> bytes:
+        """A digest of the two columns that survive ``EISResult.from_raw`` intact.
+
+        ``frequency`` and ``Z'`` are copied through unchanged (``arr[:, 0]`` and
+        ``arr[:, 3]``); ``-Z''`` is negated twice on the way, so it is left out
+        rather than relied upon.
+        """
+        digest = hashlib.blake2b(digest_size=16)
+        for column in (freq, z_real):
+            digest.update(
+                np.ascontiguousarray(np.asarray(column, dtype=float)).tobytes())
+        return digest.digest()
+
+    @classmethod
+    def clear_designed_r1(cls) -> None:
+        """Empty the register. Called from the test fixture's teardown.
+
+        The register is class-level, so without this it grows for the life of the
+        interpreter and one test's spectra remain answerable in the next. Neither
+        is a correctness problem -- the key is the spectrum's own bytes -- but an
+        unbounded cache in a 246-test file is a leak, and a stale hit is a
+        provenance claim about a rig that no longer exists.
+        """
+        cls._designed_r1.clear()
+
+    @classmethod
+    def designed_r1(cls, eis: Any) -> float | None:
+        """The ``R1`` *eis* was synthesised from, or ``None`` if it was not.
+
+        ``None`` is the honest answer for every spectrum this rig did not build
+        -- a real stored sweep, a synthetic arc written by a test -- and callers
+        must treat it as "ask the fitter", never as a value.
+        """
+        try:
+            key = cls._spectrum_key(getattr(eis, "frequency", ()),
+                                    getattr(eis, "z_real", ()))
+        except Exception:
+            return None
+        return cls._designed_r1.get(key)
+
     def elapsed_hours(self) -> float:
         if self.virtual_s_per_sweep > 0:
             return self._sweeps * self.virtual_s_per_sweep / 3600.0
@@ -237,9 +313,10 @@ class MockRig:
         segments = parse_mscr_grid(script_path)
         freq = grid_frequencies(segments)
         self._sweeps += 1
+        designed_r1 = self.r1_now(channel)
         spectrum = synthesize(
             freq,
-            r1_ohm=self.r1_now(channel),
+            r1_ohm=designed_r1,
             noise_rel=self.noise_rel,
             # Seeded from the sweep index as well as the channel, so two sweeps
             # on one cell are not the same numbers. Without that, a repeat
@@ -247,6 +324,11 @@ class MockRig:
             # noise floor would be an artifact of the mock.
             seed=int(channel) * 10_000 + self._sweeps,
         )
+        # What this sweep was BUILT from, recorded against the sweep itself. See
+        # `MOCK_DESIGNED_R1_KEY` for why it is a register rather than a stamp.
+        MockRig._designed_r1[
+            MockRig._spectrum_key(spectrum[:, 0], spectrum[:, 3])] = float(
+                designed_r1)
         logger.debug(
             "eis_validate_mock_sweep",
             channel=int(channel),
@@ -379,6 +461,7 @@ def parse_apex_spec(spec: str | None, *, default: float = 30.0) -> tuple[dict[in
 
 
 __all__ = [
+    "MOCK_DESIGNED_R1_KEY",
     "MOCK_NOISE_REL",
     "MOCK_R0_OHM",
     "FastMockRHController",

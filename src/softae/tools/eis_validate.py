@@ -100,7 +100,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import structlog
 
@@ -124,6 +124,7 @@ from softae.tools.eis_validate_hold import (
     DEFAULT_SETTLE_TOL_REL,
     DEFAULT_SOAK_S,
     DEFAULT_TEMP_APPROACH_TIMEOUT_S,
+    FIT_RAISED,
     SETTLE_RATE_TOL_DEC_PER_H_MAX,
     SETTLE_TOL_REL_MAX,
     SOAK_CEILING_FACTOR,
@@ -570,12 +571,38 @@ def _finite_or_none(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def persist(ctx: RunContext, eis: Any, arm: str) -> int:
+class Persisted(NamedTuple):
+    """What :func:`persist` wrote, **and the fit it already ran**.
+
+    ``report`` exists so the settle loop can stop fitting the same spectrum a
+    second time: :func:`persist` runs
+    :func:`~softae.analysis.eis.engine.analyze_spectrum` on every sweep it
+    records, with the arguments :func:`~softae.tools.eis_validate_hold._fitted_r1`
+    would use, and used to discard it. Under ``[eis] engine = "gated"`` that
+    discarded call costs 0.3 - 59 s.
+
+    ``report is None`` means **the fit was attempted and raised** -- never "no
+    fit was run". If this object exists at all the fit was attempted, because the
+    only statement between ``record_measurement`` and the ``return`` is the fit's
+    own try/except. The other absence -- ``persist`` itself raising before the
+    fit -- produces no ``Persisted`` at all, and is spelled ``report=None`` at
+    the *seam* rather than here; see
+    :data:`~softae.tools.eis_validate_hold.FIT_RAISED`.
+    """
+
+    measurement_id: int
+    report: Any | None
+
+
+def persist(ctx: RunContext, eis: Any, arm: str) -> Persisted:
     """Save, record, fit, capture conditions -- **after every single sweep**.
 
     Nothing accumulates in memory. A crash after the conditions write loses the
     sweep in flight and nothing else, and the report is regenerable from disk at
     any moment.
+
+    Returns a :class:`Persisted`. Three of the four call sites discard it, as
+    they always did; :func:`_settle_sweep` is the one that carries the fit on.
     """
     from softae.analysis.eis.arc import arc_closure
     from softae.analysis.eis.engine import analyze_spectrum
@@ -630,6 +657,7 @@ def persist(ctx: RunContext, eis: Any, arm: str) -> int:
 
     measurement_id = ctx.data_store.record_measurement(
         ctx.run_id, eis, role="sample")
+    report: Any = None
     try:
         # The plan's model, not a literal: the settle gate excludes a channel
         # whose R1 rests on *this* model's lower bound, so the gate and the
@@ -638,6 +666,8 @@ def persist(ctx: RunContext, eis: Any, arm: str) -> int:
         report = analyze_spectrum(eis, model_name=ctx.plan.circuit_model)
         ctx.data_store.record_fit(measurement_id, report.fit, report=report)
     except Exception as exc:
+        # `report` stays None, and that is the value the settle loop reads as
+        # FIT_RAISED: attempted here, refused here, not to be attempted again.
         logger.warning("eis_validate_fit_failed", channel=channel, arm=arm,
                        error=str(exc))
     # ONE read, two consumers: the `conditions` row and the run's
@@ -659,7 +689,7 @@ def persist(ctx: RunContext, eis: Any, arm: str) -> int:
     # retire the diagnostic on the runs that most need it.
     if arm != ARM_SETTLE:
         ctx.n_recorded += 1
-    return measurement_id
+    return Persisted(measurement_id, report)
 
 
 def measure_reference(ctx: RunContext, channel: int, arm: str) -> Any:
@@ -1865,8 +1895,13 @@ def _soak_restart(ctx: RunContext) -> Any:
     return restarted
 
 
-def _settle_sweep(ctx: RunContext, channel: int) -> Any:
+def _settle_sweep(ctx: RunContext, channel: int) -> tuple[Any, Any]:
     """One baseline-preset sweep for the settle gate. **Persisted, and tagged.**
+
+    Returns ``(eis, report)``:
+    :func:`~softae.tools.eis_validate_hold.settle_phase` normalises both shapes,
+    so a caller that wants only the spectrum still gets one from any other
+    ``measure`` callable.
 
     These spectra decide whether the material has stopped moving and supply the
     apex histogram; they are not measurements of the condition under test.
@@ -1897,12 +1932,21 @@ def _settle_sweep(ctx: RunContext, channel: int) -> Any:
     # Best-effort, and deliberately so: a settle round must never fail because a
     # diagnostic row could not be written. The gate's verdict comes from the
     # returned spectrum, which is in hand either way.
+    #
+    # **The fit rides back with it.** `persist` has just run exactly the call
+    # `_fitted_r1` would run, on these arrays, with these arguments; returning it
+    # is what makes the round cost one `analyze_spectrum` per channel instead of
+    # two. The three states are kept apart on purpose -- see `FIT_RAISED`:
+    #   a report  -> reuse it
+    #   FIT_RAISED -> persist fitted and it raised; do not try again
+    #   None      -> persist never reached the fit; fit downstream as before
+    report: Any = None
     try:
-        persist(ctx, eis, ARM_SETTLE)
+        report = persist(ctx, eis, ARM_SETTLE).report or FIT_RAISED
     except Exception as exc:                              # pragma: no cover
         logger.warning("eis_validate_settle_persist_failed",
                        channel=channel, error=str(exc))
-    return eis
+    return eis, report
 
 
 def _write_report(store: Any, plan: ValidationPlan,

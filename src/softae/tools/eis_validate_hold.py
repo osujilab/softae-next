@@ -1677,6 +1677,45 @@ class SettleOutcome:
         return self.verdict == "settled"
 
 
+class _FitRaised:
+    """The fit ran upstream and **raised**. Not 'no report was supplied'.
+
+    Three states cross the ``measure`` seam, and two of them must not be spelled
+    with one token. A settle sweep whose fit raised inside :func:`persist` is a
+    spectrum this route has already declined once, and re-fitting it would only
+    raise again; a sweep whose ``persist`` failed *before* the fit has not been
+    judged at all, and must still be fitted here or the channel leaves the settle
+    window on a disk error. ``None`` is the second of those -- the default, the
+    unchanged behaviour -- so the first needs a name of its own.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:                            # pragma: no cover
+        return "FIT_RAISED"
+
+
+#: The sentinel described by :class:`_FitRaised`. Passed as ``report=`` by
+#: :func:`~softae.tools.eis_validate._settle_sweep`.
+FIT_RAISED = _FitRaised()
+
+
+def _measured(result: Any) -> tuple[Any, Any]:
+    """Normalise a ``measure`` return: an ``EISResult``, or ``(eis, report)``.
+
+    The two-value form is what :func:`~softae.tools.eis_validate._settle_sweep`
+    returns so the fit :func:`~softae.tools.eis_validate.persist` already ran can
+    be reused. Every other caller -- every test closure, every mock-backed
+    measure -- returns the spectrum alone and keeps working unchanged.
+
+    The discrimination is total rather than merely probable: an ``EISResult`` is
+    not a tuple, and no producer anywhere returns a spectrum *as* a 2-tuple.
+    """
+    if isinstance(result, tuple) and len(result) == 2:
+        return result[0], result[1]
+    return result, None
+
+
 def settle_phase(
     manager: Any,
     plan: ValidationPlan,
@@ -1835,12 +1874,13 @@ def settle_phase(
         fits: list[Any] = []
         for channel in plan.channels:
             try:
-                eis = measure(channel)
+                eis, report = _measured(measure(channel))
             except Exception as exc:
                 logger.warning("eis_validate_settle_sweep_failed",
                                channel=channel, error=str(exc))
                 continue
-            fits.append(_round_fit(channel, eis, plan.circuit_model))
+            fits.append(_round_fit(channel, eis, plan.circuit_model,
+                                   report=report))
             closure = arc_closure(eis.frequency, eis.z_imag_neg,
                                   getattr(eis, "phase", None))
             apex = float(closure.f_apex_interior_hz)
@@ -3205,7 +3245,8 @@ def _read_rh(rh: Any) -> float | None:
 
 
 def _round_fit(
-    channel: int, eis: Any, circuit_model: str = SETTLE_CIRCUIT_MODEL
+    channel: int, eis: Any, circuit_model: str = SETTLE_CIRCUIT_MODEL,
+    *, report: Any = None,
 ) -> Any:
     """One channel's contribution to a settle round, **with a sigma**.
 
@@ -3227,15 +3268,24 @@ def _round_fit(
     priced a fit at "2.6 s per open-arc fit". The cost was the whole argument and
     it was wrong twice over:
 
-    - *Measured* (2026-08-21) through the sanctioned route,
-      :func:`~softae.analysis.eis.engine.analyze_spectrum` with ``engine`` unset
-      and ``[eis] engine = "legacy"``, on the ten real sweeps of run
-      ``20260820T164634Z_eis_validate``: **16.5 - 120.3 ms** where the fit
-      converges and **0.7 - 1.2 ms** where it refuses -- against the 2.6 s
-      quoted, i.e. **20x to 150x** cheaper. Fifteen channels is ~1 s of a 562 s
-      round even at the slow end. The pacing budget does not notice this. See
-      :func:`_fitted_r1` for the direct-fitter comparison and for the one config
-      under which this stops being true.
+    - *Measured* through the sanctioned route,
+      :func:`~softae.analysis.eis.engine.analyze_spectrum` with ``engine`` unset,
+      on the ten real sweeps of run ``20260820T164634Z_eis_validate``. Under
+      ``[eis] engine = "legacy"`` (2026-08-21) this was **16.5 - 120.3 ms**
+      converging and **0.7 - 1.2 ms** refusing, against the 2.6 s quoted -- and
+      the conclusion that fifteen channels is ~1 s of a 562 s round was right
+      *for that engine*.
+
+      **Re-measured 2026-09-14 under the shipped** ``engine = "gated"``
+      (``744e034``), median of five warm, same ten sweeps: **299.9 ms -
+      59 066.7 ms** converging and **1 699 - 2 079 ms** where the route withholds
+      the fit. The ceiling is not a typo: ``ch22_001_reference`` -- 53 points, 64
+      non-finite array cells -- costs **59 s in a single call**. Fifteen channels
+      is therefore ~6 s of a round at the median and far more on a board
+      carrying a ch22, which is why the settle sweep is now fitted **once** and
+      the result carried (see the ``report=`` seam in :func:`_fitted_r1`) instead
+      of being paid for twice. The pacing budget still absorbs it; a test suite
+      does not. See :func:`_fitted_r1` for the direct-fitter comparison.
     - The number it bought was defective. ``z_real[-1]`` is the real part **at the
       lowest swept frequency**, which on a cell whose arc has not closed there is
       `R + arc contribution` and moves with anything that moves the arc. On run
@@ -3297,15 +3347,19 @@ def _round_fit(
     )
 
     raw = _low_frequency_real(eis)
-    fit = _fitted_r1(eis, circuit_model)
+    fit = _fitted_r1(eis, circuit_model, report=report)
     if fit is None:
         return RoundFit(
             channel=int(channel), sigma=None,
             r1_ohms=None if raw is None else float("nan"),
             basis=BASIS_ABSENT if raw is None else BASIS_FIT_FAILED,
             r_raw_ohms=raw)
-    # `arc_state` and `n_points_dropped` come off the SAME fit that produced R1 --
-    # no second call and no second fit; see `_SettleFit`.
+    # `arc_state` and `n_points_dropped` come off the SAME fit that produced R1,
+    # and -- since the `report=` seam landed -- that is the same fit `persist`
+    # already ran on this spectrum one frame up. **One `analyze_spectrum` per
+    # channel per round on the whole path**, not merely one inside this function;
+    # `test_settle_round_fits_each_spectrum_exactly_once` is what says so, and it
+    # reads `2 * rounds * channels` without the seam. See `_SettleFit`.
     return RoundFit(channel=int(channel), sigma=1.0 / fit.r1_ohms,
                     r1_ohms=fit.r1_ohms, basis=BASIS_FITTED, r_raw_ohms=raw,
                     arc_state=fit.arc_state,
@@ -3328,9 +3382,16 @@ class _SettleFit:
     A return type rather than a bare float because the alternative shapes are both
     worse. Refitting to recover ``arc_state`` would pay a second
     ``analyze_spectrum`` per channel per round for numbers already in hand one
-    frame up, and it would open the possibility of the two fits disagreeing.
+    frame up -- 299.9 ms to 59 s each under the shipped gated engine, re-measured
+    2026-09-14 -- and it would open the possibility of the two fits disagreeing.
     Reaching into ``report`` from :func:`_round_fit` would give this module two
     routes to the fitter where user ruling ``[a23]`` allows one.
+
+    The same argument, one frame further up, is what the ``report=`` seam added:
+    :func:`~softae.tools.eis_validate.persist` was already running that call on
+    the same spectrum and discarding it, so the settle round was paying twice for
+    a number it had. Carrying the report is **not** a second route -- it is the
+    first route's own result, handed down rather than recomputed.
 
     ``n_points_dropped`` is the **fitter's** mask and not
     ``fit.arc_closure.n_dropped``; ``annotate_arc_closure`` says outright that the
@@ -3343,8 +3404,18 @@ class _SettleFit:
     n_points_dropped: int | None = None
 
 
-def _fitted_r1(eis: Any, circuit_model: str) -> _SettleFit | None:
+def _fitted_r1(eis: Any, circuit_model: str,
+               *, report: Any = None) -> _SettleFit | None:
     """The route's R1 in ohms, or ``None`` if it produced no usable number.
+
+    **A supplied** *report* **is reused, not re-fitted.**
+    :func:`~softae.tools.eis_validate.persist` runs exactly this call on exactly
+    this spectrum one frame up and used to discard it; it now hands it down.
+    ``report=None`` (the default, and every caller outside the settle loop) fits
+    here as before; :data:`FIT_RAISED` says the upstream fit was attempted and
+    raised, which returns ``None`` **without** a second attempt and without a
+    second warning -- the outcome is identical either way, since the same arrays
+    raise for the same reason, and the console stops saying it twice.
 
     **Returns a** :class:`_SettleFit`, **not a bare float.** R1 is still the
     reason this function exists; ``arc_state`` and ``n_points_dropped`` ride along
@@ -3364,20 +3435,30 @@ def _fitted_r1(eis: Any, circuit_model: str) -> _SettleFit | None:
     it does not already return.
 
     **The cost argument that justified the shortcut does not survive
-    measurement.** Re-measured warm on the ten stored sweeps of run
-    ``20260820T164634Z_eis_validate`` (2026-08-21), median of five, config
-    ``[eis] engine = "legacy"``:
+    measurement -- but the margin it had under legacy is gone.** Warm on the ten
+    stored sweeps of run ``20260820T164634Z_eis_validate``, median of five:
 
-    ===================  ==================  ====================
-    per spectrum         ``fit_circuit``     ``analyze_spectrum``
-    ===================  ==================  ====================
-    successful fit       15.5 - 123.5 ms     16.5 - 120.3 ms
-    refused fit          0.9 - 1.2 ms        0.7 - 1.2 ms
-    ===================  ==================  ====================
+    ===================  ==================  ====================  ====================
+    per spectrum         ``fit_circuit``     ``analyze_spectrum``  ``analyze_spectrum``
+    (2026-09-14)         (unchanged route)   ``engine="legacy"``   ``engine="gated"``
+    ===================  ==================  ====================  ====================
+    fit succeeds         14.0 - 216.4 ms     16.5 - 120.3 ms       299.9 - 59 066.7 ms
+    no usable fit        --                  0.7 - 1.2 ms          1 699 - 2 079 ms
+    ===================  ==================  ====================  ====================
 
-    The wrapper's arc annotation, quality grading and (withheld) sigma are
-    sub-millisecond against a fit that is tens of milliseconds; the difference is
-    inside the run-to-run noise. Fifteen channels is ~1 s of a ~562 s round.
+    Under legacy the wrapper's arc annotation, quality grading and (withheld)
+    sigma were sub-millisecond against a fit of tens of milliseconds, so the
+    difference sat inside the run-to-run noise. Under the shipped ``gated``
+    engine the route costs **20x to 273x** the direct fitter -- the ladder, the
+    twenty admission gates and the fallback cascade are the fit now -- and
+    ``ch22_001_reference`` alone takes 59 s. All ten sweeps converge through
+    ``fit_circuit`` today, including the three ch22 spectra that refused in 2026-08
+    before its finiteness mask landed.
+
+    **That is the argument for the** ``report=`` **seam, not against the route.**
+    ``[a23]`` still allows exactly one resolver, and this still goes through it;
+    what changed is that the settle loop stopped asking it the same question
+    twice about the same arrays.
 
     **``cell=None``, deliberately, and no sigma is taken from the report.** The
     gate compares a channel against *itself*, so the cell constant cancels out of
@@ -3418,13 +3499,20 @@ def _fitted_r1(eis: Any, circuit_model: str) -> _SettleFit | None:
     """
     from softae.analysis.eis.engine import analyze_spectrum
 
-    try:
-        report = analyze_spectrum(eis, cell=None, model_name=str(circuit_model),
-                                  blocking=True)
-    except Exception as exc:
-        logger.warning("eis_validate_settle_fit_raised",
-                       model=str(circuit_model), error=str(exc))
+    if report is FIT_RAISED:
+        # Already attempted upstream and already warned about, by `persist`.
+        # Re-fitting would raise again on the same arrays for the same reason,
+        # so the outcome is identical and only the warning would be doubled.
         return None
+    if report is None:
+        try:
+            report = analyze_spectrum(eis, cell=None,
+                                      model_name=str(circuit_model),
+                                      blocking=True)
+        except Exception as exc:
+            logger.warning("eis_validate_settle_fit_raised",
+                           model=str(circuit_model), error=str(exc))
+            return None
     fit = report.fit
     if fit is None:
         # The gated engine withholds the fit entirely on a spectrum its
@@ -3448,6 +3536,7 @@ def _fitted_r1(eis: Any, circuit_model: str) -> _SettleFit | None:
 
 
 __all__ = [
+    "FIT_RAISED",
     "DEFAULT_DRIFT_CHECK", "DEFAULT_MAX_CONSECUTIVE_FAILURES",
     "DEFAULT_MIN_TREATMENT",
     "DEFAULT_RH_APPROACH_TIMEOUT_S", "DEFAULT_RH_STABILITY_PCT",

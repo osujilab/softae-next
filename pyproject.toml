@@ -143,6 +143,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "real_fit: opt out of the canned-fit fixture; this test is about the fitter itself",
 ]
 
 [tool.ruff]
