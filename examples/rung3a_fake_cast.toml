@@ -1,0 +1,172 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Rung 3a — the "fake cast" bench cycle.
+#
+#   $env:SOFTAE_ALLOW_HARDWARE = "1"
+#   py tools/rung3_fake_cast.py examples/rung3a_fake_cast.toml `
+#       --project <project> --thickness-um 50 -y
+#
+# DO NOT RUN THIS WITH `softae-campaign run` DIRECTLY. It is a copy of
+# `bench_instance.toml` aimed at wells that are ALREADY CAST — the films from
+# the eis-validate runs of 2026-09-13/14 — and the harness above is what makes
+# the cast inert (it swaps the syringe and stage for mocks before anything
+# connects). Run through the campaign CLI on its own and the rig will dispense
+# four fresh formulations on top of four settled films.
+#
+# The recipe below is therefore NOT the experiment. It is carried unchanged from
+# `bench_instance.toml` because the campaign path needs a feasible formulation
+# to solve, project and record — but no pump will turn. The `formulations` rows
+# this run writes describe a cast that did not occur (`_record_trial_formulations`
+# runs on the batch path regardless of whether the dispense is real), and the
+# harness's `RUNG3A_FAKE_CAST.txt` in the run directory says so.
+#
+# Spec: `docs/SubAgent docs/rung3a_fake_cast.md`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name     = "rung3a_fake_cast"
+pcb_name = "SoftAE_EIS_4Stripe"
+
+objective = "auto"
+optimizer = "grid"
+
+# The four most stable already-cast wells, by the spread of log10(R1) across
+# `20260914T132645Z_eis_validate`: ch1 0.033, ch14 0.038, ch11 0.054, ch13 0.067.
+# The next two (ch2 0.072, ch12 0.090) are the alternates; every other channel on
+# that board ranged 0.7 to 3.4 decades. `batch = true` so each well is scored
+# against its OWN spectrum rather than one suggestion replicated four ways.
+channels = [1, 11, 13, 14]
+batch    = true
+budget   = 4
+
+# THREE STOCKS NEEDS THREE PUMP IDS, AND THE DEFAULT IS TWO. `CampaignSpec.pump_ids`
+# defaults to `(0, 1)` and `deposition_settings` only ever TRIMS it —
+# `self.pump_ids[:n_pumps]` cannot widen — so a three-stock formulation solved
+# against the default dies at the first deposit with
+# `[liquid_handler] ids/vols/deadvols/disp_rates length mismatch: 2/3/2/2`,
+# AFTER the startup flush has already pushed fluid. `examples/bench_instance.toml`
+# omits this line and fails exactly that way; measured 2026-09-15. The order
+# matches `pump_assignment` below.
+pump_ids = [0, 1, 2]
+
+# `electrode_capacity` is deliberately ABSENT, and the harness refuses to start
+# if it is ever set here. With a capacity the allocator takes over and walks the
+# board sequentially from `electrode_start` — onto wells that were never cast —
+# and `spec.channels` above stops meaning anything.
+
+[parameter_space.replicate]
+type = "int"
+low  = 1
+high = 4
+
+[general_formulation]
+stocks               = ["5wt% 20k PEO stock", "10 wt% silica solution", "LiCl 10M"]
+target_deposition_uL = 4.5
+budget_uL            = 118.0
+
+[general_formulation.pump_assignment]
+"5wt% 20k PEO stock"     = 0
+"10 wt% silica solution" = 1
+"LiCl 10M"               = 2
+
+[[general_formulation.axes]]
+kind  = "molar_ratio"
+a     = "Ethylene oxide"
+b     = "Lithium chloride"
+low   = 20.0
+high  = 20.0
+basis = "volume"
+
+[[general_formulation.axes]]
+kind  = "dried_fraction"
+a     = "Fumed silica"
+b     = ""
+low   = 0.10
+high  = 0.10
+basis = "volume"
+
+[measurement]
+modality = "eis"
+enabled  = true
+preset   = "Extended"
+
+# ── The run plan ─────────────────────────────────────────────────────────────
+
+[[run_plan.phases]]
+kind  = "formulate"
+scope = "per_sample"
+# NO `[run_plan.phases.conditions]` BLOCK, AND THAT IS THE POINT. `bench_instance`
+# drives the chamber to 25 C / 40 %RH here because it is about to cast wet film.
+# Nothing is cast in this run, so driving the enclosure to casting humidity would
+# do nothing but push four settled films off the 22 %RH they have been sitting at
+# — a real perturbation, in service of a cast that does not happen. An omitted
+# axis is an axis NOT DRIVEN, and an omitted `conditions` table is a phase that
+# drives neither; `conditions` is optional on every phase (`_PHASE_KEYS`), and
+# `RunPlan.__post_init__` constrains only kind, scope and settle.
+
+[[run_plan.phases]]
+kind  = "anneal"
+scope = "per_batch"
+anneal_task = "anneal_85C_8h"
+# ONE HOUR, not the catalog task's eight. D1 ruled (d): `hold_s` is the typed
+# per-run spelling of the task's `hold_time_s` and overrides it, refused only if
+# `anneal_params` spells it too. 28 800 s is the PRODUCTION cure and stays the
+# task's value for every campaign that wants it; rung 3a is a FIDELITY run —
+# it is proving the path executes, not curing a film — and an 8 h hold inside a
+# cycle that must be watched at the bench buys nothing this rung is asking for.
+hold_s = 14400.0
+  [run_plan.phases.conditions]
+  name            = "anneal"
+  # The RESTORE target: where the chamber rests when the hold ENDS, not the cure
+  # (`anneal_85C_8h` owns that at 85 C). Equal to the cure is the one combination
+  # that is certainly a mis-read of this field.
+  temp_setpoint_C = 25.0
+  # HELD THROUGH THE 85 C CURE. The anneal task drives temperature only and never
+  # rewrites the humidity setpoint, so this is the value in force for the whole
+  # hold — only the DESCENT to reach it runs at the 25 C rest.
+  rh_setpoint_pct = 22.0
+  # A CEILING, not a budget: the wait ends when the chamber arrives, and
+  # `rh_wait` carries `raise_on_timeout`, so this refusal is the point. 4 h is
+  # headroom over the single measured 85 C descent (~0.0015 %RH/s, 2026-08-11),
+  # not a rig property.
+  rh_approach_timeout_s = 14400.0
+
+[[run_plan.phases]]
+kind  = "equilibrate"
+scope = "per_batch"
+  [run_plan.phases.settle]
+  round_period_s = 240.0
+  min_hold_s     = 1500.0
+  max_hold_s     = 14400.0
+  # `rate` — decades per hour — and not the default `deviation`, because THIS
+  # RUN HAS NO TRUSTWORTHY ABSOLUTE SIGMA. These wells have zero
+  # `measured_thickness` rows, so the harness records a NOMINAL per-channel
+  # thickness to give the criterion a sigma at all. A nominal thickness makes
+  # sigma wrong in SCALE; a rate in decades per hour is a ratio of sigma to
+  # sigma and is scale-invariant, so the settle verdict survives what the
+  # absolute number does not.
+  criterion          = "rate"
+  rate_tol_dec_per_h = 0.10
+  # Deliberately loosened from the shipped `DEFAULT_RH_STABILITY_PCT = 1.5`.
+  # It judges the ROOM, not the sample: the spread of the %RH PV about itself
+  # across the judged window. It can only ever delay a `settled` verdict, never
+  # produce one early.
+  rh_stability_pct = 5.0
+  [run_plan.phases.conditions]
+  name            = "equilibrate"
+  temp_setpoint_C = 25.0
+  # 22, not `bench_instance`'s 50. This is the state these films were settled at
+  # on 2026-09-13/14 (stage SP 10 C unheated, PV ~26.5 C, 22 %RH). Commanding 50
+  # would re-wet four films whose stability is the whole reason they were chosen.
+  rh_setpoint_pct = 22.0
+  # THE PASSIVE COOL-DOWN, and an UNMEASURED BUDGET. The stage is heater-only:
+  # descent from the 85 C cure to 25 C has no measured time constant — this run
+  # is the first measurement of it. The temperature `wait` RETURNS on timeout
+  # rather than raising, so this is a budget and not a gate; at the shipped
+  # 1 800 s default the settle phase would begin on a still-cooling board and
+  # the rate criterion would read thermal drift as sample drift.
+  approach_timeout_s = 10800.0
+
+[[run_plan.phases]]
+kind  = "measure"
+scope = "per_batch"
+  [run_plan.phases.measurement]
+  preset = "Extended"
