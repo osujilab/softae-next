@@ -52,6 +52,13 @@ channels = [1, 2, 3, 4]
 batch    = true
 budget   = 4
 
+# THREE STOCKS NEEDS THREE PUMP IDS, AND THE DEFAULT IS TWO. `CampaignSpec.pump_ids`
+# defaults to `(0, 1)` and `deposition_settings` only ever TRIMS it, so without this
+# line the first deposit dies with `[liquid_handler] ids/vols/deadvols/disp_rates
+# length mismatch: 2/3/2/2` AFTER the startup flush has already pushed fluid. The
+# order matches `pump_assignment` below.
+pump_ids = [0, 1, 2]
+
 # EVERY top-level key must stay ABOVE the first `[table]` header: TOML assigns a
 # bare key to the most recently opened table, so a key written below
 # `[parameter_space.replicate]` silently becomes a *parameter attribute*.

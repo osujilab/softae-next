@@ -449,10 +449,14 @@ class TestBenchInstanceRunPlan:
     """
 
     @pytest.fixture(scope="class")
-    def plan(self):
+    def spec(self):
         from softae.core.campaign_spec_io import load_campaign_spec
 
-        return load_campaign_spec(BENCH_INSTANCE).run_plan
+        return load_campaign_spec(BENCH_INSTANCE)
+
+    @pytest.fixture(scope="class")
+    def plan(self, spec):
+        return spec.run_plan
 
     def test_bench_instance_carries_the_four_phase_arc_in_order(self, plan):
         assert [p.kind for p in plan.phases] == [
@@ -491,6 +495,19 @@ class TestBenchInstanceRunPlan:
         assert anneal.conditions.temp_setpoint_C == 25.0
         assert equilibrate.conditions.temp_setpoint_C == anneal.conditions.temp_setpoint_C
         assert equilibrate.conditions.approach_timeout_s > DEFAULT_APPROACH_TIMEOUT_S
+
+    def test_bench_instance_declares_a_pump_per_stock(self, spec):
+        """`pump_ids` defaults to two and `deposition_settings` only TRIMS it.
+
+        A third stock with no third id reaches the liquid handler as
+        `ids/vols/deadvols/disp_rates length mismatch: 2/3/2/2` — at the first
+        deposit, after the startup flush has already pushed fluid.
+        """
+        stocks = spec.general_formulation.stocks
+
+        assert len(spec.pump_ids) == len(stocks)
+        assert set(spec.pump_ids) == set(
+            spec.general_formulation.pump_assignment.values())
 
 
 # ── Registration ─────────────────────────────────────────────────────────────

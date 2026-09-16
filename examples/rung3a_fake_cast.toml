@@ -43,8 +43,8 @@ budget   = 4
 # against the default dies at the first deposit with
 # `[liquid_handler] ids/vols/deadvols/disp_rates length mismatch: 2/3/2/2`,
 # AFTER the startup flush has already pushed fluid. `examples/bench_instance.toml`
-# omits this line and fails exactly that way; measured 2026-09-15. The order
-# matches `pump_assignment` below.
+# omitted this line and failed exactly that way — measured 2026-09-15, fixed
+# 2026-09-16 (T11.25). The order matches `pump_assignment` below.
 pump_ids = [0, 1, 2]
 
 # `electrode_capacity` is deliberately ABSENT, and the harness refuses to start
