@@ -1719,7 +1719,8 @@ def settle_round_fits(
     *,
     thickness_for: Callable[[int], Any] | None = None,
 ) -> list["RoundFit"]:
-    """σ and R₁ per channel for one round — **one entry per channel, always**.
+    """The criterion's tracked quantity per channel, one round — **always one
+    entry per channel**.
 
     A channel whose step did not complete comes back as an all-``None``
     :class:`~softae.analysis.equilibration.RoundFit` rather than being dropped,
@@ -1727,41 +1728,101 @@ def settle_round_fits(
     shorter list would read to ``settle_check`` as a smaller board rather than as
     missing evidence.
 
-    **R₁ rides beside σ and is never discarded**, because it is the only thing
-    that distinguishes a film that stopped changing from a fit that came to rest
-    on the model's R₁ floor. The second reports a constant, and a constant is
-    what a settle criterion mistakes for settled.
+    Since T11.33 Design A, ``sigma`` is ``1/R₁`` (see :func:`_report_sigma`), so
+    it and ``r1_ohms`` are now the **same measurement in two units** rather than
+    two observables. ``r1_ohms`` is still carried, and the reason narrows: it is
+    what ``SettleTracker.r1_bound_ohms`` reads to tell a film that stopped
+    changing from a fit that came to rest on the model's R₁ floor. That check is
+    a *rail detector* and needs R₁ in ohms to compare against the bound — a
+    reciprocal cannot be compared to it — so it is unaffected by the change, but
+    it is no longer independent evidence about a different quantity.
+
+    Everything else on the row is provenance and gates nothing: ``basis`` says
+    which observable this is, ``sigma_mode`` and ``quality_verdict`` say what the
+    engine and the grader thought of the round that produced it.
     """
-    from softae.analysis.equilibration import RoundFit
+    from softae.analysis.equilibration import (
+        BASIS_ABSENT, BASIS_FIT_FAILED, BASIS_FITTED, RoundFit,
+    )
 
     out: list[RoundFit] = []
     for channel in channels:
         raw = raws.get(int(channel))
         thickness = thickness_for(int(channel)) if thickness_for is not None else None
+        # `engine="legacy"` — USER RULING [a265] item 2 (T11.15), on rung 3a's bench
+        # evidence ([a276]/[a277]/[a280]): the settle gate fits R₁ through the direct
+        # fitter, regardless of what `[eis] engine` is set to. That ruling STANDS, but
+        # since T11.33 Design A it is no longer load-bearing: `_report_sigma` admits a
+        # bound-mode round anyway, so the route is a cheap preference rather than the
+        # thing standing between ch13 and seven starved settle rounds.
+        #
+        # `thickness` is still resolved and still offered, and the criterion no longer
+        # needs it: `_report_sigma` admits `1/R₁` on fit convergence alone. It is kept
+        # because the report's own geometry-resolved σ and `sigma_mode` remain
+        # meaningful provenance, and because removing the lookup would silently change
+        # what the report carries for every other reader of it.
+        #
+        # The campaign's scored objective is NOT changed: `_sigma_from_eis_raw` names no
+        # engine and so still follows `[eis] engine` per [a23]. Only the geometry-free
+        # gate moves, which is exactly the scope [a265] ruled on.
         report = (None if raw is None else
                   _spectrum_report_from_raw(raw, channel=int(channel),
-                                            thickness_um=thickness))
+                                            thickness_um=thickness,
+                                            engine="legacy"))
+        sigma = _report_sigma(report)
+        # The tool path's own three-way split (`eis_validate_hold._round_fit`), reused
+        # rather than re-spelled: a sweep that never happened and a fit that did not
+        # converge send an operator to different places, and both are distinct from a
+        # number. `BASIS_FITTED` names `1/R₁` on both paths, which is the point.
+        basis = (BASIS_ABSENT if raw is None
+                 else BASIS_FITTED if sigma is not None
+                 else BASIS_FIT_FAILED)
         out.append(RoundFit(channel=int(channel),
-                            sigma=_report_sigma(report),
+                            sigma=sigma,
                             r1_ohms=_report_r1(report),
+                            basis=basis,
                             arc_state=_report_arc_state(report),
-                            n_points_dropped=_report_n_points_dropped(report)))
+                            n_points_dropped=_report_n_points_dropped(report),
+                            sigma_mode=_report_sigma_mode(report),
+                            quality_verdict=_report_quality_verdict(report)))
     return out
 
 
 def _report_sigma(report: Any) -> float | None:
-    """σ from a spectrum report when it is a *value*, else ``None``.
+    """1/R₁ — the settle criterion's own admitted quantity (T11.33 Design A).
 
-    An upper bound is a legitimate scientific result and not a number: a window
-    of bounds is as constant as a railed fit, and would settle just as falsely.
+    Admitted on ``fit.success`` and a finite positive R₁ alone — no cell
+    constant, no thickness, no σ-mode or quality-grade gate. The cell constant is
+    a per-channel *multiplicative* constant on real σ, and both settle criteria
+    are scale-invariant in it: the rate criterion regresses ``ln σ``, where a
+    constant factor vanishes into the intercept, and the deviation criterion
+    computes ``max|σ − mean| / |mean|``, in which it cancels exactly. So this
+    proxy is exactly as valid an input as a geometry-resolved σ for a
+    channel-relative comparison — the same argument ``eis_validate_hold``'s own
+    ``_fitted_r1`` already makes for the tool path, which is why both paths spell
+    the result :data:`~softae.analysis.equilibration.BASIS_FITTED`.
+
+    ``None`` **only** when there is no converged fit. A bound-mode σ or a
+    REJECT-graded fit no longer excludes the round here — those ride beside it as
+    ``sigma_mode`` / ``quality_verdict`` provenance instead of gating anything
+    (T11.33 §2: the label rides beside, never in front). Both exclusions were the
+    same defect: the tracked quantity was gated on a *label* the rate criterion
+    does not need. One saturated phase point near −90° cost ch13 seven settle
+    rounds on rung 3a, and a 16.8 % RMS residual against the 15 % ceiling
+    dropped ch22's rounds outright ([p143]) — neither round was unmeasurable.
+
+    Deliberately **not** the σ this report carries: ``report.sigma.value`` is the
+    geometry-resolved number, and reading it back would re-introduce the
+    thickness dependency this admission rule exists to shed.
     """
-    try:
-        if report is None or not report.ok or not report.sigma.is_value:
-            return None
-        value = float(report.sigma.value)
-    except Exception:
+    fit = getattr(report, "fit", None)
+    if not bool(getattr(fit, "success", False)):
         return None
-    return value if math.isfinite(value) and value > 0 else None
+    try:
+        r1 = float(getattr(fit, "R1"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return 1.0 / r1 if math.isfinite(r1) and r1 > 0 else None
 
 
 def _report_r1(report: Any) -> float | None:
@@ -1807,6 +1868,39 @@ def _report_n_points_dropped(report: Any) -> int | None:
         return None if dropped is None else int(dropped)
     except (TypeError, ValueError):
         return None
+
+
+def _report_sigma_mode(report: Any) -> str:
+    """``SigmaReport.mode`` off the same report — provenance only (T11.32/T11.33).
+
+    Never gates: :func:`_report_sigma` admits a ``bound`` round like any other
+    now, and this is the only thing that records that it *was* one.
+
+    ``""`` means *never asked* — a report that does not exist — and is
+    deliberately the same absence :attr:`RoundFit.sigma_mode` documents, not a
+    fifth state alongside ``value`` / ``bound`` / ``bound_unqualified`` /
+    ``unavailable`` (``SUBAGENT_RULES.md`` §3.1(a)).
+    """
+    sigma = getattr(report, "sigma", None)
+    mode = getattr(sigma, "mode", None)
+    return "" if mode is None else str(mode)
+
+
+def _report_quality_verdict(report: Any) -> str:
+    """``QualityReport.verdict.value`` off the same report — provenance only.
+
+    ``.value`` deliberately, and not a bare ``str()``: ``Verdict`` is a
+    ``str``-mixin ``Enum``, whose default ``str()`` renders ``"Verdict.REJECT"``
+    rather than the clean word :attr:`RoundFit.quality_verdict` means by
+    "verbatim". The two differ only in a place nothing would fail on — a
+    downstream consensus comparison would still group identical strings — so the
+    wrong one would have been invisible until an operator read the column.
+
+    ``""`` for *never asked*, on :func:`_report_sigma_mode`'s precedent.
+    """
+    quality = getattr(report, "quality", None)
+    verdict = getattr(quality, "verdict", None)
+    return "" if verdict is None else str(getattr(verdict, "value", verdict))
 
 
 class RHCeilingEscalation:
@@ -2593,7 +2687,8 @@ def _sigma_from_eis_raw(raw: Any, *, channel: int = 0,
 
 
 def _spectrum_report_from_raw(raw: Any, *, channel: int = 0,
-                              thickness_um: float | None = None) -> Any | None:
+                              thickness_um: float | None = None,
+                              engine: str | None = None) -> Any | None:
     """One EIS step result → a ``SpectrumReport``, or ``None`` if it cannot be built.
 
     **The single raw → physics hop on the campaign path.** σ and R₁ come out of
@@ -2602,22 +2697,24 @@ def _spectrum_report_from_raw(raw: Any, *, channel: int = 0,
     produced it railed on the model's R₁ floor, and those two questions are only
     comparable when one fit answers both.
 
+    ``engine`` is passed straight through to :func:`analyze_spectrum`. **Left
+    ``None`` it resolves ``[eis] engine``**, which is the objective's contract and
+    must stay that way (see the T2.6b note below). Only the settle gate names an
+    engine, and it names ``"legacy"`` — T11.15 / ``[a265]``.
+
     Never raises: a broken analysis path must not discard a measurement.
     """
     try:
-        import numpy as np
-
         from softae.analysis.eis.engine import analyze_spectrum
         from softae.analysis.eis.geometry import cell_constant_for_sample
         from softae.analysis.eis_data import EISResult
 
-        arr = np.asarray(raw[0] if isinstance(raw, (list, tuple)) else raw, dtype=float)
-        if arr.ndim < 2 or arr.shape[1] < 2:
-            return None
-
-        freq = arr[:, 0] if arr.shape[1] >= 3 else np.arange(arr.shape[0], dtype=float)
-        eis = EISResult.from_arrays(channel=channel, f=freq,
-                                    z_real=arr[:, -2], z_imag_neg=arr[:, -1])
+        # BOTH driver shapes, not just the mock's. `from_raw` branches on the mock's
+        # one-element-list-wrapped array AND on the real driver's unwrapped
+        # `palmsens.mscript` object; the hand-rolled `np.asarray(..., dtype=float)`
+        # this replaced could only read the former, so every real spectrum raised
+        # TypeError into the `except` below and became a silent `None` (T11.29).
+        eis = EISResult.from_raw(raw, channel=channel)
 
         # Dispatch by source so the cell constant records the right provenance:
         # resolve_thickness_cm takes one keyword per tier and reports which it used.
@@ -2651,7 +2748,21 @@ def _spectrum_report_from_raw(raw: Any, *, channel: int = 0,
         # the campaign and the screen report different σ for one spectrum, with nothing
         # saying so. The user ruled that one config key governs σ everywhere; flipping
         # `[eis] engine` now moves the objective and the display together.
-        return analyze_spectrum(eis, cell=cell, re_connection="bridged_by_sample")
+        #
+        # T11.15 — USER RULING, [a265] item 2, narrowing [a23] for ONE caller: "the
+        # settle gate MAY fit R1 through the direct fitter". `engine` is therefore a
+        # parameter rather than a hardcode, and it still DEFAULTS to `None` — every
+        # caller that does not name an engine (`_sigma_from_eis_raw`, the objective)
+        # keeps resolving `[eis] engine` exactly as before. `settle_round_fits` is the
+        # only caller that names one.
+        #
+        # `model_name` is made explicit rather than left to `analyze_spectrum`'s own
+        # default. The two are equal today (`SETTLE_CIRCUIT_MODEL == "simpleSalt"`) and
+        # that equality is coincidence — two defaults in two modules that nothing keeps
+        # in step, so naming ours here means the settle gate and the objective cannot
+        # silently start fitting different circuits the day either default moves.
+        return analyze_spectrum(eis, cell=cell, re_connection="bridged_by_sample",
+                                model_name=SETTLE_CIRCUIT_MODEL, engine=engine)
     except Exception:
         logger.warning("sigma_objective_unavailable", exc_info=True)
         return None

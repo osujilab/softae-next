@@ -76,13 +76,29 @@ SANCTIONED: dict[str, str] = {
 #: and ``test_the_persistence_layers_sigma_is_the_cell_constants_not_a_third_spelling``.
 STAGE_B_HELD: dict[str, str] = {}
 
-#: Modules permitted to name an engine at a call site. **Empty, and it must stay empty.**
-#: The user ruled in mail [a23]: "The GUI and objective should report the same
-#: conductivity, as nothing changes about the casting nor measurement between them."
-#: ``core/autonomous_wiring.py`` was the last holdout with its ``engine="gated"``
-#: hardcode; afl-session retired it under T2.6b on 2026-08-09. Anything added back here
-#: is a second place that decides which physics runs.
-ENGINE_DECISION_EXEMPT: dict[str, str] = {}
+#: Modules permitted to name an engine at a call site. Empty until [a265]; anything
+#: added here is a second place that decides which physics runs, and it must be a
+#: user ruling naming the exact caller, not a convenience.
+#:
+#: ``core/autonomous_wiring.py`` — USER RULING, [a265] item 2 (2026-09-15), narrowing
+#: [a23] for exactly one caller: "the settle gate MAY fit R1 through the direct
+#: fitter [...] regardless of what [eis] engine is set to." The only call in this
+#: file that ever passes a non-``None`` engine is ``settle_round_fits``, via
+#: ``_spectrum_report_from_raw``'s ``analyze_spectrum(..., engine=engine)`` pass-
+#: through (T11.15) — every other caller in the file, including the campaign's
+#: scored objective (``_sigma_from_eis_raw``), still leaves the keyword to resolve
+#: ``[eis] engine`` exactly as [a23] requires. The AST check below cannot see past
+#: the file to confirm that per-caller distinction; ``test_settle_round_fits_
+#: requests_the_legacy_engine`` and ``test_sigma_objective_names_no_engine_so_it_
+#: still_follows_config`` (``tests/test_autonomous_wiring.py``) are what actually
+#: pin it.
+ENGINE_DECISION_EXEMPT: dict[str, str] = {
+    "core/autonomous_wiring.py": (
+        "[a265] item 2 (T11.15) — settle_round_fits names engine=\"legacy\" for "
+        "the geometry-free settle gate only; the objective (_sigma_from_eis_raw) "
+        "still leaves it unset"
+    ),
+}
 
 #: Every migrated fit site — Stage A's six, plus Stage B's ``router.py`` (site 9, the
 #: workflow auto-fit, the origin of nearly every stored ``fit_results`` row), plus
@@ -264,8 +280,12 @@ def test_the_sanctioned_allowlist_cannot_grow_without_a_documented_reason():
     # a second time, which is how the P.16 guard stopped meaning anything.
     assert STAGE_B_HELD == {}
 
-    # [a23] is a user ruling, not a preference: no surface may name its own engine.
-    assert ENGINE_DECISION_EXEMPT == {}
+    # [a23] is a user ruling, not a preference: no surface may name its own engine
+    # UNLESS a later ruling names that exact caller. [a265] item 2 (2026-09-15) did,
+    # narrowly, for the settle gate alone — exact-set-equality here so a second
+    # addition (a real second exception, or a careless one) fails this test the
+    # same way a fifth `SANCTIONED` entry would, rather than passing silently.
+    assert set(ENGINE_DECISION_EXEMPT) == {"core/autonomous_wiring.py"}
 
 
 # ── Every fit site is config-governed ────────────────────────────────────────

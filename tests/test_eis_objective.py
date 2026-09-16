@@ -330,8 +330,16 @@ class TestOneSigmaEverywhere:
     def test_the_objective_names_no_engine_at_its_call_site(self, monkeypatch):
         # The mechanism, not just the outcome. Resolving `[eis] engine` here and
         # passing the answer back in would agree with the GUI today and drift the
-        # moment the resolution rule changes in one place only; omitting the keyword
-        # means there is nothing to keep in step.
+        # moment the resolution rule changes in one place only; leaving the keyword
+        # unset (or naming it `None`, which resolves identically — T11.15 gave the
+        # shared `_spectrum_report_from_raw` hop a keyword the settle gate uses and
+        # this caller does not) means there is nothing to keep in step.
+        #
+        # Asserted on the RESOLVED value, not on key presence: `engine.py`'s own
+        # dispatch treats a present `None` exactly like an absent keyword
+        # (`chosen = engine or cfg.engine or "legacy"`), so checking presence alone
+        # would fail on a call shape that decides nothing — the failure this test
+        # exists to catch is a caller passing a real engine NAME, not a keyword.
         import softae.analysis.eis.engine as engine
 
         real = engine.analyze_spectrum
@@ -346,7 +354,7 @@ class TestOneSigmaEverywhere:
         _sigma_from_eis_raw(_raw(f, Z), channel=5, thickness_um=150.0)
 
         assert seen, "the σ extractor did not reach analyze_spectrum at all"
-        assert all("engine" not in kwargs for kwargs in seen)
+        assert all(kwargs.get("engine") is None for kwargs in seen)
 
 
 class TestAggregateObjective:

@@ -1516,6 +1516,60 @@ def test_settle_round_fits_absent_channel_spells_never_asked_not_zero():
     assert fit.n_points_dropped is None
 
 
+def test_settle_round_fits_absent_channel_spells_never_asked_on_the_new_fields():
+    """The same positive control, extended to T11.33's three additions.
+
+    `basis` says WHICH of the three absences this is — a sweep that never
+    happened, spelled apart from a fit that failed, because they send an operator
+    to different places. `sigma_mode` and `quality_verdict` must read "never
+    asked" and not "asked, and clean": a feeder with nothing to report must not
+    be indistinguishable from a clean board (`SUBAGENT_RULES.md` §3.1(a)).
+    """
+    from softae.analysis.equilibration import BASIS_ABSENT
+
+    fit, = wiring.settle_round_fits({}, [7])
+
+    assert fit.basis == BASIS_ABSENT
+    assert fit.sigma_mode == ""
+    assert fit.quality_verdict == ""
+    # The helpers themselves, on the `None` report the absent branch hands them.
+    assert wiring._report_sigma_mode(None) == ""
+    assert wiring._report_quality_verdict(None) == ""
+
+
+def test_report_sigma_refuses_a_fit_that_did_not_converge():
+    """The new admission rule's ONLY `None` path for a report that exists.
+
+    Design A admits on `fit.success` and a finite positive R₁ alone, which makes
+    this the whole of what it still refuses — so without this the rule has no
+    test that it can say no at all, and a `_report_sigma` that returned a number
+    unconditionally would pass every other test in this file.
+
+    `FitResult.success` defaults to `True`, so the absent-fit case is checked
+    through `getattr(..., False)` rather than through the dataclass default.
+    """
+    class _Fit:
+        success = False
+        R1 = 50000.0
+
+    class _Report:
+        fit = _Fit()
+
+    assert wiring._report_sigma(_Report()) is None
+    assert wiring._report_sigma(None) is None
+
+    # A converged fit whose R₁ is unusable is refused on the same rule.
+    for bad_r1 in (0.0, -1.0, float("nan"), float("inf")):
+        class _BadFit:
+            success = True
+            R1 = bad_r1
+
+        class _BadReport:
+            fit = _BadFit()
+
+        assert wiring._report_sigma(_BadReport()) is None, bad_r1
+
+
 def test_settle_round_fits_distinguishes_dropped_zero_from_never_asked():
     """`0` and `None` must not be spelled with the same token (§3.1(a))."""
     measured, absent = wiring.settle_round_fits({7: _closed_arc_raw()}, [7, 8])
@@ -1542,6 +1596,305 @@ def test_report_arc_state_returns_empty_for_a_fit_never_annotated():
 
     assert wiring._report_arc_state(_Report()) == ""
     assert wiring._report_n_points_dropped(_Report()) == 3
+
+
+# ── T11.15: the settle gate fits through the direct (legacy) route ───────────
+#
+# USER RULING [a265] item 2, narrowing [a23] to exempt the geometry-free gate.
+# The defect it fixes ([a280]): the gated engine's σ has a third state — a BOUND —
+# which `_report_sigma` correctly refuses as a number, so ONE phase reading
+# saturated at the instrument's rail drops that whole channel out of the settle
+# rate window. On rung 3a's real board that starved the criterion below
+# `min_channels` for seven consecutive rounds. `_legacy_report` builds only
+# "unavailable"/"value" and never calls `decide_report_mode`, so the state does
+# not exist on that route.
+#
+# The fixture below is a *positive control*, not a happy path: the gated half of
+# the first test asserts the spectrum really does bound, so a green legacy half
+# means the route changed the outcome rather than that the input was benign
+# (`SUBAGENT_RULES.md` §3.1(e)).
+
+#: Thickness the campaign would resolve per channel. Without one the cell cannot
+#: report conductivity at all and EVERY mode is "unavailable" — which would make
+#: the test below vacuous in exactly the way §3.1(a) describes.
+_SETTLE_THICKNESS_UM = 50.0
+
+
+def _phase_saturated_raw():
+    """A closed arc with THREE adjacent readings pinned at the phase rail.
+
+    [a280]'s root cause, updated for T11.31 ([a285]): `decide_report_mode` no
+    longer takes a bare minimum tan δ across the sweep — it takes the minimum of
+    a 5-point running median, which a single saturated point cannot pull under
+    the phase floor (the other four points in its window outvote it). Three
+    adjacent rail points are enough to drag a 5-point window's median down too.
+    The other points are untouched, and the fit still recovers R₁ ≈ 50 kΩ on
+    both engines — which is the point: the spectrum is measurable, and only the
+    gated engine declines to say so.
+    """
+    import numpy as np
+    from tests.eis_synthetic import reference_spectrum
+
+    f, Z = reference_spectrum(Q=0.0, R_series=500.0, R_bulk=50000.0, C_par=1e-9)
+    Z = Z.copy()
+    Z[0:3] = np.abs(Z[0:3]) * np.exp(1j * np.radians(-89.999))
+    return _eis_raw(f, Z)
+
+
+def test_settle_round_fits_admits_a_converged_fit_with_a_bound_sigma_label():
+    """T11.33 Design A: the bound label survives as provenance and stops gating.
+
+    This REPLACES `test_spectrum_report_legacy_engine_never_bounds_a_phase_
+    saturated_spectrum`, whose premise Design A retires. That test asserted
+    `_report_sigma(gated) is None` — the bound starving the channel — as the
+    defect T11.15's engine swap routed around. Under Design A the admission rule
+    is `fit.success` and a finite positive R₁ alone, so BOTH engines now
+    contribute `1/R₁` and the difference between them is recorded rather than
+    acted on. The T11.15 ruling stands; it is simply no longer load-bearing.
+
+    Both halves are asserted, because only the pair is informative: that the
+    spectrum genuinely still bounds under `gated` (so this is not a benign input
+    quietly passing, `SUBAGENT_RULES.md` §3.1(e)), and that the bound no longer
+    withholds the number.
+    """
+    raw = _phase_saturated_raw()
+
+    # The control, unchanged from the retired test: this spectrum really does
+    # reach the bound branch. If it ever stops doing so the rest is vacuous.
+    gated = wiring._spectrum_report_from_raw(
+        raw, channel=7, thickness_um=_SETTLE_THICKNESS_UM, engine="gated")
+    assert gated is not None
+    assert gated.sigma.is_bound and not gated.sigma.is_value
+
+    legacy = wiring._spectrum_report_from_raw(
+        raw, channel=7, thickness_um=_SETTLE_THICKNESS_UM, engine="legacy")
+    assert legacy is not None
+    assert legacy.engine == "legacy"
+    assert not legacy.sigma.is_bound
+    assert legacy.sigma.mode == "value"
+
+    # The change: a bound no longer withholds the number, and the number is the
+    # conductance proxy — NOT the geometry-resolved σ the report also carries.
+    for report in (gated, legacy):
+        assert report.fit.success
+        admitted = wiring._report_sigma(report)
+        assert admitted is not None
+        assert admitted == pytest.approx(1.0 / report.fit.R1)
+
+    # ...and it is a different number from the σ that used to be admitted, so a
+    # regression to `report.sigma.value` cannot pass this test.
+    assert wiring._report_sigma(legacy) != pytest.approx(legacy.sigma.value)
+
+    # The label rides beside it, verbatim, for the one engine that can produce it.
+    assert wiring._report_sigma_mode(gated) == "bound"
+    assert wiring._report_sigma_mode(legacy) == "value"
+
+    # Both engines fit the same film; only the reporting decision differed.
+    assert legacy.fit.R1 == pytest.approx(gated.fit.R1, rel=0.1)
+
+
+def _reject_graded_raw():
+    """A converged fit the grader REJECTS — `[p143]`'s ch22, reproduced.
+
+    20 % multiplicative noise on the closed-arc reference. The fit still
+    converges and still recovers R₁ within ~0.4 % of the 50 kΩ truth, but its RMS
+    residual lands at ~18.9 % against `[quality] max_residual_pct = 15.0`, so
+    `grade_fit` returns REJECT and `SpectrumReport.ok` (which is `quality.ok`) is
+    False. Seeded, so the residual is deterministic rather than a coin flip near
+    the ceiling.
+
+    That combination — measurable R₁, refusing grade — is the exact shape that
+    dropped ch22's rounds out of the rate window under the old admission rule.
+    """
+    from tests.eis_synthetic import reference_spectrum
+    return _eis_raw(*reference_spectrum(Q=0.0, R_series=500.0, R_bulk=50000.0,
+                                        C_par=1e-9, noise_pct=20.0, seed=0))
+
+
+def test_settle_round_fits_admits_a_converged_fit_the_grader_rejected():
+    """`[p143]`'s ch22 pinned permanently: a REJECT grade records, never gates.
+
+    The old rule dropped this round via `report.ok`, which on the legacy route is
+    `quality.ok` — and `_legacy_report` enforces `grade_fit`'s verdict
+    unconditionally, unlike the gated engine which promotes it only when
+    `[eis.gates] enabled`. So the route T11.15 installed is precisely the one on
+    which a residual grade could still starve a channel. Design A ends that: the
+    verdict reaches the operator on the row instead of the round vanishing.
+    """
+    from softae.analysis.quality import Verdict
+
+    report = wiring._spectrum_report_from_raw(
+        _reject_graded_raw(), channel=22, thickness_um=_SETTLE_THICKNESS_UM,
+        engine="legacy")
+
+    # The premise, asserted rather than assumed — a fit that converged, whose R₁
+    # is good, and which the grader nonetheless refuses to speak for.
+    assert report is not None
+    assert report.fit.success
+    assert report.quality.verdict is Verdict.REJECT
+    assert not report.ok
+    assert report.fit.quality["residual_rms_pct"] > 15.0
+    assert report.fit.R1 == pytest.approx(50000.0, rel=0.05)
+
+    # The change: admitted anyway, and graded on the record.
+    admitted = wiring._report_sigma(report)
+    assert admitted is not None
+    assert admitted == pytest.approx(1.0 / report.fit.R1)
+
+    # `.value`, not `str(verdict)` — `Verdict` is a str-mixin enum whose default
+    # `str()` renders "Verdict.REJECT". This asserts the clean word specifically,
+    # because the difference is invisible to every downstream comparison and
+    # would only ever surface in front of an operator.
+    assert wiring._report_quality_verdict(report) == "reject"
+    assert wiring._report_quality_verdict(report) != str(report.quality.verdict)
+
+    # End to end, through the feeder the campaign actually calls.
+    fit, = wiring.settle_round_fits({22: _reject_graded_raw()}, [22],
+                                    thickness_for=lambda ch: _SETTLE_THICKNESS_UM)
+    assert fit.sigma is not None
+    assert fit.quality_verdict == "reject"
+    assert fit.basis == "fitted"
+
+
+def test_settle_round_fits_needs_no_thickness_to_produce_a_rate():
+    """T11.33 §2 consequence 3, made concrete — a real capability change.
+
+    Without a thickness the cell constant is unresolvable, so `_legacy_report`
+    builds `SigmaReport(mode="unavailable")` and the OLD rule returned `None` for
+    every round of that channel forever. Design A's quantity is `1/R₁`, which a
+    fit produces without any geometry at all.
+
+    This is also the pin behind the rehearsal's `not_evaluable` scenario losing
+    its mechanism (T11.33 §7): withholding a thickness no longer withholds a
+    participant, so that scenario has to be re-forced through genuine absence.
+    """
+    from softae.analysis.equilibration import BASIS_FITTED
+
+    for thickness_for in (None, lambda ch: None):
+        fit, = wiring.settle_round_fits({7: _closed_arc_raw()}, [7],
+                                        thickness_for=thickness_for)
+
+        assert fit.sigma is not None
+        assert fit.sigma == pytest.approx(1.0 / fit.r1_ohms)
+        assert fit.basis == BASIS_FITTED
+        # The control: the report really did decline to state a conductivity, so
+        # the σ above cannot have come from the geometry path.
+        assert fit.sigma_mode == "unavailable"
+
+
+def test_sigma_from_eis_raw_still_resolves_the_configured_engine(monkeypatch):
+    """The objective is untouched by Design A — the one thing that must not move.
+
+    `[a23]`'s guard restated structurally rather than by engine keyword (that
+    half is `test_sigma_objective_names_no_engine_so_it_still_follows_config`,
+    which already exists and is kept). This asserts the *stronger* property the
+    T11.33 edit put at risk: the objective path must not call the settle feeder's
+    admission rule or either provenance helper, so that changing what the
+    criterion regresses can never change what BO scores.
+
+    Spying on the three helpers rather than reading the source, because an
+    indirect call through a future refactor would still be caught.
+    """
+    from softae.analysis.eis import engine as eis_engine
+
+    called: list[str] = []
+    for name in ("_report_sigma", "_report_sigma_mode", "_report_quality_verdict"):
+        real = getattr(wiring, name)
+
+        def spy(report, *, _name=name, _real=real):
+            called.append(_name)
+            return _real(report)
+
+        monkeypatch.setattr(wiring, name, spy)
+
+    seen: list[dict] = []
+    real_analyze = eis_engine.analyze_spectrum
+
+    def analyze_spy(*args, **kwargs):
+        seen.append(kwargs)
+        return real_analyze(*args, **kwargs)
+
+    monkeypatch.setattr(eis_engine, "analyze_spectrum", analyze_spy)
+
+    sigma = wiring._sigma_from_eis_raw(_closed_arc_raw(), channel=7,
+                                       thickness_um=_SETTLE_THICKNESS_UM)
+
+    assert called == []
+    assert len(seen) == 1
+    assert seen[0].get("engine") is None
+    # And it is still the geometry-resolved σ, not the criterion's 1/R₁ proxy.
+    assert sigma is not None
+    assert sigma > 1e-3
+
+
+def test_settle_round_fits_requests_the_legacy_engine():
+    """The call site names the engine, once per channel."""
+    seen: list[dict] = []
+
+    def spy(raw, **kwargs):
+        seen.append(kwargs)
+        return None
+
+    original = wiring._spectrum_report_from_raw
+    wiring._spectrum_report_from_raw = spy
+    try:
+        wiring.settle_round_fits({7: _closed_arc_raw(), 8: _open_arc_raw()}, [7, 8])
+    finally:
+        wiring._spectrum_report_from_raw = original
+
+    assert len(seen) == 2
+    assert [kw.get("engine") for kw in seen] == ["legacy", "legacy"]
+
+
+def test_sigma_objective_names_no_engine_so_it_still_follows_config(monkeypatch):
+    """Regression guard for [a23] on the path [a265] did NOT touch.
+
+    The campaign's scored objective must keep resolving `[eis] engine`, so the
+    number BO optimises against and the number the GUI shows cannot diverge.
+    Spying on `analyze_spectrum` rather than on `_spectrum_report_from_raw`
+    catches the stronger failure too: a default of "legacy" on the new keyword
+    would re-couple the objective to the settle gate's choice invisibly.
+    """
+    from softae.analysis.eis import engine as eis_engine
+
+    seen: list[dict] = []
+    real = eis_engine.analyze_spectrum
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(eis_engine, "analyze_spectrum", spy)
+    wiring._sigma_from_eis_raw(_closed_arc_raw(), channel=7,
+                               thickness_um=_SETTLE_THICKNESS_UM)
+
+    assert len(seen) == 1
+    assert seen[0].get("engine") is None
+
+
+def test_settle_round_fits_legacy_engine_still_populates_arc_state_and_drops(monkeypatch):
+    """T11.15 does not undo the J feeder: both fields still come off the real fit.
+
+    The same spy shape as the objective guard above, so a "legacy" here and a
+    `None` there are read by one instrument — the check can distinguish them.
+    """
+    from softae.analysis.eis import engine as eis_engine
+
+    seen: list[str | None] = []
+    real = eis_engine.analyze_spectrum
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("engine"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(eis_engine, "analyze_spectrum", spy)
+    fit, = wiring.settle_round_fits({7: _closed_arc_raw()}, [7])
+
+    assert seen == ["legacy"]
+    assert fit.arc_state == "closed"
+    assert fit.n_points_dropped == 0
+    assert isinstance(fit.n_points_dropped, int)
+    assert fit.r1_ohms is not None
 
 
 # ── The observation seam failing is itself an event ──────────────────────────
@@ -1586,3 +1939,130 @@ async def test_a_failing_trial_measured_hook_is_wired_to_a_campaign_event(
     assert emitted[0]["error"] == "RuntimeError: settle exploded"
     assert "iteration" in emitted[0]
     store.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _spectrum_report_from_raw — BOTH driver shapes (T11.29)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# The campaign's single raw → physics hop has to read two legitimate shapes:
+#
+#   MockESPico.sendscript_getdata  → [ndarray(npts, 5)]  (one-element list)
+#   AsyncESPico.sendscript_getdata → palmsens.mscript.parse_result_lines(...),
+#                                    returned UNWRAPPED and opaque
+#
+# It used to hand-roll `np.asarray(..., dtype=float)`, which reads only the first.
+# The real shape raised TypeError into the function's own `except Exception`, so
+# every real spectrum became a silent `None` — no crash, total data loss on
+# hardware. Every prior campaign test ran `--mock`, so nothing caught it.
+#
+# The two fixtures below are the SAME Nyquist shape scaled by 100x in impedance
+# and 5x in frequency, so neither test can pass by accidentally taking the other
+# branch: the mock fixture sits at R0~4.8e4 / R1~1.8e6, the real one at R0~4.8e2 /
+# R1~1.8e4, two decades apart with no overlap in any asserted band.
+
+import types  # noqa: E402
+from unittest.mock import MagicMock, patch  # noqa: E402
+
+import numpy as np  # noqa: E402
+
+from softae.core.autonomous_wiring import _spectrum_report_from_raw  # noqa: E402
+
+#: CPE exponent shared by both fixtures (matches the mock's own circuit).
+_CPE_ALPHA = 0.7
+
+#: Thickness so σ resolves to a value rather than "unavailable" — both tests
+#: assert on σ, and σ needs a cell constant.
+_THICKNESS_UM = 40.0
+
+
+def _mock_shaped_raw():
+    """Exactly what ``MockESPico.sendscript_getdata`` returns (mock_espico.py:118).
+
+    A one-element list wrapping an ``(npts, 5)`` array whose columns are
+    ``[f, |Z|, phase_deg, Z', -Z'']``.
+    """
+    from softae.drivers.mock_espico import _synthetic_eis
+    return [_synthetic_eis(R0=4.81e4, R1=1.84e6, seed=7)]
+
+
+def _real_shaped_columns():
+    """``{column_index: values}`` for the real driver's ``get_values_by_column``.
+
+    Column order is the one ``EISResult.from_raw`` reads on the palmsens branch:
+    0 = frequency, 1 = Z', 2 = Z'' (note: Z'', not -Z'').
+    """
+    freq = np.geomspace(1.0e4, 0.2, 29)
+    omega = 2.0 * np.pi * freq
+    R0, R1, C, Q = 481.0, 1.84e4, 5.5e-8, 3.08517e-5
+    Z = R0 + 1.0 / (Q * (1j * omega) ** _CPE_ALPHA) + R1 / (1.0 + 1j * omega * R1 * C)
+    return {0: freq, 1: Z.real, 2: Z.imag}
+
+
+def test_spectrum_report_from_raw_mock_shape_still_builds_report():
+    """REGRESSION PIN: the mock's shape must keep working after the real-shape fix.
+
+    Both callers (``settle_round_fits``, ``_sigma_from_eis_raw``) are exercised
+    through this shape by every other campaign test, so a regression here would be
+    a campaign-wide outage in simulation.
+    """
+    report = _spectrum_report_from_raw(_mock_shaped_raw(), channel=21,
+                                       thickness_um=_THICKNESS_UM)
+
+    assert report is not None, (
+        "the mock's shape stopped parsing: _spectrum_report_from_raw swallowed an "
+        "exception and returned None")
+    assert report.fit is not None and report.fit.success
+
+    # The mock fixture's own decade, two decades above the real-shape fixture.
+    assert 2.0e4 < report.fit.R0 < 1.0e5, f"R0={report.fit.R0:g} is not the mock's"
+    assert 1.0e6 < report.fit.R1 < 3.0e6, f"R1={report.fit.R1:g} is not the mock's"
+    assert report.sigma.is_value
+    assert 5.0e-5 < report.sigma.value < 5.0e-4
+
+
+def test_spectrum_report_from_raw_real_palmsens_shape_builds_report():
+    """The real driver's shape now parses — this is the bench defect (T11.29).
+
+    ``AsyncESPico.sendscript_getdata`` returns ``parse_result_lines(...)`` unwrapped:
+    an opaque PalmSens object, not float-castable. We fake the SDK boundary exactly
+    as ``tests/test_real_drivers.py`` does rather than hand-building ``MScriptVar``
+    rows (those need correctly hex-encoded ``data`` strings).
+
+    Before the fix this asserted-on report was ``None`` — ``np.asarray(raw,
+    dtype=float)`` raised ``TypeError`` into the function's own ``except``, and
+    ``get_values_by_column`` was never called at all.
+    """
+    columns = _real_shaped_columns()
+
+    ps_mscript = types.ModuleType("palmsens.mscript")
+    ps_mscript.get_values_by_column = MagicMock(
+        side_effect=lambda data, col: columns[col])
+    ps_root = types.ModuleType("palmsens")
+    ps_root.mscript = ps_mscript
+    mods = {"palmsens": ps_root, "palmsens.mscript": ps_mscript}
+
+    class _OpaqueRawData:
+        """Stands in for ``parse_result_lines``'s return: not float-castable."""
+
+    with patch.dict("sys.modules", mods):
+        report = _spectrum_report_from_raw(_OpaqueRawData(), channel=21,
+                                           thickness_um=_THICKNESS_UM)
+
+    assert report is not None, (
+        "the real driver's shape still does not parse: every bench spectrum "
+        "silently becomes None")
+    assert report.fit is not None and report.fit.success
+
+    # POSITIVE CONTROL that the palmsens branch is the one that ran: the 2D-array
+    # and 5-array branches never touch this function, so a non-zero call count is
+    # proof the `else` branch was entered rather than coincidentally matched.
+    assert ps_mscript.get_values_by_column.call_count == 3
+    assert [c.args[1] for c in ps_mscript.get_values_by_column.call_args_list] == [0, 1, 2]
+
+    # The real fixture's own decade — disjoint from the mock fixture's bands above,
+    # so this cannot pass on data that took the wrong branch.
+    assert 3.0e2 < report.fit.R0 < 1.0e3, f"R0={report.fit.R0:g} is not the fed-in one"
+    assert 1.0e4 < report.fit.R1 < 3.0e4, f"R1={report.fit.R1:g} is not the fed-in one"
+    assert report.sigma.is_value
+    assert 5.0e-3 < report.sigma.value < 5.0e-2
