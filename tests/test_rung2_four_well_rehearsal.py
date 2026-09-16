@@ -18,12 +18,15 @@ run to find:
 1. **``install_mock_picos`` must run BEFORE ``connect_all()``.** It puts freshly
    constructed (and therefore DISCONNECTED) picos into ``manager._instruments``;
    installed after connecting, every sweep dies ``[pico2] not connected``.
-2. **Without a recorded thickness there is no sigma, and without sigma the only
-   reachable verdict is ``not_evaluable``.** The campaign's own predicted tier
-   needs a composition-mode spec; these raw-volume specs get ``twin = None`` and
-   a NULL thickness. ``_record_thickness_on_run_start`` supplies the
-   profilometry tier through the public writer, and it is a precondition of this
-   module meaning anything — see its docstring.
+2. **A thickness is provenance here; since T11.33 it is no longer the lever.**
+   ``settle_round_fits`` admits ``1/R1`` on fit convergence alone (Design A), so
+   a well with no thickness still fits, still votes, and still settles a board.
+   ``_record_thickness_on_run_start`` fills the profilometry tier for **every**
+   well anyway, through the public writer, because the report's
+   geometry-resolved sigma and its ``sigma_mode`` are what the stored row
+   carries and a NULL thickness would silently change that for every other
+   reader. What it no longer decides is who may be judged: the unjudgeable board
+   is forced by **absence** instead — see :func:`_no_settle_sweep_for`.
 3. **``max_hold_s`` is sized against ROUND cost, not against the intended
    hold.** A four-channel round costs 23-38 s here: ~2.6 s per gated fit plus
    roughly 17 s of executor and payload work that does not shrink with the
@@ -43,11 +46,13 @@ run to find:
    arc, so the fitter is fitting noise and the rail is a ~1-in-6 coin flip per
    (channel, sweep). A test that leant on it would pass on the run it was
    written against and flake afterwards — it did, once, here. The exclusion
-   these boards use instead is ``sigma_null``, withheld per channel and
-   deterministic by construction: **no thickness for a well, no sigma for it,
-   no vote from it.** The R1-bound threading itself stays covered where it is
-   deterministic, in ``test_campaign_settle_phase.py`` and
-   ``test_equilibration_analysis.py``, against fabricated fits.
+   these boards use instead is ``absent``, forced per channel and deterministic
+   by construction: **no settle sweep for a well, no round fit for it, no vote
+   from it.** (Withholding a *thickness* was the earlier lever and stopped
+   working at T11.33 Design A, which admits ``1/R1`` with no geometry at all.)
+   The R1-bound threading itself stays covered where it is deterministic, in
+   ``test_campaign_settle_phase.py`` and ``test_equilibration_analysis.py``,
+   against fabricated fits.
 
 **Sentinels.** One strict ``xfail`` remains — T11.8's ``certification`` field on
 a measurement row, whose name parallel has confirmed. T11.7's sentinel has been
@@ -71,7 +76,7 @@ from typing import Any
 import pytest
 
 from softae.analysis.equilibration import (
-    EXCLUDED_SIGMA_NULL,
+    EXCLUDED_ABSENT,
     RATE_MOVING,
     SETTLE_CEILING,
     SETTLE_CRITERION_DEVIATION,
@@ -125,10 +130,12 @@ SPACE = {
 #: and the fitted R1 sits near 4.8e7 ohm, round to round, to within ~0.5 %.
 QUIET_APEX_HZ = 30.0
 
-#: The thickness handed to the profilometry tier. Any positive number works —
-#: sigma is a ratio and the criterion is relative — but it must EXIST, and a
-#: channel it is withheld from is a channel with no sigma at all. That is the
-#: lever the ``not_evaluable`` board uses; see :data:`SCENARIOS`.
+#: The thickness handed to the profilometry tier, for every well on every
+#: board. Any positive number works — sigma is a ratio and the criterion is
+#: relative. Since T11.33 Design A it is **not** a lever on judgeability at all:
+#: a channel with no thickness still fits an R1 and still votes. It is recorded
+#: because it is what the stored report's geometry-resolved sigma is built
+#: from; see :func:`_record_thickness_on_run_start`.
 REHEARSAL_THICKNESS_UM = 50.0
 
 
@@ -247,36 +254,84 @@ def _spec(max_hold_s: float, *, measurement: MeasurementSpec | None = None,
 #: slowdown says *why* it failed rather than merely that it did.
 CEILING_HOLD_S = 80.0
 
-#: The three boards, the ceiling each needs, and which wells are given a
-#: thickness. See the module docstring on why the ceilings are tens of seconds
-#: rather than the fractions of a second the neighbouring fast-settle fixture
-#: uses, and why the unjudgeable wells are withheld thicknesses rather than
+#: The three boards, the ceiling each needs, and which wells are swept at all
+#: during the hold. See the module docstring on why the ceilings are tens of
+#: seconds rather than the fractions of a second the neighbouring fast-settle
+#: fixture uses, and why the unjudgeable wells are silenced outright rather than
 #: driven to the R1 floor.
 #:
-#: Every well is quiet in all three: what separates the boards is the DRIFT
-#: (does sigma move?) and the THICKNESS (does the well have a sigma at all?),
-#: and both of those are deterministic.
+#: Every well is quiet in all three and every well has a thickness: what
+#: separates the boards is the DRIFT (does sigma move?) and the ABSENCE (did the
+#: well produce a round fit at all?), and both of those are deterministic.
 SCENARIOS: dict[str, dict[str, Any]] = {
     # Four wells, all measurable, none moving -> the criterion says settled.
     "settled": dict(
         max_hold_s=90.0,
         drift_decades_per_hour=0.0,
         thickness_channels=CHANNELS,
+        absent_channels=(),
     ),
     # Four wells, all measurable, all still drying -> held to the ceiling.
     "ceiling": dict(
         max_hold_s=CEILING_HOLD_S,
         drift_decades_per_hour=1.5,
         thickness_channels=CHANNELS,
+        absent_channels=(),
     ),
-    # Two wells carry no thickness, so they carry no sigma and cannot vote:
-    # 2 participants against settle_min_channels=3.
+    # Two wells are never swept, so they carry no round fit at all and cannot
+    # vote: 2 participants against settle_min_channels=3. Their thickness is the
+    # same as everyone else's — withholding it stopped silencing anything at
+    # T11.33 Design A, which regresses 1/R1 and needs no geometry.
+    #
+    # **Scheduled rewrite.** This board leans on the board minimum, and T11.33
+    # step 3 takes it off the campaign path (`board_minimum=None`, judge per
+    # well). When that lands, two absent wells of four will settle on the other
+    # two, and the scenario has to become "no well is judgeable at all" — every
+    # channel absent — which is spec section 7's test 17.
     "not_evaluable": dict(
         max_hold_s=CEILING_HOLD_S,
         drift_decades_per_hour=0.0,
-        thickness_channels=(21, 22),
+        thickness_channels=CHANNELS,
+        absent_channels=(23, 24),
     ),
 }
+
+
+def _no_settle_sweep_for(channels: Sequence[int]) -> Any:
+    """``settle_measure_step``, minus the step for each of *channels*.
+
+    **The lever the unjudgeable board runs on, and it is the sweep rather than
+    the geometry.** A channel with no step in the round's workflow produces no
+    result for the executor to capture, so ``_settle_round`` hands
+    ``settle_round_fits`` a ``None`` raw for it, that builds an all-``None``
+    :class:`RoundFit`, and ``_exclusion`` reads exactly that shape as
+    ``absent``. It is the real production state of a well whose step never
+    completed — the case ``settle_round_fits`` documents itself against — and
+    since T11.33 Design A it is the only exclusion this rig can produce on
+    demand: ``1/R1`` fits without a thickness, so withholding one no longer
+    silences anybody.
+
+    **Not a raise, deliberately.** A mock pico that threw for those channels
+    would fail the step, exhaust its retries and abort the whole round through
+    ``WorkflowExecutor``, losing the two wells that are supposed to survive; the
+    board would then be empty rather than narrow, which is a different verdict
+    reached for a different reason. Withholding the step is the one shape that
+    silences two channels and leaves the rest of the round untouched.
+
+    Patched at ``wiring.settle_measure_step`` and not at the workflow builder,
+    because the builder is what has to stay real: the surviving channels go
+    through the shipped step, the shipped tags, the shipped executor and the
+    shipped fitter.
+    """
+    silent = frozenset(int(ch) for ch in channels)
+    shipped = wiring.settle_measure_step
+
+    def build(channel: int, round_index: int, measurement: Any = None) -> Any:
+        if int(channel) in silent:
+            return None
+        return shipped(channel, round_index, measurement)
+
+    return build
 
 
 async def _drive(kind: str, project_dir: Path) -> Rehearsal:
@@ -298,6 +353,12 @@ async def _drive(kind: str, project_dir: Path) -> Rehearsal:
 
     store = DataStore(project_dir)
     events: list[dict[str, Any]] = []
+    # Undone in the `finally` below. A module-scoped fixture cannot take the
+    # `monkeypatch` fixture, which is function-scoped.
+    patched = pytest.MonkeyPatch()
+    if scenario["absent_channels"]:
+        patched.setattr(wiring, "settle_measure_step",
+                        _no_settle_sweep_for(scenario["absent_channels"]))
 
     def on_event(event: dict[str, Any]) -> None:
         events.append(event)
@@ -319,6 +380,7 @@ async def _drive(kind: str, project_dir: Path) -> Rehearsal:
                          calls=list(rig.calls), rows=rows,
                          settle_records=records, n_trials=result.n_trials)
     finally:
+        patched.undo()
         store.close()
         await manager.disconnect_all()
         MockRig.clear_designed_r1()
@@ -327,26 +389,29 @@ async def _drive(kind: str, project_dir: Path) -> Rehearsal:
 def _record_thickness_on_run_start(
     store: DataStore, run_id: str, channels: Sequence[int]
 ) -> None:
-    """Give the criterion a sigma to watch. **Not optional scaffolding.**
+    """Fill the profilometry rung, for every well on every board.
 
-    ``settle_round_fits`` reports ``sigma=None`` for any spectrum whose report
-    carries no conductivity, and conductivity needs a cell constant, which needs
-    a thickness. The campaign's own ladder has two rungs: ``measured_thickness``
-    (profilometry) and ``formulations.predicted_thickness_um`` (the deposition
-    twin). The twin only speaks for a *composition-mode* spec; on the raw-volume
-    axes used here it returns ``None``, so the row is NULL and withheld.
+    **It stopped being a precondition of the criterion at T11.33, and that is
+    worth stating rather than quietly deleting.** Until Design A,
+    ``settle_round_fits`` reported ``sigma=None`` for any spectrum whose report
+    carried no conductivity; conductivity needed a cell constant and a cell
+    constant needed a thickness. Without this writer every channel was excluded
+    ``sigma_null``, no board ever cleared ``settle_min_channels``, and **every
+    scenario reported ``not_evaluable``** — a module that looked like it tested
+    three outcomes while only one was reachable. Design A regresses ``1/R1``,
+    which needs no geometry, so none of that is true any more.
 
-    Every channel would then be excluded ``sigma_null``, the board would be
-    narrower than ``settle_min_channels``, and **every scenario would report
-    ``not_evaluable``** — a module that looks like it is testing three outcomes
-    while only one of them is reachable. So the profilometry rung is filled in
-    here, through the public writer and the real lookup, at ``run_started``
-    because that is the first moment the ``run_id`` exists.
+    What is still true is that the campaign's own thickness ladder does not
+    reach here by itself: its rungs are ``measured_thickness`` (profilometry)
+    and ``formulations.predicted_thickness_um`` (the deposition twin), and the
+    twin only speaks for a *composition-mode* spec — on the raw-volume axes used
+    here it returns ``None``. The row would be NULL, and the stored report's
+    sigma would come back ``unavailable`` with a ``sigma_mode`` saying so. That
+    is provenance this rehearsal wants to be realistic, not scaffolding a
+    verdict depends on, and it is written through the public writer at
+    ``run_started`` because that is the first moment the ``run_id`` exists.
 
-    It is also the **per-channel** lever the ``not_evaluable`` board uses. A
-    well with no thickness is excluded ``sigma_null`` every round, every time,
-    with no dependence on a fit landing where a test hoped — which is exactly
-    what the rail-by-apex route could not offer.
+    The unjudgeable board is forced elsewhere now: :func:`_no_settle_sweep_for`.
     """
     for channel in channels:
         store.record_thickness(int(channel), REHEARSAL_THICKNESS_UM,
@@ -485,9 +550,9 @@ def test_every_well_that_could_be_judged_was_counted_as_evidence(
     """All four wells vote, and the verdict says so rather than implying it.
 
     The complement of the ``not_evaluable`` board below: there, two wells are
-    withheld a thickness and are excluded by name. Here nothing is withheld, so
-    an exclusion of any kind would mean a quiet well silently stopped counting
-    — which is how a board narrows without anybody noticing.
+    never swept and are excluded by name. Here every well is swept, so an
+    exclusion of any kind would mean a quiet well silently stopped counting —
+    which is how a board narrows without anybody noticing.
     """
     verdict = settled_run.of_type("settle_verdict")[0]
     assert sorted(verdict["participating"]) == list(CHANNELS)
@@ -624,17 +689,26 @@ def test_a_drifting_board_runs_to_the_ceiling_without_parking_the_campaign(
 
 
 @pytest.mark.slow
-def test_two_wells_without_a_sigma_leave_the_criterion_unable_to_judge(
+def test_two_absent_wells_leave_the_criterion_unable_to_judge(
     not_evaluable_run: Rehearsal
 ):
     """*"Could not judge"* and *"judged, not settled"* want opposite actions.
 
     Two participants against ``settle_min_channels=3``: the phase runs to its
     ceiling and says it could not be evaluated, rather than reporting a drift it
-    never measured. The two silent wells carry no thickness, so they carry no
-    sigma — a real production state (an uncast or unmeasured well reaches the
-    criterion the same way), and the only one of the exclusion reasons this rig
-    can produce on demand.
+    never measured. The two silent wells get no settle sweep at all
+    (:func:`_no_settle_sweep_for`), so every round builds an all-``None``
+    ``RoundFit`` for them and the criterion reads that as ``absent`` — a real
+    production state (an unmeasured well, or a step that never completed,
+    reaches the criterion the same way), and the only exclusion reason this rig
+    can produce on demand now that ``1/R1`` needs no thickness.
+
+    **Scheduled rewrite, named here so it is not discovered as a red.** This
+    board leans on the board minimum, and T11.33 step 3 takes that off the
+    campaign path (``board_minimum=None``, judge per well). When it lands, two
+    absent wells of four will settle on the other two, and this scenario must
+    become *no judgeable well at all* — every channel absent — which is spec
+    section 7's test 17.
     """
     verdicts = not_evaluable_run.of_type("settle_verdict")
     assert len(verdicts) == 1
@@ -652,7 +726,7 @@ def test_two_wells_without_a_sigma_leave_the_criterion_unable_to_judge(
     # `settle.json` round-trips the mapping through JSON, so its keys are
     # strings; the event's are not. Compared as strings on both sides.
     excluded = {str(k): v for k, v in verdicts[0]["excluded"].items()}
-    assert excluded == {"23": EXCLUDED_SIGMA_NULL, "24": EXCLUDED_SIGMA_NULL}
+    assert excluded == {"23": EXCLUDED_ABSENT, "24": EXCLUDED_ABSENT}
     # Still recorded, and still not a reason to stop.
     assert not_evaluable_run.settle_records
     assert not not_evaluable_run.of_type("park")
