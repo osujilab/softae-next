@@ -2424,10 +2424,30 @@ def _excluded_round_word(entry: Any) -> str:
     :data:`CONSENSUS_ARC_STATE` **is** that string. So the reason is rebuilt from
     the entry's parts rather than edited, which is why ``ExcludedRound`` carries
     ``observed`` and ``consensus`` beside the prose.
-    """
-    from softae.analysis.equilibration import CONSENSUS_ARC_STATE
 
-    noun = "arc" if entry.kind == CONSENSUS_ARC_STATE else "masked-point band"
+    **One noun per kind, never a binary and an "everything else".** The same
+    assertion forbids ``sigma`` and ``fit``, and T11.32's two kinds are spelled
+    with both -- :data:`CONSENSUS_SIGMA_MODE` *is* ``sigma_mode``, and the
+    obvious English for :data:`CONSENSUS_QUALITY_VERDICT` is "fit grade" -- so
+    each needs a translated noun rather than merely a branch. The shape this
+    replaces was ``arc`` else ``masked-point band``, correct while
+    :data:`CONSENSUS_DROP_BUCKET` was the only other kind and silently wrong the
+    moment a third arrived. An unrecognised kind renders as the generic noun on
+    ``_exclusion_word``'s precedent: a catch-all that names a *specific* element
+    is exactly the defect above, and a future kind's own word may itself be a
+    forbidden substring.
+    """
+    from softae.analysis.equilibration import (
+        CONSENSUS_ARC_STATE,
+        CONSENSUS_DROP_BUCKET,
+        CONSENSUS_QUALITY_VERDICT,
+        CONSENSUS_SIGMA_MODE,
+    )
+
+    noun = {CONSENSUS_ARC_STATE: "arc",
+            CONSENSUS_DROP_BUCKET: "masked-point band",
+            CONSENSUS_SIGMA_MODE: "estimate mode",
+            CONSENSUS_QUALITY_VERDICT: "quality grade"}.get(entry.kind, "shape")
     return f"{noun} {entry.observed} vs consensus {entry.consensus}"
 
 

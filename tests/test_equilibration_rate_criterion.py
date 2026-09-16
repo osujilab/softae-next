@@ -32,14 +32,20 @@ import pytest
 
 from softae.analysis.equilibration import (
     DEFAULT_SETTLE_MIN_FIT_POINTS,
+    EXCLUDED_ABSENT,
+    EXCLUDED_RAILED,
     EXCLUDED_SIGMA_NULL,
     EXCLUDED_UNSETTLEABLE,
     RATE_MOVING,
     RATE_SPAN_TOO_SHORT,
     RATE_TOO_FEW_POINTS,
     RATE_UNDETECTABLE,
+    SETTLE_CEILING,
     SETTLE_CONSENSUS_DROP_BUCKET,
     SETTLE_MIN_FIT_POINTS,
+    SETTLE_NOT_EVALUABLE,
+    SETTLE_SETTLED,
+    WELL_FIT_FAILED,
     RoundFit,
     SettleTracker,
     channel_noise_floors,
@@ -390,7 +396,12 @@ class TestRefusals:
                          # A switch for the consensus rule, and it names no
                          # target either: the shape it compares is the WINDOW's
                          # own mode, so this stays a series compared to itself.
-                         "consensus_exclude"}
+                         "consensus_exclude",
+                         # T11.33's policy. A COUNT of participating wells, and
+                         # `None` for no count at all -- a statement about how
+                         # wide the board must be, never about where any PV
+                         # should be. The prohibition is untouched by it.
+                         "board_minimum"}
         for forbidden in ("setpoint", "target", "command", "_pv", "pv_"):
             assert not any(forbidden in name for name in names), forbidden
 
@@ -1075,3 +1086,659 @@ class TestPhysicalConsensus:
         # the certifying sentence may quote.
         assert check.max_upper_bound_per_hour > certifying
         assert f"{check.max_upper_bound_per_hour:.4f} ln/h is" not in check.reason
+
+
+# ── T11.32: one round the fitter would not speak for is a ROUND, not a well ───
+
+
+def _graded(series: dict[int, list[float]],
+            verdicts: dict[int, list[str]] | None = None,
+            modes: dict[int, list[str]] | None = None,
+            states: dict[int, list[str]] | None = None):
+    """`_shaped`, plus the two provenance words -- and the sigma that follows.
+
+    A round whose verdict is anything but `ok` or `""`, or whose mode is anything
+    but `value` or `""`, carries `sigma=None` beside an INTACT `r1_ohms`. That is
+    not a fixture convenience: it is exactly what `_report_sigma` hands the
+    tracker for a REJECT-graded or a bounded report (`autonomous_wiring.py`), and
+    the one shape the round-level forgiveness exists for. A round with no R1
+    either is genuine ABSENCE and is a different test.
+    """
+    rounds = max(len(values) for values in series.values())
+    window = []
+    for i in range(rounds):
+        row = []
+        for ch, values in sorted(series.items()):
+            verdict = (verdicts or {}).get(ch, [""] * rounds)[i]
+            mode = (modes or {}).get(ch, [""] * rounds)[i]
+            usable = verdict in ("", "ok") and mode in ("", "value")
+            row.append(RoundFit(
+                channel=ch, sigma=(1.0 / values[i]) if usable else None,
+                r1_ohms=values[i],
+                arc_state=(states or {}).get(ch, ["closed"] * rounds)[i],
+                n_points_dropped=0, sigma_mode=mode, quality_verdict=verdict))
+        window.append(row)
+    return window
+
+
+def _one_round(index: int, word: str, otherwise: str,
+               n: int = ARMED_WINDOW) -> list[str]:
+    return [word if i == index else otherwise for i in range(n)]
+
+
+class TestForgivableRound:
+    """Rung-3a ch13 and ch22, as the two shapes that cost seven rounds each.
+
+    ch13 had ONE round whose sigma came back a bound and was whole-channel-
+    excluded for it r10-r16; ch22 had a CONVERGED fit graded `reject` on a 16.8 %
+    residual against a 15 % threshold. Both are "the fit ran and reported, and
+    declined to speak for the number" -- which is a fact about one round, and was
+    being spent as a fact about the well. Participation fell to 2 against a
+    minimum of 3 on a board whose R1 was moving smoothly the whole time.
+
+    The budget is unchanged: at most ONE round per channel per window, shared
+    across all four elements of the shape.
+    """
+
+    FORGIVEN_ROUND = 2
+
+    def _board(self, verdicts=None, modes=None, states=None):
+        quiet = _quiet_r1(ARMED_WINDOW)
+        return _graded({18: list(quiet), 19: list(quiet), 20: list(quiet)},
+                       verdicts=verdicts, modes=modes, states=states)
+
+    def test_rate_check_drops_one_reject_graded_round_not_the_channel(self):
+        """ch22's shape. The whole deliverable on the legacy settle route, where
+        `grade_fit`'s residual REJECT is enforced unconditionally and is
+        therefore the DISCRIMINATING axis -- there is no bound mode to read.
+        """
+        window = self._board(
+            verdicts={18: _one_round(self.FORGIVEN_ROUND, "reject", "ok")})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3)
+
+        assert 18 not in check.excluded
+        assert check.quiet == [18, 19, 20] and check.settled is True
+        assert [(e.channel, e.round_index, e.reason)
+                for e in check.excluded_rounds] == [
+            (18, self.FORGIVEN_ROUND,
+             "quality_verdict reject vs consensus ok")]
+        # Six points regressed, not seven: the round left with its time point.
+        assert check.by_channel[18].n_points == ARMED_WINDOW - 1
+
+    def test_the_same_reject_graded_board_without_the_rule_loses_the_channel(
+            self):
+        """**The positive control.** Identical window, rule disarmed -- and the
+        pre-T11.32 verdict is what comes back: one round with no usable sigma
+        takes the whole channel, the board falls under its minimum, and the
+        phase runs to its ceiling. If this ever goes green the forgiveness has
+        stopped being what makes the test above certify.
+        """
+        window = self._board(
+            verdicts={18: _one_round(self.FORGIVEN_ROUND, "reject", "ok")})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3,
+                           consensus_exclude=False)
+
+        assert check.excluded[18] == EXCLUDED_SIGMA_NULL
+        assert check.participating == [19, 20]
+        assert check.evaluable is False and check.settled is False
+
+    def test_rate_check_drops_one_bound_mode_round_not_the_channel(self):
+        """ch13's shape, kept as a regression guard even though T11.15 made it
+        structurally unreachable on the campaign's settle feeder: the legacy
+        engine builds only `unavailable` or `value`. `eis-validate`'s gated
+        path, and any campaign path that re-admits bound mode, still produce it.
+        """
+        window = self._board(
+            modes={18: _one_round(self.FORGIVEN_ROUND, "bound", "value")})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3)
+
+        assert 18 not in check.excluded and check.settled is True
+        assert [(e.channel, e.round_index, e.kind, e.reason)
+                for e in check.excluded_rounds] == [
+            (18, self.FORGIVEN_ROUND, "sigma_mode",
+             "sigma_mode bound vs consensus value")]
+
+    def test_rate_check_two_forgivable_rounds_still_excludes_the_channel(self):
+        """The budget, asserted as the thing it refuses.
+
+        One round on each axis -- one `reject`, one `bound` -- is TWO
+        disagreements out of a budget of one, and `rate_window_rounds = 7` can
+        only pay for one drop before the regression falls under
+        `min_fit_points`. Two is not an outlier; it is a channel that is not
+        consensus-stable, and it goes whole, exactly as it did before T11.32.
+        """
+        window = self._board(
+            verdicts={18: _one_round(2, "reject", "ok")},
+            modes={18: _one_round(4, "bound", "value")})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3)
+
+        assert check.excluded[18] == EXCLUDED_SIGMA_NULL
+        assert check.excluded_rounds == []
+        assert check.participating == [19, 20] and check.evaluable is False
+
+    def test_rate_check_one_absent_round_not_forgiven_by_consensus(self):
+        """Absence is not forgivable, and this is the fixture that separates it.
+
+        The placeholder `_window_series` inserts for a missing channel carries no
+        `arc_state`, so it IS a lone shape outlier and consensus would drop it if
+        it were ever asked. It must not be: a round that never ran and a fit that
+        declined to speak send an operator to different places, and folding the
+        first into a budget sized for the second spends a whole round's missing
+        evidence on nothing.
+        """
+        window = self._board()
+        window[self.FORGIVEN_ROUND] = [
+            fit for fit in window[self.FORGIVEN_ROUND] if fit.channel != 18]
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3)
+
+        assert check.excluded[18] == EXCLUDED_ABSENT
+        assert check.excluded_rounds == []
+        assert check.participating == [19, 20]
+
+    def test_rate_check_reject_and_arc_shape_share_one_budget(self):
+        """One round, two divergent elements, ONE drop -- the shared 4-tuple.
+
+        A round taken mid-transient opens the arc and grades `reject` for the
+        same reason, and counting that as two disagreements would exclude the
+        channel for being consistent with itself. The kind reported is the
+        element nearest the spectrum, which is the tuple's own order.
+        """
+        window = self._board(
+            verdicts={18: _one_round(self.FORGIVEN_ROUND, "reject", "ok")},
+            states={18: _one_open_round(self.FORGIVEN_ROUND)})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3)
+
+        assert [(e.channel, e.round_index, e.kind)
+                for e in check.excluded_rounds] == [
+            (18, self.FORGIVEN_ROUND, "arc_state")]
+        assert check.by_channel[18].n_points == ARMED_WINDOW - 1
+        assert check.settled is True
+
+    def test_a_second_problem_among_the_survivors_still_takes_the_channel(self):
+        """The forgiveness buys ONE round, and the gate then runs on what is
+        left. A railed R1 among the surviving six is still a railed channel."""
+        quiet = _quiet_r1(ARMED_WINDOW)
+        railed = list(quiet)
+        railed[5] = 1.0e-2
+        window = _graded({18: railed, 19: list(quiet), 20: list(quiet)},
+                         verdicts={18: _one_round(2, "reject", "ok")})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3,
+                           r1_bound_ohms=1.0e-2)
+
+        assert check.excluded[18] == EXCLUDED_RAILED
+        assert check.excluded_rounds == []
+
+    def test_a_quality_verdict_alone_makes_the_rule_available(self):
+        """`SUBAGENT_RULES.md` §3.1(a), widened with the tuple.
+
+        `consensus_unavailable` asks whether the feeder shipped its half, and
+        after T11.32 the shape has three words in it rather than one. A feeder
+        that records a verdict and no `arc_state` HAS answered; reading only
+        `arc_state` would call that window unaskable and silently decline to
+        forgive anything on it.
+        """
+        blank = [""] * ARMED_WINDOW
+        window = self._board(
+            verdicts={18: _one_round(self.FORGIVEN_ROUND, "reject", "ok")},
+            states={ch: list(blank) for ch in (18, 19, 20)})
+
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3)
+
+        assert check.consensus_unavailable is False
+        assert [(e.channel, e.round_index) for e in check.excluded_rounds] == [
+            (18, self.FORGIVEN_ROUND)]
+
+    def test_settle_check_is_untouched_by_the_round_level_forgiveness(self):
+        """T11.32 is scoped to `rate_check`. The deviation criterion has no
+        per-round-drop mechanism, was named in neither ruling, and a bound round
+        reaching it is a separate, open question -- flagged rather than silently
+        decided. So the SAME window the rate criterion now forgives must still
+        cost the deviation criterion the whole channel.
+        """
+        window = self._board(
+            verdicts={18: _one_round(self.FORGIVEN_ROUND, "reject", "ok")})
+        check = settle_check(window, tol_rel=0.10, min_channels=3)
+
+        assert check.excluded[18] == EXCLUDED_SIGMA_NULL
+        assert check.participating == [19, 20]
+        assert check.evaluable is False
+
+
+# ── T11.33: no board minimum, and a word for every well ──────────────────────
+#
+# Operator ruling 2026-09-16 (`[a282]`), on an autonomous optimization run:
+#
+#   "it is important to follow through regardless of participating well count
+#    and extract the highest fidelity information on each well to feed back to
+#    the optimizer. Therefore, this constraint needs to be removed, each
+#    individual well valued equally, and proper handling of its state relayed
+#    faithfully to the autonomous machinery."
+#
+# Two halves, and they are one parameter. `board_minimum=None` takes the count
+# gate off AND replaces `len(quiet) >= needed` with the early-stop rule ruled in
+# `[a289]` -- no well moving, no well still resolving, at least one well quiet.
+# `WellVerdict` is the "relayed faithfully" half: a word, a slope and a bound for
+# every well on the board, including the ones nothing could be said about.
+#
+# Every fixture below is a FOUR-well board, because four is what the campaign
+# runs and three was the old minimum -- so a four-well board is exactly where a
+# count gate and a per-well rule give different answers.
+
+
+def _campaign_board(series: dict[int, list[float]], absent: tuple[int, ...] = ()):
+    """*series* wells that were measured, *absent* wells that never swept.
+
+    Absence is spelled as a `RoundFit` with no sigma and no R1 in every round --
+    which is what `_window_series` inserts for a channel missing from a round,
+    and what the campaign feeder writes for a channel whose sweep never
+    completed. The well is on the board, and that is the point: a well the
+    criterion cannot speak for must still leave the phase with a word.
+    """
+    rounds = []
+    for i in range(ARMED_WINDOW):
+        row = [RoundFit(channel=ch, sigma=1.0 / values[i], r1_ohms=values[i])
+               for ch, values in series.items()]
+        row += [RoundFit(channel=ch) for ch in absent]
+        rounds.append(sorted(row, key=lambda fit: fit.channel))
+    return rounds
+
+
+class TestNoBoardMinimum:
+    """The count gate, off -- and what takes its place."""
+
+    def test_rate_check_two_quiet_wells_of_four_settle_the_board(self):
+        """The ruling, in one assertion. Two absent wells used to take a
+        four-well board under `min_channels=3` to its ceiling every trial; now
+        the two that reported are judged on their own evidence and certify.
+        """
+        window = _campaign_board({1: _quiet_r1(ARMED_WINDOW),
+                                  2: _quiet_r1(ARMED_WINDOW)}, absent=(3, 4))
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, board_minimum=None)
+
+        assert check.settled is True and check.evaluable is True
+        assert check.quiet == [1, 2]
+        assert check.excluded == {3: EXCLUDED_ABSENT, 4: EXCLUDED_ABSENT}
+
+    def test_rate_check_the_same_board_still_refuses_under_an_int_minimum(self):
+        """**The positive control**, and the regression guard for the two tool
+        paths the ruling did not touch. The identical window under
+        `min_channels=3` must come back exactly as it does today: two
+        participants, not evaluable, run to the ceiling. If this ever goes green
+        the policy has stopped being a policy.
+        """
+        window = _campaign_board({1: _quiet_r1(ARMED_WINDOW),
+                                  2: _quiet_r1(ARMED_WINDOW)}, absent=(3, 4))
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3)
+
+        assert check.participating == [1, 2]
+        assert check.evaluable is False and check.settled is False
+        assert "< 3 required" in check.reason
+
+    def test_rate_check_one_moving_well_holds_the_board(self):
+        """The clause that survives the ruling untouched. `rate_moving` is the
+        one refusal that is evidence about the SAMPLE, so three quiet wells
+        cannot outvote it -- the board is still conditioning.
+        """
+        window = _campaign_board({1: _quiet_r1(ARMED_WINDOW),
+                                  2: _quiet_r1(ARMED_WINDOW),
+                                  3: _quiet_r1(ARMED_WINDOW),
+                                  4: _decaying_transient_r1(ARMED_WINDOW)})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, board_minimum=None)
+
+        assert check.moving == [4] and check.settled is False
+        assert check.quiet == [1, 2, 3]
+        assert check.by_well[4].word == RATE_MOVING
+        # Recorded even under the refusal: the slope is what T11.17 wants on the
+        # row, and "how fast was it moving when we stopped waiting?" is a
+        # question a refusal does not answer.
+        assert check.by_well[4].rate_per_hour < 0.0
+
+    def test_rate_check_one_undetectable_well_holds_the_board(self):
+        """The clause the cheaper rule (`quiet >= 1 and moving == []`) would
+        have dropped. A well too noisy to judge at this tolerance is still
+        RESOLVING -- more rounds is exactly what it asks for -- so stopping now
+        would spend the hold on three wells and abandon the fourth.
+        """
+        window = _campaign_board({1: _quiet_r1(ARMED_WINDOW),
+                                  2: _quiet_r1(ARMED_WINDOW),
+                                  3: _quiet_r1(ARMED_WINDOW),
+                                  4: _flat_and_noisy_r1(ARMED_WINDOW)})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, board_minimum=None)
+
+        assert check.undetectable == [4] and check.settled is False
+        assert check.quiet == [1, 2, 3]
+        assert "still resolving" in check.reason and "ch4" in check.reason
+        # Still EVALUABLE: ch4 produced a rate estimate, it just could not be
+        # certified. The board word is `ceiling`, never `not_evaluable`.
+        assert check.evaluable is True
+
+    def test_rate_check_one_unsettleable_well_does_not_hold_the_board(self):
+        """The asymmetry, and it is the whole reason the rule names two classes
+        rather than one. The SAME noisy well, now given a relative tolerance its
+        own residual cannot meet: no hold length can ever certify it, so waiting
+        for it is a hold spent on nothing and the board stops.
+        """
+        window = _campaign_board({1: _quiet_r1(ARMED_WINDOW),
+                                  2: _quiet_r1(ARMED_WINDOW),
+                                  3: _quiet_r1(ARMED_WINDOW),
+                                  4: _flat_and_noisy_r1(ARMED_WINDOW)})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, tol_rel=0.10,
+                           board_minimum=None)
+
+        assert check.unsettleable == [4] and check.settled is True
+        assert check.by_well[4].word == EXCLUDED_UNSETTLEABLE
+        # It neither blocked nor certified: the certificate is quoted over the
+        # wells that were quiet, and ch4 is not one of them.
+        assert check.quiet == [1, 2, 3]
+
+    def test_rate_check_board_minimum_none_never_reports_not_evaluable_on_count(
+            self):
+        """One well is a board. `not_evaluable` is reserved for a board where
+        NOTHING could be judged, and a count is no longer one of the ways to get
+        there -- which is delta 2 of the spec, stated as the pair.
+        """
+        window = _campaign_board({1: _quiet_r1(ARMED_WINDOW)},
+                                 absent=(2, 3, 4))
+        times = _times(ARMED_WINDOW)
+
+        alone = rate_check(window, times, tol_per_hour=RATE_TOL_LN_PER_H,
+                           board_minimum=None)
+        assert alone.evaluable is True and alone.settled is True
+        assert "required" not in alone.reason
+
+        counted = rate_check(window, times, tol_per_hour=RATE_TOL_LN_PER_H,
+                             min_channels=3)
+        assert counted.evaluable is False
+
+    def test_rate_check_a_board_with_no_judgeable_well_is_still_not_evaluable(
+            self):
+        """The floor under the ruling. Removing the count gate does not make an
+        empty board evaluable -- and every well still leaves with its word, which
+        is what makes that verdict attributable instead of a bare refusal.
+        """
+        window = [[RoundFit(channel=ch) for ch in (1, 2, 3, 4)]
+                  for _ in range(ARMED_WINDOW)]
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, board_minimum=None)
+
+        assert check.evaluable is False and check.settled is False
+        assert {ch: verdict.word for ch, verdict in check.by_well.items()} == {
+            ch: EXCLUDED_ABSENT for ch in (1, 2, 3, 4)}
+
+
+class TestTooFewPointsSplits:
+    """`[a289]`'s refinement, which is a distinction between two shortfalls.
+
+    A well short of points because the WINDOW has not filled is still resolving
+    and holds the board. A well short because ITS OWN rounds went missing is
+    not, and must not be -- otherwise a well whose sweeps keep failing reports
+    `rate_too_few_points` on every window for the life of the run, no board ever
+    stops early, and every trial spends its whole `max_hold_s` on a heater-only
+    rig whose post-anneal descent is already the rate limiter.
+    """
+
+    def test_rate_check_a_short_window_holds_the_board(self):
+        """The blocking half. Every well counted every round and is STILL short,
+        so the shortfall belongs to the observation and more rounds fix it.
+        """
+        window = _campaign_board({1: _quiet_r1(ARMED_WINDOW),
+                                  2: _quiet_r1(ARMED_WINDOW),
+                                  3: _quiet_r1(ARMED_WINDOW)})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H,
+                           min_fit_points=ARMED_WINDOW + 2, board_minimum=None)
+
+        assert check.settled is False
+        assert "still resolving" in check.reason
+        assert RATE_TOO_FEW_POINTS in check.reason
+        assert check.by_well[1].n_points == ARMED_WINDOW
+
+    def test_rate_check_a_well_short_of_its_own_rounds_does_not_hold_the_board(
+            self):
+        """The non-blocking half, on the fixture T11.32 built: ch18 spends the
+        consensus rule's forgiven round and regresses on six points while its
+        neighbours regress on seven. At `min_fit_points=7` that is a shortfall
+        of ch18's own making, so the two wells that CAN be judged certify and
+        the board stops instead of holding for a round ch18 will never gain.
+        """
+        window = _graded(
+            {18: _quiet_r1(ARMED_WINDOW), 19: _quiet_r1(ARMED_WINDOW),
+             20: _quiet_r1(ARMED_WINDOW)},
+            verdicts={18: _one_round(2, "reject", "ok")})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H,
+                           min_fit_points=ARMED_WINDOW, board_minimum=None)
+
+        assert check.by_well[18].word == RATE_TOO_FEW_POINTS
+        assert check.by_well[18].n_points == ARMED_WINDOW - 1
+        assert check.quiet == [19, 20] and check.settled is True
+
+
+class TestWellVerdict:
+    """A word, a slope and a bound for every well -- design C."""
+
+    def test_rate_check_reports_a_verdict_for_every_well_including_absent_ones(
+            self):
+        """`by_well` covers the BOARD and not the participants. The four lists
+        beside it name the wells that fell into each bucket; a well that fell
+        into none of them -- absent, or whose fit never converged -- left no
+        trace at all before this, which is what "every well followed through"
+        is named for.
+        """
+        quiet = _quiet_r1(ARMED_WINDOW)
+        window = _graded({1: list(quiet),
+                          2: _decaying_transient_r1(ARMED_WINDOW),
+                          3: list(quiet)},
+                         verdicts={3: ["reject"] * ARMED_WINDOW})
+        window = [row + [RoundFit(channel=4)] for row in window]
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, board_minimum=None)
+
+        assert {ch: verdict.word for ch, verdict in check.by_well.items()} == {
+            1: SETTLE_SETTLED, 2: RATE_MOVING,
+            3: WELL_FIT_FAILED, 4: EXCLUDED_ABSENT}
+        # The word is re-spelled for the operator; the reason keeps the token
+        # `RateCheck.excluded` and every stored run already use, so the two
+        # records still join.
+        assert check.excluded[3] == EXCLUDED_SIGMA_NULL
+        assert EXCLUDED_SIGMA_NULL in check.by_well[3].reason
+
+    def test_rate_check_carries_the_slope_and_bound_of_a_well_that_did_not_certify(
+            self):
+        """T11.17, as the thing a refusal does not excuse. A well that came back
+        `rate_undetectable` still measured a slope, and the optimizer's record
+        wants it -- the decision to WEIGHT anything by certification is a
+        separate ruling, and it can only be made on evidence that was kept.
+        """
+        window = _campaign_board({1: _quiet_r1(ARMED_WINDOW),
+                                  2: _quiet_r1(ARMED_WINDOW),
+                                  3: _quiet_r1(ARMED_WINDOW),
+                                  4: _flat_and_noisy_r1(ARMED_WINDOW)})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, board_minimum=None)
+
+        noisy = check.by_well[4]
+        assert noisy.word == RATE_UNDETECTABLE
+        for value in (noisy.rate_per_hour, noisy.upper_bound_per_hour,
+                      noisy.stderr_per_hour, noisy.resid_rel):
+            assert value is not None and np.isfinite(value)
+        assert noisy.span_s == pytest.approx(_times(ARMED_WINDOW)[-1])
+
+    def test_rate_check_one_reject_graded_round_is_forgiven_once_and_counted(
+            self):
+        """The two halves of the same round, and they must not collapse. The
+        consensus rule FORGIVES it -- ch18 keeps its place in the window -- and
+        `quality_rejects` COUNTS it, so a well carried by forgiveness is not
+        indistinguishable from one that never needed any.
+        """
+        window = _graded(
+            {18: _quiet_r1(ARMED_WINDOW), 19: _quiet_r1(ARMED_WINDOW),
+             20: _quiet_r1(ARMED_WINDOW)},
+            verdicts={18: _one_round(2, "reject", "ok")})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, board_minimum=None)
+
+        verdict = check.by_well[18]
+        assert verdict.word == SETTLE_SETTLED and check.settled is True
+        assert verdict.quality_rejects == 1
+        assert verdict.forgiven_round is not None
+        assert verdict.forgiven_round.round_index == 2
+        assert check.by_well[19].quality_rejects == 0
+        assert check.by_well[19].forgiven_round is None
+
+    def test_rate_check_two_reject_graded_rounds_still_exclude_the_channel(self):
+        """The budget, unchanged by the ruling. Two disagreements is not an
+        outlier, so ch18 goes whole -- and under `board_minimum=None` that costs
+        the BOARD nothing: `fit_failed` carries no information, so it neither
+        blocks nor certifies, and its two neighbours certify on their own.
+        """
+        window = _graded(
+            {18: _quiet_r1(ARMED_WINDOW), 19: _quiet_r1(ARMED_WINDOW),
+             20: _quiet_r1(ARMED_WINDOW)},
+            verdicts={18: ["reject" if i in (2, 4) else "ok"
+                           for i in range(ARMED_WINDOW)]})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, board_minimum=None)
+
+        assert check.excluded[18] == EXCLUDED_SIGMA_NULL
+        assert check.excluded_rounds == []
+        assert check.by_well[18].word == WELL_FIT_FAILED
+        assert check.by_well[18].quality_rejects == 2
+        assert check.by_well[18].rate_per_hour is None
+        assert check.quiet == [19, 20] and check.settled is True
+
+    def test_rate_check_carries_the_last_sigma_mode_a_well_recorded(self):
+        """Provenance, and the absence it must not be confused with. The
+        placeholder round for a channel that missed one carries `""` = never
+        asked; letting it overwrite a mode the well DID report would spell an
+        absence with the token for an answer.
+        """
+        window = _graded(
+            {18: _quiet_r1(ARMED_WINDOW), 19: _quiet_r1(ARMED_WINDOW),
+             20: _quiet_r1(ARMED_WINDOW)},
+            modes={18: _one_round(2, "bound", "value")})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, board_minimum=None)
+
+        assert check.by_well[18].sigma_mode == "value"
+        assert check.by_well[18].forgiven_round.kind == "sigma_mode"
+
+    def test_rate_check_by_well_omits_a_participant_no_verdict_was_reached_on(
+            self):
+        """`SUBAGENT_RULES.md` §3.1(a), pointed at the new field.
+
+        A window an int `board_minimum` refuses on its COUNT has participants
+        that were never judged, and no word in the vocabulary is true of them:
+        they are not settled, not moving, not resolving and not excluded. So
+        they get no entry rather than a word somebody invented. The wells that
+        WERE excluded still carry theirs, because that is a fact the window
+        established before the count gate fired.
+
+        Under `board_minimum=None` this branch is reachable only with no
+        participants at all, so `by_well` is complete on the campaign path.
+        """
+        window = _campaign_board({1: _quiet_r1(ARMED_WINDOW),
+                                  2: _quiet_r1(ARMED_WINDOW)}, absent=(3, 4))
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3)
+
+        assert check.participating == [1, 2]
+        assert {ch: verdict.word for ch, verdict in check.by_well.items()} == {
+            3: EXCLUDED_ABSENT, 4: EXCLUDED_ABSENT}
+
+
+class TestBoardMinimumPolicyReachesBothCriteria:
+    """One policy, two criteria, and three construction sites."""
+
+    def test_settle_check_board_minimum_none_judges_one_participant(self):
+        """The deviation criterion gains the policy and NOTHING else: its
+        settled decision is already per channel and aggregates with `max`, so
+        one participant is judged by exactly the rule fifteen would have been.
+        """
+        window = _campaign_board({1: _quiet_r1(ARMED_WINDOW)},
+                                 absent=(2, 3, 4))
+
+        assert settle_check(window, tol_rel=0.10, board_minimum=None).settled
+        assert settle_check(window, tol_rel=0.10,
+                            min_channels=3).evaluable is False
+
+    def test_settle_check_board_minimum_none_still_refuses_an_empty_board(self):
+        """`max` over no participants is not a settled board, it is an
+        exception -- and an empty board is an absence of evidence under every
+        reading of the ruling.
+        """
+        window = [[RoundFit(channel=ch) for ch in (1, 2)]
+                  for _ in range(ARMED_WINDOW)]
+        check = settle_check(window, tol_rel=0.10, board_minimum=None)
+
+        assert check.evaluable is False and check.settled is False
+
+    def test_settle_tracker_board_minimum_defaults_to_min_channels(self):
+        """Backward compatibility, asserted rather than assumed. Twelve
+        references in `eis_validate_hold.py` and a hardware-actuating CLI in
+        `workflows/equilibration.py` construct this without the parameter, and
+        the ruling is scoped away from both.
+        """
+        assert SettleTracker(min_channels=4).board_minimum == 4
+        assert SettleTracker(min_channels=4,
+                             board_minimum=None).board_minimum is None
+        assert SettleTracker(min_channels=4, board_minimum=1).board_minimum == 1
+
+    def test_settle_tracker_board_minimum_none_settles_a_two_well_board_on_rate(
+            self):
+        """End to end through the tracker, on the criterion the campaign routes
+        on. Two quiet wells of four over seven rounds: settled under the policy,
+        and the identical stream is not evaluable without it.
+        """
+        window = _campaign_board({1: _quiet_r1(ARMED_WINDOW),
+                                  2: _quiet_r1(ARMED_WINDOW)}, absent=(3, 4))
+        times = _times(ARMED_WINDOW)
+
+        def run(**policy):
+            tracker = SettleTracker(
+                criterion="rate", rate_tol_per_hour=RATE_TOL_LN_PER_H,
+                tol_rel=0.10, min_channels=3, **policy)
+            for fits, t_s in zip(window, times):
+                tracker.observe(fits, t_s=t_s)
+            return tracker
+
+        assert run(board_minimum=None).settled is True
+        assert run().settled is False
+
+    def test_settle_tracker_board_minimum_none_separates_ceiling_from_not_evaluable(
+            self):
+        """The board word, which is what `ever_evaluable` carries. A board whose
+        only well is too noisy to judge ran to its CEILING -- the criterion was
+        evaluable and said no. A board where nothing swept at all is
+        `not_evaluable`, and after this ruling that is the only way to get there.
+        """
+        times = _times(ARMED_WINDOW)
+
+        def run(window):
+            tracker = SettleTracker(
+                criterion="rate", rate_tol_per_hour=RATE_TOL_LN_PER_H,
+                min_channels=3, board_minimum=None)
+            for fits, t_s in zip(window, times):
+                tracker.observe(fits, t_s=t_s)
+            return tracker.outcome(stopped_early=False)
+
+        noisy = _campaign_board({1: _flat_and_noisy_r1(ARMED_WINDOW)},
+                                absent=(2, 3, 4))
+        nothing = [[RoundFit(channel=ch) for ch in (1, 2, 3, 4)]
+                   for _ in range(ARMED_WINDOW)]
+
+        assert run(noisy) == SETTLE_CEILING
+        assert run(nothing) == SETTLE_NOT_EVALUABLE

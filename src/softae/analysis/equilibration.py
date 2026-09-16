@@ -73,6 +73,7 @@ from softae.analysis.conditions import (
     combine_temperature_sources,
     resolve_temperature_C,
 )
+from softae.analysis.quality import Verdict
 from softae.errors import AnalysisError
 
 logger = structlog.get_logger(__name__)
@@ -1023,6 +1024,19 @@ DEFAULT_SETTLE_N_ROUNDS = 3
 #: Below this many participating channels the window is not evidence, and the
 #: setpoint runs to its ceiling instead of "settling" on one channel's opinion.
 DEFAULT_SETTLE_MIN_CHANNELS = 3
+
+#: *"The caller never mentioned a board minimum"*, told apart from *"the caller
+#: asked for no board minimum at all"*. The two want opposite behaviour and
+#: ``None`` already spells the second, so the default cannot also be ``None``.
+#:
+#: The operator's 2026-09-16 ruling (`[a282]`, T11.33) takes the board-level
+#: participating-well minimum **off the autonomous campaign path** — "each
+#: individual well valued equally" — and leaves it on the two tool paths
+#: (`eis_validate_hold.py`, `workflows/equilibration.py`), which are validation
+#: runs and not optimisation runs. So it is a **policy** and not a deletion:
+#: ``board_minimum=None`` judges per well, an int refuses below it, and a caller
+#: that has never heard of the parameter keeps :attr:`min_channels` exactly.
+_BOARD_MINIMUM_UNSET: Any = object()
 #: ~3 τ at the session's first setpoint (τ = 425–575 s measured, films drying
 #: from ambient to 15 %RH). The first setpoint carries essentially the whole
 #: transient, so it gets its own floor.
@@ -1143,15 +1157,28 @@ SETTLE_CONSENSUS_DROP_BUCKET = 5
 #: survivors mechanism, which already has a word for it.
 SETTLE_CONSENSUS_MAX_EXCLUDED = 1
 
-#: Which half of the shape disagreed. Carried as a word beside the rendered
+#: Which element of the shape disagreed. Carried as a word beside the rendered
 #: reason so a narrator can re-render it in its own vocabulary without parsing
 #: prose — the ``_exclusion_word`` precedent, one level down.
 CONSENSUS_ARC_STATE = "arc_state"
 CONSENSUS_DROP_BUCKET = "drop_bucket"
-#: How an absent half of the shape is rendered in a reason. ``arc_state`` is
+#: The two provenance elements T11.32 added to the shape. A round whose σ came
+#: back a *bound* rather than a value, or whose fit graded ``reject``, is a round
+#: the fitter itself declined to speak for — the same claim ``arc_state`` makes
+#: about the spectrum, one level up — so it shares the shape tuple and therefore
+#: the **one round per channel per window** budget rather than getting its own.
+CONSENSUS_SIGMA_MODE = "sigma_mode"
+CONSENSUS_QUALITY_VERDICT = "quality_verdict"
+#: How an absent element of the shape is rendered in a reason. ``arc_state`` is
 #: ``""`` on a feeder that never asked, and a reason reading "arc_state  vs
 #: consensus closed" would lose the distinction in whitespace.
 CONSENSUS_UNRECORDED = "unrecorded"
+#: The kinds, **in :func:`_fit_shape`'s own tuple order**. The pairing is
+#: positional, so the two must be edited together; a kind list out of step with
+#: the tuple would label every exclusion with the wrong neighbour's word and
+#: nothing would go red.
+_CONSENSUS_KINDS = (CONSENSUS_ARC_STATE, CONSENSUS_DROP_BUCKET,
+                    CONSENSUS_SIGMA_MODE, CONSENSUS_QUALITY_VERDICT)
 
 # ── Which criterion a tracker gates on ───────────────────────────────────────
 #
@@ -1282,6 +1309,30 @@ class RoundFit:
     #: "unknown" must not be spelled with the token for "asked, and none"
     #: (``SUBAGENT_RULES.md`` §3.1(a)).
     n_points_dropped: int | None = None
+    #: ``SigmaReport.mode`` this round's σ came from — ``value`` / ``bound`` /
+    #: ``bound_unqualified`` / ``unavailable`` — and ``""`` on a feeder that
+    #: never asked, on ``basis``' stated precedent. A bound is a legitimate
+    #: scientific result and *not* a number, so the σ beside it is ``None``
+    #: either way; this field is the only thing that says which of the two
+    #: ``None``\ s it was.
+    #:
+    #: Structurally unreachable as ``bound`` on the campaign's settle feeder
+    #: today — T11.15 routes it through the legacy engine, which builds only
+    #: ``unavailable`` or ``value`` — and kept for provenance and for the feeders
+    #: that can still produce it (``eis-validate``'s gated-engine path, or a
+    #: campaign path that later re-admits bound mode).
+    sigma_mode: str = ""
+    #: ``report.quality.verdict`` verbatim, and ``""`` on a feeder that never
+    #: asked. Spelled apart from :attr:`sigma_mode` because the two answer
+    #: different questions and the discriminating one differs by route: on the
+    #: legacy settle feeder ``grade_fit``'s residual ``reject`` is enforced
+    #: unconditionally, so a *converged* fit with a good-looking σ can still be
+    #: a round the fitter declined to speak for, and no σ label records that.
+    #:
+    #: Both default ``""`` = "never asked", never "asked and got nothing" — a
+    #: feeder that has not shipped its half must not be readable as a clean
+    #: board (``SUBAGENT_RULES.md`` §3.1(a)).
+    quality_verdict: str = ""
 
 
 @dataclass(frozen=True)
@@ -1301,7 +1352,10 @@ class ExcludedRound:
 
     channel: int
     round_index: int
-    #: :data:`CONSENSUS_ARC_STATE` or :data:`CONSENSUS_DROP_BUCKET`.
+    #: One of :data:`_CONSENSUS_KINDS` — :data:`CONSENSUS_ARC_STATE`,
+    #: :data:`CONSENSUS_DROP_BUCKET`, :data:`CONSENSUS_SIGMA_MODE` or
+    #: :data:`CONSENSUS_QUALITY_VERDICT`. The **first** element of the shape that
+    #: diverged, in that order, when more than one did.
     kind: str
     #: What this round's shape was, and what the rest of the window agreed on.
     #: Carried apart from :attr:`reason` so a narrator bound to a restricted
@@ -1380,6 +1434,109 @@ class ChannelRate:
     reason: str = ""
 
 
+#: The fit did not converge, as a **well word**. Operator ruling 2026-09-16
+#: (`[a289]`, ruling 5): a new token, deliberately **not** a reuse of
+#: :data:`EXCLUDED_SIGMA_NULL`'s ``"sigma_null"``.
+#:
+#: The two are the same event seen from two heights and only one of them is
+#: still true after T11.33. ``sigma_null`` names a *participation* refusal — "no
+#: usable σ in this channel's window" — and under design A the campaign feeder
+#: admits `1/R1` from any converged fit, so a null σ there can only mean the fit
+#: itself produced nothing. The word an operator reads should be the one that is
+#: true of the well. :data:`EXCLUDED_SIGMA_NULL` is **unchanged** everywhere it
+#: already appears, including :attr:`RateCheck.excluded` and every stored run,
+#: and :attr:`WellVerdict.reason` still carries it verbatim so the two records
+#: can be joined.
+WELL_FIT_FAILED = "fit_failed"
+
+#: The grade :attr:`WellVerdict.quality_rejects` counts, taken from
+#: :class:`~softae.analysis.quality.Verdict` rather than written down again —
+#: a vocabulary restated in a second place is one that disagrees with the grader
+#: after the first edit. ``.value``, not ``str()``: ``Verdict`` is a
+#: ``str``-mixin ``Enum`` whose ``str()`` renders ``"Verdict.REJECT"``, which is
+#: not what :attr:`RoundFit.quality_verdict` carries.
+QUALITY_REJECT = Verdict.REJECT.value
+
+
+@dataclass(frozen=True)
+class WellVerdict:
+    """One well's word, slope and bound — for **every** well on the board.
+
+    The T11.33 ruling's other half. The board minimum coming off the campaign
+    path (:data:`_BOARD_MINIMUM_UNSET`) says no well's evidence is discarded for
+    being outnumbered; this says none is discarded for being *unjudgeable*
+    either. A well that was absent, whose fit failed, whose R₁ railed or whose
+    own noise floor no hold length can beat still leaves the phase with a word,
+    so the optimizer's record says what happened to each of its samples rather
+    than listing the ones that happened to survive.
+
+    :attr:`word` draws from **one** vocabulary, the union of the two that exist
+    today — :attr:`ChannelRate.refusal` for the wells that were judged and
+    :attr:`RateCheck.excluded` for the wells that were not:
+
+    ==================================  ==========================  ============
+    word                                class                        blocks?
+    ==================================  ==========================  ============
+    :data:`SETTLE_SETTLED`              certifying                   certifies
+    :data:`RATE_MOVING`                 evidence about the sample    **yes**
+    :data:`RATE_UNDETECTABLE`           still resolving              **yes**
+    :data:`RATE_SPAN_TOO_SHORT`         still resolving              **yes**
+    :data:`RATE_TOO_FEW_POINTS`         still resolving              conditional
+    :data:`EXCLUDED_UNSETTLEABLE`       no hold can certify it       no
+    :data:`WELL_FIT_FAILED`             no information               no
+    :data:`EXCLUDED_RAILED`             no information               no
+    :data:`EXCLUDED_ZERO_MEAN`          no information               no
+    :data:`EXCLUDED_ABSENT`             no information, a different  no
+                                        one
+    ==================================  ==========================  ============
+
+    The words are the **constants' own values** and not a second spelling of
+    them — ``rate_moving``, not ``moving`` — so a reader joining this record to
+    :attr:`RateCheck.excluded` or to a stored ``ChannelRate.refusal`` is
+    comparing one vocabulary to itself. :data:`WELL_FIT_FAILED` is the single
+    exception, and it is an operator ruling rather than a slip.
+
+    Which of these block an early stop is :func:`_campaign_settled`'s business,
+    not this class's: a verdict is a record of what was seen, and a rule that
+    reads it is free to change without every stored row changing meaning.
+    """
+
+    channel: int
+    word: str
+    #: ĝ and its one-sided 95 % bound, in ln-units per hour — T11.17's pair,
+    #: recorded for **every** well including the ones that did not certify,
+    #: because "how fast was it moving when we stopped waiting?" is a question
+    #: about the sample and a refusal is not an answer to it. ``None`` for a
+    #: well that never reached :func:`_channel_rate`.
+    rate_per_hour: float | None = None
+    upper_bound_per_hour: float | None = None
+    stderr_per_hour: float | None = None
+    resid_rel: float | None = None
+    n_points: int = 0
+    span_s: float = 0.0
+    #: The one round the consensus rule took out of **this** well's regression,
+    #: or ``None``. Carried whole rather than as a flag so the row says which
+    #: round and on which element of the shape.
+    forgiven_round: ExcludedRound | None = None
+    #: The **last** ``sigma_mode`` this well recorded in the window, or ``""``
+    #: when no round carried one. Provenance, never a discriminator: T11.15 pins
+    #: the campaign's settle feeder to the legacy engine, on which the mode is
+    #: only ever ``value`` or ``unavailable``, so a count over it would be
+    #: near-degenerate. Last **recorded** rather than last-in-the-window, because
+    #: the placeholder :func:`_window_series` inserts for a missing round carries
+    #: ``""`` = *never asked*, which must not erase an answer the well gave.
+    sigma_mode: str = ""
+    #: How many rounds in this well's window the grader called
+    #: :data:`QUALITY_REJECT`. The counter that is live today: under design A a
+    #: ``reject``-graded converged fit **contributes** its `1/R1` instead of
+    #: vanishing, and this is the number that says how often that happened. One
+    #: is the consensus rule's forgiven round; two or more is a well whose fits
+    #: the grader would not speak for, left in the regression where
+    #: :attr:`resid_rel` reports it.
+    quality_rejects: int = 0
+    reason: str = ""
+
+
 @dataclass
 class RateCheck:
     """The rate verdict on one window — per cell, and then aggregated.
@@ -1427,13 +1584,29 @@ class RateCheck:
     #: but only when :attr:`consensus_unavailable` is ``False``, which is the
     #: whole reason the two fields are separate.
     excluded_rounds: list[ExcludedRound] = field(default_factory=list)
-    #: **No round in the window carried an** ``arc_state`` **at all**, so the mode
-    #: is a unanimous ``""``, nothing can ever disagree, and the rule returns the
+    #: **No round in the window carried any element of the shape at all** — no
+    #: ``arc_state``, no ``sigma_mode``, no ``quality_verdict`` — so the mode is a
+    #: unanimous ``""``, nothing can ever disagree, and the rule returns the
     #: shape of a pass while being structurally unable to fire. Recorded so "no
     #: round disagreed" and "no round was asked" are never the same token
     #: (``SUBAGENT_RULES.md`` §3.1(a)). This is the field that catches a feeder
     #: shipped without its half.
     consensus_unavailable: bool = False
+    #: One :class:`WellVerdict` per channel in the window — **participants and
+    #: excluded wells alike**, which is the whole point of it and the one thing
+    #: the four lists above cannot do: they name the wells that fell into each
+    #: bucket, and a well that fell into none of them leaves no trace at all.
+    #:
+    #: Complete on the campaign path in **every** branch. The one branch that is
+    #: partial is the board-minimum count shortfall — an int policy refusing a
+    #: window before any well was judged — where a participating well has no
+    #: word that is true of it and inventing one would be exactly the token
+    #: collapse ``SUBAGENT_RULES.md`` §3.1(a) forbids. That branch is
+    #: unreachable under ``board_minimum=None``, and the tool paths that can
+    #: reach it do not read this field.
+    #:
+    #: Trailing, with a default, so every existing construction is unchanged.
+    by_well: dict[int, WellVerdict] = field(default_factory=dict)
 
 
 def r1_lower_bound_ohms(circuit_model: str) -> float | None:
@@ -1513,12 +1686,85 @@ def _exclusion(fits: Sequence[RoundFit], bound_ohms: float | None) -> str:
     return ""
 
 
-def _fit_shape(fit: RoundFit) -> tuple[str, int | None]:
-    """The pair the consensus is taken over: closure state, bucketed mask size."""
+def _rate_exclusion(fits: Sequence[RoundFit], bound_ohms: float | None) -> str:
+    """:func:`_exclusion` plus the one refusal the rate criterion adds.
+
+    A conductance that is not strictly positive has no logarithm, and it is not
+    a measurement of a conducting cell either. Spelled with the existing name
+    because the cause is the existing one: the fit produced no usable σ.
+
+    A function rather than two blocks because :func:`rate_check` now asks it
+    twice per channel in the worst case — once on the raw window, once on what
+    survives a consensus exclusion — and two copies of a participation rule is
+    how the two answers drift apart.
+    """
+    if (why := _exclusion(fits, bound_ohms)):
+        return why
+    if any(fit.sigma is None or float(fit.sigma) <= 0.0 for fit in fits):
+        return EXCLUDED_SIGMA_NULL
+    return ""
+
+
+def _fit_shape(fit: RoundFit) -> tuple[str, int | None, str, str]:
+    """The tuple the consensus is taken over, in :data:`_CONSENSUS_KINDS`' order.
+
+    Closure state, bucketed mask size, σ mode, quality verdict. All four are
+    statements the *fitter* made about this round, never statistics about the
+    number it returned: the operator ruled against outlier removal by size, so a
+    round leaves a regression because the fit says a different cell or a
+    different spectrum was measured, and never because the residual was large.
+
+    One tuple and not two rules, so the four share
+    :data:`SETTLE_CONSENSUS_MAX_EXCLUDED` — a round that is both arc-divergent
+    and ``reject``-graded is **one** disagreement, which is what keeps the window
+    arithmetic (``rate_window_rounds = min_fit_points + 1``) balanced.
+    """
     dropped = fit.n_points_dropped
     return (str(fit.arc_state),
             None if dropped is None
-            else int(dropped) // SETTLE_CONSENSUS_DROP_BUCKET)
+            else int(dropped) // SETTLE_CONSENSUS_DROP_BUCKET,
+            str(fit.sigma_mode),
+            str(fit.quality_verdict))
+
+
+def _shape_recorded(fit: RoundFit) -> bool:
+    """Did any feeder answer *any* of the shape questions for this round?
+
+    ``SUBAGENT_RULES.md`` §3.1(a): a window where nothing was asked has a
+    unanimous shape, so it can never exclude, and "no round disagreed" would
+    then be spelled with the same token as "no round was asked".
+
+    ``n_points_dropped`` is deliberately **not** counted. Its bucket has never
+    been the availability signal — the rule shipped reading ``arc_state`` alone —
+    and a feeder that records a mask size but no word about the fit has not
+    answered the question this predicate asks.
+    """
+    return bool(fit.arc_state or fit.sigma_mode or fit.quality_verdict)
+
+
+def _has_absent_round(fits: Sequence[RoundFit]) -> bool:
+    """Is any round in this channel's window one where **no fit ran at all**?
+
+    :func:`_exclusion`'s own first test, asked separately because absence must
+    never enter the one-round forgiveness budget. A round that ran and reported
+    nothing usable disagrees in *shape* with the rounds around it and can be
+    dropped; a round that never happened has no shape to disagree with, and
+    forgiving it would fold a second window's worth of missing evidence into a
+    budget sized for one. :func:`_exclusion`'s docstring is the standing reason:
+    the two send an operator to different places.
+    """
+    return any(fit.sigma is None and fit.r1_ohms is None for fit in fits)
+
+
+def _consensus_word(element: str | int | None) -> str:
+    """One element of a shape, as it is rendered into a reason.
+
+    ``None`` and ``""`` are both "never asked" and both render
+    :data:`CONSENSUS_UNRECORDED`; ``0`` is a real bucket and must not.
+    """
+    if element is None or element == "":
+        return CONSENSUS_UNRECORDED
+    return str(element)
 
 
 def _consensus_exclusion(
@@ -1545,18 +1791,52 @@ def _consensus_exclusion(
     if dissent != SETTLE_CONSENSUS_MAX_EXCLUDED or seen <= dissent:
         return None
     index = next(i for i, shape in enumerate(shapes) if shape != mode)
-    state, bucket = shapes[index]
-    mode_state, mode_bucket = mode
-    if state != mode_state:
-        return ExcludedRound(
-            channel=int(channel), round_index=index, kind=CONSENSUS_ARC_STATE,
-            observed=state or CONSENSUS_UNRECORDED,
-            consensus=mode_state or CONSENSUS_UNRECORDED)
-    return ExcludedRound(
-        channel=int(channel), round_index=index, kind=CONSENSUS_DROP_BUCKET,
-        observed=CONSENSUS_UNRECORDED if bucket is None else str(bucket),
-        consensus=(CONSENSUS_UNRECORDED if mode_bucket is None
-                   else str(mode_bucket)))
+    # The FIRST element that diverged names the exclusion, in
+    # `_CONSENSUS_KINDS`' order. More than one may diverge on the same round --
+    # a round taken mid-transient can open the arc *and* grade `reject` -- and
+    # that is still one disagreement out of one budget, reported under the
+    # element nearest the spectrum.
+    for kind, observed, consensus in zip(_CONSENSUS_KINDS, shapes[index], mode):
+        if observed != consensus:
+            return ExcludedRound(
+                channel=int(channel), round_index=index, kind=kind,
+                observed=_consensus_word(observed),
+                consensus=_consensus_word(consensus))
+    raise AssertionError(  # unreachable: `index` is where the shape differs
+        f"ch{channel} round {index} was selected as divergent from the mode "
+        f"{mode!r} and then matched it element for element")
+
+
+def _board_gate(min_channels: int, board_minimum: Any) -> int | None:
+    """How many participating channels this window needs, or ``None`` per-well.
+
+    The one place the T11.33 policy resolves, so the two criteria cannot come to
+    different answers about the same pair of arguments. Three inputs and they are
+    genuinely three: the sentinel means *"never mentioned"* and falls back to
+    *min_channels*, ``None`` means *"no board gate"*, and an int is today's rule.
+
+    A caller that has never heard of ``board_minimum`` therefore gets
+    ``max(1, min_channels)`` — byte-identical to the expression this replaced at
+    both call sites.
+    """
+    minimum = (min_channels if board_minimum is _BOARD_MINIMUM_UNSET
+               else board_minimum)
+    return None if minimum is None else max(1, int(minimum))
+
+
+def _board_shortfall_reason(participating: Sequence[int], needed: int | None) -> str:
+    """Why a window with too few participants is not evidence.
+
+    Two sentences for two situations. Under an int policy the board is *narrower
+    than the criterion needs*, which is a statement about the board; with no
+    board gate at all the only way to arrive here is that **nothing** was
+    judgeable, which is a statement about every well on it.
+    """
+    if needed is None:
+        return ("no channel carried usable evidence in this window; the "
+                "criterion cannot be evaluated")
+    return (f"{len(participating)} participating channel(s) < {needed} "
+            f"required; the criterion cannot be evaluated")
 
 
 def settle_check(
@@ -1564,6 +1844,7 @@ def settle_check(
     *,
     tol_rel: float = DEFAULT_SETTLE_TOL_REL,
     min_channels: int = DEFAULT_SETTLE_MIN_CHANNELS,
+    board_minimum: Any = _BOARD_MINIMUM_UNSET,
     r1_bound_ohms: float | None = None,
 ) -> SettleCheck:
     """Has σ stopped moving across *window*? Pure, and it never guesses.
@@ -1580,6 +1861,13 @@ def settle_check(
     Fewer than *min_channels* participants is **not** a "no": it is
     ``evaluable=False``, and the caller must run to its ceiling rather than treat
     an absence of evidence as evidence of settling.
+
+    *board_minimum* is the T11.33 policy (:data:`_BOARD_MINIMUM_UNSET`) and the
+    **only** thing it changes here: ``None`` removes the count gate, and what
+    remains is the same per-channel rule over whatever participants there are.
+    The settled decision — worst deviation against *tol_rel* — is untouched,
+    because it is already per channel and aggregates with ``max``, so one
+    participant is judged by exactly the rule fifteen would have been.
     """
     rounds = [list(r) for r in window]
     if not rounds:
@@ -1589,13 +1877,15 @@ def settle_check(
     excluded = {ch: why for ch, fits in by_channel.items()
                 if (why := _exclusion(fits, r1_bound_ohms))}
     participating = sorted(ch for ch in by_channel if ch not in excluded)
-    needed = max(1, int(min_channels))
-    if len(participating) < needed:
+    needed = _board_gate(min_channels, board_minimum)
+    # No participants is never evaluable, whatever the policy: `worst` below is a
+    # `max` over an empty sequence, and more to the point an empty board is an
+    # absence of evidence under every reading of it.
+    if not participating or (needed is not None and len(participating) < needed):
         return SettleCheck(
             evaluable=False, settled=False, participating=participating,
             excluded=excluded, n_rounds=len(rounds),
-            reason=(f"{len(participating)} participating channel(s) < {needed} "
-                    f"required; the criterion cannot be evaluated"))
+            reason=_board_shortfall_reason(participating, needed))
 
     worst = 0.0
     for channel in participating:
@@ -1829,6 +2119,144 @@ def _channel_rate(
         **fields)
 
 
+def _last_sigma_mode(fits: Sequence[RoundFit]) -> str:
+    """The last ``sigma_mode`` this channel actually recorded, or ``""``.
+
+    Last **recorded**, not last in the window. :func:`_window_series` pads a
+    channel's missing rounds with a bare :class:`RoundFit`, whose ``""`` means
+    *never asked*; letting that pad overwrite a mode the channel did report
+    would spell an absence with the token for an answer.
+    """
+    return next((str(fit.sigma_mode) for fit in reversed(list(fits))
+                 if fit.sigma_mode), "")
+
+
+def _well_verdicts(
+    by_channel: dict[int, list[RoundFit]],
+    by_rate: dict[int, ChannelRate],
+    excluded: dict[int, str],
+    excluded_rounds: Sequence[ExcludedRound],
+) -> dict[int, WellVerdict]:
+    """One :class:`WellVerdict` per channel the window can say a word about.
+
+    Built once, from the three records that already exist — the raw window, the
+    per-cell rates, and the channel-level exclusions — rather than accumulated
+    along the way, so the verdict cannot disagree with the lists beside it on
+    :class:`RateCheck`.
+
+    A channel that is in neither *by_rate* nor *excluded* gets **no entry**: it
+    participated and was never judged, which happens only when an int
+    ``board_minimum`` refuses the window on its count, and no word in the
+    vocabulary is true of it. See :attr:`RateCheck.by_well`.
+    """
+    forgiven = {entry.channel: entry for entry in excluded_rounds}
+    verdicts: dict[int, WellVerdict] = {}
+    for channel, fits in by_channel.items():
+        rejects = sum(1 for fit in fits
+                      if str(fit.quality_verdict) == QUALITY_REJECT)
+        common: dict[str, Any] = {
+            "channel": int(channel),
+            "forgiven_round": forgiven.get(channel),
+            "sigma_mode": _last_sigma_mode(fits),
+            "quality_rejects": rejects,
+        }
+        if (rate := by_rate.get(channel)) is not None:
+            verdicts[channel] = WellVerdict(
+                word=SETTLE_SETTLED if rate.settled else rate.refusal,
+                rate_per_hour=rate.rate_per_hour,
+                upper_bound_per_hour=rate.upper_bound_per_hour,
+                stderr_per_hour=rate.stderr_per_hour,
+                resid_rel=rate.resid_rel, n_points=rate.n_points,
+                span_s=rate.span_s, reason=rate.reason, **common)
+        elif (why := excluded.get(channel)) is not None:
+            # The exclusion word is re-spelled for the operator and kept
+            # verbatim in the reason, so this row still joins to
+            # `RateCheck.excluded` and to every run stored before the rename.
+            verdicts[channel] = WellVerdict(
+                word=WELL_FIT_FAILED if why == EXCLUDED_SIGMA_NULL else why,
+                reason=f"not judged; excluded from the window ({why})",
+                **common)
+    return verdicts
+
+
+def _resolving(rate: ChannelRate, window_len: int) -> bool:
+    """Is this well still on its way to a verdict, as opposed to out of the race?
+
+    The clause of the early-stop rule that is not a lookup, and the one the
+    operator refined by name (`[a289]`, ruling 2). :data:`RATE_UNDETECTABLE` and
+    :data:`RATE_SPAN_TOO_SHORT` are unconditionally still resolving — more
+    rounds is exactly what both of them ask for.
+
+    :data:`RATE_TOO_FEW_POINTS` splits, and the split is the refinement: a well
+    short of points because the **window** has not filled yet is still
+    resolving and holds the board, while a well short because **its own** rounds
+    went missing is not, and must not. Without the split a well whose sweeps
+    keep failing reports ``rate_too_few_points`` on every window for the life of
+    the run, the board can never stop early, and every trial spends its whole
+    ``max_hold_s`` — on a heater-only rig whose post-anneal descent is already
+    the rate limiter.
+
+    The test is a count, not a flag, and it is exact:
+    :meth:`SettleTracker._rate_verdict` only calls :func:`rate_check` once the
+    window is at its full length, so a participating well regresses on either
+    *window_len* points or, having spent the consensus rule's one forgiven
+    round, *window_len* − 1. (A genuinely absent round excludes the whole
+    channel upstream and never arrives here.) Equal means the window itself is
+    short; fewer means this well is.
+    """
+    if rate.refusal in (RATE_UNDETECTABLE, RATE_SPAN_TOO_SHORT):
+        return True
+    return (rate.refusal == RATE_TOO_FEW_POINTS
+            and rate.n_points >= int(window_len))
+
+
+def _campaign_settled(
+    by_rate: dict[int, ChannelRate], window_len: int,
+) -> tuple[bool, str]:
+    """The early-stop rule when there is no board minimum. ``(settled, why)``.
+
+    Operator ruling 2026-09-16 (`[a289]`), verbatim in three clauses: the phase
+    is settled when **no** well is moving, **no** well is still resolving, and
+    **at least one** well is quiet.
+
+    It replaces ``len(quiet) >= needed`` rather than re-thresholding it, because
+    a count is the wrong question once every well is valued equally. The cheaper
+    alternative — ``quiet >= 1 and moving == []`` — was offered and declined: it
+    stops the hold while a well one round away from a usable interval is still
+    being observed, and the ruling this implements says "extract the highest
+    fidelity information on each well".
+
+    Wells that can carry no information (:data:`WELL_FIT_FAILED`,
+    :data:`EXCLUDED_RAILED`, :data:`EXCLUDED_ZERO_MEAN`,
+    :data:`EXCLUDED_ABSENT`) and wells no hold length can certify
+    (:data:`EXCLUDED_UNSETTLEABLE`) neither block nor certify — they are not in
+    *by_rate* at all, or they are and are counted in neither clause. The
+    asymmetry is deliberate: waiting cannot fix either, so waiting for them is
+    a hold spent on nothing.
+    """
+    moving = sorted(ch for ch, rate in by_rate.items()
+                    if rate.refusal == RATE_MOVING)
+    resolving = sorted(ch for ch, rate in by_rate.items()
+                       if _resolving(rate, window_len))
+    quiet = sorted(ch for ch, rate in by_rate.items() if rate.settled)
+    # The moving clause is stated here as well as acted on by `rate_check`'s own
+    # earlier return, so this function is the whole rule rather than the part of
+    # it that happened to be left over.
+    if moving:
+        return False, ("still moving: "
+                       + " ".join(f"ch{ch}" for ch in moving))
+    if resolving:
+        return False, ("still resolving, and more rounds is what they ask for: "
+                       + " ".join(f"ch{ch} {by_rate[ch].refusal}"
+                                  for ch in resolving))
+    if not quiet:
+        return False, ("no well certified quiet, and none is still resolving; "
+                       "nothing here can be settled by waiting")
+    return True, ("every well is judged: "
+                  + " ".join(f"ch{ch}" for ch in quiet)
+                  + " quiet, none moving, none still resolving")
+
+
 def rate_check(
     window: Sequence[Sequence[RoundFit]],
     times_s: Sequence[float | None],
@@ -1837,6 +2265,7 @@ def rate_check(
     tol_rel: float | None = None,
     min_fit_points: int = DEFAULT_SETTLE_MIN_FIT_POINTS,
     min_channels: int = DEFAULT_SETTLE_MIN_CHANNELS,
+    board_minimum: Any = _BOARD_MINIMUM_UNSET,
     r1_bound_ohms: float | None = None,
     consensus_exclude: bool = True,
 ) -> RateCheck:
@@ -1869,6 +2298,17 @@ def rate_check(
     certify it, so waiting is the wrong instruction. Omit it and the window is
     judged on rate alone.
 
+    *board_minimum* is the T11.33 policy, and it changes the verdict in two
+    places rather than one. ``None`` removes the participation count gate — no
+    window is refused for being narrow — **and** replaces the settled decision
+    with :func:`_campaign_settled`, the operator's early-stop rule: no well
+    moving, no well still resolving, at least one well quiet. An int, or the
+    default (:data:`_BOARD_MINIMUM_UNSET`, meaning *min_channels*), keeps both
+    halves exactly as they are today. The two are one parameter because a board
+    with no minimum and a settled rule phrased as a count would certify on the
+    first quiet well while its neighbour was one round from an interval, which
+    is the opposite of what the ruling asked for.
+
     *consensus_exclude* arms the **physical** consensus rule: a channel whose
     fits were one shape on every round but one had that round taken from a
     different cell, not measured more noisily, so it leaves that channel's
@@ -1876,6 +2316,15 @@ def rate_check(
     See :func:`_consensus_exclusion` for what it refuses to do, and
     :attr:`RateCheck.consensus_unavailable` for what it says when it could not
     look at all.
+
+    The rule is asked **before** the participation gate, not after it. A round
+    that ran and reported no usable σ — a bound, or a fit graded ``reject`` — is
+    a shape disagreement like any other, but it is also what
+    :func:`_exclusion` whole-channel-excludes on, so on the old ordering such a
+    channel was gone before the rule could spend its one round on it. What a
+    round can never buy is *absence*: a channel missing a round entirely
+    (:func:`_has_absent_round`) is routed straight to the participation gate on
+    its full window, because nothing ran there to disagree with anything.
 
     **Nothing calls this yet, by design.** It ships as a pure unit so that the
     criterion can be measured against real windows before it is given any
@@ -1896,42 +2345,62 @@ def rate_check(
     axis = [float(t) for t in known]
 
     by_channel = _window_series(rounds)
-    excluded = {ch: why for ch, fits in by_channel.items()
-                if (why := _exclusion(fits, r1_bound_ohms))}
-    # A conductance that is not strictly positive has no logarithm, and it is not
-    # a measurement of a conducting cell either. Spelled with the existing name
-    # because the cause is the existing one: the fit produced no usable σ.
-    for channel, fits in by_channel.items():
-        if channel not in excluded and any(
-                fit.sigma is None or float(fit.sigma) <= 0.0 for fit in fits):
-            excluded[channel] = EXCLUDED_SIGMA_NULL
-    participating = sorted(ch for ch in by_channel if ch not in excluded)
-    span_s = max(axis) - min(axis)
-    needed = max(1, int(min_channels))
-    if len(participating) < needed:
-        return RateCheck(
-            evaluable=False, settled=False, participating=participating,
-            excluded=excluded, n_rounds=len(rounds), span_s=span_s,
-            reason=(f"{len(participating)} participating channel(s) < {needed} "
-                    f"required; the criterion cannot be evaluated"))
-
-    # THE CONSENSUS RULE. Per channel, and it may drop at most one round from one
-    # channel's regression -- never a channel from the window, which is
-    # `_exclusion`'s job one block up and a different question.
+    # THE CONSENSUS RULE, asked BEFORE the participation gate and not after it.
+    #
+    # It used to run second, on the channels `_exclusion` had already let
+    # through, and that ordering made it unreachable for the case it is most
+    # needed on: one round with no usable σ whole-channel-excludes at the first
+    # gate, so the channel never arrived to have that round forgiven. Rung-3a's
+    # ch13 lost seven consecutive rounds to a single one, and took the board
+    # under `min_channels` with it. The rule is still capped at one round per
+    # channel per window; what changed is which channels get to spend it.
     excluded_rounds: list[ExcludedRound] = []
     consensus_unavailable = False
     if consensus_exclude:
-        # Asked BEFORE anything is excluded: a window carrying no `arc_state` at
-        # all has a unanimous "" mode, so it can never exclude, and "nothing
-        # disagreed" would then be the same token as "nothing was asked".
+        # Asked over the WHOLE window rather than over the survivors, because
+        # the survivors are no longer known yet at this point -- and a window
+        # carrying no shape at all can never exclude, so "nothing disagreed"
+        # would be the same token as "nothing was asked".
         consensus_unavailable = not any(
-            fit.arc_state for channel in participating
-            for fit in by_channel[channel])
-        if not consensus_unavailable:
-            excluded_rounds = [
-                found for channel in participating
-                if (found := _consensus_exclusion(
-                    channel, by_channel[channel])) is not None]
+            _shape_recorded(fit)
+            for fits in by_channel.values() for fit in fits)
+
+    excluded: dict[int, str] = {}
+    for channel, fits in by_channel.items():
+        # A genuinely absent round is not forgivable and goes to `_exclusion` on
+        # the full window, exactly as it always has.
+        candidate = (
+            None if consensus_unavailable or not consensus_exclude
+            or _has_absent_round(fits)
+            else _consensus_exclusion(channel, fits))
+        judged = fits if candidate is None else [
+            fit for index, fit in enumerate(fits)
+            if index != candidate.round_index]
+        # The final channel-level gate runs on what SURVIVES the forgiveness, so
+        # a second problem among the remaining rounds -- railed, zero-mean, a
+        # second round with no usable σ -- still takes the whole channel.
+        if (why := _rate_exclusion(judged, r1_bound_ohms)):
+            excluded[channel] = why
+        elif candidate is not None:
+            excluded_rounds.append(candidate)
+    participating = sorted(ch for ch in by_channel if ch not in excluded)
+    span_s = max(axis) - min(axis)
+    needed = _board_gate(min_channels, board_minimum)
+    # No participants is never evaluable, whatever the policy. Under
+    # `board_minimum=None` it is the ONLY way to arrive here, and it is exactly
+    # the board word `not_evaluable` is reserved for -- so every well carries
+    # its exclusion word out, which is the one thing that makes that verdict
+    # attributable rather than a bare refusal.
+    if not participating or (needed is not None and len(participating) < needed):
+        return RateCheck(
+            evaluable=False, settled=False, participating=participating,
+            excluded=excluded, n_rounds=len(rounds), span_s=span_s,
+            by_well=_well_verdicts(by_channel, {}, excluded, ()),
+            reason=_board_shortfall_reason(participating, needed))
+
+    # One entry per channel that both spent its exclusion AND survived to be
+    # judged: a channel the window dropped outright regresses on nothing, so a
+    # round dropped from it is not a fact about any regression.
     dropped_index = {entry.channel: entry.round_index for entry in excluded_rounds}
 
     # Per channel, not one shared axis: an excluded round must leave BOTH the σ
@@ -1980,6 +2449,8 @@ def rate_check(
         "reference_half_width_per_hour": reference,
         "excluded_rounds": excluded_rounds,
         "consensus_unavailable": consensus_unavailable,
+        "by_well": _well_verdicts(by_channel, by_rate, excluded,
+                                  excluded_rounds),
     }
     tol = float(tol_per_hour)
     if grouped[RATE_MOVING]:
@@ -1989,7 +2460,16 @@ def rate_check(
                     f"{tol:.4f} ln/h: "
                     + " ".join(f"ch{ch}" for ch in grouped[RATE_MOVING])),
             **common)
-    if len(quiet) >= needed:
+    # THE EARLY-STOP RULE. The two policies differ here in what `settled`
+    # MEANS and not merely in where a threshold sits, which is why
+    # `board_minimum=None` REPLACES this decision rather than lowering it: a
+    # count answers "were enough wells quiet?", and once every well is valued
+    # equally the question is "is any well still owed rounds?".
+    if needed is None:
+        settled, why = _campaign_settled(by_rate, len(rounds))
+    else:
+        settled, why = len(quiet) >= needed, ""
+    if settled:
         # **The worst bound among the CERTIFYING channels, not among all
         # participants.** `bounds` spans every participant, including cells that
         # came back `rate_undetectable` or `unsettleable` — whose bounds are by
@@ -2000,17 +2480,32 @@ def rate_check(
         # certified is the worst one over `quiet`.
         certifying = [by_rate[ch].upper_bound_per_hour for ch in quiet
                       if by_rate[ch].upper_bound_per_hour is not None]
+        certificate = (f"worst 95 % bound "
+                       f"{max(certifying) if certifying else float('nan'):.4f} "
+                       f"ln/h is within {tol:.4f} ln/h")
+        observed = f"{len(rounds)} rounds over {span_s:.0f} s"
         return RateCheck(
             evaluable=True, settled=True,
-            reason=(f"{len(rounds)} rounds over {span_s:.0f} s, {len(quiet)} "
-                    f"quiet channel(s): worst 95 % bound "
-                    f"{max(certifying) if certifying else float('nan'):.4f} "
-                    f"ln/h is within {tol:.4f} ln/h"),
+            reason=(f"{observed}, {why}; {certificate}" if why else
+                    f"{observed}, {len(quiet)} quiet channel(s): {certificate}"),
             **common)
     tally = ", ".join(
         f"{len(grouped[name])} {name}" for name in
         (RATE_UNDETECTABLE, EXCLUDED_UNSETTLEABLE, RATE_SPAN_TOO_SHORT,
          RATE_TOO_FEW_POINTS) if grouped[name])
+    if needed is None:
+        # `evaluable` under this policy is "did ANY well produce a rate
+        # estimate", certified or not — the input to the board word, where
+        # `ceiling` says the hold ran out on a board that could be judged and
+        # `not_evaluable` says no well on it ever could. A count shortfall is no
+        # longer one of the ways to be unjudgeable, so it must not be spelled
+        # like one.
+        return RateCheck(
+            evaluable=any(rate.rate_per_hour is not None
+                          for rate in by_rate.values()),
+            settled=False,
+            reason=(f"{why} ({tally})" if tally else why),
+            **common)
     return RateCheck(
         evaluable=False, settled=False,
         reason=(f"{len(quiet)} channel(s) certified quiet < {needed} required "
@@ -2100,6 +2595,11 @@ class SettleTracker:
     which routes on deviation while computing and reporting the rate. The last
     exists so a bench run can compare the two on identical windows before either
     is trusted; it is a shadow, and :attr:`last_rate` is where it lands.
+
+    *board_minimum* selects the **policy** the T11.33 ruling made per-tracker —
+    ``None`` to judge per well on the autonomous campaign path, an int to refuse
+    a narrow board on the two tool paths, and unmentioned to keep
+    *min_channels*. See :attr:`board_minimum`.
     """
 
     def __init__(
@@ -2109,6 +2609,7 @@ class SettleTracker:
         tol_rel: float = DEFAULT_SETTLE_TOL_REL,
         n_rounds: int = DEFAULT_SETTLE_N_ROUNDS,
         min_channels: int = DEFAULT_SETTLE_MIN_CHANNELS,
+        board_minimum: Any = _BOARD_MINIMUM_UNSET,
         r1_bound_ohms: float | None = None,
         rh_stability_pct: float | None = None,
         criterion: str = SETTLE_CRITERION_DEVIATION,
@@ -2120,6 +2621,18 @@ class SettleTracker:
         self.tol_rel = float(tol_rel)
         self.n_rounds = max(2, int(n_rounds))
         self.min_channels = max(1, int(min_channels))
+        #: The board-minimum **policy**, resolved once at construction so it is
+        #: always an ``int | None`` and never the sentinel: an int refuses a
+        #: window below it, ``None`` judges per well. A tracker built without
+        #: mentioning it resolves to :attr:`min_channels`, which is what keeps
+        #: the two tool paths — ``eis_validate_hold.py`` and
+        #: ``workflows/equilibration.py``, the second of them a hardware-
+        #: actuating hold executor — on today's behaviour with no edit of their
+        #: own. Threaded into **both** criteria, because a tracker under
+        #: ``"both"`` routes on deviation and reports the rate, and a policy
+        #: applied to only one of them would make the shadow comparison a
+        #: comparison of two different policies.
+        self.board_minimum: int | None = _board_gate(min_channels, board_minimum)
         self.r1_bound_ohms = r1_bound_ohms
         #: Which criterion **routes**. Defaults to today's, so every existing
         #: construction keeps every existing verdict. Refused at construction
@@ -2228,7 +2741,9 @@ class SettleTracker:
                 return None
             self.last = settle_check(
                 self.rounds[-self.n_rounds:], tol_rel=self.tol_rel,
-                min_channels=self.min_channels, r1_bound_ohms=self.r1_bound_ohms)
+                min_channels=self.min_channels,
+                board_minimum=self.board_minimum,
+                r1_bound_ohms=self.r1_bound_ohms)
         self._apply_rh_clause(self.last)
         # After the clause, never before: a window the room made non-evaluable
         # must not be counted as evidence that the criterion was ever evaluable.
@@ -2303,7 +2818,8 @@ class SettleTracker:
             self.rounds[-window:], self.times_s[-window:],
             tol_per_hour=self.rate_tol_per_hour, tol_rel=self.tol_rel,
             min_fit_points=self.min_fit_points,
-            min_channels=self.min_channels, r1_bound_ohms=self.r1_bound_ohms,
+            min_channels=self.min_channels, board_minimum=self.board_minimum,
+            r1_bound_ohms=self.r1_bound_ohms,
             consensus_exclude=self.settle_consensus_exclude)
 
     def _apply_rh_clause(self, check: SettleCheck) -> None:

@@ -1980,6 +1980,56 @@ def test_an_excluded_round_reaches_the_stream_with_channel_round_and_reason():
         assert forbidden not in text, forbidden
 
 
+def test_each_consensus_kind_gets_its_own_word_not_a_catch_all():
+    """T11.32 widened the shape; the narrator's noun lookup has to widen with it.
+
+    `_excluded_round_word` shipped as "arc" else "masked-point band", which was
+    exhaustive while `drop_bucket` was the only other kind. `sigma_mode` and
+    `quality_verdict` make it a catch-all that mislabels two thirds of its
+    domain -- and neither can be narrated under its own name: `sigma` and `fit`
+    are both FORBIDDEN substrings in `events.jsonl`
+    (`test_the_stream_carries_no_scientific_value`), so `sigma_mode` is
+    unspeakable verbatim and the obvious English for `quality_verdict` -- "fit
+    grade" -- is unspeakable too. Asserted at `_rate_payload` on the sibling
+    test's pattern, with the forbidden sweep run over the rendered bytes.
+
+    One channel per kind because the rule spends at most
+    `SETTLE_CONSENSUS_MAX_EXCLUDED` per channel: two divergences on one channel
+    is a channel that is not consensus-stable and excludes nothing.
+    """
+    from softae.analysis.equilibration import RoundFit, SettleTracker
+
+    quiet = [1.0e4, 1.02e4, 1.0e4, 0.98e4, 1.0e4, 1.02e4, 1.0e4]
+    tracker = SettleTracker(criterion="rate", rate_tol_per_hour=0.30,
+                            min_channels=1)
+    for index, r1 in enumerate(quiet):
+        tracker.observe(
+            # ch18 diverges on sigma mode alone -- round 2's sigma came back a
+            # bound, not a value. ch19 diverges on the quality grade alone, and
+            # its sigma mode is constant so the FIRST divergent element is the
+            # verdict.
+            [RoundFit(channel=18, sigma=1.0 / r1, r1_ohms=r1,
+                      sigma_mode="bound" if index == 2 else "value"),
+             RoundFit(channel=19, sigma=1.0 / r1, r1_ohms=r1,
+                      sigma_mode="value",
+                      quality_verdict="reject" if index == 4 else "accept")],
+            t_s=index * 562.5)
+
+    payload = H._rate_payload(tracker)
+
+    assert payload["rate_consensus_unavailable"] is False
+    assert payload["rate_excluded_rounds"] == [
+        {"channel": 18, "round": 2,
+         "reason": "estimate mode bound vs consensus value"},
+        {"channel": 19, "round": 4,
+         "reason": "quality grade reject vs consensus accept"}]
+    # ...and neither new noun smuggled an observable's name back in.
+    text = json.dumps(payload).lower()
+    for forbidden in ("r1", "sigma", "fit", "ohms", "arc_state", "spectrum",
+                      "quality_verdict"):
+        assert forbidden not in text, forbidden
+
+
 def test_a_stream_with_no_shape_says_the_rule_could_not_look():
     """`SUBAGENT_RULES.md` §3.1(a) at the stream: the campaign feeder has not
     shipped its half yet, so every campaign window is this case, and an empty
