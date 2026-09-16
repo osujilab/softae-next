@@ -133,6 +133,20 @@ class SigmaReport:
     model_free_R_ohm: float = float("nan")
     cross_check_pct: float = float("nan")
     phase_headroom: float = float("nan")
+    #: Where :attr:`phase_headroom`'s numerator came from (T11.31). The margin is
+    #: now the minimum over running medians of a :data:`DEFAULT_HEADROOM_WINDOW`-wide
+    #: frequency window, so it names a real measured point — and at |phase| → 90°,
+    #: where ``Re Z → 0`` drives ``tan δ`` to zero whatever the sample is doing, that
+    #: point's phase is the difference between a margin and an artefact.
+    #:
+    #: ``headroom_window == 1`` means the minimum was taken on a single point — too
+    #: few survivors to window. **Not persisted**: ``data_store`` stores
+    #: ``phase_headroom`` alone, and 0 of 3918 stored rows carry one, so no stored
+    #: number changes meaning.
+    numerator_f_hz: float = float("nan")
+    numerator_phase_deg: float = float("nan")
+    numerator_phase_saturated: bool = False
+    headroom_window: int = 1
 
     @property
     def is_bound(self) -> bool:
@@ -363,6 +377,70 @@ class SpectrumReport:
         return f"[{self.engine}] {self.gate_summary()} — {self.sigma.describe()}"
 
 
+#: Width, in points, of the frequency window whose running **median** the headroom
+#: numerator minimises over. Odd by construction, so the winning median is a real
+#: measured point rather than an interpolation between two.
+#:
+#: **Five, because two is the widest rail-adjacent cluster the corpus produces.** On
+#: run ``20260915T172522Z_rung3a_fake_cast`` (84 spectra) the single-point minimum
+#: landed on isolated points at |phase| → 90°, where ``Z' → 0`` drives ``tan δ`` to
+#: zero whatever the sample is doing: ch13 r10 is a 300× notch one point wide, and
+#: ch11 r9/r12 are *two* consecutive such points. A 3-wide median still lands on one
+#: of a pair, which is why ``k = 3`` leaves 3 of the 11 false bounds standing and
+#: ``k = 5`` leaves none.
+#:
+#: **Not a config key, deliberately.** The width is the definition of a statistic, not
+#: a site knob; ``tand_headroom_mult`` is already the configurable strictness, and a
+#: tunable width invites turning a diagnostic into a filter.
+DEFAULT_HEADROOM_WINDOW = 5
+
+#: |phase| at or above which the numerator point is **flagged** as rail-adjacent.
+#:
+#: **A flag, never a filter.** Numerator phases on rung 3a run *continuously* from
+#: −78.25° to −89.997°; only 1 of 84 is within 0.005° of the rail, and cutting at 89.9°
+#: would still leave 6 of the 11 false bounds standing, because ch11 r2/r11/r13 and its
+#: production read are decided at −89.65…−89.83°. A hard cut is a cliff in the middle
+#: of a continuum, and it does not fix the defect. What the threshold buys is the
+#: operator sentence — *"the margin was decided by a phase-saturated point at 1.03 kHz"*
+#: — which nobody could say about rung 3a without re-reading 84 netCDFs.
+PHASE_SATURATION_DEG = 89.9
+
+
+@dataclass(frozen=True)
+class HeadroomDecision:
+    """What :func:`decide_report_mode` decided, and what decided it.
+
+    A 3-tuple carried the verdict and nothing about its provenance, so the fact that a
+    bound had been decided by one reading at the instrument's phase rail was
+    unrecoverable downstream. The flag has to travel *with* the decision or it is a log
+    line nobody reads back.
+
+    ``window == 1`` means the minimum was taken on a **single point** — the fallback
+    when fewer than ``headroom_window`` points survived (an odd width is *narrowed* to
+    fit a short spectrum; an even one is refused outright, since nothing passes it).
+    It is recorded rather than implied, because an unknown must not be spelled like
+    a checked answer
+    (``SUBAGENT_RULES`` §3.1(a)).
+    """
+
+    mode: str
+    provisional: bool
+    headroom: float
+    #: The frequency and phase of the point whose ``tan δ`` *is* the winning median —
+    #: a real measured point, not an interpolation.
+    numerator_f_hz: float = float("nan")
+    numerator_phase_deg: float = float("nan")
+    #: Whether **any** point in the winning window sits at or past
+    #: :data:`PHASE_SATURATION_DEG`. The window decided the margin, so the window is
+    #: what the flag describes.
+    numerator_phase_saturated: bool = False
+    n_saturated_in_window: int = 0
+    window: int = 1
+    window_f_lo_hz: float = float("nan")
+    window_f_hi_hz: float = float("nan")
+    n_tand_used: int = 0
+
+
 def decide_report_mode(
     freq: np.ndarray,
     Z: np.ndarray,
@@ -370,8 +448,9 @@ def decide_report_mode(
     envelope: Any,
     cell: Any,
     tand_headroom_mult: float = 3.0,
-) -> tuple[str, bool, float]:
-    """Decide value vs bound. Returns ``(mode, provisional, phase_headroom)``.
+    headroom_window: int = DEFAULT_HEADROOM_WINDOW,
+) -> HeadroomDecision:
+    """Decide value vs bound. Returns a :class:`HeadroomDecision`.
 
     The comparison is always the same one (framework §4.8) —
     ``headroom = tan δ_measured / tan(ε)``, and below ``tand_headroom_mult`` the
@@ -386,18 +465,40 @@ def decide_report_mode(
       decades without comment is how the withdrawn ``Z_φ`` ceiling was born.
     * ``ε`` unmeasured → provisional bound. Never a value.
 
-    **The numerator is the MINIMUM ``tan δ``, not the median, and the asymmetry is the
-    whole point.** ``derive_phase_table`` carries an evidenced refusal to use a minimum —
-    across a sweep it is the single luckiest point, and a phase floor that small qualifies
-    almost any spectrum as a value. That refusal is correct for the **instrument**, which
-    is the *denominator*, and applying it to the *numerator* as well was the defect this
-    function shipped with. Conservatism runs in opposite directions on the two sides of a
-    ratio: understating the **sample's** own margin errs toward reporting a *bound*, which
-    is the safe direction; a median over-qualifies the sample and throws that direction
-    away. Concretely, every state in the commissioning figure converges on ``tan δ ≈ 5`` at
-    10⁵ Hz, so a band median is dominated by the region where every spectrum looks alike —
-    the statistic meant to detect *"there is no measurement here"* was being computed where
-    nothing distinguishes anything.
+    **The numerator is a WINDOWED minimum — the most pessimistic five-point region of
+    the spectrum, not its single smallest reading.** Two rules are at work here and they
+    are orthogonal, which is what the earlier prose on this line conflated.
+
+    *Direction.* ``derive_phase_table`` refuses to use a minimum for the **instrument**,
+    and is right: understating the floor qualifies almost any spectrum as a value. On the
+    **sample** — the numerator — the direction reverses, because understating the
+    sample's own margin errs toward reporting a *bound*, which is the safe direction. A
+    band median over-qualifies the sample: every state in the commissioning figure
+    converges on ``tan δ ≈ 5`` at 10⁵ Hz, so it is computed exactly where nothing
+    distinguishes anything. **Median for the instrument, minimum for the sample**, and
+    that has not changed.
+
+    *Robustness.* What changed is that a **single-point** minimum is not an
+    understatement of the sample's margin — it is a noise statistic. At |phase| → 90°,
+    ``Z' → 0``, so ``tan δ = Z'/|Z''| → 0`` whatever the sample is doing, and one such
+    reading decides the whole spectrum. On rung 3a (84 spectra, 21 rounds over which R₁
+    moved ~1 %) the single minimum produced 11 bounds, ten of them on one channel, which
+    it flipped between value and bound fourteen times while the film did not change; the
+    five-wide windowed minimum produces none, and leaves the negative-control channel's
+    spread at 1.5× against 1.6× today. A minimum is defenceless against one unlucky
+    point; a windowed minimum is not. Robustness is what makes the direction mean
+    anything.
+
+    Concretely: the surviving ``(f, tan δ, phase)`` triples are sorted into **ascending
+    frequency** — explicitly, because the engine merely *happens* to hand them over in
+    sweep order and a statistic must not depend on that — the running median is taken
+    over every full ``headroom_window``-wide window, and the smallest of those medians is
+    the numerator. Being odd-width, that median *is* one of the measured points, so the
+    decision carries a real frequency and a real phase, and
+    :data:`PHASE_SATURATION_DEG` flags when the window that decided it sat on the rail.
+
+    **The flag is not a filter, and this function never drops a point for its phase.**
+    See :data:`PHASE_SATURATION_DEG` for why a hard cut cannot do this job.
 
     Non-positive ``tan δ`` is still excluded, because a ratio needs a positive numerator
     and a negative ``tan δ`` is a statement that the passive-quadrant assumption failed at
@@ -414,9 +515,24 @@ def decide_report_mode(
        the *survivors* of ``gate_quadrant``, so the excluded count seen below is already
        net of that drop. That site is coupled to the envelope wiring and is scoped
        separately.
+
+    .. note::
+       ``measurability.tand_margin`` takes the identical single-point minimum for S2 and
+       is **not** changed here — it feeds only the offline ``tools/measurability_sweep.py``
+       and carries its own ledger item.
     """
+    # Refused, not silently repaired. An even width has no median *point*, so there
+    # is no reading to hang a frequency and a phase on, and both plausible repairs —
+    # round down to the next odd, or up to the largest odd that fits — are guesses
+    # about a value no caller passes. This module's posture everywhere else is to
+    # refuse rather than substitute.
+    if (int(headroom_window) != headroom_window
+            or headroom_window < 1 or headroom_window % 2 == 0):
+        raise ValueError(
+            f"headroom_window must be a positive odd integer, got {headroom_window!r}")
+
     if cell is None:
-        return "unavailable", False, float("nan")
+        return HeadroomDecision("unavailable", False, float("nan"))
 
     from softae.analysis.eis.admittance import loss_tangent
 
@@ -448,12 +564,13 @@ def decide_report_mode(
     if not measured or not (floor == floor) or floor <= 0:
         logger.info("eis_reported_as_bound",
                     reason="phase noise unmeasured", provisional=True)
-        return "bound_unqualified", True, float("nan")
+        return HeadroomDecision("bound_unqualified", True, float("nan"))
 
-    tand = loss_tangent(Z)
-    finite = np.isfinite(tand)
-    n_excluded = int(np.count_nonzero(finite & (tand <= 0)))
-    tand = tand[finite & (tand > 0)]
+    tand_all = loss_tangent(Z)
+    finite = np.isfinite(tand_all)
+    n_excluded = int(np.count_nonzero(finite & (tand_all <= 0)))
+    keep = finite & (tand_all > 0)
+    tand = tand_all[keep]
     if n_excluded:
         logger.info(
             "eis_tand_points_excluded", n_excluded=n_excluded, n_used=int(tand.size),
@@ -461,25 +578,90 @@ def decide_report_mode(
                 "the headroom numerator (see measurability.negative_conductance_count)",
         )
     if tand.size == 0:
-        return "bound_unqualified", True, float("nan")
+        return HeadroomDecision("bound_unqualified", True, float("nan"))
 
-    headroom = float(np.min(tand)) / floor
+    f_kept = np.asarray(freq, dtype=float).ravel()[keep]
+    phase_kept = np.angle(Z, deg=True)[keep]
+
+    order = np.argsort(f_kept, kind="stable")          # NaN frequencies sort last
+    tand_s, f_s, phase_s = tand[order], f_kept[order], phase_kept[order]
+
+    n = int(tand_s.size)
+    k = int(headroom_window)
+    if k > n:
+        k = n - 1 if n % 2 == 0 else n                 # largest odd width that fits
+    k = max(k, 1)
+
+    if k <= 1:
+        i_num = int(np.argmin(tand_s))
+        lo = hi = i_num
+    else:
+        medians = np.median(
+            np.lib.stride_tricks.sliding_window_view(tand_s, k), axis=1)
+        lo = int(np.argmin(medians))
+        hi = lo + k - 1
+        # The median of an odd-width window IS one of its points, and ``argsort``'s
+        # middle index names which — so the numerator is a measured reading with a
+        # frequency and a phase, not a summary statistic floating free of the sweep.
+        i_num = lo + int(np.argsort(tand_s[lo:hi + 1], kind="stable")[k // 2])
+
+    headroom = float(tand_s[i_num]) / floor
+    win_phase = np.abs(phase_s[lo:hi + 1])
+    n_saturated = int(np.count_nonzero(
+        np.isfinite(win_phase) & (win_phase >= PHASE_SATURATION_DEG)))
+
+    provenance = dict(
+        headroom_window=k,
+        numerator_f_hz=float(f_s[i_num]),
+        numerator_phase_deg=float(phase_s[i_num]),
+        numerator_phase_saturated=bool(n_saturated),
+        n_saturated_in_window=n_saturated,
+        n_tand_used=n,
+    )
+
+    def _decide(mode: str, provisional: bool) -> HeadroomDecision:
+        return HeadroomDecision(
+            mode, provisional, headroom,
+            numerator_f_hz=provenance["numerator_f_hz"],
+            numerator_phase_deg=provenance["numerator_phase_deg"],
+            numerator_phase_saturated=provenance["numerator_phase_saturated"],
+            n_saturated_in_window=n_saturated,
+            window=k,
+            window_f_lo_hz=float(f_s[lo]),
+            window_f_hi_hz=float(f_s[hi]),
+            n_tand_used=n,
+        )
+
+    # Emitted whatever the mode, because a *value* decided at the rail is exactly as
+    # worth seeing as a bound — and only one of those two would ever be looked for.
+    if n_saturated:
+        logger.info(
+            "eis_headroom_numerator_phase_saturated",
+            phase_headroom=headroom, z_median_ohm=z_med,
+            window_f_lo_hz=float(f_s[lo]), window_f_hi_hz=float(f_s[hi]),
+            msg="the headroom numerator's window touches the instrument's phase rail, "
+                "where Re Z -> 0 drives tan delta to zero whatever the sample is doing",
+            **provenance,
+        )
+
     resolution_limited = headroom < float(tand_headroom_mult)
 
     if resolution_limited:
         logger.info(
             "eis_reported_as_bound", reason="loss tangent below the phase floor",
             phase_headroom=headroom, z_median_ohm=z_med, provisional=not in_band,
+            **provenance,
         )
-        return ("bound" if in_band else "bound_unqualified"), not in_band, headroom
+        return _decide("bound" if in_band else "bound_unqualified", not in_band)
 
     if not in_band:
         logger.info(
             "eis_phase_floor_extrapolated", z_median_ohm=z_med,
             phase_headroom=headroom,
             msg="value reported, but the phase floor it cleared is extrapolated",
+            **provenance,
         )
-    return "value", not in_band, headroom
+    return _decide("value", not in_band)
 
 
 def sigma_upper_bound(

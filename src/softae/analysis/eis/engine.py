@@ -792,10 +792,12 @@ def analyze_spectrum(
     arc = annotate_arc_closure(fit, surviving)
 
     f_ok, Z_ok = _physics_complex(surviving)
-    mode, provisional, headroom = decide_report_mode(
+    decision = decide_report_mode(
         f_ok, Z_ok, envelope=env, cell=cell,
         tand_headroom_mult=gate_cfg.tand_headroom_mult,
     )
+    mode, provisional, headroom = (
+        decision.mode, decision.provisional, decision.headroom)
     bound = sigma_upper_bound(f_ok, Z_ok, envelope=env, cell=cell)
 
     R, R_se, basis, rho = _resolve_reported_resistance(
@@ -805,6 +807,20 @@ def analyze_spectrum(
         cell, mode=mode, provisional=provisional, upper_bound=bound,
         phase_headroom=headroom, model_free_R=model_free_r_bulk(Z_ok),
         R_se=R_se, R_basis=basis, rho=rho,
+    )
+    # The numerator's provenance is decided upstream and has nothing to do with the
+    # resistance `_sigma_from_R` converts, so it is attached here rather than threaded
+    # through that signature. `window` rides as `headroom_window`: 1 means the minimum
+    # was taken on a single point, which is a different claim from a windowed one and
+    # must not be spelled the same way (`SUBAGENT_RULES` 3.1(a)).
+    from dataclasses import replace as _replace
+
+    sigma = _replace(
+        sigma,
+        numerator_f_hz=decision.numerator_f_hz,
+        numerator_phase_deg=decision.numerator_phase_deg,
+        numerator_phase_saturated=decision.numerator_phase_saturated,
+        headroom_window=decision.window,
     )
 
     # Front 2 — how well determined is the answer? These read the fit from ctx and

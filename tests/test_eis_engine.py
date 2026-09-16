@@ -578,14 +578,25 @@ class TestBoundReporting:
 
 
 class TestHeadroomNumerator:
-    """``decide_report_mode``'s numerator: minimum ``tan δ``, not median (spec §6).
+    """``decide_report_mode``'s numerator: a WINDOWED minimum ``tan δ`` (T11.31).
 
-    Conservatism runs in opposite directions on the two sides of ``tan δ / tan ε``. The
-    median was the shipped statistic and it over-qualifies the sample: every state in the
-    commissioning figure converges on ``tan δ ≈ 5`` at 10⁵ Hz, so a band median is
-    dominated by the region where every spectrum looks alike. This lives on the gated
-    branch only in production, but ``shadow_rehearse`` forces ``engine="gated"``, which is
-    the instrument the arming evidence is meant to come from.
+    Two rules are at work and they are orthogonal.
+
+    *Direction* — median for the instrument, minimum for the sample. A band median
+    over-qualifies the sample: every state in the commissioning figure converges on
+    ``tan δ ≈ 5`` at 10⁵ Hz, so it is computed exactly where nothing distinguishes
+    anything. That has not changed.
+
+    *Robustness* — a **single-point** minimum is not an understatement of the sample's
+    margin, it is a noise statistic. At |phase| → 90°, ``Re Z → 0`` sends ``tan δ`` to
+    zero whatever the sample is doing; on rung 3a one such reading per spectrum produced
+    11 false bounds and flipped ch11 between value and bound fourteen times while R₁
+    moved 1 %. So the numerator is the minimum over running **medians** of a 5-wide
+    frequency window — still the most pessimistic *region*, no longer the luckiest
+    single reading in it.
+
+    This lives on the gated branch only in production, but ``shadow_rehearse`` forces
+    ``engine="gated"``, which is the instrument the arming evidence is meant to come from.
     """
 
     FREQ = np.logspace(0.0, 5.0, 41)
@@ -597,46 +608,239 @@ class TestHeadroomNumerator:
                                phase_noise_valid_at=lambda _z: in_band)
 
     @classmethod
-    def _spectrum(cls, tand: np.ndarray, C: float = 1e-10) -> np.ndarray:
-        """``Z`` with a prescribed ``tan δ`` per point, built in admittance."""
-        f = cls.FREQ
+    def _spectrum(cls, tand: np.ndarray, C: float = 1e-10,
+                  freq: np.ndarray | None = None) -> np.ndarray:
+        """``Z`` with a prescribed ``tan δ`` per point, built in admittance.
+
+        ``arg Z = −atan2(1, tan δ)``, so a point's phase is fixed by its ``tan δ`` — a
+        rail-adjacent phase and a vanishing loss tangent are the *same* fact, which is
+        why the flag cannot be a filter.
+        """
+        f = cls.FREQ if freq is None else freq
         return 1.0 / (tand * 2.0 * np.pi * f * C + 1j * 2.0 * np.pi * f * C)
 
-    def test_the_headroom_is_the_minimum_loss_tangent_over_the_floor(self):
+    @classmethod
+    def _capture(cls, fn):
+        """Run ``fn`` with ``report.logger.info`` collected rather than emitted."""
+        from softae.analysis.eis import report as report_module
+
+        emitted: list[tuple[str, dict]] = []
+        original = report_module.logger.info
+        report_module.logger.info = lambda ev, **kw: emitted.append((ev, kw))
+        try:
+            return fn(report_module), emitted
+        finally:
+            report_module.logger.info = original
+
+    def test_decide_report_mode_three_point_dip_is_the_headroom_numerator(self):
+        """The numerator is a *region*, so a dip has to be wide enough to own a median.
+
+        Three adjacent points at 0.05 are the majority of a 5-wide window, so 0.05 is
+        that window's median and the spectrum's margin. One point at 0.05 is not — that
+        is the next test.
+        """
         from softae.analysis.eis.report import decide_report_mode
 
         tand = np.full(self.FREQ.size, 5.0)
-        tand[10] = 0.05
-        _, _, headroom = decide_report_mode(
+        tand[9:12] = 0.05
+        d = decide_report_mode(
             self.FREQ, self._spectrum(tand), envelope=self._envelope(), cell=CELL)
-        assert headroom == pytest.approx(0.05 / self.FLOOR, rel=1e-6)
+        assert d.headroom == pytest.approx(0.05 / self.FLOOR, rel=1e-6)
+        assert d.window == 5
+        assert d.n_tand_used == self.FREQ.size
 
-    def test_a_spectrum_whose_only_loss_is_high_frequency_is_reported_as_a_bound(self):
-        """The defect, as behaviour rather than as arithmetic.
+    def test_decide_report_mode_single_low_point_no_longer_bounds(self):
+        """The defect, as behaviour — and its own positive control.
 
-        One low-loss point at 0.005 among a band converging on ``tan δ = 5``. The median
-        gives a headroom of ~1900 and calls this a measured value; the minimum gives ~1.9
-        and calls it a bound. Same spectrum, opposite claim.
+        One point at 0.005 among a band converging on ``tan δ = 5``. The single-point
+        minimum gives a headroom of 1.9 and calls this resolution-limited; the 5-wide
+        windowed minimum gives 1923 and calls it a measured value. The same input with
+        ``headroom_window=1`` still bounds, which is what makes the window — and not
+        some other change in this function — the thing that moved the verdict.
         """
         from softae.analysis.eis.report import decide_report_mode
 
         tand = np.full(self.FREQ.size, 5.0)
         tand[10] = 0.005
-        mode, _, headroom = decide_report_mode(
+        Z = self._spectrum(tand)
+
+        windowed = decide_report_mode(
+            self.FREQ, Z, envelope=self._envelope(), cell=CELL)
+        assert windowed.mode == "value"
+        assert windowed.headroom == pytest.approx(5.0 / self.FLOOR, rel=1e-6)
+
+        single = decide_report_mode(
+            self.FREQ, Z, envelope=self._envelope(), cell=CELL, headroom_window=1)
+        assert single.mode == "bound"
+        assert single.headroom == pytest.approx(0.005 / self.FLOOR, rel=1e-6)
+        assert single.window == 1
+
+    def test_decide_report_mode_two_adjacent_low_points_no_longer_bound(self):
+        """ch11 r9/r12's shape: *two* consecutive rail-adjacent points, not one.
+
+        A 3-wide median still lands on one of a pair — which is why k=3 leaves 3 of
+        rung 3a's 11 false bounds standing and k=5 leaves none. Five is the smallest
+        odd width that tolerates the largest cluster the corpus actually produces.
+        """
+        from softae.analysis.eis.report import decide_report_mode
+
+        tand = np.full(self.FREQ.size, 5.0)
+        tand[10:12] = 0.005
+        Z = self._spectrum(tand)
+
+        assert decide_report_mode(self.FREQ, Z, envelope=self._envelope(),
+                                  cell=CELL).mode == "value"
+        assert decide_report_mode(self.FREQ, Z, envelope=self._envelope(), cell=CELL,
+                                  headroom_window=3).mode == "bound"
+
+    def test_decide_report_mode_broad_low_loss_band_still_bounds(self):
+        """**Negative control, and it is mandatory** (spec §2e, ``SUBAGENT_RULES`` §3.2).
+
+        Under the windowed minimum all 84 rung-3a spectra report a value, so that corpus
+        can show the false bounds are gone and **cannot** show a true one is still
+        reachable. Nine consecutive points genuinely under the floor are a measurement
+        that is not there, and must still refuse.
+        """
+        from softae.analysis.eis.report import decide_report_mode
+
+        tand = np.full(self.FREQ.size, 5.0)
+        tand[10:19] = 0.0005                       # 9 adjacent, well under 3 × floor
+        d = decide_report_mode(
             self.FREQ, self._spectrum(tand), envelope=self._envelope(), cell=CELL)
-        assert headroom < 3.0
-        assert mode == "bound"
+        assert d.mode == "bound"
+        assert d.headroom == pytest.approx(0.0005 / self.FLOOR, rel=1e-6)
+        assert d.headroom < 3.0
         assert float(np.median(tand)) / self.FLOOR > 3.0      # the median would pass
+
+    def test_decide_report_mode_rail_adjacent_numerator_sets_saturated_flag(self):
+        """A margin decided next to the phase rail is still reported — and said so.
+
+        The flag describes the **window** that decided the margin, because the window is
+        what decided it. Here the window's median is an honest 0.05 and the verdict is a
+        value; one of its five points sits at −89.99°, and that is a fact the operator
+        could not otherwise recover without re-reading the raw sweep.
+        """
+        from softae.analysis.eis.report import decide_report_mode
+
+        tand = np.full(self.FREQ.size, 5.0)
+        tand[9:12] = 0.05
+        tand[10] = 1.0e-4                          # arg Z = −89.994°
+        d, emitted = self._capture(lambda _m: decide_report_mode(
+            self.FREQ, self._spectrum(tand), envelope=self._envelope(), cell=CELL))
+
+        assert d.mode == "value"
+        assert d.numerator_phase_saturated is True
+        assert d.n_saturated_in_window == 1
+        assert d.numerator_f_hz == pytest.approx(self.FREQ[11])
+        assert d.numerator_phase_deg == pytest.approx(
+            -np.degrees(np.arctan2(1.0, 0.05)), rel=1e-6)
+        assert d.window_f_lo_hz == pytest.approx(self.FREQ[7])
+        assert d.window_f_hi_hz == pytest.approx(self.FREQ[11])
+        # Emitted whatever the mode: a value decided at the rail is exactly as worth
+        # seeing as a bound, and only one of the two would ever be looked for.
+        flagged = [kw for ev, kw in emitted
+                   if ev == "eis_headroom_numerator_phase_saturated"]
+        assert len(flagged) == 1
+        assert flagged[0]["n_saturated_in_window"] == 1
+
+    def test_decide_report_mode_clean_numerator_leaves_saturated_flag_false(self):
+        """Negative control for the flag: a lossy spectrum is nowhere near the rail."""
+        from softae.analysis.eis.report import decide_report_mode
+
+        d, emitted = self._capture(lambda _m: decide_report_mode(
+            self.FREQ, self._spectrum(np.full(self.FREQ.size, 5.0)),
+            envelope=self._envelope(), cell=CELL))
+
+        assert d.numerator_phase_saturated is False
+        assert d.n_saturated_in_window == 0
+        assert not [ev for ev, _ in emitted
+                    if ev == "eis_headroom_numerator_phase_saturated"]
+
+    def test_decide_report_mode_short_spectrum_falls_back_to_single_point_window(self):
+        """Too few survivors to window, and the fallback is *recorded*, not implied.
+
+        ``window == 1`` is the difference between "the most pessimistic five-point
+        region" and "one reading", and reporting the second with the first's name is
+        the failure ``SUBAGENT_RULES`` §3.1(a) is about.
+        """
+        from softae.analysis.eis.report import decide_report_mode
+
+        f = self.FREQ[:2]
+        tand = np.array([5.0, 0.01])
+        d = decide_report_mode(f, self._spectrum(tand, freq=f),
+                               envelope=self._envelope(), cell=CELL)
+        assert d.window == 1
+        assert d.n_tand_used == 2
+        assert d.headroom == pytest.approx(0.01 / self.FLOOR, rel=1e-6)
+        assert d.numerator_f_hz == pytest.approx(f[1])
+
+    def test_decide_report_mode_window_is_taken_in_frequency_order(self):
+        """The engine *happens* to hand these over in sweep order; the statistic may
+        not depend on that, so the triples are sorted explicitly."""
+        from softae.analysis.eis.report import decide_report_mode
+
+        tand = np.full(self.FREQ.size, 5.0)
+        tand[9:12] = 0.05
+        Z = self._spectrum(tand)
+        shuffle = np.random.default_rng(11).permutation(self.FREQ.size)
+
+        ordered = decide_report_mode(
+            self.FREQ, Z, envelope=self._envelope(), cell=CELL)
+        shuffled = decide_report_mode(
+            self.FREQ[shuffle], Z[shuffle], envelope=self._envelope(), cell=CELL)
+
+        assert shuffled.mode == ordered.mode
+        assert shuffled.headroom == pytest.approx(ordered.headroom, rel=1e-12)
+        assert shuffled.numerator_f_hz == pytest.approx(ordered.numerator_f_hz)
+        assert shuffled.window_f_lo_hz == pytest.approx(ordered.window_f_lo_hz)
+
+    def test_decide_report_mode_bound_log_event_carries_window_and_numerator_phase(self):
+        """The refusal has to name what refused, or the next rung re-reads 84 netCDFs."""
+        from softae.analysis.eis.report import decide_report_mode
+
+        tand = np.full(self.FREQ.size, 5.0)
+        tand[10:19] = 0.0005
+        d, emitted = self._capture(lambda _m: decide_report_mode(
+            self.FREQ, self._spectrum(tand), envelope=self._envelope(), cell=CELL))
+
+        assert d.mode == "bound"
+        bounds = [kw for ev, kw in emitted if ev == "eis_reported_as_bound"]
+        assert len(bounds) == 1
+        assert bounds[0]["headroom_window"] == 5
+        assert bounds[0]["n_tand_used"] == self.FREQ.size
+        assert bounds[0]["numerator_f_hz"] == pytest.approx(d.numerator_f_hz)
+        assert bounds[0]["numerator_phase_deg"] == pytest.approx(d.numerator_phase_deg)
+        assert bounds[0]["numerator_phase_saturated"] is True
+        # The event carries the DECISION's counts, not a recount. Several windows
+        # over this synthetic plateau have bit-identical medians and ``argmin``
+        # deterministically takes the first, so the placement is fixed — the count
+        # is pinned as "most of the window" because the plateau's width, not its
+        # exact alignment, is what this test is about.
+        assert bounds[0]["n_saturated_in_window"] == d.n_saturated_in_window >= 3
+
+    def test_decide_report_mode_extrapolated_value_log_event_carries_the_numerator(self):
+        from softae.analysis.eis.report import decide_report_mode
+
+        d, emitted = self._capture(lambda _m: decide_report_mode(
+            self.FREQ, self._spectrum(np.full(self.FREQ.size, 5.0)),
+            envelope=self._envelope(in_band=False), cell=CELL))
+
+        assert (d.mode, d.provisional) == ("value", True)
+        extrapolated = [kw for ev, kw in emitted
+                        if ev == "eis_phase_floor_extrapolated"]
+        assert len(extrapolated) == 1
+        assert extrapolated[0]["headroom_window"] == 5
+        assert extrapolated[0]["numerator_phase_saturated"] is False
 
     def test_a_spectrum_with_real_loss_everywhere_is_still_a_value(self):
         # Negative control: the minimum must not turn every spectrum into a bound.
         from softae.analysis.eis.report import decide_report_mode
 
-        mode, _, headroom = decide_report_mode(
+        d = decide_report_mode(
             self.FREQ, self._spectrum(np.full(self.FREQ.size, 5.0)),
             envelope=self._envelope(), cell=CELL)
-        assert mode == "value"
-        assert headroom == pytest.approx(5.0 / self.FLOOR, rel=1e-6)
+        assert d.mode == "value"
+        assert d.headroom == pytest.approx(5.0 / self.FLOOR, rel=1e-6)
 
     def test_non_positive_loss_tangents_are_excluded_and_the_exclusion_is_logged(self):
         """A negative ``tan δ`` says the passive quadrant failed at that point — not that
@@ -645,33 +849,65 @@ class TestHeadroomNumerator:
         the drop is announced, because masking these silently is half of what made the
         median look defensible.
         """
-        from softae.analysis.eis import report as report_module
+        tand = np.full(self.FREQ.size, 5.0)
+        tand[:4] = -0.5
+        tand[9:12] = 0.05
+        d, emitted = self._capture(lambda m: m.decide_report_mode(
+            self.FREQ, self._spectrum(tand), envelope=self._envelope(), cell=CELL))
 
-        emitted: list[tuple[str, dict]] = []
-        original = report_module.logger.info
-        report_module.logger.info = lambda ev, **kw: emitted.append((ev, kw))
-        try:
-            tand = np.full(self.FREQ.size, 5.0)
-            tand[:4] = -0.5
-            tand[10] = 0.05
-            _, _, headroom = report_module.decide_report_mode(
-                self.FREQ, self._spectrum(tand), envelope=self._envelope(), cell=CELL)
-        finally:
-            report_module.logger.info = original
-
-        assert headroom == pytest.approx(0.05 / self.FLOOR, rel=1e-6)
+        assert d.headroom == pytest.approx(0.05 / self.FLOOR, rel=1e-6)
+        assert d.n_tand_used == self.FREQ.size - 4
         excluded = [kw for ev, kw in emitted if ev == "eis_tand_points_excluded"]
         assert excluded and excluded[0]["n_excluded"] == 4
 
     def test_a_spectrum_with_no_positive_loss_tangent_is_an_unqualified_bound(self):
         from softae.analysis.eis.report import decide_report_mode
 
-        mode, provisional, headroom = decide_report_mode(
+        d = decide_report_mode(
             self.FREQ, self._spectrum(np.full(self.FREQ.size, -0.5)),
             envelope=self._envelope(), cell=CELL)
-        assert mode == "bound_unqualified"
-        assert provisional
-        assert np.isnan(headroom)
+        assert d.mode == "bound_unqualified"
+        assert d.provisional
+        assert np.isnan(d.headroom)
+        assert d.window == 1                       # nothing was windowed; say so
+
+    def test_decide_report_mode_even_window_is_refused(self):
+        """An even width has no median point, and both repairs are guesses.
+
+        Nothing in the tree passes one, which is exactly why substituting silently
+        would never be noticed. Refuse at the boundary instead.
+        """
+        from softae.analysis.eis.report import decide_report_mode
+
+        Z = self._spectrum(np.full(self.FREQ.size, 5.0))
+        for bad in (4, 0, -3, 2.5):
+            with pytest.raises(ValueError, match="positive odd"):
+                decide_report_mode(self.FREQ, Z, envelope=self._envelope(),
+                                   cell=CELL, headroom_window=bad)
+
+    def test_a_spectrum_with_no_cell_constant_is_unavailable(self):
+        from softae.analysis.eis.report import decide_report_mode
+
+        d = decide_report_mode(
+            self.FREQ, self._spectrum(np.full(self.FREQ.size, 5.0)),
+            envelope=self._envelope(), cell=None)
+        assert d.mode == "unavailable"
+        assert not d.provisional
+        assert np.isnan(d.headroom)
+
+    def test_the_gated_engine_records_the_numerator_on_the_sigma_report(self):
+        """§3.2's fields have to be *reachable*, not merely defined.
+
+        Four defaults on a frozen dataclass are indistinguishable from a seam that never
+        fires (``SUBAGENT_RULES`` §3.1(e)), so this asserts the engine's one call site
+        actually attaches them to the report the DataStore and the analysis tab read.
+        """
+        report = analyze_spectrum(as_eis_result(*reference_spectrum()),
+                                  cell=CELL, settings=_gated())
+        assert report.sigma.headroom_window == 5
+        assert np.isfinite(report.sigma.numerator_f_hz)
+        assert np.isfinite(report.sigma.numerator_phase_deg)
+        assert report.sigma.numerator_phase_saturated in (True, False)
 
 
 class TestVocabularyBridge:

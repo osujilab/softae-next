@@ -352,8 +352,10 @@ class TestTheCommittedCalibrationAsset:
 class TestTheCommissionedFloorInDecideReportMode:
     """Decision 2's behavioural half — a 41× denominator changes what may be claimed.
 
-    ``decide_report_mode`` divides the spectrum's minimum ``tan δ`` by the envelope's
-    floor and calls anything under ``tand_headroom_mult`` (3.0) resolution-limited.
+    ``decide_report_mode`` divides the spectrum's windowed-minimum ``tan δ`` by the
+    envelope's floor and calls anything under ``tand_headroom_mult`` (3.0)
+    resolution-limited. These spectra are constant in ``tan δ``, so the window (T11.31)
+    cannot move the numerator and the denominator is the only variable left.
     The configured floor is tan(0.149°) = 0.0026; the commissioned one is
     tan(6.12°) = 0.1072. A spectrum whose minimum loss sits between 3×0.0026 and
     3×0.1072 is a value under one and a bound under the other.
@@ -367,24 +369,24 @@ class TestTheCommissionedFloorInDecideReportMode:
 
     def test_a_commissioned_floor_turns_a_marginal_value_into_a_bound(self):
         Z = self._spectrum(0.05)          # 19x the configured floor, 0.47x the commissioned
-        base_mode, _, base_headroom = decide_report_mode(
+        base = decide_report_mode(
             self.FREQ, Z, envelope=instrument_envelope(), cell=CELL)
-        wired_mode, _, wired_headroom = decide_report_mode(
+        wired = decide_report_mode(
             self.FREQ, Z, envelope=_commissioned().envelope(), cell=CELL)
 
-        assert base_mode == "value"
-        assert base_headroom > 3.0
-        assert wired_mode in BOUND_MODES
-        assert wired_headroom < 3.0
+        assert base.mode == "value"
+        assert base.headroom > 3.0
+        assert wired.mode in BOUND_MODES
+        assert wired.headroom < 3.0
 
     def test_a_genuinely_lossy_spectrum_is_still_a_value_under_the_commissioned_floor(self):
         """Negative control: a 41× floor must not turn *everything* into a bound."""
         Z = self._spectrum(5.0)
-        mode, _, headroom = decide_report_mode(
+        decision = decide_report_mode(
             self.FREQ, Z, envelope=_commissioned().envelope(), cell=CELL)
 
-        assert mode == "value"
-        assert headroom > 3.0
+        assert decision.mode == "value"
+        assert decision.headroom > 3.0
 
     def test_the_anchor_decides_whether_a_bound_is_qualified(self):
         """``argmax(ε)`` moves the anchor to 1.0118e7 Ω, where this rig's films live.
@@ -404,7 +406,7 @@ class TestTheCommissionedFloorInDecideReportMode:
         assert at_argmax.phase_noise_valid_at(z_med) is True
         assert at_argmin.phase_noise_valid_at(z_med) is False
         assert decide_report_mode(
-            self.FREQ, near_anchor, envelope=at_argmax, cell=CELL)[0] == "bound"
+            self.FREQ, near_anchor, envelope=at_argmax, cell=CELL).mode == "bound"
         assert decide_report_mode(
             self.FREQ, near_anchor, envelope=at_argmin,
-            cell=CELL)[0] == "bound_unqualified"
+            cell=CELL).mode == "bound_unqualified"
