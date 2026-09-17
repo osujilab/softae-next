@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 from softae.workflows.workflow_model import WorkflowStep
 
@@ -45,6 +46,11 @@ __all__ = [
     "TEMP_INSTRUMENT",
     "RH_INSTRUMENT",
     "CONDITIONS_PHASE_TAG",
+    "BASELINE_TAG",
+    "BASELINE_EVENT",
+    "BASELINE_ABSENT_EVENT",
+    "first_phase_axes",
+    "baseline_event_payload",
 ]
 
 #: Instrument keys, matching ``data/tasks.toml``'s ``rh_*`` tasks and
@@ -55,6 +61,20 @@ RH_INSTRUMENT = "rh_controller"
 #: ``tags["phase"]`` every emitted step carries, so a condition step is
 #: distinguishable from the cast, cure and measure steps around it.
 CONDITIONS_PHASE_TAG = "conditions"
+
+#: ``tags["baseline"]`` on the steps :meth:`PhaseSetpoints.command_steps` emits.
+#: The campaign-level baseline and a phase's own conditions are structurally
+#: identical apart from the two waits, and "the baseline" is not a thing an
+#: absence can say: a transcript reader counting condition steps has to be able
+#: to tell the floor from the phase that overrode it.
+BASELINE_TAG = "baseline"
+
+#: Events the campaign emits at run start, recording what the baseline commanded
+#: — or that there was none. The second is the T11.28 case itself: a campaign
+#: after a park is unconditioned until the first phase that speaks, and that is
+#: recorded rather than inferred from silence.
+BASELINE_EVENT = "conditions_baseline"
+BASELINE_ABSENT_EVENT = "conditions_baseline_absent"
 
 # The four tolerance/timeout defaults are the values
 # ``softae.workflows.equilibration`` measured and documents at length
@@ -210,7 +230,36 @@ class PhaseSetpoints:
         must be unique within a workflow, and the caller owns that: two phases
         emitting the same condition name under the same suffix would collide.
         """
+        return self._emit(suffix, wait=True)
+
+    def command_steps(self, suffix: str) -> list[WorkflowStep]:
+        """``establish_steps`` minus the two waits: **commanded, not gated**.
+
+        The campaign-level baseline (``CampaignSpec.conditions``) is established
+        at the top of the first trial workflow, before the startup flush, and its
+        whole purpose is that the axes are *driven* while the pumps run. A wait
+        there would be a new refusal on the path to the first cast — and the RH
+        wait raises on timeout, so a cold, dry chamber left by
+        :func:`~softae.core.safe_park.safe_park` would abort the campaign before
+        anything was cast. The chamber arrives during the flush and the first
+        casts; "it may not have arrived yet" is said at ``check`` time by
+        :func:`softae.core.preflight.project_campaign`, not by a gate here.
+
+        Everything else is identical to :meth:`establish_steps` — same
+        instruments, same methods, same params, same order, same
+        ``tags["phase"] = "conditions"`` — plus ``tags["baseline"] = "true"`` so
+        the floor is distinguishable from the phase that overrides it. An axis
+        whose setpoint is ``None`` still contributes **no steps**, and
+        ``rh_setpoint_pct = 0.0`` is still a *commanded dry purge* rather than an
+        absence: this method changes what waits, never what is driven.
+        """
+        return self._emit(suffix, wait=False)
+
+    def _emit(self, suffix: str, *, wait: bool) -> list[WorkflowStep]:
+        """Shared builder. ``wait=False`` drops the two approach waits."""
         tags = {"phase": CONDITIONS_PHASE_TAG, "condition": self.name}
+        if not wait:
+            tags[BASELINE_TAG] = "true"
         steps: list[WorkflowStep] = []
 
         if self.temp_setpoint_C is not None:
@@ -227,15 +276,16 @@ class PhaseSetpoints:
                 timeout_s=30.0,
                 tags=temp_tags,
             ))
-            steps.append(WorkflowStep(
-                name=f"conditions_{self.name}_temp_wait_{suffix}",
-                instrument=TEMP_INSTRUMENT,
-                method="wait",
-                params={"within": float(self.tolerance_C),
-                        "timeout": float(self.approach_timeout_s)},
-                timeout_s=_step_ceiling(float(self.approach_timeout_s)),
-                tags=temp_tags,
-            ))
+            if wait:
+                steps.append(WorkflowStep(
+                    name=f"conditions_{self.name}_temp_wait_{suffix}",
+                    instrument=TEMP_INSTRUMENT,
+                    method="wait",
+                    params={"within": float(self.tolerance_C),
+                            "timeout": float(self.approach_timeout_s)},
+                    timeout_s=_step_ceiling(float(self.approach_timeout_s)),
+                    tags=temp_tags,
+                ))
 
         if self.rh_setpoint_pct is not None:
             rh_tags = {**tags, "axis": "humidity"}
@@ -255,16 +305,69 @@ class PhaseSetpoints:
                 timeout_s=30.0,
                 tags=rh_tags,
             ))
-            steps.append(WorkflowStep(
-                name=f"conditions_{self.name}_rh_wait_{suffix}",
-                instrument=RH_INSTRUMENT,
-                method="wait",
-                params={"target": float(self.rh_setpoint_pct),
-                        "tol": float(self.rh_tolerance_pct),
-                        "timeout": float(self.rh_approach_timeout_s),
-                        "raise_on_timeout": True},
-                timeout_s=_step_ceiling(float(self.rh_approach_timeout_s)),
-                tags=rh_tags,
-            ))
+            if wait:
+                steps.append(WorkflowStep(
+                    name=f"conditions_{self.name}_rh_wait_{suffix}",
+                    instrument=RH_INSTRUMENT,
+                    method="wait",
+                    params={"target": float(self.rh_setpoint_pct),
+                            "tol": float(self.rh_tolerance_pct),
+                            "timeout": float(self.rh_approach_timeout_s),
+                            "raise_on_timeout": True},
+                    timeout_s=_step_ceiling(float(self.rh_approach_timeout_s)),
+                    tags=rh_tags,
+                ))
 
         return steps
+
+
+# ── the run-start transcript ─────────────────────────────────────────────────
+
+def first_phase_axes(run_plan: Any) -> list[str]:
+    """The axes the plan's **first** phase drives, as ``["temperature", ...]``.
+
+    ``[]`` covers three different worlds on purpose — no plan, no phases, a first
+    phase carrying no ``conditions`` — because from the chamber's point of view
+    they are one world: nothing is driven at the top of the run. What separates
+    them is recorded alongside it, in ``first_phase_kind``.
+    """
+    phases = list(getattr(run_plan, "phases", ()) or ())
+    if not phases:
+        return []
+    conditions = getattr(phases[0], "conditions", None)
+    if conditions is None:
+        return []
+    axes = []
+    if conditions.drives_temperature:
+        axes.append("temperature")
+    if conditions.drives_humidity:
+        axes.append("humidity")
+    return axes
+
+
+def baseline_event_payload(spec: Any) -> tuple[str, dict[str, Any]]:
+    """``(event_type, payload)`` for the campaign's ``emit()`` at run start.
+
+    Pure, and deliberately returns the *absent* event rather than ``None``: a
+    campaign that commanded nothing before its first cast is the T11.28 case
+    itself, and a transcript that merely omits a line cannot be read apart from
+    one written before the field existed. Two events, never zero.
+
+    ``waited`` is spelled out on the commanded event because a setpoint is not an
+    arrival: :meth:`PhaseSetpoints.command_steps` emits no wait, so nothing in
+    the run has checked that the chamber got there.
+    """
+    baseline = getattr(spec, "conditions", None)
+    if baseline is None:
+        phases = list(getattr(getattr(spec, "run_plan", None), "phases", ()) or ())
+        kind = getattr(phases[0], "kind", None) if phases else None
+        return BASELINE_ABSENT_EVENT, {
+            "first_phase_kind": getattr(kind, "value", kind),
+            "first_phase_drives": first_phase_axes(getattr(spec, "run_plan", None)),
+        }
+    return BASELINE_EVENT, {
+        "name": str(baseline.name),
+        "temp_setpoint_C": baseline.temp_setpoint_C,
+        "rh_setpoint_pct": baseline.rh_setpoint_pct,
+        "waited": False,
+    }

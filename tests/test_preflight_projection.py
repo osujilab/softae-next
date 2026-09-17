@@ -26,6 +26,7 @@ from softae.core.preflight import (
     per_iteration_draw,
     project_campaign,
     rh_floor_advisories,
+    unconditioned_start_warnings,
 )
 from softae.core.reservoir import ReservoirLedger
 from softae.core.run_plan import (
@@ -746,3 +747,170 @@ class TestMeasurementBlockOnTheMeasurePhase:
         p = project_campaign(_spec(run_plan=plan, batch=True), catalog=catalog)
         assert p.settle_ceiling_s == 0.0
         assert p.per_iteration_s == p.workflow_s
+
+
+# ─────────────────────── the campaign-level [conditions] baseline (T11.28) ───────────────────────
+
+BASELINE = PhaseSetpoints(name="baseline", temp_setpoint_C=25.0,
+                          rh_setpoint_pct=40.0)
+
+
+def _with_baseline(spec, baseline=BASELINE):
+    """Attach a campaign-level baseline to *spec*.
+
+    Set as an attribute rather than passed to the constructor: ``CampaignSpec``
+    lives in another session's file and does not declare the field yet, and
+    ``preflight`` reads it through ``getattr(spec, "conditions", None)``
+    throughout. This works identically once the dataclass declares it.
+    """
+    spec.conditions = baseline
+    return spec
+
+
+def _silent_first_phase_plan() -> RunPlan:
+    """The rung-3a shape: a FORMULATE phase that deliberately drives nothing.
+
+    Nothing is cast in that run, so a casting humidity would only push four
+    settled films off 22 %RH -- which is exactly how a campaign comes to run its
+    startup flush with no axis driven at all.
+    """
+    return RunPlan((
+        RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE),
+        RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                 anneal_task="anneal_85C_8h",
+                 conditions=_conditions("anneal", 85.0, 20.0)),
+        RunPhase(PhaseKind.MEASURE, PhaseScope.PER_BATCH),
+    ))
+
+
+class TestTheUnconditionedStartAdvisory:
+    """A5: an advisory, never a refusal -- an advisory commands no humidifier."""
+
+    def test_preflight_advisory_when_first_phase_drives_no_axis(self, catalog):
+        p = project_campaign(_spec(run_plan=_silent_first_phase_plan(),
+                                   batch=True), catalog=catalog)
+        assert any("unconditioned until the first phase" in w
+                   for w in p.warnings)
+        assert any("startup flush" in w for w in p.warnings)
+
+    def test_preflight_no_advisory_when_baseline_declared(self, catalog):
+        """The check can pass as well as fail -- the declaration silences it."""
+        spec = _with_baseline(_spec(run_plan=_silent_first_phase_plan(),
+                                    batch=True))
+        p = project_campaign(spec, catalog=catalog)
+        assert not any("unconditioned until the first phase" in w
+                       for w in p.warnings)
+
+    def test_preflight_no_advisory_when_the_first_phase_drives_an_axis(self):
+        """One axis is enough: the advisory is about silence, not completeness."""
+        assert unconditioned_start_warnings(
+            _spec(run_plan=_bench_plan())) == []
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE,
+                     conditions=PhaseSetpoints("cast", temp_setpoint_C=25.0)),
+            RunPhase(PhaseKind.MEASURE, PhaseScope.PER_BATCH),
+        ))
+        assert unconditioned_start_warnings(_spec(run_plan=plan)) == []
+
+    def test_preflight_no_advisory_for_a_campaign_with_no_run_plan(self, catalog):
+        """A legacy pointwise campaign never commanded the chamber at all.
+
+        That is an older and different situation from a written plan whose first
+        phase stays silent, and saying this sentence about it would put a note on
+        every campaign that projects today.
+        """
+        assert unconditioned_start_warnings(_spec()) == []
+        text = project_campaign(_spec(), catalog=catalog).describe()
+        assert "unconditioned until the first phase" not in text
+
+
+class TestTheBaselineIsCommandedAndCostsNoGatedTime:
+
+    def test_preflight_approach_ceiling_unchanged_by_baseline(self):
+        """``approach_ceiling_s`` sums condition steps whose method is ``wait``.
+
+        The baseline emits none, so its number must not move -- which is correct
+        rather than a gap: a commanded setpoint nothing waits for costs no gated
+        time. Built through the engine rather than asserted about it, so a
+        baseline that acquired a wait would be caught here.
+        """
+        from softae.core.deposition_recipe import (
+            build_recipe_deposition_workflow,
+            get_deposition_recipe,
+        )
+
+        cat = TaskCatalog.load_toml(loader.tasks_toml_path())
+        kw = dict(catalog=cat, pump_ids=[0, 1], dispense_rate=100.0,
+                  flush_rate=500.0, flush_factor=3.0, settle_factor=2.0,
+                  pcb={"grid": [8, 4], "spacing_mm": [10, 10]},
+                  origin_xy=(43.5, 50.0), run_plan=_bench_plan())
+        recipe = get_deposition_recipe("single_drop")
+        bare = build_recipe_deposition_workflow(recipe, [21], {21: [1.0, 1.0]}, **kw)
+        with_baseline = build_recipe_deposition_workflow(
+            recipe, [21], {21: [1.0, 1.0]}, baseline=BASELINE, **kw)
+
+        assert approach_ceiling_s(with_baseline) == approach_ceiling_s(bare)
+        assert any(s.tags.get("baseline") == "true"
+                   for s in with_baseline.setup), "the baseline was not emitted"
+
+    def test_preflight_commanded_conditions_puts_the_baseline_at_the_head(self):
+        """Where the engine commands it: ahead of every phase."""
+        plan = _bench_plan()
+        assert commanded_conditions(plan, BASELINE)[0] is BASELINE
+        assert commanded_conditions(plan, BASELINE)[1:] == commanded_conditions(plan)
+        assert commanded_conditions(plan) == commanded_conditions(plan, None)
+
+    def test_preflight_commanded_conditions_dedups_a_first_phase_equal_to_it(self):
+        """The engine emits nothing for a matching first phase; nor does this.
+
+        Advising twice about one approach would misrepresent what the run does.
+        """
+        first = _conditions("casting", 25.0, 40.0)
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE, conditions=first),
+            RunPhase(PhaseKind.MEASURE, PhaseScope.PER_BATCH),
+        ))
+        assert commanded_conditions(plan, first) == [first]
+
+    def test_preflight_rh_floor_advisory_sees_the_baselines_humidity(self):
+        """Without this it is the one commanded humidity the advisory cannot see."""
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE),
+            RunPhase(PhaseKind.MEASURE, PhaseScope.PER_BATCH),
+        ))
+        bins = [TemperatureBin(temperature_C=25.0, rh_floor_pct=30.0,
+                               rh_setpoint_min_pct=25.0, n_rows=12)]
+        dry = PhaseSetpoints("baseline", temp_setpoint_C=25.0, rh_setpoint_pct=10.0)
+
+        assert rh_floor_advisories(plan, bins) == []
+        lines = rh_floor_advisories(plan, bins, baseline=dry)
+        assert len(lines) == 1
+        assert "condition 'baseline' commands 10 %RH" in lines[0]
+
+    def test_rh_floor_warnings_baseline_without_a_run_plan_is_advised(
+        self, catalog, tmp_path
+    ):
+        """A baseline is a commanded humidity even with no plan at all.
+
+        ``_rh_floor_warnings`` used to short-circuit on ``run_plan is None``; the
+        baseline is commanded before any phase exists, so the guard is now the
+        commanded set itself. Untested, that behaviour would be indistinguishable
+        from the advisory never having been reached.
+        """
+        spec = _with_baseline(_spec(),
+                              PhaseSetpoints("baseline", temp_setpoint_C=25.0,
+                                             rh_setpoint_pct=10.0))
+        p = project_campaign(spec, catalog=catalog,
+                             project_dir=tmp_path / "nothing-here")
+        assert spec.run_plan is None
+        assert any("no RH-floor history was consulted" in w for w in p.warnings)
+
+    def test_rh_floor_warnings_no_baseline_and_no_run_plan_stays_silent(
+        self, catalog, tmp_path
+    ):
+        """The companion: nothing commanded, nothing said -- and no "not
+        consulted" note either, which is the half that would hide a check that
+        had simply stopped running."""
+        p = project_campaign(_spec(), catalog=catalog,
+                             project_dir=tmp_path / "nothing-here")
+        assert not any("RH-floor" in w for w in p.warnings)

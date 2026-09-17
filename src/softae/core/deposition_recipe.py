@@ -440,6 +440,7 @@ def build_deposition_workflow(
     settings: DepositionSettings,
     catalog: TaskCatalog,
     eis_step_by_channel: dict[int, WorkflowStep] | None = None,
+    baseline: "PhaseSetpoints | None" = None,
     name: str = "deposition",
 ) -> Workflow:
     """Build a deposition Workflow from a :class:`DepositionSettings`.
@@ -453,6 +454,11 @@ def build_deposition_workflow(
     the hardware boundary, so it is also the one place dead-volume correction is
     applied (P2.2) — see :class:`DeadVolumeCorrection` for why the conversion
     belongs this late rather than inside the solver.
+
+    ``baseline`` is the campaign-level ``[conditions]`` floor (T11.28). It rides
+    as its own keyword rather than inside :class:`DepositionSettings` because it
+    belongs to the *campaign*, not to a cast: the HT tab has no baseline and the
+    settings object is shared with it.
     """
     if settings.correction is not None and settings.correction.enabled:
         formulation_by_channel = dict(
@@ -472,6 +478,7 @@ def build_deposition_workflow(
         start_flush_uL=list(settings.start_flush_uL) or None,
         deposit_method=settings.deposit_method,
         eis_step_by_channel=eis_step_by_channel,
+        baseline=baseline,
         piezo=settings.piezo,
         pcb=settings.pcb,
         origin_xy=settings.origin_xy,
@@ -497,6 +504,7 @@ def build_recipe_deposition_workflow(
     start_flush_uL: Sequence[float] | None = None,
     deposit_method: str | None = None,
     eis_step_by_channel: dict[int, WorkflowStep] | None = None,
+    baseline: "PhaseSetpoints | None" = None,
     piezo: PiezoPlan | None = None,
     pcb: dict,
     origin_xy: tuple[float, float] | None = None,
@@ -527,6 +535,16 @@ def build_recipe_deposition_workflow(
     last setpoint, so a phase repeating the standing condition emits nothing. The
     steps are tagged ``phase="conditions"`` with the condition's ``name``.
 
+    ``baseline`` is the campaign-level floor (T11.28): its setpoints are
+    **commanded at the very top of ``setup``**, ahead of the piezo event step and
+    the startup flush, and **waited for by nothing** — the ask is that the axes be
+    driven while the pumps run, not that casting be gated. It also seeds the
+    standing-condition tracker, so a first phase whose ``conditions`` equal the
+    baseline emits nothing and one that differs emits its own full
+    ``establish_steps``, waits included. **A floor, not a policy**: the first
+    phase that speaks overrides it and it never returns. ``None`` leaves every
+    existing caller's workflow byte-identical.
+
     ``deposit_method`` overrides the deposit phase's method (the HT deposit-method
     selector).  ``eis_step_by_channel`` omitted (and no MEASURE phase) → no EIS
     (formulate-only).  ``time_scale`` (when given) is injected into every
@@ -542,6 +560,13 @@ def build_recipe_deposition_workflow(
         origin_xy = deposition_positions().origin
 
     setup: list[WorkflowStep] = []
+
+    # FIRST, ahead of the piezo event step and the startup flush. Both
+    # observations behind T11.28 are about the stretch before the first phase
+    # speaks: the pumps run, the chamber drifts, and after a `safe_park` it
+    # drifts from 10 °C and a zeroed humidity setpoint.
+    if baseline is not None:
+        setup.extend(baseline.command_steps("baseline"))
 
     piezo_on = piezo is not None and piezo.enabled
     piezo_all = piezo is not None and piezo.enabled and piezo.elution_scope == "all_elution"
@@ -741,8 +766,10 @@ def build_recipe_deposition_workflow(
     #
     # A plan whose phases carry no conditions emits nothing here, which is what
     # keeps every existing caller's workflow byte-identical.
-    established: "PhaseSetpoints | None" = None
+    established: "PhaseSetpoints | None" = baseline
     condition_keys: set[str] = set()
+    if baseline is not None:
+        condition_keys.add(f"{baseline.name}/baseline")
 
     def _condition_suffix(name: str, base: str) -> str:
         """A step-name suffix unique within this workflow, for condition *name*.

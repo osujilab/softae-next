@@ -146,3 +146,59 @@ class TestLoadEvent:
 
         assert event["recipe_pinned"] is False
         assert event["n_searched_axes"] == 0
+
+
+# ─────────────────────── the campaign-level [conditions] baseline (T11.28) ───────────────────────
+
+class TestTheConditionsFieldIsRegistered:
+    """``conditions`` crosses the file boundary like ``run_plan`` does.
+
+    **The seam, stated.** The loader's legal-key set is
+    ``{f.name for f in dataclass_fields(CampaignSpec)}``, and ``CampaignSpec``
+    lives in ``core/autonomous_wiring.py`` -- another session's file. Until the
+    one-line field lands there, a top-level ``[conditions]`` block is refused as
+    an unknown field, so the round trip is exercised here through the registered
+    codec rather than through ``spec_from_dict``. The two halves commit together.
+    """
+
+    def test_spec_io_conditions_is_registered_as_an_object_field(self):
+        from softae.core.campaign_spec_fields import OBJECT_FIELDS
+        from softae.core.campaign_spec_run_plan import baseline_conditions_codec
+
+        assert OBJECT_FIELDS["conditions"] is baseline_conditions_codec()
+
+    def test_spec_io_conditions_block_round_trips(self):
+        from softae.core.campaign_spec_fields import OBJECT_FIELDS
+        from softae.core.phase_setpoints import PhaseSetpoints
+
+        codec = OBJECT_FIELDS["conditions"]
+        table = {"name": "baseline", "temp_setpoint_C": 25.0,
+                 "rh_setpoint_pct": 40.0}
+        setpoints = codec.decode(table)
+
+        assert setpoints == PhaseSetpoints("baseline", temp_setpoint_C=25.0,
+                                           rh_setpoint_pct=40.0)
+        assert codec.encode(setpoints) == table
+        assert codec.decode(codec.encode(setpoints)) == setpoints
+
+    def test_spec_io_conditions_reaches_the_loader_when_the_spec_declares_it(self):
+        """Records WHICH state the seam is in, rather than leaving it silent.
+
+        This is a statement about ``CampaignSpec``, not about the codec: the
+        moment the dataclass declares ``conditions``, the loader carries it and
+        this test is replaced by a round trip through ``spec_from_dict``.
+        """
+        from dataclasses import fields as dataclass_fields
+
+        from softae.core.autonomous_wiring import CampaignSpec
+
+        declared = any(f.name == "conditions"
+                       for f in dataclass_fields(CampaignSpec))
+        if declared:
+            spec = spec_from_dict({**MINIMAL, "conditions": {
+                "name": "baseline", "temp_setpoint_C": 25.0}})
+            assert spec.conditions.temp_setpoint_C == 25.0
+            return
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict({**MINIMAL, "conditions": {"name": "baseline"}})
+        assert "unknown field(s) ['conditions']" in str(exc.value)

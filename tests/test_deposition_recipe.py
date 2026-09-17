@@ -635,6 +635,123 @@ def test_conditions_free_plan_emits_the_pre_conditions_workflow_unchanged():
     assert not _condition_names(wf)
 
 
+# ─────────────────────────── The campaign-level baseline (T11.28) ───────────────────────────
+#
+# Both observations behind the spec are about the stretch NOBODY drives: the
+# pumps run before any axis is commanded, and a campaign following a `safe_park`
+# starts from 10 degC and a zeroed humidity setpoint. The baseline is commanded
+# at the very top of `setup`, waits for nothing, and is overridden by the first
+# phase that speaks.
+
+BASELINE = PhaseSetpoints(name="baseline", temp_setpoint_C=25.0,
+                          rh_setpoint_pct=40.0)
+
+#: Three steps per commanded baseline: temp sp, rh sp, rh start. No waits.
+_STEPS_PER_BASELINE = 3
+
+
+def _baseline_names(wf) -> list[str]:
+    return [s.name for s in wf.setup if s.tags.get("baseline") == "true"]
+
+
+def _step_shape(wf) -> list[tuple]:
+    return [(s.name, s.instrument, s.method, s.params, s.timeout_s,
+             sorted(s.tags.items())) for s in wf.setup]
+
+
+def test_recipe_workflow_baseline_precedes_the_startup_flush():
+    """The test the spec exists for: the axes are driven before the pumps run."""
+    wf = _build_plan("single_drop", [21], {21: [1, 1, 1]},
+                     _batch_plan_with_conditions(), baseline=BASELINE)
+    names = [s.name for s in wf.setup]
+    flush = names.index("startup_flush")
+    baseline = [names.index(n) for n in _baseline_names(wf)]
+    assert len(baseline) == _STEPS_PER_BASELINE
+    assert max(baseline) < flush
+    assert names[:_STEPS_PER_BASELINE] == [
+        "conditions_baseline_temp_sp_baseline",
+        "conditions_baseline_rh_sp_baseline",
+        "conditions_baseline_rh_start_baseline",
+    ]
+
+
+def test_recipe_workflow_baseline_precedes_the_piezo_event_step():
+    """Ahead of the piezo profile too: the top of `setup` means the top."""
+    piezo = PiezoPlan(enabled=True, event_task="piezo_liquid_event")
+    wf = _build_plan("single_drop", [21], {21: [1, 1, 1]}, None,
+                     baseline=BASELINE, piezo=piezo)
+    names = [s.name for s in wf.setup]
+    assert names.index("piezo_event") == _STEPS_PER_BASELINE
+
+
+def test_recipe_workflow_baseline_emits_no_wait_step():
+    """Commanded, not gated. A wait here is a new refusal before the first cast."""
+    wf = _build_plan("single_drop", [21], {21: [1, 1, 1]},
+                     _batch_plan_with_conditions(), baseline=BASELINE)
+    baseline_steps = [s for s in wf.setup if s.tags.get("baseline") == "true"]
+    assert baseline_steps
+    assert not any(s.method == "wait" for s in baseline_steps)
+
+
+def test_recipe_workflow_baseline_absent_leaves_setup_unchanged():
+    """`baseline=None` reproduces today's step list exactly, params and tags."""
+    args = ("single_drop", [21, 22], {21: [1, 1, 1], 22: [2, 2, 2]},
+            _batch_plan_with_conditions())
+    without = _build_plan(*args)
+    default = _build_plan(*args, baseline=None)
+    assert _step_shape(default) == _step_shape(without)
+    assert not _baseline_names(default)
+
+
+def test_recipe_workflow_first_phase_matching_baseline_emits_no_conditions():
+    """The tracker is seeded, so the cast phase re-establishes nothing.
+
+    Re-emitting would not merely be idle: `establish_steps` gives the RH wait
+    `raise_on_timeout=True`, so a needless approach is a fresh way for a correct
+    run to abort, and this one would sit right before the first cast.
+    """
+    plan = RunPlan((
+        RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE, conditions=CASTING),
+        RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH, conditions=CURING),
+    ))
+    wf = _build_plan("single_drop", [21], {21: [1, 1, 1]}, plan, baseline=CASTING)
+    established = [n for n in _condition_names(wf) if n not in _baseline_names(wf)]
+    assert not [n for n in established if "_casting_" in n]
+    assert len(_baseline_names(wf)) == _STEPS_PER_BASELINE
+    assert len([n for n in established if "_curing_" in n]) == _STEPS_PER_CONDITION
+
+
+def test_recipe_workflow_first_phase_differing_from_baseline_still_waits():
+    """A floor, not a policy: the first phase that speaks overrides it in full."""
+    wf = _build_plan("single_drop", [21], {21: [1, 1, 1]},
+                     _batch_plan_with_conditions(), baseline=BASELINE)
+    casting = [s for s in wf.setup if "_casting_" in s.name]
+    assert len(casting) == _STEPS_PER_CONDITION
+    rh_wait = next(s for s in casting
+                   if s.method == "wait" and s.instrument == "rh_controller")
+    assert rh_wait.params["raise_on_timeout"] is True
+
+
+def test_recipe_workflow_baseline_never_returns_after_a_phase_overrides_it():
+    """It is the earliest setpoint and only that.
+
+    A baseline that re-asserted itself would fight the ANNEAL phase's rest state
+    at the one boundary this project has reasoned hardest about.
+    """
+    wf = _build_plan("single_drop", [21], {21: [1, 1, 1]},
+                     _batch_plan_with_conditions(), baseline=BASELINE)
+    assert _baseline_names(wf) == [s.name for s in wf.setup[:_STEPS_PER_BASELINE]]
+
+
+def test_recipe_workflow_baseline_drives_only_the_axes_it_names():
+    """An omitted axis is not driven: the same rule the phases obey."""
+    wf = _build_plan("single_drop", [21], {21: [1, 1, 1]}, None,
+                     baseline=PhaseSetpoints("baseline", rh_setpoint_pct=22.0))
+    assert [(s.instrument, s.method) for s in wf.setup[:2]] == [
+        ("rh_controller", "set_setpoint"), ("rh_controller", "start")]
+    assert wf.setup[0].params["val"] == 22.0
+
+
 # ── An anneal's duration and its temperature: one authority each ─────────────
 #
 # `docs/SubAgent docs/anneal_phase_duration.md` §4, operator ruling D1 = (d):

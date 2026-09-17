@@ -11,11 +11,15 @@ from __future__ import annotations
 import pytest
 
 from softae.core.phase_setpoints import (
+    BASELINE_ABSENT_EVENT,
+    BASELINE_EVENT,
     DEFAULT_APPROACH_TIMEOUT_S,
     DEFAULT_RH_APPROACH_TIMEOUT_S,
     DEFAULT_RH_TOLERANCE_PCT,
     DEFAULT_TOLERANCE_C,
     PhaseSetpoints,
+    baseline_event_payload,
+    first_phase_axes,
 )
 
 
@@ -230,3 +234,187 @@ def test_rh_approach_timeout_is_a_phase_parameter_not_the_driver_default():
     wait = sp.establish_steps("all")[-1]
     assert wait.params["timeout"] == pytest.approx(6000.0)
     assert wait.params["timeout"] != driver_default
+
+
+# -- the campaign-level baseline: commanded, never gated (T11.28) -------------
+
+#: ``establish_steps("ch3")`` as HEAD built it, read out of
+#: ``git show HEAD:src/softae/core/phase_setpoints.py`` and run *before* the
+#: ``wait=`` factoring existed. That provenance is the whole value of the pin:
+#: a literal regenerated from the refactored code would agree with itself no
+#: matter what the refactor did.
+_HEAD_ESTABLISH_STEPS = [
+    ("conditions_anneal_temp_sp_ch3", "temp_controller", "write_sp",
+     {"T_SP": 85.0, "print_flag": 0}, 30.0,
+     {"axis": "temperature", "condition": "anneal", "phase": "conditions"}),
+    ("conditions_anneal_temp_wait_ch3", "temp_controller", "wait",
+     {"timeout": 2400.0, "within": 1.5}, 3060.0,
+     {"axis": "temperature", "condition": "anneal", "phase": "conditions"}),
+    ("conditions_anneal_rh_sp_ch3", "rh_controller", "set_setpoint",
+     {"val": 20.0}, 30.0,
+     {"axis": "humidity", "condition": "anneal", "phase": "conditions"}),
+    ("conditions_anneal_rh_start_ch3", "rh_controller", "start",
+     {}, 30.0,
+     {"axis": "humidity", "condition": "anneal", "phase": "conditions"}),
+    ("conditions_anneal_rh_wait_ch3", "rh_controller", "wait",
+     {"raise_on_timeout": True, "target": 20.0, "timeout": 6000.0, "tol": 3.0},
+     7560.0,
+     {"axis": "humidity", "condition": "anneal", "phase": "conditions"}),
+]
+
+
+def _tuned() -> PhaseSetpoints:
+    """Every field non-default, so the pin below can see any of them move."""
+    return PhaseSetpoints("anneal", temp_setpoint_C=85.0, rh_setpoint_pct=20.0,
+                          tolerance_C=1.5, rh_tolerance_pct=3.0,
+                          approach_timeout_s=2400.0, rh_approach_timeout_s=6000.0)
+
+
+def _rows(steps):
+    return [(s.name, s.instrument, s.method, s.params, s.timeout_s, s.tags)
+            for s in steps]
+
+
+def test_phase_setpoints_establish_steps_output_unchanged_by_refactor():
+    """The positive control on the ``wait=`` factoring.
+
+    ``command_steps`` exists because ``establish_steps`` was split in two, and a
+    split that quietly moved a param, a ceiling or a tag would leave every other
+    test in this file green -- they assert instruments and methods, not numbers.
+    """
+    assert _rows(_tuned().establish_steps("ch3")) == _HEAD_ESTABLISH_STEPS
+
+
+def test_phase_setpoints_command_steps_emits_no_wait():
+    """The same steps, in the same order, minus the two ``wait`` steps."""
+    steps = _tuned().command_steps("ch3")
+    assert [s.method for s in steps] == ["write_sp", "set_setpoint", "start"]
+    assert _rows(steps) == [
+        (name, instrument, method, params, ceiling, {**tags, "baseline": "true"})
+        for (name, instrument, method, params, ceiling, tags)
+        in _HEAD_ESTABLISH_STEPS if method != "wait"
+    ]
+
+
+def test_phase_setpoints_command_steps_match_establish_apart_from_the_waits():
+    """Name, instrument, method, params and ceiling identical; only tags differ.
+
+    A baseline that reached the chamber differently from a phase's conditions
+    would be a second way to command the same two axes, which is the thing
+    ``PhaseSetpoints`` exists to prevent.
+    """
+    sp = _tuned()
+    commanded = {s.name: s for s in sp.command_steps("ch3")}
+    for step in sp.establish_steps("ch3"):
+        if step.method == "wait":
+            assert step.name not in commanded
+            continue
+        twin = commanded[step.name]
+        assert (twin.instrument, twin.method, twin.params, twin.timeout_s) == (
+            step.instrument, step.method, step.params, step.timeout_s)
+        assert twin.tags == {**step.tags, "baseline": "true"}
+
+
+def test_phase_setpoints_command_steps_carry_the_conditions_and_baseline_tags():
+    steps = PhaseSetpoints("baseline", temp_setpoint_C=25.0,
+                           rh_setpoint_pct=40.0).command_steps("baseline")
+    assert {s.tags["phase"] for s in steps} == {"conditions"}
+    assert {s.tags["baseline"] for s in steps} == {"true"}
+    assert all("baseline" not in s.tags
+               for s in PhaseSetpoints("anneal", temp_setpoint_C=25.0,
+                                       rh_setpoint_pct=40.0).establish_steps("all"))
+
+
+def test_phase_setpoints_command_steps_single_axis_emits_only_that_axis():
+    """``None`` contributes no steps here either -- the rule is unchanged."""
+    temp_only = PhaseSetpoints("warm", temp_setpoint_C=25.0).command_steps("baseline")
+    assert [(s.instrument, s.method) for s in temp_only] == [
+        ("temp_controller", "write_sp")]
+    rh_only = PhaseSetpoints("damp", rh_setpoint_pct=22.0).command_steps("baseline")
+    assert [(s.instrument, s.method) for s in rh_only] == [
+        ("rh_controller", "set_setpoint"), ("rh_controller", "start")]
+    assert PhaseSetpoints("inherit").command_steps("baseline") == []
+
+
+def test_phase_setpoints_command_steps_rh_zero_is_a_commanded_dry_purge():
+    """Section 4's direction rule, pinned on the wait-free path as well.
+
+    Bench-verified 2026-08-21 (``async_rh_controller.safe_dry``): ``ctrl`` near
+    zero is dry air and ``ctrl == 0`` exactly shuts both Aalborg PSVs. So a
+    baseline cannot spell *leave it alone* as ``rh_setpoint_pct = 0.0`` -- that
+    commands a dry purge, which after a park is the state the chamber is already
+    stuck in. Absence is the only spelling of "not driven".
+    """
+    purge = PhaseSetpoints("purge", rh_setpoint_pct=0.0).command_steps("baseline")
+    assert [(s.instrument, s.method) for s in purge] == [
+        ("rh_controller", "set_setpoint"), ("rh_controller", "start")]
+    assert purge[0].params["val"] == 0.0
+    assert PhaseSetpoints("quiet", rh_setpoint_pct=None).command_steps("baseline") == []
+
+
+# -- the run-start transcript -------------------------------------------------
+
+class _Spec:
+    def __init__(self, conditions=None, run_plan=None):
+        self.conditions = conditions
+        self.run_plan = run_plan
+
+
+class _Plan:
+    def __init__(self, *phases):
+        self.phases = phases
+
+
+class _Phase:
+    def __init__(self, kind, conditions=None):
+        self.kind = kind
+        self.conditions = conditions
+
+
+def test_baseline_event_payload_declared_reports_the_setpoints_and_waited_false():
+    sp = PhaseSetpoints("baseline", temp_setpoint_C=25.0, rh_setpoint_pct=40.0)
+    assert baseline_event_payload(_Spec(conditions=sp)) == (
+        BASELINE_EVENT,
+        {"name": "baseline", "temp_setpoint_C": 25.0, "rh_setpoint_pct": 40.0,
+         "waited": False},
+    )
+
+
+def test_baseline_event_payload_waited_is_stated_not_implied():
+    """``command_steps`` emits no wait, so nothing in the run checked arrival.
+
+    A transcript that merely omitted the key would read as *arrived* to anyone
+    who did not know the emission shape.
+    """
+    sp = PhaseSetpoints("baseline", rh_setpoint_pct=22.0)
+    _, payload = baseline_event_payload(_Spec(conditions=sp))
+    assert payload["waited"] is False
+    assert payload["temp_setpoint_C"] is None
+
+
+def test_baseline_event_payload_absent_names_the_first_phase_and_its_axes():
+    """The T11.28 case itself, recorded rather than inferred from silence."""
+    plan = _Plan(_Phase("formulate"), _Phase("anneal"))
+    assert baseline_event_payload(_Spec(run_plan=plan)) == (
+        BASELINE_ABSENT_EVENT,
+        {"first_phase_kind": "formulate", "first_phase_drives": []},
+    )
+
+
+def test_baseline_event_payload_absent_lists_a_speaking_first_phases_axes():
+    """The check can fail *and* pass: a first phase that speaks reports its axes."""
+    plan = _Plan(_Phase("formulate",
+                        PhaseSetpoints("casting", temp_setpoint_C=25.0,
+                                       rh_setpoint_pct=40.0)))
+    event, payload = baseline_event_payload(_Spec(run_plan=plan))
+    assert event == BASELINE_ABSENT_EVENT
+    assert payload["first_phase_drives"] == ["temperature", "humidity"]
+
+
+def test_first_phase_axes_reports_each_driven_axis_separately():
+    assert first_phase_axes(_Plan(_Phase(
+        "formulate", PhaseSetpoints("warm", temp_setpoint_C=25.0)))) == ["temperature"]
+    assert first_phase_axes(_Plan(_Phase(
+        "formulate", PhaseSetpoints("damp", rh_setpoint_pct=0.0)))) == ["humidity"]
+    assert first_phase_axes(_Plan()) == []
+    assert first_phase_axes(None) == []

@@ -119,8 +119,12 @@ from softae.core.run_plan import (
 logger = structlog.get_logger(__name__)
 
 __all__ = [
+    "BASELINE_CONDITIONS_WHY_NOT",
     "RUN_PLAN_WHY_NOT",
+    "baseline_conditions_codec",
+    "decode_baseline_conditions",
     "decode_run_plan",
+    "encode_baseline_conditions",
     "encode_run_plan",
     "field_codec",
 ]
@@ -149,6 +153,20 @@ _CONDITION_AXES = ("temp_setpoint_C", "rh_setpoint_pct")
 _CONDITION_TUNING = ("tolerance_C", "rh_tolerance_pct",
                      "approach_timeout_s", "rh_approach_timeout_s")
 _CONDITION_KEYS = frozenset(("name",) + _CONDITION_AXES + _CONDITION_TUNING)
+
+#: The campaign-level ``[conditions]`` baseline (T11.28) is the same type and the
+#: same axes — but **nothing waits for it**, so the two approach timeouts are
+#: numbers that would do nothing. A number that does nothing is the trap this
+#: codec exists to avoid, so they are refused there rather than accepted in
+#: silence. The two *tolerances* are refused with them: a band is only ever read
+#: by a wait, so it is exactly as inert.
+_BASELINE_KEYS = frozenset(("name",) + _CONDITION_AXES)
+
+#: Why an encode of the baseline can answer ``UNREPRESENTABLE``.
+BASELINE_CONDITIONS_WHY_NOT = (
+    "a baseline carrying an approach tolerance or timeout, which the campaign "
+    "baseline waits for nothing and so cannot carry"
+)
 
 _SETTLE_REQUIRED = ("round_period_s", "min_hold_s", "max_hold_s")
 _SETTLE_OPTIONAL = ("settle_tol_rel", "settle_n_rounds", "settle_min_channels",
@@ -369,28 +387,70 @@ def _enum_from(enum_cls: type, raw: Any, key: str, index: int) -> Any:
 
 
 def _conditions_from_dict(raw: Any, index: int) -> PhaseSetpoints:
-    where = f"phase #{index}: [conditions]"
+    return _conditions_from_table(raw, f"phase #{index}: [conditions]", tuning=True)
+
+
+def _conditions_from_table(raw: Any, where: str, *, tuning: bool) -> PhaseSetpoints:
+    """*raw* as :class:`PhaseSetpoints`. ``tuning=False`` is the baseline shape."""
     if not isinstance(raw, dict):
         raise ValueError(f"{where} must be a table")
-    unknown = sorted(set(raw) - _CONDITION_KEYS)
+    if not tuning:
+        inert = sorted(set(raw) & set(_CONDITION_TUNING))
+        if inert:
+            raise ValueError(
+                f"{where} names {inert}, and NOTHING WAITS HERE. The campaign "
+                f"baseline is commanded at the top of the run and waited for by "
+                f"nothing, so an approach band or timeout would be a number with "
+                f"no reader — accepting it would read as a gate that does not "
+                f"exist. Put them on the phase whose [conditions] actually gates, "
+                f"or drop them.")
+    legal = _CONDITION_KEYS if tuning else _BASELINE_KEYS
+    unknown = sorted(set(raw) - legal)
     if unknown:
         raise ValueError(
-            f"{where} has unknown key(s) {unknown}; valid keys: "
-            f"{sorted(_CONDITION_KEYS)}")
+            f"{where} has unknown key(s) {unknown}; valid keys: {sorted(legal)}")
     if "name" not in raw:
         raise ValueError(
             f"{where} needs a 'name' — it is what an operator reads back in the "
             f"phase order")
     kwargs: dict[str, Any] = {"name": raw["name"]}
     # An omitted axis is the axis not being driven at all, which is exactly what
-    # `None` means on PhaseSetpoints; TOML has no other way to say it.
-    for key in _CONDITION_AXES + _CONDITION_TUNING:
+    # `None` means on PhaseSetpoints; TOML has no other way to say it. In
+    # particular `rh_setpoint_pct = 0.0` is NOT absence — it is a commanded dry
+    # purge (`drivers/async_rh_controller.safe_dry`, bench-verified 2026-08-21).
+    for key in _CONDITION_AXES + (_CONDITION_TUNING if tuning else ()):
         if key in raw:
             kwargs[key] = _number(raw[key], f"{where} '{key}'")
     try:
         return PhaseSetpoints(**kwargs)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{where}: {exc}") from exc
+
+
+# ── the campaign-level [conditions] baseline (T11.28) ────────────────────────
+
+def encode_baseline_conditions(value: Any) -> Any:
+    """The baseline as a ``[conditions]`` table, or :data:`UNREPRESENTABLE`.
+
+    A baseline carrying a non-default tolerance or timeout answers
+    ``UNREPRESENTABLE`` rather than writing keys this module's own decoder
+    refuses: a file that cannot be read back is worse than a field reported
+    missing by ``spec_toml_completeness``.
+    """
+    from softae.core.campaign_spec_fields import UNREPRESENTABLE
+
+    if not isinstance(value, PhaseSetpoints):
+        return UNREPRESENTABLE
+    table = _conditions_to_table(value)
+    if set(table) - _BASELINE_KEYS:
+        logger.warning("baseline_conditions_not_encodable", name=value.name)
+        return UNREPRESENTABLE
+    return table
+
+
+def decode_baseline_conditions(value: Any) -> PhaseSetpoints:
+    """The campaign-level ``[conditions]`` table as :class:`PhaseSetpoints`."""
+    return _conditions_from_table(value, "[conditions]", tuning=False)
 
 
 def _settle_from_dict(raw: Any, index: int) -> SettlePlan:
@@ -504,3 +564,18 @@ def field_codec() -> Any:
 
         _CODEC = FieldCodec(encode_run_plan, decode_run_plan, RUN_PLAN_WHY_NOT)
     return _CODEC
+
+
+_BASELINE_CODEC: Any = None
+
+
+def baseline_conditions_codec() -> Any:
+    """The ``conditions`` codec, built on first call for ``field_codec``'s reason."""
+    global _BASELINE_CODEC
+    if _BASELINE_CODEC is None:
+        from softae.core.campaign_spec_fields import FieldCodec
+
+        _BASELINE_CODEC = FieldCodec(
+            encode_baseline_conditions, decode_baseline_conditions,
+            BASELINE_CONDITIONS_WHY_NOT)
+    return _BASELINE_CODEC

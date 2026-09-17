@@ -632,15 +632,25 @@ def _fmt_duration(seconds: float) -> str:
 
 # ── The RH-floor advisory ────────────────────────────────────────────────────
 
-def commanded_conditions(run_plan: Any) -> list[Any]:
-    """Every distinct :class:`PhaseSetpoints` a run plan commands, in plan order.
+def commanded_conditions(run_plan: Any, baseline: Any = None) -> list[Any]:
+    """Every distinct :class:`PhaseSetpoints` a campaign commands, in run order.
 
     Deduplicated on the object itself, because the deposition engine emits a
     condition's steps **only when the setpoint changes** — two consecutive
     phases carrying the same conditions establish them once, and advising twice
     about one approach would misrepresent what the run does.
+
+    *baseline* is the campaign-level ``[conditions]`` floor (T11.28), and it
+    belongs at the **head** because that is where the engine commands it: before
+    the piezo step and the startup flush, ahead of every phase. Without it, the
+    one setpoint driven before the first cast is the only commanded humidity the
+    RH-floor advisory cannot see. It defaults to ``None`` so every existing
+    caller is unchanged, and it dedups against the first phase exactly as the
+    engine does — a first phase equal to the baseline re-establishes nothing.
     """
     seen: list[Any] = []
+    if baseline is not None:
+        seen.append(baseline)
     for phase in getattr(run_plan, "phases", ()) or ():
         conditions = getattr(phase, "conditions", None)
         if conditions is not None and conditions not in seen:
@@ -668,6 +678,7 @@ def rh_floor_advisories(
     bins: "Sequence[TemperatureBin] | None",
     *,
     bin_width_C: float | None = None,
+    baseline: Any = None,
 ) -> list[str]:
     """Advisories for commanded humidities below what this chamber has reached.
 
@@ -694,7 +705,7 @@ def rh_floor_advisories(
 
     width = float(DEFAULT_BIN_WIDTH_C if bin_width_C is None else bin_width_C)
     lines: list[str] = []
-    for conditions in commanded_conditions(run_plan):
+    for conditions in commanded_conditions(run_plan, baseline):
         rh = getattr(conditions, "rh_setpoint_pct", None)
         temp = getattr(conditions, "temp_setpoint_C", None)
         name = getattr(conditions, "name", "?")
@@ -776,9 +787,10 @@ def _rh_floor_warnings(spec: Any, project_dir: "Path | str | None") -> list[str]
     8 h cure. So the absence is stated.
     """
     run_plan = getattr(spec, "run_plan", None)
-    if run_plan is None or not any(
+    baseline = getattr(spec, "conditions", None)
+    if not any(
         getattr(c, "rh_setpoint_pct", None) is not None
-        for c in commanded_conditions(run_plan)
+        for c in commanded_conditions(run_plan, baseline)
     ):
         return []
 
@@ -791,7 +803,38 @@ def _rh_floor_warnings(spec: Any, project_dir: "Path | str | None") -> list[str]
     # humidity falls in no bin, and `rh_floor_advisories` says so per condition —
     # which is the more specific sentence, naming the temperature that was never
     # watched rather than only that the project has no rows at all.
-    return rh_floor_advisories(run_plan, bins)
+    return rh_floor_advisories(run_plan, bins, baseline=baseline)
+
+
+#: The A5 advisory (T11.28 §10). Not a refusal: an advisory commands no
+#: humidifier, and the fix is a ``[conditions]`` block the operator writes.
+UNCONDITIONED_START_WARNING = (
+    "This plan's first phase drives neither temperature nor humidity, and no "
+    "campaign-level [conditions] baseline is declared: a campaign following a "
+    "park is unconditioned until the first phase that carries conditions, so "
+    "the chamber will drift to room RH during the startup flush and the first "
+    "casts. Declare a top-level [conditions] block to drive both axes from the "
+    "top of the run (it waits for nothing)."
+)
+
+
+def unconditioned_start_warnings(spec: Any) -> list[str]:
+    """The A5 advisory for *spec*, or ``[]``.
+
+    Gated on a plan actually existing. A campaign with **no** ``run_plan`` runs
+    the engine's legacy pointwise layout, which has never commanded the chamber
+    at all — that is a different and older situation than a written plan whose
+    first phase happens to stay silent, and saying this sentence about it would
+    put a note on every legacy campaign that projects today.
+    """
+    from softae.core.phase_setpoints import first_phase_axes
+
+    run_plan = getattr(spec, "run_plan", None)
+    if run_plan is None or getattr(spec, "conditions", None) is not None:
+        return []
+    if not (getattr(run_plan, "phases", ()) or ()):
+        return []
+    return [] if first_phase_axes(run_plan) else [UNCONDITIONED_START_WARNING]
 
 
 def project_campaign(
@@ -867,6 +910,7 @@ def project_campaign(
     settle_ceiling, settle_floor = _settle_window(spec, warnings)
     per_iteration_s = est.total_s + settle_ceiling
 
+    warnings.extend(unconditioned_start_warnings(spec))
     warnings.extend(_rh_floor_warnings(spec, project_dir))
 
     stock: dict[int, float | None] = {}

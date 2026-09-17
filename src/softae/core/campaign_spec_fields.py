@@ -35,6 +35,9 @@ from typing import Any, Callable
 
 import structlog
 
+from softae.core.campaign_spec_run_plan import (
+    baseline_conditions_codec as _baseline_conditions_codec,
+)
 from softae.core.campaign_spec_run_plan import field_codec as _run_plan_codec
 
 logger = structlog.get_logger(__name__)
@@ -370,6 +373,12 @@ OBJECT_FIELDS: dict[str, FieldCodec] = {
     # level: the dependency runs one way, and the import order of the pair
     # cannot become load-bearing.
     "run_plan": _run_plan_codec(),
+    # The campaign-level baseline (T11.28): the same `PhaseSetpoints` a phase
+    # carries, decoded by the same module, minus the approach bands and timeouts
+    # — nothing waits for a baseline, so a number that only a wait reads would
+    # have no reader. Built through `baseline_conditions_codec()` for the same
+    # import-order reason as `run_plan` above.
+    "conditions": _baseline_conditions_codec(),
     "general_formulation": FieldCodec(
         encode_general_formulation, decode_general_formulation,
         "a composition context whose targets are a Python callable rather than "

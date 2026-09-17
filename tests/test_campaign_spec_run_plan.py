@@ -27,7 +27,10 @@ from softae.core.campaign_spec_io import (
     spec_toml_completeness,
 )
 from softae.core.campaign_spec_run_plan import (
+    baseline_conditions_codec,
+    decode_baseline_conditions,
     decode_run_plan,
+    encode_baseline_conditions,
     encode_run_plan,
     field_codec,
 )
@@ -589,3 +592,108 @@ class TestHoldS:
              "anneal_task": "anneal_85C_8h", "hold_s": 28800.0})})
 
         assert spec.run_plan.phases[1].hold_s == 28800.0
+
+
+# ─────────────────────── the campaign-level [conditions] baseline (T11.28) ───────────────────────
+
+class TestTheBaselineConditionsCodec:
+    """A ``[conditions]`` table at the TOP level, not on a phase.
+
+    Same type, same two axes, same "an omitted axis is not driven" rule. What it
+    cannot carry is the approach bands and timeouts, and that is the point of
+    the block: the baseline is commanded at the top of the run and waited for by
+    NOTHING, so a tolerance or a timeout there would be a number with no reader.
+    A number that does nothing reads as a gate that does not exist.
+    """
+
+    def test_baseline_conditions_round_trip_preserves_both_axes(self):
+        table = {"name": "baseline", "temp_setpoint_C": 25.0,
+                 "rh_setpoint_pct": 40.0}
+        setpoints = decode_baseline_conditions(table)
+        assert setpoints == PhaseSetpoints("baseline", temp_setpoint_C=25.0,
+                                           rh_setpoint_pct=40.0)
+        assert encode_baseline_conditions(setpoints) == table
+
+    def test_baseline_conditions_an_omitted_axis_stays_undriven(self):
+        setpoints = decode_baseline_conditions({"name": "damp",
+                                                "rh_setpoint_pct": 22.0})
+        assert setpoints.temp_setpoint_C is None
+        assert setpoints.drives_temperature is False
+        assert "temp_setpoint_C" not in encode_baseline_conditions(setpoints)
+
+    def test_baseline_conditions_rh_zero_is_a_commanded_dry_purge_not_absence(self):
+        """Section 4's direction rule, at the file boundary.
+
+        ``ctrl`` near zero is dry air and ``ctrl == 0`` exactly shuts both
+        Aalborg PSVs (bench-verified 2026-08-21), so ``0.0`` must survive the
+        round trip as ``0.0`` and an omitted key as ``None``. A codec that
+        collapsed them would turn "leave the axis alone" into a dry purge, which
+        after a park is the state the chamber is already stuck in.
+        """
+        driven = decode_baseline_conditions({"name": "purge",
+                                             "rh_setpoint_pct": 0.0})
+        assert driven.rh_setpoint_pct == 0.0
+        assert driven.drives_humidity is True
+        assert encode_baseline_conditions(driven)["rh_setpoint_pct"] == 0.0
+
+        quiet = decode_baseline_conditions({"name": "quiet"})
+        assert quiet.rh_setpoint_pct is None
+        assert quiet.drives_humidity is False
+
+    @pytest.mark.parametrize("key, value", [
+        ("approach_timeout_s", 10800.0),
+        ("rh_approach_timeout_s", 14400.0),
+        ("tolerance_C", 1.0),
+        ("rh_tolerance_pct", 3.0),
+    ])
+    def test_baseline_conditions_refuses_an_approach_band_or_timeout(
+        self, key, value
+    ):
+        with pytest.raises(ValueError) as exc:
+            decode_baseline_conditions({"name": "baseline",
+                                        "rh_setpoint_pct": 22.0, key: value})
+        assert "NOTHING WAITS HERE" in str(exc.value)
+        assert key in str(exc.value)
+
+    def test_phase_conditions_still_accept_the_same_keys(self):
+        """The control: the refusal is about WHERE the table sits, not the key.
+
+        Without this the refusal above would pass just as well if the decoder
+        had started rejecting the tuning keys everywhere.
+        """
+        plan = decode_run_plan({"phases": [
+            {**FORMULATE, "conditions": {"name": "casting",
+                                         "temp_setpoint_C": 25.0,
+                                         "approach_timeout_s": 10800.0}}]})
+        assert plan.phases[0].conditions.approach_timeout_s == 10800.0
+
+    def test_baseline_conditions_without_a_name_is_refused(self):
+        with pytest.raises(ValueError, match="name"):
+            decode_baseline_conditions({"temp_setpoint_C": 25.0})
+
+    def test_baseline_conditions_an_unknown_key_names_the_legal_ones(self):
+        with pytest.raises(ValueError) as exc:
+            decode_baseline_conditions({"name": "b", "temp_setpoint_c": 25.0})
+        assert "unknown key(s) ['temp_setpoint_c']" in str(exc.value)
+
+    def test_baseline_conditions_encode_refuses_a_tuned_setpoints(self):
+        """Unrepresentable, rather than writing a file this decoder refuses.
+
+        A ``PhaseSetpoints`` built in Python can carry a non-default timeout;
+        the baseline block cannot spell one, so the encoder says so and
+        ``spec_toml_completeness`` reports the field missing. Writing it would
+        produce a file that raises on the next load.
+        """
+        from softae.core.campaign_spec_fields import UNREPRESENTABLE
+
+        tuned = PhaseSetpoints("baseline", rh_setpoint_pct=22.0,
+                               rh_approach_timeout_s=14400.0)
+        assert encode_baseline_conditions(tuned) is UNREPRESENTABLE
+        assert encode_baseline_conditions("not a PhaseSetpoints") is UNREPRESENTABLE
+
+    def test_baseline_conditions_codec_is_the_registered_pair(self):
+        codec = baseline_conditions_codec()
+        assert codec is baseline_conditions_codec()
+        assert (codec.encode, codec.decode) == (encode_baseline_conditions,
+                                                decode_baseline_conditions)
+        assert codec.why_not
