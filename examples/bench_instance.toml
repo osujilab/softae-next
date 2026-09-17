@@ -125,6 +125,34 @@ enabled  = true
 # at 20 Hz, which is not enough band for the gated engine to judge a film.
 preset = "Extended"
 
+# ── The chamber BEFORE the first phase speaks (T11.28) ──────────────────
+#
+# Campaign-level baseline. Established once, at the top of the first trial
+# workflow, BEFORE the piezo event step and the startup flush. It commands both
+# axes and WAITS FOR NEITHER: a floor, not a gate. Without it the pumps run
+# before any axis is driven, and a campaign following a park starts from
+# `safe_park`'s 10 °C and a zeroed humidity setpoint with nothing driving until
+# the first phase that happens to carry [conditions].
+#
+# The first phase carrying its own [conditions] OVERRIDES it (waits included)
+# and it never returns — so it can never fight the ANNEAL phase's rest state.
+# The values here are the FORMULATE phase's own casting environment below, and
+# the FORMULATE phase still re-establishes them AND WAITS: the suppression is
+# keyed on the whole PhaseSetpoints, `name` included, so "baseline" and
+# "casting" are two conditions that happen to agree. That is what is wanted —
+# the baseline drives the axes while the pumps run, and the cast is still gated
+# on the chamber having arrived.
+#
+# An omitted axis is an axis NOT DRIVEN, and `rh_setpoint_pct = 0.0` is NOT
+# "leave it alone" — it is a commanded dry purge (`ctrl == 0` shuts both Aalborg
+# PSVs; bench-verified 2026-08-21). `approach_timeout_s` / `rh_approach_timeout_s`
+# are REFUSED here rather than accepted in silence, because nothing waits: a
+# number with no reader would read as a gate that does not exist.
+[conditions]
+name            = "baseline"
+temp_setpoint_C = 25.0
+rh_setpoint_pct = 40.0
+
 # ── The run plan: cast all four, cure once, settle, then read ────────────────
 #
 # `scope` is written on EVERY phase and is never inferred — not from `batch`,
