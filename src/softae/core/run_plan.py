@@ -53,6 +53,7 @@ if TYPE_CHECKING:  # annotation-only: keeps the deposition engine's import path
     # free of the measurement and workflow-model layers.
     from softae.core.measurement_spec import MeasurementSpec
     from softae.core.phase_setpoints import PhaseSetpoints
+    from softae.core.task_catalog import TaskCatalog
 
 __all__ = [
     "PhaseKind",
@@ -259,6 +260,40 @@ def _minutes(seconds: float) -> str:
     return f"{seconds / 3600:g}h"
 
 
+def _degrees(value: Any) -> str:
+    """``85``, ``85.0`` and ``'85'`` all render ``'85°C'``; anything else as-is.
+
+    ``anneal_params`` is a free ``Mapping[str, Any]`` and a catalogued task's
+    ``params`` is no narrower, so the two sources of a cure temperature reach
+    this with different types for the same number. Normalising here is what
+    keeps ``85.0`` from the catalog and ``85`` from an override rendering as two
+    different anneals; the non-numeric fallback prints rather than raises,
+    because a label is not the place a malformed param is discovered.
+    """
+    try:
+        return f"{float(value):g}°C"
+    except (TypeError, ValueError):
+        return f"{value}°C"
+
+
+def _task_cure_temp_C(catalog: "TaskCatalog | None", task_name: str) -> Any | None:
+    """The catalogued task's ``target_temp_C``, or ``None`` when nobody said.
+
+    ``None`` covers three genuinely different situations — no catalog was
+    supplied, the catalog does not hold this task, the task states no
+    temperature — and they are deliberately spelled the same because the label
+    says the same thing about all three: *this phase does not know the cure
+    temperature, and here is the task name that does*. What it must never do is
+    invent one, so there is no default anywhere on this path.
+
+    Duck-typed (``in`` then ``get``) rather than imported: the catalog stays an
+    annotation, so ``run_plan`` keeps its runtime import surface.
+    """
+    if catalog is None or task_name not in catalog:
+        return None
+    return getattr(catalog.get(task_name), "params", {}).get("target_temp_C")
+
+
 @dataclass(frozen=True)
 class RunPhase:
     """One phase in a run plan.
@@ -342,12 +377,20 @@ class RunPhase:
                 f"time is not a cure, and 'no hold stated' is spelled None"
             )
 
-    def label(self) -> str:
-        """Short human-readable phase label (for :meth:`RunPlan.describe`)."""
+    def label(self, catalog: "TaskCatalog | None" = None) -> str:
+        """Short human-readable phase label (for :meth:`RunPlan.describe`).
+
+        *catalog* is optional and used only by an ANNEAL phase, to name the cure
+        temperature its task carries (see :meth:`_anneal_label`). It is passed
+        in and never loaded here: a frozen dataclass that opened
+        ``data/tasks.toml`` itself would make every label — and, through
+        ``_run_plan_digest``, every resume fingerprint — depend on a gitignored,
+        machine-local file.
+        """
         if self.kind is PhaseKind.EQUILIBRATE:
             name = f"Equilibrate ({self.settle.label()})" if self.settle else "Equilibrate"
         elif self.kind is PhaseKind.ANNEAL:
-            name = self._anneal_label()
+            name = self._anneal_label(catalog)
         elif self.kind is PhaseKind.FORMULATE:
             name = "Formulate"
         elif self.kind is PhaseKind.MEASURE:
@@ -361,24 +404,54 @@ class RunPhase:
         scope = "per sample" if self.scope is PhaseScope.PER_SAMPLE else "per batch"
         return f"{name} [{scope}]"
 
-    def _anneal_label(self) -> str:
-        """``'Anneal (85°C/8h) → rests at 25 °C'`` — both numbers, and their roles.
+    def _anneal_label(self, catalog: "TaskCatalog | None" = None) -> str:
+        """``'Anneal (anneal_85C_8h: 85°C/8h) → rests at 25 °C'`` — who, what, then after.
 
-        Renders only what the phase itself knows: the catalog is **not**
-        consulted, because a frozen dataclass reading ``data/tasks.toml`` would
-        make a label depend on a gitignored, machine-local file. So an
-        un-overridden cure still prints the task *name* — the task is where its
-        temperature and hold are written down.
+        **The rule: the task name is always present, whatever else is.** It used
+        to drop out the moment any typed field appeared, so the commonest real
+        phase of all — a bare ``hold_s`` on a catalogued cure — rendered
+        ``'Anneal (8h) → rests at 25 °C'``, in which the only temperature shown
+        is the one the chamber returns to *after* the cure and the cure's own
+        temperature appears nowhere. A label that names a rest state and not the
+        hold invites reading the rest state as the hold.
+
+        So the shape is ``Anneal (<task>: <temp>/<hold>)``, degrading left to
+        right and never inventing a number:
+
+        =========================== ==============================================
+        What is known               Renders
+        =========================== ==============================================
+        task only                   ``Anneal (anneal_85C_8h)``
+        task + hold                 ``Anneal (anneal_85C_8h: 8h)``
+        task + cure temp + hold     ``Anneal (anneal_85C_8h: 85°C/8h)``
+        =========================== ==============================================
+
+        The cure temperature comes from ``anneal_params["target_temp_C"]`` when
+        the run overrides it, otherwise from *catalog* when one is supplied and
+        holds the task — the same precedence the emitter applies to build the
+        step, so the label cannot name a temperature the rig will not use. With
+        no catalog and no override the row above degrades to the task name
+        alone, which is honest: the task is where the temperature is written
+        down. See :func:`_task_cure_temp_C` on why an absent catalog, an absent
+        task and a silent task all render alike.
+
+        The ``→ rests at`` suffix is unchanged and keeps its own role, because
+        ``conditions`` on an ANNEAL phase is the RESTORE target rather than a
+        second spelling of the cure — the distinction the driver already makes
+        and the reason both numbers are worth one line.
         """
         over = dict(self.anneal_params or {})
         temp = over.get("target_temp_C")
+        if temp is None:
+            temp = _task_cure_temp_C(catalog, self.anneal_task)
         hold = self.hold_s if self.hold_s is not None else over.get("hold_time_s")
         bits = []
         if temp is not None:
-            bits.append(f"{temp}°C")
+            bits.append(_degrees(temp))
         if hold is not None:
             bits.append(_minutes(float(hold)))
-        name = f"Anneal ({'/'.join(bits) if bits else self.anneal_task})"
+        name = f"Anneal ({self.anneal_task}"
+        name = f"{name}: {'/'.join(bits)})" if bits else f"{name})"
         # `conditions` is the RESTORE target, not the cure, so the label says
         # which one it is — visible at `check` time rather than in a docstring.
         rest = self.conditions.temp_setpoint_C if self.conditions else None
@@ -456,9 +529,16 @@ class RunPlan:
                 out.append((phase.scope, [phase]))
         return out
 
-    def describe(self) -> str:
-        """One-line ordered summary for display (GUI sequence preview)."""
-        return "  →  ".join(p.label() for p in self.phases)
+    def describe(self, catalog: "TaskCatalog | None" = None) -> str:
+        """One-line ordered summary for display (GUI sequence preview).
+
+        *catalog* is forwarded to :meth:`RunPhase.label` so an ANNEAL phase can
+        name its task's cure temperature; omitted, every phase describes itself
+        from what it carries. Callers that already hold a catalog — anything
+        past ``TaskCatalog.load_toml`` — get a strictly more informative line by
+        passing it.
+        """
+        return "  →  ".join(p.label(catalog) for p in self.phases)
 
     # ── factories ─────────────────────────────────────────────────────────
 

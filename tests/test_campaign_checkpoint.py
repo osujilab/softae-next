@@ -188,16 +188,24 @@ class TestSpecSnapshot:
         assert cool["fields"]["run_plan_digest"] != hot["fields"]["run_plan_digest"]
 
     def test_a_different_anneal_task_changes_the_run_plan_digest(self):
-        """The gap `RunPlan.describe()` alone gets wrong — the positive control.
+        """The digest separates two catalog tasks for its OWN reason.
 
-        `RunPhase._anneal_label` folds `anneal_task` into the label **only when
-        neither** a temperature override nor a hold is set; the moment either is
-        present — the common case, since every real anneal states a hold —
-        the task name is dropped from the string entirely. So two plans that
-        cure with genuinely different catalog tasks `describe()` **byte
-        identically**, and a digest built from `describe()` alone would call
-        them the same plan. Hence the digest names `hold_s` / `anneal_task` /
-        `anneal_params` explicitly as well.
+        Historically this was the gap `RunPlan.describe()` alone got wrong:
+        `RunPhase._anneal_label` folded `anneal_task` into the label **only
+        when neither** a temperature override nor a hold was set, so the moment
+        either appeared — the common case, since every real anneal states a
+        hold — the task name vanished and two genuinely different cures
+        `describe()`d byte identically. **T11.21 closed that**: the label now
+        always carries the task name, so the two strings differ here.
+
+        That makes the premise below an inequality rather than a collision, and
+        it is worth keeping explicit, because the two facts are independent.
+        The digest names `hold_s` / `anneal_task` / `anneal_params` explicitly
+        **as well as** `describe()`, and that is what this test guards: were the
+        label to stop carrying the task name again, or to be reworded, the
+        digest would still have to separate these two plans. A test resting on
+        the label alone would silently become a test of `_anneal_label`'s
+        wording instead of one of the digest's coverage.
 
         The complementary property — that a field merely *added* to `RunPhase`
         must NOT move the digest — cannot be exercised here without editing the
@@ -215,9 +223,12 @@ class TestSpecSnapshot:
 
         one = _task_plan("anneal_pe")
         two = _task_plan("anneal_hot")
-        # The premise: the labels really do collide, so this is not a test that
-        # would pass under a `describe()`-only digest.
-        assert one.describe() == two.describe()
+        # The premise, since T11.21: the labels differ, because the label
+        # carries the task name whatever else is set. The guarantee below does
+        # NOT rest on that — the digest hashes `anneal_task` itself, not only
+        # the label — which is exactly why both are asserted separately.
+        assert one.describe() != two.describe()
+        assert "anneal_pe" in one.describe() and "anneal_hot" in two.describe()
 
         first = json.loads(serialize_campaign_spec(_spec(run_plan=one)))
         second = json.loads(serialize_campaign_spec(_spec(run_plan=two)))

@@ -12,16 +12,34 @@ from softae.analysis.equilibration import (
 from softae.core.measurement_spec import MeasurementSpec
 from softae.core.phase_setpoints import PhaseSetpoints
 from softae.core.run_plan import (
+    DEFAULT_ANNEAL_TASK,
     PhaseKind,
     PhaseScope,
     RunPhase,
     RunPlan,
     SettlePlan,
 )
+from softae.core.task_catalog import Task, TaskCatalog
 
 
 def _settle() -> SettlePlan:
     return SettlePlan(round_period_s=240.0, min_hold_s=1500.0, max_hold_s=14400.0)
+
+
+def _catalog(temp_C: float | None = 85.0) -> TaskCatalog:
+    """A one-task catalog, built in memory rather than read from ``data/``.
+
+    ``data/tasks.toml`` is gitignored, so a label test that read the real
+    catalog would assert on a machine-local file and could not be green in a
+    fresh checkout. ``temp_C=None`` is the task that states no cure temperature.
+    """
+    params: dict = {"hold_time_s": 28800, "ramp_rate": 5, "tolerance": 1.0}
+    if temp_C is not None:
+        params["target_temp_C"] = temp_C
+    catalog = TaskCatalog()
+    catalog.add(Task(name="anneal_85C_8h", instrument="temp_controller",
+                     method="anneal", params=params, timeout_s=36900))
+    return catalog
 
 
 # ── factories ────────────────────────────────────────────────────────────────
@@ -106,7 +124,7 @@ def test_anneal_label_reflects_explicit_params():
         PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
         anneal_params={"target_temp_C": 120, "hold_time_s": 600},
     )
-    assert phase.label() == "Anneal (120°C/10min) [per batch]"
+    assert phase.label() == f"Anneal ({DEFAULT_ANNEAL_TASK}: 120°C/10min) [per batch]"
 
 
 # ── conditions / measurement (the bench-instance contract) ───────────────────
@@ -164,7 +182,7 @@ def test_phase_label_renders_the_commanded_conditions():
     phase = RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
                      anneal_params={"target_temp_C": 85, "hold_time_s": 28800},
                      conditions=PhaseSetpoints("anneal", 85.0, 20.0))
-    assert phase.label() == ("Anneal (85°C/8h) → rests at 85 °C "
+    assert phase.label() == (f"Anneal ({DEFAULT_ANNEAL_TASK}: 85°C/8h) → rests at 85 °C "
                              "@ anneal (85 °C, 20 %RH) [per batch]")
 
 
@@ -255,14 +273,114 @@ def test_anneal_label_names_cure_and_restore_temperatures():
     label = phase.label()
 
     assert "85" in label and "25" in label
-    assert label.startswith("Anneal (85°C/8h) → rests at 25 °C")
+    assert label.startswith(f"Anneal ({DEFAULT_ANNEAL_TASK}: 85°C/8h) → rests at 25 °C")
 
 
 def test_anneal_label_without_conditions_names_no_restore_temperature():
     """The silent half: no conditions, nothing to say about the resting state."""
     phase = RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH, hold_s=1800.0)
 
-    assert phase.label() == "Anneal (30min) [per batch]"
+    assert phase.label() == f"Anneal ({DEFAULT_ANNEAL_TASK}: 30min) [per batch]"
+
+
+# ── T11.21: the label keeps the anneal's own identity ────────────────────────
+#
+# The defect: any typed field displaced the task name entirely, so the most
+# ordinary phase there is — a bare `hold_s` on a catalogued cure — rendered
+# "Anneal (8h) → rests at 25 °C". The only temperature on that line is the
+# RESTORE target, and an operator reading it has nothing telling them so.
+
+def test_anneal_label_hold_only_keeps_the_task_name():
+    """`hold_s` alone no longer displaces the task; both survive, in one line."""
+    phase = RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     anneal_task="anneal_85C_8h", hold_s=28800.0,
+                     conditions=PhaseSetpoints("cooldown", 25.0))
+
+    label = phase.label()
+
+    assert label == ("Anneal (anneal_85C_8h: 8h) → rests at 25 °C "
+                     "@ cooldown (25 °C) [per batch]")
+    # The point of the task name being there: the cure's temperature is
+    # *findable*, and the only number shown is the one whose role is stated.
+    assert "25 °C" in label and "rests at" in label
+
+
+def test_anneal_label_with_catalog_renders_cure_and_rest_temperatures():
+    """Both temperatures, each with its role — the cure from the task, the rest
+    from ``conditions``. Neither is inferred from the other."""
+    phase = RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     anneal_task="anneal_85C_8h", hold_s=28800.0,
+                     conditions=PhaseSetpoints("cooldown", 25.0))
+
+    label = phase.label(_catalog())
+
+    assert label.startswith("Anneal (anneal_85C_8h: 85°C/8h) → rests at 25 °C")
+    # 85.0 from the catalog and 85 from an override are one anneal, not two.
+    assert "85.0°C" not in label
+
+
+def test_anneal_label_with_unknown_task_invents_no_temperature():
+    """A task the catalog does not hold degrades to its name — never a default.
+
+    The honest failure and the dangerous one differ by one number: printing a
+    cure temperature nothing supports would be read off the screen as the
+    commanded hold.
+    """
+    phase = RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     anneal_task="anneal_not_in_this_catalog", hold_s=1800.0)
+
+    label = phase.label(_catalog())
+
+    assert label == "Anneal (anneal_not_in_this_catalog: 30min) [per batch]"
+    assert "°C" not in label
+
+
+def test_anneal_label_with_silent_task_invents_no_temperature():
+    """A catalogued task stating no ``target_temp_C`` is 'nobody said', not 0 °C."""
+    phase = RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     anneal_task="anneal_85C_8h", hold_s=1800.0)
+
+    assert phase.label(_catalog(temp_C=None)) == "Anneal (anneal_85C_8h: 30min) [per batch]"
+
+
+def test_anneal_label_override_outranks_the_catalog_temperature():
+    """The emitter's precedence, rendered: the run's override wins the hold, so
+    it must win the label — a label naming 85 while the rig ramps to 120 is
+    worse than one naming neither."""
+    phase = RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     anneal_task="anneal_85C_8h",
+                     anneal_params={"target_temp_C": 120}, hold_s=600.0)
+
+    assert phase.label(_catalog()) == "Anneal (anneal_85C_8h: 120°C/10min) [per batch]"
+
+
+def test_anneal_label_with_no_typed_fields_is_the_task_alone():
+    """The pre-existing bare case is unchanged apart from gaining no parameters."""
+    phase = RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     anneal_task="anneal_85C_8h")
+
+    assert phase.label() == "Anneal (anneal_85C_8h) [per batch]"
+
+
+def test_describe_forwards_the_catalog_to_every_anneal_phase():
+    """`describe()` is the only caller of `label()` in production, so the
+    catalog has to reach the phase through it or the capability is unreachable."""
+    plan = RunPlan.batch(anneal=True, anneal_task="anneal_85C_8h", hold_s=28800.0)
+
+    assert "Anneal (anneal_85C_8h: 8h)" in plan.describe()
+    assert "Anneal (anneal_85C_8h: 85°C/8h)" in plan.describe(_catalog())
+
+
+def test_describe_without_a_catalog_opens_no_file(monkeypatch):
+    """The label never loads the catalog itself: it feeds a resume digest, and a
+    read of gitignored ``data/tasks.toml`` would make that digest machine-local."""
+    def _refuse(*args, **kwargs):
+        raise AssertionError("describe() opened a file")
+
+    monkeypatch.setattr("builtins.open", _refuse)
+    monkeypatch.setattr(TaskCatalog, "load_toml", _refuse)
+
+    assert "Anneal" in RunPlan.batch(anneal=True, hold_s=3600.0).describe()
 
 
 def test_factories_thread_hold_s_onto_the_anneal_phase():
