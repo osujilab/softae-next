@@ -225,6 +225,67 @@ def short_is_plausible(R_ohm: float, L_H: float) -> tuple[bool, str]:
 #: preferences) does not, which is why this is a curated list rather than the whole file.
 HARDWARE_SECTIONS = ("pcb", "channels", "instruments", "eis.instrument")
 
+#: Keys excluded from :func:`hardware_hash`'s material even though their section is
+#: hashed — control-loop gains, timeouts, retry counts and similar behavior knobs that
+#: describe how a device is DRIVEN, not what is wired. Keyed by dotted path within
+#: ``instruments.*`` (e.g. ``"rh_controller.pid_kd"``) or under ``eis.instrument``.
+#: Editing one of these must never invalidate a calibration: commit ``744e034`` moved
+#: ``pid_kd`` 0.05 → 0.035 and silently dropped a good mux16 calibration for three days
+#: (T11.40, [a307]). A blocklist rather than an allowlist on purpose — an unlisted
+#: tuning key gives a *false* staleness (annoying, fails toward the configured
+#: fallback), an unlisted identity key would give a *silent* stale application to
+#: different hardware, which is the failure this whole mechanism exists to prevent.
+TUNING_KEYS = frozenset({
+    "instruments.stage.velocity",
+    "instruments.stage.visa_timeout_ms",
+    "instruments.stage.query_delay",
+    "instruments.syringe.max_rate",
+    "instruments.syringe.min_rate",
+    "instruments.temp_controller.max_temp",
+    "instruments.temp_controller.min_temp",
+    "instruments.camera.exposure",
+    "instruments.keithley.nplc",
+    "instruments.ht_sensor.read_retries",
+    "instruments.ht_sensor.read_retry_delay_s",
+    "instruments.ht_sensor.reset_on_unrecoverable",
+    "instruments.rh_controller.pid_kp",
+    "instruments.rh_controller.pid_ki",
+    "instruments.rh_controller.pid_kd",
+    "instruments.rh_controller.max_consecutive_failures",
+    "instruments.rh_controller.max_stale_s",
+    "eis.instrument.max_amplitude_mV",
+})
+
+
+def _without_tuning_keys(prefix: str, node: Any) -> Any:
+    """``node`` minus any key whose dotted path under ``prefix`` is a tuning key.
+
+    Returns ``node`` itself when nothing is dropped, so a section carrying no tuning
+    key hashes byte-identically to what it hashed before this filter existed.
+    """
+    if not isinstance(node, Mapping):
+        return node
+    kept = {k: v for k, v in node.items() if f"{prefix}.{k}" not in TUNING_KEYS}
+    return node if len(kept) == len(node) else kept
+
+
+def _hash_material(section: str, node: Any) -> Any:
+    """One hashed section's contribution, with tuning knobs stripped.
+
+    ``instruments`` nests one level deeper than its section name (the tuning path is
+    ``instruments.<device>.<key>``); ``eis.instrument`` is already at device level.
+    ``pcb`` and ``channels`` carry no tuning keys and are passed through untouched.
+    """
+    if section == "eis.instrument":
+        return _without_tuning_keys(section, node)
+    if section != "instruments" or not isinstance(node, Mapping):
+        return node
+    filtered = {
+        sub: _without_tuning_keys(f"instruments.{sub}", subnode)
+        for sub, subnode in node.items()
+    }
+    return node if all(filtered[s] is node[s] for s in filtered) else filtered
+
 
 def hardware_hash(config: Mapping[str, Any] | None = None) -> str:
     """A stable digest of the hardware a calibration was taken on.
@@ -252,7 +313,7 @@ def hardware_hash(config: Mapping[str, Any] | None = None) -> str:
         for part in section.split("."):
             node = (node or {}).get(part) if isinstance(node, Mapping) else None
         if node is not None:
-            material[section] = node
+            material[section] = _hash_material(section, node)
 
     blob = json.dumps(material, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
@@ -352,10 +413,54 @@ class PhaseAccuracyTable:
     #: and it stays 1.0 because that is a property of the instrument, not of how many
     #: points happened to survive gating.
     valid_decades: float = 1.0
+    #: Per-row load class — ``resistive`` or ``capacitive``, one entry per row.
+    #:
+    #: :attr:`load` is one scalar for a table whose rows come from *different* parts,
+    #: so it is wrong for whichever class did not write it last. This is the per-row
+    #: truth a floor must bracket within; empty means the asset predates the column.
+    load_kind: tuple[str, ...] = ()
+    #: Acquisition each row was derived from, one per row, ``-1`` where none was recorded.
+    #:
+    #: Provenance only — it gates nothing, so a ``-1`` never suppresses a floor.
+    source_measurement_id: tuple[int, ...] = ()
 
     @property
     def is_empty(self) -> bool:
         return not self.z_ohm or not self.eps_deg
+
+    @property
+    def has_load_kinds(self) -> bool:
+        """Whether every row carries its own load class *and* its own provenance.
+
+        All-or-nothing on purpose. A 6-entry :attr:`load_kind` against 22 rows must not
+        read as "the other 16 are capacitive" — a partial tuple is the shape that lets
+        an unknown be spelled the same way as a checked value, so it reads as False and
+        says so in the log rather than being trusted row-wise.
+        """
+        n = len(self.z_ohm)
+        if n == 0 or len(self.eps_deg) != n:
+            return False
+        if len(self.load_kind) != n or len(self.source_measurement_id) != n:
+            if self.load_kind or self.source_measurement_id:
+                logger.warning(
+                    "phase_table_load_kind_ragged",
+                    n_rows=n,
+                    n_load_kind=len(self.load_kind),
+                    n_source_measurement_id=len(self.source_measurement_id),
+                )
+            return False
+        return all(str(kind).strip() for kind in self.load_kind)
+
+    def rows(self) -> tuple[tuple[float, float, str, int], ...]:
+        """``(z_ohm, eps_deg, load_kind, source_measurement_id)`` per row.
+
+        Empty unless :attr:`has_load_kinds` — a caller bracketing by load class gets
+        every row or none, never a silently truncated subset.
+        """
+        if not self.has_load_kinds:
+            return ()
+        return tuple(zip(self.z_ohm, self.eps_deg,
+                         self.load_kind, self.source_measurement_id))
 
     @property
     def decades_spanned(self) -> float:
@@ -496,6 +601,7 @@ __all__ = [
     "MAX_PLAUSIBLE_L_LEAD_H",
     "MAX_PLAUSIBLE_SHORT_OHM",
     "MEASUREMENT_ROLES",
+    "TUNING_KEYS",
     "TWO_TERMINAL_ROLES",
     "CalibrationCapabilities",
     "FixtureConductance",

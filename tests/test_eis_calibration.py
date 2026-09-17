@@ -28,6 +28,7 @@ import pytest
 from softae.analysis.eis.calibration import (
     COMMISSIONING_ROLES,
     MEASUREMENT_ROLES,
+    TUNING_KEYS,
     TWO_TERMINAL_ROLES,
     CalibrationSet,
     PhaseAccuracyTable,
@@ -611,6 +612,64 @@ class TestPhaseAccuracyTable:
         assert "resistive" in table.describe()
 
 
+class TestPerRowLoadProvenance:
+    """The scalar ``load`` is wrong for whichever class did not write it last.
+
+    The committed asset mixes reference-resistor and reference-capacitor rows under one
+    label, and a floor that brackets by class needs each row's own class to do it.
+    """
+
+    def test_a_fully_populated_table_carries_load_kinds_and_rows(self):
+        table = PhaseAccuracyTable(
+            z_ohm=(1001.5, 7324.0, 1.0118e7),
+            eps_deg=(0.177, 3.853, 6.120),
+            load_kind=("resistive", "capacitive", "resistive"),
+            source_measurement_id=(4291, 3492, 3897),
+        )
+        assert table.has_load_kinds
+        assert table.rows() == (
+            (1001.5, 0.177, "resistive", 4291),
+            (7324.0, 3.853, "capacitive", 3492),
+            (1.0118e7, 6.120, "resistive", 3897),
+        )
+
+    def test_a_table_without_the_columns_loads_exactly_as_today(self):
+        # Backward compatibility: every asset written before T11.41 constructs this way.
+        table = PhaseAccuracyTable(z_ohm=(1e4, 1e6), eps_deg=(0.15, 0.35))
+        assert not table.has_load_kinds
+        assert table.rows() == ()
+        assert table.epsilon_deg(1e5) == pytest.approx(0.25, rel=0.01)
+
+    def test_a_ragged_load_kind_is_false_not_partially_trusted(self):
+        # 6 resistive rows against a 22-row table must never read as "the other 16
+        # are capacitive" — the unknown may not be spelled like a checked value.
+        table = PhaseAccuracyTable(
+            z_ohm=tuple(10.0 ** (i / 4.0) for i in range(22)),
+            eps_deg=tuple(0.1 * (i + 1) for i in range(22)),
+            load_kind=("resistive",) * 6,
+            source_measurement_id=(4291, 4292, 3898, 4293, 3896, 3897),
+        )
+        assert not table.has_load_kinds                              # does not raise
+        assert table.rows() == ()                                    # not 6 rows
+
+    def test_an_empty_load_kind_entry_disqualifies_the_whole_table(self):
+        table = PhaseAccuracyTable(
+            z_ohm=(1e3, 1e5), eps_deg=(0.5, 1.5),
+            load_kind=("resistive", ""), source_measurement_id=(4291, -1),
+        )
+        assert not table.has_load_kinds
+        assert table.rows() == ()
+
+    def test_an_unrecorded_source_id_is_carried_not_suppressed(self):
+        # -1 is provenance, never a gate: the row still stands as a floor candidate.
+        table = PhaseAccuracyTable(
+            z_ohm=(1e3,), eps_deg=(0.5,),
+            load_kind=("capacitive",), source_measurement_id=(-1,),
+        )
+        assert table.has_load_kinds
+        assert table.rows() == ((1e3, 0.5, "capacitive", -1),)
+
+
 class TestCapabilityLadder:
     def test_an_empty_calibration_blocks_everything_and_says_what_would_help(self):
         caps = CalibrationSet().capabilities()
@@ -764,6 +823,73 @@ class TestHardwareHash:
         a = {"eis": {"instrument": {"z_max_ohm": 1e9}}}
         b = {"eis": {"instrument": {"z_max_ohm": 1e8}}}
         assert hardware_hash(a) != hardware_hash(b)
+
+
+def _config_with(dotted_key: str, value):
+    """A minimal config carrying ``dotted_key = value`` beside identity siblings.
+
+    ``"instruments.rh_controller.pid_kd"`` becomes
+    ``{"pcb": ..., "instruments": {"rh_controller": {"driver": ..., "pid_kd": value}}}``.
+    The siblings matter: a section stripped to nothing would hash the same for a
+    trivial reason, and this test must fail for the real one.
+    """
+    *prefix, key = dotted_key.split(".")
+    node: dict = {"driver": "acme", "port": "COM3", key: value}
+    for part in reversed(prefix):
+        node = {part: node}
+    return {"pcb": {"name": "A"}, **node}
+
+
+class TestTuningKeysAreNotHardware:
+    """A knob that says how a device is driven is not what device is wired.
+
+    Commit ``744e034`` moved ``[instruments.rh_controller] pid_kd`` 0.05 → 0.035 and
+    the committed mux16 calibration went silently stale for three days, every gated
+    fit since running against the fallback envelope (T11.40, [a307]).
+    """
+
+    @pytest.mark.parametrize("dotted_key", sorted(TUNING_KEYS))
+    def test_hash_toggling_any_tuning_key_unchanged(self, dotted_key):
+        assert hardware_hash(_config_with(dotted_key, 1)) == hardware_hash(
+            _config_with(dotted_key, 2))
+
+    def test_hash_pid_kd_edit_of_744e034_unchanged(self):
+        # The exact reported regression, spelled out rather than only parametrized.
+        before = {"instruments": {"rh_controller": {
+            "driver": "arduino", "port": "COM7", "pid_kp": 0.8, "pid_ki": 0.02,
+            "pid_kd": 0.05}}}
+        after = {"instruments": {"rh_controller": {
+            "driver": "arduino", "port": "COM7", "pid_kp": 0.8, "pid_ki": 0.02,
+            "pid_kd": 0.035}}}
+        assert hardware_hash(before) == hardware_hash(after)
+
+    @pytest.mark.parametrize("identity_key", ["driver", "port"])
+    def test_hash_identity_key_in_a_filtered_subsection_moves(self, identity_key):
+        # The negative control: the filter is per-key, not a section-wide no-op.
+        base = {"instruments": {"rh_controller": {
+            "driver": "arduino", "port": "COM7", "pid_kd": 0.05}}}
+        moved = {"instruments": {"rh_controller": dict(
+            base["instruments"]["rh_controller"], **{identity_key: "CHANGED"})}}
+        assert hardware_hash(base) != hardware_hash(moved)
+
+    def test_hash_eis_instrument_drops_amplitude_but_keeps_envelope(self):
+        base = {"eis": {"instrument": {"z_max_ohm": 1e9, "max_amplitude_mV": 25}}}
+        tuned = {"eis": {"instrument": {"z_max_ohm": 1e9, "max_amplitude_mV": 50}}}
+        rewired = {"eis": {"instrument": {"z_max_ohm": 1e8, "max_amplitude_mV": 25}}}
+        assert hardware_hash(base) == hardware_hash(tuned)
+        assert hardware_hash(base) != hardware_hash(rewired)
+
+    @pytest.mark.parametrize("section", ["pcb", "channels"])
+    def test_hash_a_tuning_name_under_pcb_or_channels_moves(self, section):
+        # Exclusion is by full dotted path. "pid_kd" appearing under pcb or channels
+        # is an unrelated key in an unfiltered section and must still count.
+        assert hardware_hash({section: {"pid_kd": 0.05}}) != hardware_hash(
+            {section: {"pid_kd": 0.035}})
+
+    def test_hash_a_tuning_name_under_another_instrument_moves(self):
+        # Only rh_controller's pid_kd is listed; the same name elsewhere is not.
+        assert hardware_hash({"instruments": {"stage": {"pid_kd": 0.05}}}) != (
+            hardware_hash({"instruments": {"stage": {"pid_kd": 0.035}}}))
 
 
 # ── Acquisition: a commissioning sweep is an EIS measurement with a tag ──────
