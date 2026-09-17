@@ -26,6 +26,11 @@ from softae.core.autonomous_wiring import (
     run_autonomous_campaign,
 )
 from softae.core.data_store import DataStore
+from softae.core.phase_setpoints import (
+    BASELINE_ABSENT_EVENT,
+    BASELINE_EVENT,
+    PhaseSetpoints,
+)
 from softae.core.task_catalog import TaskCatalog
 from softae.drivers.mock_factory import create_mock_manager
 from softae.optimizers import BayesianOptimizer, GridSearchOptimizer
@@ -89,6 +94,25 @@ def test_channels_scalar_normalised_to_tuple():
 def test_empty_channels_rejected():
     with pytest.raises(ValueError):
         CampaignSpec(name="x", channels=())
+
+
+def test_campaign_spec_conditions_defaults_to_none_and_round_trips():
+    """The campaign-level ``[conditions]`` baseline is a field, not a phase's.
+
+    Its absence was the whole T11.28 gap: ``campaign_spec_fields`` already
+    registers a ``"conditions"`` codec and ``spec_from_dict`` derives its
+    accepted-key list from ``dataclasses.fields(CampaignSpec)``, so until the
+    field existed a ``[conditions]`` block in a campaign TOML was rejected as an
+    unknown field by the very loader written to decode it. ``None`` is a real
+    answer here — "nothing was commanded" — not a missing one.
+    """
+    from dataclasses import fields as dataclass_fields
+
+    assert "conditions" in {f.name for f in dataclass_fields(CampaignSpec)}
+    assert _spec().conditions is None
+
+    baseline = PhaseSetpoints("floor", temp_setpoint_C=25.0, rh_setpoint_pct=30.0)
+    assert _spec(conditions=baseline).conditions is baseline
 
 
 # ── Per-trial builder (shared deposition engine) ─────────────────────────────
@@ -209,6 +233,42 @@ def test_build_batch_trial_workflow_length_mismatch_raises(catalog):
     spec = _spec(batch=True)  # 4 channels
     with pytest.raises(ValueError, match="must match channel count"):
         build_batch_trial_workflow(spec, [PARAMS, PARAMS], catalog=catalog)
+
+
+def test_build_trial_workflow_threads_spec_conditions_to_the_engine_as_baseline(
+    catalog, monkeypatch
+):
+    """The campaign baseline reaches the one marshaller, or it reaches nothing.
+
+    ``deposition_recipe.build_deposition_workflow`` has accepted and threaded
+    ``baseline=`` since T11.28's engine half landed, and this call site was the
+    missing link — so a ``[conditions]`` block that parsed cleanly onto the spec
+    still commanded the chamber nothing. Asserted at the kwarg rather than at
+    the emitted steps on purpose: what the engine *does* with a baseline is
+    ``test_deposition_recipe.py``'s subject, and reproving it here would couple
+    this test to step names it does not own.
+    """
+    from softae.core import autonomous_wiring as _wiring
+
+    seen: dict = {}
+    real = _wiring.build_deposition_workflow
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_wiring, "build_deposition_workflow", spy)
+
+    baseline = PhaseSetpoints("floor", temp_setpoint_C=25.0, rh_setpoint_pct=30.0)
+    build_trial_workflow(_spec(conditions=baseline), PARAMS, catalog=catalog)
+    assert seen["baseline"] is baseline
+
+    seen.clear()
+    build_trial_workflow(_spec(), PARAMS, catalog=catalog)
+    assert seen["baseline"] is None, (
+        "a campaign with no [conditions] must reach the engine as an explicit "
+        "None — the kwarg is always passed, so 'no baseline' is stated rather "
+        "than left to the engine's default")
 
 
 # NOTE: the campaign tests below deliberately say *nothing* about the objective.
@@ -442,6 +502,50 @@ async def test_campaign_runs_budget_and_records_doe(connected, tmp_path: Path):
     assert sum(e["type"] == "suggestion" for e in events) == 5
     assert sum(e["type"] == "result" for e in events) == 5
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_campaign_run_start_narrates_the_baseline_present_and_absent(
+    connected, tmp_path: Path
+):
+    """Two events, never zero, and both sited immediately after ``run_started``.
+
+    Silence is not available as a spelling for "nothing was commanded": a
+    campaign starting after a park is genuinely unconditioned until the first
+    phase that speaks, and a transcript that merely *omits* the line cannot be
+    told apart from one written before the field existed. So the absent case
+    gets its own event rather than no event — ``SUBAGENT_RULES.md`` §3.1(a),
+    "unknown must not be spelled with the same token as checked and clean".
+
+    ``run_started`` stays first because that is where a watcher replaying from
+    byte 0 learns the run's identity.
+    """
+    store = DataStore(tmp_path / "proj_baseline")
+    try:
+        absent: list[dict] = []
+        await run_autonomous_campaign(
+            _spec(optimizer="grid", budget=1), manager=connected,
+            data_store=store, on_event=absent.append)
+
+        baseline = PhaseSetpoints("floor", temp_setpoint_C=25.0,
+                                  rh_setpoint_pct=30.0)
+        present: list[dict] = []
+        await run_autonomous_campaign(
+            _spec(optimizer="grid", budget=1, conditions=baseline),
+            manager=connected, data_store=store, on_event=present.append)
+    finally:
+        store.close()
+
+    assert [e["type"] for e in absent][:2] == ["run_started", BASELINE_ABSENT_EVENT]
+    assert BASELINE_EVENT not in {e["type"] for e in absent}
+
+    assert [e["type"] for e in present][:2] == ["run_started", BASELINE_EVENT]
+    assert present[1]["name"] == "floor"
+    assert present[1]["temp_setpoint_C"] == 25.0
+    assert present[1]["rh_setpoint_pct"] == 30.0
+    # A setpoint is not an arrival: `command_steps` emits no wait, so nothing in
+    # the run has checked the chamber got there. Stated, not implied.
+    assert present[1]["waited"] is False
 
 
 @pytest.mark.asyncio

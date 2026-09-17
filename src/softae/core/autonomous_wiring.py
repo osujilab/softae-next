@@ -92,6 +92,10 @@ from softae.core.measurement_spec import (
 # module exclusively inside functions, so its module body never reaches back
 # here. Keep it that way — see `modality_registry`'s "Import discipline".
 from softae.core.modality_registry import ObjectiveSpec, get_modality
+# Safe at module scope: `phase_setpoints` is a leaf — its module body imports
+# only `workflows.workflow_model`, which this file already imports below, so
+# there is no path back here to close a cycle.
+from softae.core.phase_setpoints import PhaseSetpoints, baseline_event_payload
 # Safe at module scope in this direction only, and for the same reason as
 # `modality_registry` above: `production_read`'s module body imports nothing from
 # here (its `CampaignSpec` reference is annotation-only, and it reaches back for
@@ -441,6 +445,14 @@ class CampaignSpec:
     #: anneal-all → measure-all), or insert an ANNEAL phase to cure between
     #: deposit and measure. See :mod:`softae.core.run_plan`.
     run_plan: "RunPlan | None" = None
+    #: Campaign-level ``[conditions]`` baseline (T11.28) — the chamber floor the
+    #: run commands once, before the first cast, and which any phase's own
+    #: ``conditions`` then overrides. ``None`` is a real answer, not a missing
+    #: one: a campaign after a park is *unconditioned* until the first phase
+    #: that speaks, which the run-start event records explicitly rather than
+    #: leaving to be inferred from silence. Same type as a phase's conditions —
+    #: see :mod:`softae.core.phase_setpoints`.
+    conditions: "PhaseSetpoints | None" = None
     budget: int = 12
     #: What this campaign measures, and how (T2.4). One block naming a
     #: **modality** alongside its preset/overrides, so a second modality needs no
@@ -795,11 +807,11 @@ def _run_plan_digest(run_plan: "RunPlan | None") -> str | None:
     (kind, scope, conditions, measurement, and — through ``_anneal_label`` — an
     ANNEAL phase's temp/hold when either is set) plus, **explicitly**, each
     phase's ``hold_s``, ``anneal_task`` and ``anneal_params``. The explicit
-    trio is load-bearing, not redundant with ``describe()``:
-    ``RunPhase._anneal_label`` drops ``anneal_task`` from the label entirely
-    whenever ``hold_s`` or an ``anneal_params["target_temp_C"]`` override is
-    present — the common case — and never surfaces the rest of
-    ``anneal_params``, only ``target_temp_C``/``hold_time_s``.
+    trio is load-bearing, not redundant with ``describe()``: ``RunPhase._anneal_label``
+    now always names ``anneal_task`` (T11.21), but it still surfaces none of
+    ``anneal_params`` beyond ``target_temp_C``/``hold_time_s``, and the label is
+    display text free to be reworded — so the digest names the three fields
+    rather than trusting it.
 
     ``None`` for no plan, matching the field's prior meaning exactly (a real
     "that run had no plan", not "never asked" — see ``load_resume_plan``'s own
@@ -1437,6 +1449,7 @@ def _build_deposition_workflow(
         settings=spec.deposition_settings(pcb=pcb, n_pumps=len(ids)),
         catalog=catalog,
         eis_step_by_channel=measure_by_channel,
+        baseline=getattr(spec, "conditions", None),
         name=f"{spec.name}_trial",
     )
     _stamp_sample_uuids(wf, sample_uuid_by_channel)
@@ -3260,6 +3273,12 @@ async def run_autonomous_campaign(
             **({} if heartbeat_s is None else {"heartbeat_s": heartbeat_s}))
 
         emit("run_started", run_id=run_id, spec=spec.name)
+        # What the chamber was told before the first cast — or, explicitly, that
+        # it was told nothing (T11.28). `baseline_event_payload` returns an event
+        # in *both* cases deliberately: a transcript that merely omits a line
+        # cannot be read apart from one written before the field existed.
+        _ev, _payload = baseline_event_payload(spec)
+        emit(_ev, **_payload)
 
         # Beats on the event loop, not between steps. Sync instrument methods
         # are dispatched through `run_in_executor` (`server/base_instrument.py`),
