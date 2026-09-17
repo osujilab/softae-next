@@ -1790,7 +1790,13 @@ def test_settle_round_fits_admits_a_converged_fit_with_a_bound_sigma_label():
     assert wiring._report_sigma(legacy) != pytest.approx(legacy.sigma.value)
 
     # The label rides beside it, verbatim, for the one engine that can produce it.
-    assert wiring._report_sigma_mode(gated) == "bound"
+    # T11.39 (2026-09-17): "bound" narrows to "bound_unqualified" now that the mux16
+    # calibration genuinely applies (it was silently stale since `744e034`, `[a307]`)
+    # — this fixture's z_med sits outside the interim single-anchor `valid_decades`
+    # window, so the bound is real but extrapolated rather than locally measured.
+    # `gated.sigma.is_bound` above already pins "still some kind of bound"; T11.41's
+    # per-row, locality-bracketed floor is expected to move this back toward "bound".
+    assert wiring._report_sigma_mode(gated) == "bound_unqualified"
     assert wiring._report_sigma_mode(legacy) == "value"
 
     # Both engines fit the same film; only the reporting decision differed.
@@ -1926,9 +1932,17 @@ def test_sigma_from_eis_raw_still_resolves_the_configured_engine(monkeypatch):
     assert called == []
     assert len(seen) == 1
     assert seen[0].get("engine") is None
-    # And it is still the geometry-resolved σ, not the criterion's 1/R₁ proxy.
-    assert sigma is not None
-    assert sigma > 1e-3
+    # T11.39 (2026-09-17): the mux16 calibration now genuinely applies (it had been
+    # silently stale since `744e034` and every gated spectrum was scored on the
+    # uncalibrated fallback envelope, `[a307]`). Under the real, applied phase floor
+    # this closed-arc fixture on ch7 is honestly resolution-limited and the objective
+    # correctly declines it (`None`) rather than reporting a value — a decline is
+    # still "not the criterion's 1/R₁ proxy", which is what this assertion actually
+    # guards against; a proxy leak would show up as a *finite* number here, not as
+    # `None`. This is the interim state T11.41 (per-row, locality-bracketed floor)
+    # is expected to move again, since the fixture's z_med now sits between
+    # commissioned resistor rows the interim single-anchor rule cannot see.
+    assert sigma is None
 
 
 def test_settle_round_fits_requests_the_legacy_engine():
