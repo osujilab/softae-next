@@ -633,29 +633,56 @@ def _fmt_duration(seconds: float) -> str:
 # ── The RH-floor advisory ────────────────────────────────────────────────────
 
 def commanded_conditions(run_plan: Any, baseline: Any = None) -> list[Any]:
-    """Every distinct :class:`PhaseSetpoints` a campaign commands, in run order.
+    """Every :class:`PhaseSetpoints` a campaign establishes, in run order.
 
-    Deduplicated on the object itself, because the deposition engine emits a
-    condition's steps **only when the setpoint changes** — two consecutive
-    phases carrying the same conditions establish them once, and advising twice
-    about one approach would misrepresent what the run does.
+    **Deduplicated against the LAST established condition, not against every
+    condition seen so far** — because that is the engine's rule, and this
+    projection exists to say what the engine will do. ``deposition_recipe``'s
+    ``_condition_steps`` holds a single ``established`` value and emits steps
+    whenever ``wanted != established``, so a plan that returns to an earlier
+    setpoint — **A → B → A** — genuinely re-establishes A at the bench, with a
+    fresh ramp and a fresh RH approach.
+
+    A ``seen``-set dedup suppressed that third entry, and suppressed it in the
+    **optimistic** direction: the RH-floor advisory for the second A never
+    appeared, and a missing advisory is indistinguishable from a run that needed
+    none (T11.35). Two *consecutive* equal conditions still collapse to one,
+    which is the case the old wording was actually describing.
+
+    Comparison is whole-value ``==`` on ``PhaseSetpoints``, **the name
+    included**, again as the engine does: two setpoint pairs differing only in
+    label are two establishes at the bench, so they are two entries here.
+
+    A phase carrying no conditions does not clear the standing setpoint — the
+    chamber goes on holding what it was last told to hold — so ``None`` is
+    skipped without disturbing *established*.
 
     *baseline* is the campaign-level ``[conditions]`` floor (T11.28), and it
     belongs at the **head** because that is where the engine commands it: before
     the piezo step and the startup flush, ahead of every phase. Without it, the
     one setpoint driven before the first cast is the only commanded humidity the
     RH-floor advisory cannot see. It defaults to ``None`` so every existing
-    caller is unchanged, and it dedups against the first phase exactly as the
-    engine does — a first phase equal to the baseline re-establishes nothing.
+    caller is unchanged, and it seeds *established* exactly as the engine does
+    — a first phase equal to the baseline re-establishes nothing.
+
+    **Known remaining divergence.** The engine runs ``_condition_steps`` inside
+    its per-channel loop, so a PER_SAMPLE segment whose phases carry conditions
+    re-establishes them once per channel; this function walks
+    ``run_plan.phases`` once. The projection is still the optimistic side there
+    — see T11.35's report — but the fix is a count, not a policy, and it is not
+    this change.
     """
-    seen: list[Any] = []
+    commanded: list[Any] = []
+    established: Any = baseline
     if baseline is not None:
-        seen.append(baseline)
+        commanded.append(baseline)
     for phase in getattr(run_plan, "phases", ()) or ():
         conditions = getattr(phase, "conditions", None)
-        if conditions is not None and conditions not in seen:
-            seen.append(conditions)
-    return seen
+        if conditions is None or conditions == established:
+            continue
+        commanded.append(conditions)
+        established = conditions
+    return commanded
 
 
 def _bin_for(

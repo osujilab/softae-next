@@ -914,3 +914,151 @@ class TestTheBaselineIsCommandedAndCostsNoGatedTime:
         p = project_campaign(_spec(), catalog=catalog,
                              project_dir=tmp_path / "nothing-here")
         assert not any("RH-floor" in w for w in p.warnings)
+
+
+# ───────────────── the dedup mirrors the engine's tracker (T11.35) ─────────────────
+
+COOL = _conditions("cool", 25.0, 40.0)
+HOT = _conditions("hot", 85.0, 20.0)
+
+
+def _revisiting_plan() -> RunPlan:
+    """A → B → A: the shape the old ``seen``-set dedup collapsed to two."""
+    return RunPlan((
+        RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE, conditions=COOL),
+        RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                 anneal_task="anneal_85C_8h", conditions=HOT),
+        RunPhase(PhaseKind.MEASURE, PhaseScope.PER_BATCH, conditions=COOL),
+    ))
+
+
+class TestTheDedupIsTheEnginesAndNotASeenSet:
+    """The projection's job is to say what the engine will do, so its dedup rule
+    has to *be* the engine's: compare against the **last established**
+    condition, never against every condition seen so far.
+
+    The divergence was one-directional, which is what made it worth a task. A
+    ``seen`` set can only ever emit **fewer** conditions than the engine
+    establishes, so every suppressed entry is a bench approach — a temperature
+    ramp and an RH descent — that the projection did not cost and the RH-floor
+    advisory did not inspect. A missing advisory reads exactly like a run that
+    needed none.
+    """
+
+    def test_commanded_conditions_returning_to_an_earlier_condition_emits_it_again(self):
+        """A → B → A is three establishes, not two: B displaced A."""
+        assert commanded_conditions(_revisiting_plan()) == [COOL, HOT, COOL]
+
+    def test_commanded_conditions_consecutive_repeat_emits_once(self):
+        """A → A → B stays two — the case the old wording actually described.
+
+        The companion to the test above, and the reason the fix is "last
+        established" rather than "no dedup at all": the chamber goes on holding
+        what it was told, so a repeat setpoint really does establish nothing.
+        """
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE, conditions=COOL),
+            RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     anneal_task="anneal_85C_8h", conditions=COOL),
+            RunPhase(PhaseKind.MEASURE, PhaseScope.PER_BATCH, conditions=HOT),
+        ))
+        assert commanded_conditions(plan) == [COOL, HOT]
+
+    def test_commanded_conditions_a_phase_driving_nothing_does_not_clear_the_setpoint(self):
+        """``conditions=None`` means *do not drive*, not *stop holding*.
+
+        The engine's tracker is untouched by such a phase, so A → (none) → A is
+        one establish. Were *established* reset to ``None`` here, the second A
+        would look like a change and the projection would invent an approach the
+        bench never makes — the optimistic error's mirror image.
+        """
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE, conditions=COOL),
+            RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     anneal_task="anneal_85C_8h"),
+            RunPhase(PhaseKind.MEASURE, PhaseScope.PER_BATCH, conditions=COOL),
+        ))
+        assert commanded_conditions(plan) == [COOL]
+
+    def test_commanded_conditions_returning_to_the_baseline_emits_it_again(self):
+        """The baseline is the first *established* value, not a permanent member.
+
+        ``test_preflight_commanded_conditions_dedups_a_first_phase_equal_to_it``
+        pins the head of this: a first phase equal to the baseline establishes
+        nothing. This pins the tail — once a phase has displaced the baseline,
+        coming back to it is a fresh approach, and it is the campaign-level
+        ``[conditions]`` humidity that the advisory would otherwise stay silent
+        about on the way back down.
+        """
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE, conditions=BASELINE),
+            RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     anneal_task="anneal_85C_8h", conditions=HOT),
+            RunPhase(PhaseKind.MEASURE, PhaseScope.PER_BATCH, conditions=BASELINE),
+        ))
+        assert commanded_conditions(plan, BASELINE) == [BASELINE, HOT, BASELINE]
+
+    def test_commanded_conditions_matches_the_sequence_the_engine_establishes(self):
+        """The pin: built through the engine, not asserted about it.
+
+        Compared surface — ``build_recipe_deposition_workflow``'s emitted
+        ``setup``, filtered to steps tagged ``phase=conditions``, one group per
+        ``write_sp`` (``establish_steps`` emits temperature's setpoint first and
+        exactly once per establish, so those steps *are* the establish groups
+        for temperature-driving conditions). The ordered ``condition`` tags off
+        those steps are checked against the ordered ``name``s this function
+        returns — the sequence, not merely the count, so a right-length list in
+        the wrong order still fails.
+
+        **One channel and per-batch tail phases deliberately.** The engine runs
+        its tracker inside the per-channel loop, so a PER_SAMPLE segment
+        carrying conditions re-establishes them once per channel; that
+        multiplicity is a separate divergence (see ``commanded_conditions``'s
+        docstring) and this pin is not the place to smuggle a claim about it.
+        """
+        from softae.core.deposition_recipe import (
+            build_recipe_deposition_workflow,
+            get_deposition_recipe,
+        )
+
+        plan = _revisiting_plan()
+        assert all(c.temp_setpoint_C is not None for c in commanded_conditions(plan))
+
+        cat = TaskCatalog.load_toml(loader.tasks_toml_path())
+        wf = build_recipe_deposition_workflow(
+            get_deposition_recipe("single_drop"), [21], {21: [1.0, 1.0]},
+            catalog=cat, pump_ids=[0, 1], dispense_rate=100.0, flush_rate=500.0,
+            flush_factor=3.0, settle_factor=2.0,
+            pcb={"grid": [8, 4], "spacing_mm": [10, 10]},
+            origin_xy=(43.5, 50.0), run_plan=plan)
+
+        established = [s.tags.get("condition") for s in wf.setup
+                       if (s.tags or {}).get("phase") == CONDITIONS_PHASE_TAG
+                       and str(s.method) == "write_sp"]
+
+        assert established == ["cool", "hot", "cool"], (
+            "the engine no longer re-establishes a revisited condition; if that "
+            "is deliberate, this function's rule has to move with it")
+        assert [c.name for c in commanded_conditions(plan)] == established
+
+    def test_rh_floor_advisories_warn_once_per_engine_establish(self):
+        """What the divergence actually cost, in the caller that consumes it.
+
+        The second approach to a below-floor humidity produced no line at all
+        under the ``seen`` dedup. It is the same sentence twice, which is
+        correct: the chamber makes the descent twice.
+        """
+        dry = _conditions("dry", 25.0, 10.0)
+        plan = RunPlan((
+            RunPhase(PhaseKind.FORMULATE, PhaseScope.PER_SAMPLE, conditions=dry),
+            RunPhase(PhaseKind.ANNEAL, PhaseScope.PER_BATCH,
+                     anneal_task="anneal_85C_8h", conditions=HOT),
+            RunPhase(PhaseKind.MEASURE, PhaseScope.PER_BATCH, conditions=dry),
+        ))
+        bins = [TemperatureBin(temperature_C=25.0, rh_floor_pct=30.0,
+                               rh_setpoint_min_pct=25.0, n_rows=12),
+                TemperatureBin(temperature_C=85.0, rh_floor_pct=15.0,
+                               rh_setpoint_min_pct=15.0, n_rows=12)]
+        lines = rh_floor_advisories(plan, bins)
+        assert len(lines) == 2
+        assert all("condition 'dry' commands 10 %RH" in line for line in lines)
