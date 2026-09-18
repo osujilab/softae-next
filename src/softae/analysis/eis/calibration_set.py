@@ -91,6 +91,17 @@ class CalibrationSet:
     #: role → measurement_id, so every derived number can be traced to its spectrum (R17).
     sources: dict[str, int] = field(default_factory=dict)
 
+    #: Why this set's fixture constants read empty, when it is not "never commissioned".
+    #:
+    #: ``""`` for both a fresh set and one still under construction; non-empty only on
+    #: the degraded copy :func:`resolve_calibration` returns when :meth:`is_stale` is
+    #: true. It distinguishes "we have not measured this yet" from "we measured it, and
+    #: it no longer applies" — the same distinction :attr:`channels_assumed` draws for a
+    #: different kind of gap — and makes staleness an inspectable fact on the artifact
+    #: rather than a transient log line. Deliberately **not** serialised: a saved asset
+    #: is not stale, and staleness is decided against the hardware hash at load time.
+    stale_reason: str = ""
+
     # ── Interrogation ────────────────────────────────────────────────────────
 
     @property
@@ -310,6 +321,7 @@ class CalibrationSet:
         """
         from softae.analysis.eis.envelope import (
             InstrumentEnvelope,
+            PhaseFloorRow,
             instrument_envelope,
             magnitude_window_applies,
         )
@@ -317,11 +329,26 @@ class CalibrationSet:
         env = base if base is not None else instrument_envelope()
         updates: dict[str, Any] = {}
 
+        # Empty unless every row carries its own class — the all-or-nothing rule in
+        # ``PhaseAccuracyTable.has_load_kinds``. An asset predating the columns then
+        # publishes no rows and the envelope answers from its single anchor, exactly
+        # as it does today.
+        rows = self.phase_acc.rows()
+        if rows:
+            updates["phase_rows"] = tuple(
+                PhaseFloorRow(float(z), float(e), str(kind), int(mid))
+                for z, e, kind, mid in rows
+            )
+
         idx = self._headline_phase_row()
         if idx is not None:
             updates["phase_noise_deg"] = float(self.phase_acc.eps_deg[idx])
             updates["phase_noise_at_ohm"] = float(self.phase_acc.z_ohm[idx])
-            updates["phase_noise_load"] = self.phase_acc.load
+            # The headline row's OWN class, not the table's last-branch-wins scalar.
+            # On the live asset that scalar says the 6.120° anchor was measured on a
+            # "capacitive" load when it was the 10 MΩ reference resistor.
+            updates["phase_noise_load"] = (
+                str(rows[idx][2]) if rows else self.phase_acc.load)
             updates["phase_noise_valid_decades"] = float(self.phase_acc.valid_decades)
             updates["phase_noise_measured"] = True
 
@@ -378,11 +405,16 @@ class CalibrationSet:
                          "exponent": float(v.exponent)}
                 for k, v in self.G_fixture.items()
             },
+            # Flat parallel lists beside the existing arrays, not nested tables: the
+            # TOML writer renders a list of str and a list of int already, and lists
+            # stay scalars in their parent table.
             "phase_acc": {
                 "z_ohm": list(self.phase_acc.z_ohm),
                 "eps_deg": list(self.phase_acc.eps_deg),
                 "load": self.phase_acc.load,
                 "valid_decades": self.phase_acc.valid_decades,
+                "load_kind": list(self.phase_acc.load_kind),
+                "source_measurement_id": list(self.phase_acc.source_measurement_id),
             },
             "z_min_ohm": self.z_min_ohm,
             "z_max_ohm": self.z_max_ohm,
@@ -409,11 +441,16 @@ class CalibrationSet:
                 return float("nan")
 
         pa = data.get("phase_acc") or {}
+        # ``or []`` on both new keys: an asset written before the columns existed loads
+        # exactly as it does today, with ``has_load_kinds`` False.
         phase = PhaseAccuracyTable(
             z_ohm=tuple(float(z) for z in (pa.get("z_ohm") or [])),
             eps_deg=tuple(float(e) for e in (pa.get("eps_deg") or [])),
             load=str(pa.get("load", "resistive")),
             valid_decades=float(pa.get("valid_decades", 1.0) or 1.0),
+            load_kind=tuple(str(k) for k in (pa.get("load_kind") or [])),
+            source_measurement_id=tuple(
+                int(m) for m in (pa.get("source_measurement_id") or [])),
         )
         opens: dict[int, bool] = {}
         for k, v in (data.get("open_usable") or {}).items():
@@ -552,6 +589,8 @@ def resolve_calibration(
         cal, R_short_ohm={}, L_lead_H={}, C_stray_F={}, open_usable={},
         phase_acc=PhaseAccuracyTable(), z_min_ohm=float("nan"),
         z_max_ohm=float("nan"), load_error_pct=float("nan"),
+        stale_reason=f"hardware_hash moved: recorded {cal.hardware_hash or '(none)'}, "
+                     f"current {current}",
     )
 
 

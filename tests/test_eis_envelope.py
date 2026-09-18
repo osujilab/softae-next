@@ -322,8 +322,17 @@ class TestTheCommittedCalibrationAsset:
     it is a testable asset. The 2026-09-03 reference-resistor run took the table from
     16 rows to 19 and moved ``argmax(ε)`` off a ``reference_cap`` and onto the 10 MΩ
     reference resistor — a cleaner reference, since a resistor's true phase is exactly
-    zero, and a *more* conservative floor.
+    zero, and a *more* conservative floor. The 2026-09-17 bench pass (T11.39) widened
+    the table to 22 rows and dropped ``z_min_ohm`` to a directly-measured 110 Ω-scale
+    reference resistor — the anchor (``argmax(ε)``, the 10 MΩ row) did not move, so
+    this class's own local constant tracks the window independently of the file-wide
+    ``Z_MIN``/``Z_MAX`` above, which several *other* tests in this module use as an
+    arbitrary synthetic gate-boundary value and must not move with the real asset.
     """
+
+    #: The committed asset's own ``z_min_ohm`` as of the 2026-09-17 re-derivation
+    #: (T11.39/`[p148]`) — deliberately not the shared ``Z_MIN`` above.
+    COMMITTED_Z_MIN = 109.60589540190168
 
     def _committed(self) -> CalibrationSet:
         cal = load_calibration("mux16", root=REPO_ROOT / "calibration" / "eis")
@@ -339,12 +348,12 @@ class TestTheCommittedCalibrationAsset:
     def test_the_committed_anchor_is_not_the_lowest_impedance_row(self):
         cal = self._committed()
         lowest = min(cal.phase_acc.z_ohm)
-        assert lowest == pytest.approx(Z_MIN)
+        assert lowest == pytest.approx(self.COMMITTED_Z_MIN)
         assert cal.envelope().phase_noise_at_ohm != pytest.approx(lowest)
 
     def test_the_committed_window_is_the_one_the_wiring_publishes(self):
         env = self._committed().envelope()
-        assert env.z_min_ohm == pytest.approx(Z_MIN)
+        assert env.z_min_ohm == pytest.approx(self.COMMITTED_Z_MIN)
         assert env.z_max_ohm == pytest.approx(Z_MAX)
         assert env.magnitude_window_measured is True
 

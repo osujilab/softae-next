@@ -484,6 +484,23 @@ def _cap_acq(channel: int, C: float, tand: float, *, nominal: float,
                             measurement_id=measurement_id)
 
 
+def _res_acq(channel: int, R: float, eps_deg: float, *,
+             measurement_id: int | None = None, n: int = 41):
+    """A reference resistor whose phase is *eps_deg* off its ideal zero.
+
+    Flat |Z| by construction, so `phase_table_gate`'s slope-plateau detector keeps every
+    point and the angle that reaches the table is the one written here.
+    """
+    import numpy as np
+
+    from softae.workflows.commissioning import AcquiredSpectrum
+
+    f = np.logspace(np.log10(200_000.0), np.log10(4.0), n)
+    Z = np.full(f.shape, R + 0j) * np.exp(1j * np.deg2rad(-eps_deg))
+    return AcquiredSpectrum(channel, f, Z, nominal=R, electrode_mode="two",
+                            measurement_id=measurement_id)
+
+
 class _CommissioningStore:
     """A real store holding commissioning rows, so the UPDATE is exercised for real.
 
@@ -904,6 +921,69 @@ class TestReferenceCapPhaseGate:
                             lambda ev, **kw: events.append(ev))
         self._derive({"reference_cap": [self._id_3493(), self._id_1933()]})
         assert "commissioning_no_usable_phase_reference" not in events
+
+
+class TestPhaseRowsCarryTheirOwnLoadClass:
+    """One label over two load classes was the T11.41 defect, in one line.
+
+    `derive_calibration` knew each row's class at derive time and discarded it into one
+    scalar the last branch to fire overwrote, so six resistor rows and sixteen capacitor
+    rows shipped labelled "capacitive" -- and a floor that must bracket within a class
+    could not see one. The scalar keeps its old meaning; the rows now carry their own.
+    """
+
+    def _mixed(self):
+        from softae.workflows.commissioning import derive_calibration
+
+        return derive_calibration(
+            {
+                "reference_r": [_res_acq(1, 1.0e5, 0.48, measurement_id=4293)],
+                "reference_cap": [_cap_acq(25, 119.4e-12, 0.0463, nominal=1e-9,
+                                           measurement_id=3493)],
+            },
+            fixture_id="mux16",
+        )
+
+    def test_derive_calibration_labels_a_mixed_artifact_set_per_row(self):
+        table = self._mixed().phase_acc
+
+        assert table.has_load_kinds is True
+        by_kind = dict(zip(table.load_kind, table.source_measurement_id))
+        # NOT last-branch-wins: both classes are present, each under its own id.
+        assert set(table.load_kind) == {"resistive", "capacitive"}
+        assert by_kind["resistive"] == 4293
+        assert by_kind["capacitive"] == 3493
+        assert table.load_kind.count("resistive") == 1      # one resistor, one row
+        assert table.load_kind.count("capacitive") == len(table.z_ohm) - 1
+
+    def test_the_scalar_load_and_the_window_keep_todays_meaning(self):
+        cal = self._mixed()
+
+        # "capacitive if any capacitive row contributed" -- unchanged, so the key does
+        # not move for any reader of the asset.
+        assert cal.phase_acc.load == "capacitive"
+        assert cal.z_min_ohm == pytest.approx(min(cal.phase_acc.z_ohm))
+        assert cal.z_max_ohm == pytest.approx(max(cal.phase_acc.z_ohm))
+
+    def test_the_resistor_row_is_the_floor_the_envelope_brackets_with(self):
+        """The row survives into `floor_at`, which is what the label is for."""
+        env = self._mixed().envelope()
+
+        at = env.floor_at(1.0e5)
+        assert at.rows_used == (4293,)
+        assert at.eps_deg == pytest.approx(0.48, abs=1e-9)
+        assert at.z_anchor_ohm == pytest.approx(1.0e5, rel=1e-9)
+
+    def test_an_acquisition_with_no_measurement_id_records_minus_one(self):
+        """Provenance only: an unrecorded id must not suppress a floor."""
+        from softae.workflows.commissioning import derive_calibration
+
+        cal = derive_calibration(
+            {"reference_r": [_res_acq(1, 1.0e5, 0.48)]}, fixture_id="mux16")
+
+        assert cal.phase_acc.source_measurement_id == (-1,)
+        assert cal.phase_acc.has_load_kinds is True
+        assert cal.envelope().floor_at(1.0e5).rows_used == (-1,)
 
 
 class TestPhaseReferencePlausibility:

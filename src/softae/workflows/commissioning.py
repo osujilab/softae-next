@@ -358,6 +358,15 @@ def derive_calibration(
     nominals = nominals or {}
     overrides = nominal_overrides or {}
 
+    def _row_source(acq: AcquiredSpectrum) -> int:
+        """This acquisition's id for the phase table, ``-1`` where none was recorded.
+
+        Provenance only — it gates nothing downstream, so a ``-1`` never suppresses a
+        floor. A tuple-built ``AcquiredSpectrum`` legitimately has none.
+        """
+        mid = getattr(acq, "measurement_id", None)
+        return int(mid) if mid is not None else -1
+
     def _nominal_for(role: str, acq: AcquiredSpectrum) -> float | None:
         """This acquisition's marked value: override, then its own, then the role's."""
         if role in overrides:
@@ -437,13 +446,17 @@ def derive_calibration(
 
     # Phase accuracy: every reference component contributes one (|Z|, eps) point.
     #
-    # z_points is also the *only* source of the measured |Z| window below, so nothing
+    # phase_rows is also the *only* source of the measured |Z| window below, so nothing
     # ungated may reach it. It used to receive the reference capacitor's whole sweep
     # via an ungated table, which put the instrument's ~1.0147 GΩ input rail into
     # z_max — an envelope bound that was the instrument giving up, not a magnitude the
     # fixture reproduces.
-    z_points: list[float] = []
-    eps_points: list[float] = []
+    # One row per surviving point, carrying its own class and its own acquisition. The
+    # branches below used to write a single `load_kind` scalar that the last one to fire
+    # overwrote, so six resistor rows and sixteen capacitor rows shipped under one label
+    # — and `floor_at` cannot bracket within a class it cannot see. The scalar `load`
+    # keeps its old meaning below so that key does not move.
+    phase_rows: list[tuple[float, float, str, int]] = []
     load_kind = "resistive"
     for acq in artifacts.get("reference_r", []):
         nom = _nominal_for("reference_r", acq)
@@ -468,14 +481,14 @@ def derive_calibration(
         # sweep, which they cannot see.
         #
         # Anchoring on ref.z_at_eps_ohm rather than |R| also makes the comment above
-        # z_points true again: median(Re Z) is pulled below |Z| by exactly that
+        # phase_rows true again: median(Re Z) is pulled below |Z| by exactly that
         # roll-off, by 2.9x on a 10 MΩ reference, so epsilon would be filed at an
         # impedance the sweep never characterised — and at the top of the ladder that
         # gap approaches valid_decades, where the table starts claiming coverage it
         # does not have and refusing coverage it does.
         if ref.z_at_eps_ohm == ref.z_at_eps_ohm and ref.eps_deg == ref.eps_deg:
-            z_points.append(ref.z_at_eps_ohm)
-            eps_points.append(ref.eps_deg)
+            phase_rows.append((ref.z_at_eps_ohm, ref.eps_deg, "resistive",
+                               _row_source(acq)))
         measured.add(int(acq.channel))
 
     rejected_phase_refs: list[tuple[int, str]] = []
@@ -530,8 +543,9 @@ def derive_calibration(
                                "the instrument's error. Its capacitance is still "
                                "reported; only its phase contribution is dropped")
         elif z_dec:
-            z_points.extend(z_dec)
-            eps_points.extend(e_dec)
+            src = _row_source(acq)
+            phase_rows.extend(
+                (z, e, "capacitive", src) for z, e in zip(z_dec, e_dec))
             load_kind = "capacitive"
             phase_refs_contributed += 1
         measured.add(ch)
@@ -557,19 +571,21 @@ def derive_calibration(
                 "low-loss C0G/NP0 is what this artifact needs")
 
     phase = PhaseAccuracyTable()
-    if z_points:
-        order = sorted(range(len(z_points)), key=lambda i: z_points[i])
+    if phase_rows:
+        phase_rows.sort(key=lambda row: row[0])
         phase = PhaseAccuracyTable(
-            z_ohm=tuple(z_points[i] for i in order),
-            eps_deg=tuple(eps_points[i] for i in order),
+            z_ohm=tuple(row[0] for row in phase_rows),
+            eps_deg=tuple(row[1] for row in phase_rows),
             load=load_kind,
+            load_kind=tuple(row[2] for row in phase_rows),
+            source_measurement_id=tuple(row[3] for row in phase_rows),
         )
 
     # The window is the *surviving* points, because those are the only ones that were
     # measurements. With nothing left the empty-table path stands: NaN, and the ladder
     # keeps asking for the reference resistors.
-    z_min = min(z_points) if z_points else float("nan")
-    z_max = max(z_points) if z_points else float("nan")
+    z_min = min((row[0] for row in phase_rows), default=float("nan"))
+    z_max = max((row[0] for row in phase_rows), default=float("nan"))
 
     # Assumed on the strength of the SHORT specifically, not of the shared `measured`
     # set. Only the blank_short loop populates R_short/L_lead, but every role's loop

@@ -53,10 +53,11 @@ from softae.analysis.eis.engine_support import (
 from softae.analysis.eis.geometry import CellConstant
 from softae.analysis.eis.policy import build_context, reduce_gates
 from softae.analysis.eis.report import (
+    SigmaCeiling,
     SigmaReport,
     SpectrumReport,
     decide_report_mode,
-    sigma_upper_bound,
+    sigma_loss_ceiling,
 )
 from softae.analysis.eis.settings import eis_settings
 
@@ -99,7 +100,7 @@ def _sigma_from_R(
     *,
     mode: str,
     provisional: bool,
-    upper_bound: float,
+    ceiling: SigmaCeiling,
     phase_headroom: float,
     model_free_R: float,
     R_se: float = float("nan"),
@@ -145,7 +146,14 @@ def _sigma_from_R(
     )
 
     if mode in ("bound", "bound_unqualified"):
-        return SigmaReport(mode=mode, upper_bound=upper_bound,
+        # ``fit_implied_sigma`` costs one call: ``cell`` and ``R_ohm`` are already in
+        # scope here, and the pairing used to be discarded. It is the "and the fit says
+        # this about the same sample" half that makes a ceiling three decades under the
+        # point estimate visible instead of arithmetic a reader has to do.
+        return SigmaReport(mode=mode, upper_bound=ceiling.value,
+                           upper_bound_f_hz=ceiling.f_hz,
+                           upper_bound_basis=ceiling.basis,
+                           fit_implied_sigma=cell.sigma(R_ohm),
                            provisional=provisional, **common)
 
     # ``provisional`` carries into the value branch too.  A value that merely cleared
@@ -160,6 +168,39 @@ def _sigma_from_R(
         provisional=provisional,
         **common,
     )
+
+
+#: Front-2 flag raised when the loss ceiling does not cover the fit-implied σ.
+CEILING_BELOW_FIT = "ceiling_below_fit"
+
+
+def _note_sigma_ceiling(sigma: SigmaReport, ceiling: SigmaCeiling,
+                        quality: Any) -> None:
+    """Log every reported ceiling, and FLAG the ones that sit under the fit.
+
+    ``value < fit_implied_sigma`` is two estimators of two different quantities
+    disagreeing — the loss tangent's parallel conductance at one frequency against the
+    fit's DC resistance — not evidence the spectrum is bad. So it is a flag on
+    ``quality.issues`` and **never a refusing gate**: the verdict is untouched, which
+    is the ruling the operator gave ``arc_closure`` on 2026-09-10 for the same reason.
+    A gate here would refuse real films over an estimator mismatch.
+    """
+    if not sigma.is_bound:
+        return
+    value, fit = sigma.upper_bound, sigma.fit_implied_sigma
+    decades = float("nan")
+    if value == value and fit == fit and value > 0 and fit > 0:
+        decades = float(np.log10(fit) - np.log10(value))
+    logger.info(
+        "eis_sigma_ceiling", ceiling_S_per_cm=value, f_hz=ceiling.f_hz,
+        c_farad=ceiling.c_farad, basis=ceiling.basis,
+        fit_implied_S_per_cm=fit, decades_below_fit=decades,
+    )
+    if value == value and fit == fit and value < fit:
+        quality.issues.append(
+            f"{CEILING_BELOW_FIT}: loss ceiling {value:.2g} S/cm does not cover the "
+            f"fit-implied {fit:.2g} S/cm"
+        )
 
 
 class _LegacyReport(SpectrumReport):
@@ -798,13 +839,17 @@ def analyze_spectrum(
     )
     mode, provisional, headroom = (
         decision.mode, decision.provisional, decision.headroom)
-    bound = sigma_upper_bound(f_ok, Z_ok, envelope=env, cell=cell)
+    # The ceiling is evaluated at the frequency that DECIDED the label — the headroom
+    # numerator's — which is why ``decision`` is read here rather than only its mode.
+    # A missing numerator frequency yields ``basis="unavailable"``, never ``min(f)``.
+    ceiling = sigma_loss_ceiling(f_ok, Z_ok, envelope=env, cell=cell,
+                                 at_f_hz=decision.numerator_f_hz)
 
     R, R_se, basis, rho = _resolve_reported_resistance(
         fit, rho_degenerate=gate_cfg.rho_degenerate)
     sigma = _sigma_from_R(
         R if fit.success else float("nan"),
-        cell, mode=mode, provisional=provisional, upper_bound=bound,
+        cell, mode=mode, provisional=provisional, ceiling=ceiling,
         phase_headroom=headroom, model_free_R=model_free_r_bulk(Z_ok),
         R_se=R_se, R_basis=basis, rho=rho,
     )
@@ -850,6 +895,7 @@ def analyze_spectrum(
         quality.issues.append(railed)
     if not arc.closed:
         quality.issues.append(arc.detail)
+    _note_sigma_ceiling(sigma, ceiling, quality)
     quality.metrics.update(fit_report.metrics)
     # A correction that drove points non-physical is a data-quality fact, so it travels
     # with the verdict rather than living only in the log where nothing reads it.

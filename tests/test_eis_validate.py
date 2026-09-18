@@ -1706,13 +1706,21 @@ def test_settle_line_names_the_quantity_the_threshold_and_the_worst_channel(
     assert "sigma drift" in line and "%RH" in line
     assert "(tol 10.00%)" in line
     assert "worst ch20" in line
-    # The same units as the tolerance. 16.92 % and not the 16.67 % the raw ratio
-    # 10 k -> 13 k gives: the gate reads the FITTED R1 now, and `simpleSalt`
-    # recovers 9893 / 12916 from this arc rather than 10000 / 13000. The two
-    # differ by the fit's own bias, which is the point -- a bias that is stable
-    # across rounds cancels from a relative deviation, and the raw point's
-    # ROUND-TO-ROUND scatter does not.
-    assert " 16.92%" in line
+    # The same units as the tolerance. 16.67 % is the ratio 10 k -> 13 k itself,
+    # and under `engine = gated` that is also what the FITTED route reports: an
+    # ideal Debye arc is answered by the canned fit (`report.engine == "canned"`,
+    # exact to rel 1e-9 -- see `test_canned_fit_reproduces_the_designed_*`), so
+    # the fit's own bias is zero here and cancels nothing because there is
+    # nothing to cancel. Under the retired `legacy` engine `simpleSalt` recovered
+    # 9893 / 12916 from this arc and the line read 16.92 %.
+    #
+    # So this literal no longer DISCRIMINATES fitted-from-raw -- both routes give
+    # 16.67 % on this fixture. It is pinned here only as the drift figure the
+    # line must carry in the tolerance's units. The claim that the gate reads the
+    # fitted R1 rather than the raw low-frequency point is carried by
+    # `test_round_fit_a_scattering_raw_point_settles_on_the_fitted_basis`, whose
+    # fixture scatters only the sweep tail and so separates the two by ~10x.
+    assert " 16.67%" in line
     assert "spread 0.130" not in line              # the old, unitless, anonymous form
 
 
@@ -2443,20 +2451,31 @@ def _scattering_low_frequency_point(scale: float):
 def test_round_fit_uses_the_fitted_r1_not_the_raw_low_frequency_point():
     """`sigma = 1/R1_fitted`, and the raw point rides along as a diagnostic.
 
-    `fit_circuit` is the INDEPENDENT oracle here, not the implementation:
-    `_round_fit` goes through `analyze_spectrum` with `engine` unset (P.20), and
-    on the legacy engine that must return the same `R1` byte for byte. Rewriting
-    the expectation in terms of `analyze_spectrum` would turn this into `x == x`.
-    """
-    from softae.analysis.circuit_fitting import fit_circuit
+    **The oracle is `_debye_r1`, not a second fitter.** This test used to pin
+    `R1` byte for byte against `fit_circuit`, which was sound only while
+    `[eis] engine = legacy` made `fit_circuit` the very code the route ran; since
+    `744e034` shipped `gated`, the two genuinely disagree (9893 vs 9992 on this
+    arc) and the legacy number is a fossil. Pinning gated's own output instead
+    would be the `x == x` the old docstring warned about, so the expectation
+    moves to the quantity that is exact on EVERY engine: `_sweep_at` builds an
+    ideal Debye arc, for which `(Z'^2 + Z''^2) / Z' = R` at every point.
 
+    `_round_fit` fits with `blocking=True`, which is the path that bypasses the
+    canned recogniser, so this really is the fitter answering -- gated lands
+    -0.08 % from truth here, hence `rel=5e-3`, per `_sweep_at`'s own table.
+
+    What separates `fitted` from `raw` is not the tolerance -- both are within
+    0.1 % of truth on a clean arc -- but the exact `!=` below: substituting the
+    raw point would make the two identical rather than merely close.
+    """
     eis = _sweep_at(10_000.0)
     fit = H._round_fit(20, eis)
-    expected = fit_circuit(eis, model_name="simpleSalt")
+    truth = _debye_r1(eis)
 
+    assert truth == pytest.approx(10_000.0, rel=1e-9)   # the fixture is ideal
     assert fit.basis == "fitted"
-    assert fit.r1_ohms == pytest.approx(expected.R1)
-    assert fit.sigma == pytest.approx(1.0 / expected.R1)
+    assert fit.r1_ohms == pytest.approx(truth, rel=5e-3)
+    assert fit.sigma == pytest.approx(1.0 / fit.r1_ohms)
     # Carried, never used: this is what makes "did the fit buy anything?"
     # answerable from a run's own record instead of from a second bench run.
     assert fit.r_raw_ohms == pytest.approx(float(eis.z_real[-1]))
@@ -2534,24 +2553,35 @@ def test_round_fit_a_missing_spectrum_is_absent_rather_than_a_failed_fit():
 
 @pytest.mark.real_fit
 def test_round_fit_a_railed_fit_is_demoted_by_the_route_before_the_bound_sees_it():
-    """MOVED because `_round_fit` now fits through `analyze_spectrum` (P.20/[a23]).
+    """A cell the model cannot represent reaches the gate as no fit, not as a bound.
 
-    Previously `_fitted_r1` called `fit_circuit` directly, which reports a fit
-    resting on the model's R1 floor as `success = True` with `R1 = 100` -- so the
-    railed value reached `RoundFit` as a `fitted` basis and the phase's own
-    `r1_bound_ohms` wiring was what excluded it, as `EXCLUDED_RAILED`.
+    **The fixture moved from 150 to 50 ohm because `744e034` fixed the fitter,
+    not because the property moved.** `simpleSalt`'s R1 floor is 100 ohm, and
+    under `engine = legacy` a 150 ohm arc was enough to pin the optimiser to that
+    floor: `fit_circuit` returned `success = True` with `R1 = 100` -- a property
+    of `CIRCUIT_MODELS` wearing a measurement's clothes -- and the route's
+    `_demote_if_railed` stripped the claim back off. Gated recovers 149.966 ohm
+    from that same arc, correctly, so 150 no longer rails and the branch this
+    test exists for is simply not entered by it (`SUBAGENT_RULES.md` §3.2a).
 
-    On the route, `analyze_spectrum` runs `_demote_if_railed` first, and that
-    helper names the settle criterion by name as one of the consumers it exists
-    to protect: it clears `success` and NaNs `R1`, because "the optimiser
-    reported where the wall was" is not a measurement. So the demotion now
-    happens one level upstream and the channel arrives as `fit_failed`.
+    50 ohm restores the branch honestly: the cell is BELOW the model's floor, so
+    no in-bounds fit exists at all. Both routes decline, and the WAY they decline
+    is the one thing that changed --
 
-    The consequence for the gate is unchanged -- excluded on the same round,
-    same verdict -- and the console is strictly better, because a `fitted` basis
-    was never announced by `_announce_basis` and a `fit_failed` one is. What
-    moves is the exclusion WORD, and that is asserted in both places below so a
-    future reader can see it was decided rather than drifted.
+    * `fit_circuit` refuses outright on bounds ("Initial guess is outside of
+      provided bounds") rather than coming to rest on one;
+    * `analyze_spectrum` withholds the fit object entirely (`report.fit is None`),
+      which is `_round_fit`'s `eis_validate_settle_fit_withheld` branch.
+
+    Neither is the `_demote_if_railed` path this function's NAME still implies,
+    and that is worth stating rather than leaving the name to imply it: no value
+    of `_sweep_at` rails under gated, because the split path that reports R1 is
+    not held by `simpleSalt`'s R1 box at all. The demotion helper is still live
+    wiring for fits that do converge onto a bound -- it is just not this fixture
+    that produces one any more.
+
+    What the GATE sees is unchanged, and that is what this test guarantees:
+    `fit_failed`, a null sigma, a NaN (not None) `r1_ohms`, `EXCLUDED_SIGMA_NULL`.
     """
     from softae.analysis.circuit_fitting import fit_circuit
     from softae.analysis.eis.engine import analyze_spectrum
@@ -2563,14 +2593,18 @@ def test_round_fit_a_railed_fit_is_demoted_by_the_route_before_the_bound_sees_it
         settle_check,
     )
 
-    eis = _sweep_at(150.0)
+    eis = _sweep_at(50.0)
     bound = r1_lower_bound_ohms("simpleSalt")
 
-    # The two routes genuinely disagree, and this is the disagreement.
+    # The fixture's own truth by the exact invariant, not by assertion: this
+    # really is a cell below the floor, which is what makes it unfittable at all.
+    assert _debye_r1(eis) == pytest.approx(50.0, rel=1e-9)
+    assert _debye_r1(eis) < bound
+
+    # Both routes decline -- by different mechanisms, neither of them railing.
     direct = fit_circuit(eis, model_name="simpleSalt")
-    assert direct.success and direct.R1 == pytest.approx(bound)
-    routed = analyze_spectrum(eis, cell=None, model_name="simpleSalt").fit
-    assert not routed.success and "railed fit" in str(routed.error_msg)
+    assert not direct.success and math.isnan(float(direct.R1))
+    assert analyze_spectrum(eis, cell=None, model_name="simpleSalt").fit is None
 
     railed = H._round_fit(20, eis)
     quiet = [H._round_fit(ch, _sweep_at(10_000.0)) for ch in (18, 19)]
@@ -2591,16 +2625,21 @@ def test_round_fit_a_railed_fit_is_demoted_by_the_route_before_the_bound_sees_it
 
 @pytest.mark.real_fit
 def test_settle_phase_a_railed_channel_leaves_the_window_as_an_unusable_fit(tmp_path):
-    """MOVED with the test above: the narrated word is `no_value`, not `railed`.
+    """The same cell as the test above, end to end inside the phase.
 
-    End to end inside the phase. The verdict, the participant list and the
-    refusal are all byte-identical to what they were; the one byte that changed
-    is the reason `excluded_by_channel` carries, because the route withholds the
-    bound value instead of handing it over to be recognised downstream.
+    The narrated word is `no_value`, not `railed`: the route withholds the value
+    instead of handing a bound one down to be recognised downstream.
+
+    Fixture moved 150 -> 50 ohm for the reason given on the test above -- gated
+    fits a 150 ohm arc correctly, so only a cell below `simpleSalt`'s 100 ohm
+    floor still arrives at the gate with nothing usable on it. The verdict, the
+    participant list and the refusal are unchanged from when this fixture railed,
+    which is the point: what the phase does with an unusable fit does not depend
+    on which mechanism made it unusable.
     """
     payloads: list[dict] = []
     _plan_used, outcome = _scripted_settle(
-        tmp_path, {18: [10_000.0], 19: [10_000.0], 20: [150.0]},
+        tmp_path, {18: [10_000.0], 19: [10_000.0], 20: [50.0]},
         on_round=payloads.append)
     judged = [p for p in payloads if p["evaluable"] is not None][0]
 

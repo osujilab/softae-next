@@ -433,6 +433,14 @@ def tand_margin(freq: np.ndarray, Z: np.ndarray, table: Any) -> TandMargin:
        spec §8 — not by minimising the ratio itself. Where ``ε`` rises steeply with ``|Z|``
        the two can differ, and minimising the ratio would be the stricter statistic. Left
        as specified; recorded here because it is a real choice, not an oversight.
+
+    .. note::
+       **Cross-reference, T11.34.** This numerator is still a *single-point* minimum,
+       where ``report.decide_report_mode``'s has become a windowed one (T11.31) and
+       ``report.sigma_loss_ceiling`` is now evaluated at that window's frequency. The
+       two statistics answer the same question on two paths — this one feeds only the
+       offline ``tools/measurability_sweep.py`` — and **must not be allowed to
+       diverge**; the fix here is filed, not taken.
     """
     f = np.asarray(freq, dtype=float)
     Zc = np.asarray(Z, dtype=complex)

@@ -565,11 +565,25 @@ class TestBoundReporting:
         assert report.sigma.provisional
         assert np.isnan(report.sigma.value)
         assert np.isfinite(report.sigma.upper_bound)
+        # T11.34: with ε unmeasured the number is ``K/Z_max`` — a genuine ceiling on σ,
+        # and the only branch entitled to the word. The basis says so rather than
+        # leaving a reader to infer it from the magnitude.
+        assert report.sigma.upper_bound_basis == "magnitude_ceiling"
 
     def test_a_bound_renders_as_a_ceiling_and_says_it_is_provisional(self):
+        """T11.34 rewrote this string: the ceiling now names its frequency and the fit.
+
+        A ceiling is proportional to ω, so without the frequency it is not a statement
+        anyone can check — which is how ``sigma_upper_bound`` shipped the detection
+        floor at ``min(f)`` for as long as it did. The fit-implied σ rides along so the
+        two estimators' disagreement is visible rather than arithmetic to be done.
+        """
         text = SigmaReport(mode="bound_unqualified", upper_bound=4e-7,
+                           upper_bound_f_hz=1033.0, fit_implied_sigma=4.2e-6,
                            provisional=True).as_text()
         assert "≲" in text and "provisional" in text
+        assert "@1.03 kHz" in text and "fit implies 4.2e-06" in text
+        assert "loss ceiling below the fit" in text
 
     def test_a_bound_reduces_to_suspect_because_it_is_a_result_but_not_a_value(self):
         report = reduce_gates([], n_surviving=20, min_fit_pts=8, report_mode="bound")

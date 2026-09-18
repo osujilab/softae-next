@@ -96,13 +96,34 @@ BASIS_TEXT = {
 }
 
 
+def _format_hz(f_hz: float) -> str:
+    """``1033.0`` → ``"1.03 kHz"``. Operator-facing only."""
+    f = float(f_hz)
+    return f"{f / 1000.0:.3g} kHz" if abs(f) >= 1000.0 else f"{f:.3g} Hz"
+
+
 @dataclass(frozen=True)
 class SigmaReport:
     """Conductivity, the resistance it came from, and what may be claimed about it."""
 
     mode: str = "unavailable"
     value: float = float("nan")
+    #: The loss ceiling from :func:`sigma_loss_ceiling` — **name deliberately
+    #: unchanged**, because ``core/autonomous_wiring.py`` reads
+    #: ``report.sigma.upper_bound`` for its ``objective_declined_bound`` log line and
+    #: that file belongs to another session. What changed is the *number*: it is now
+    #: ``K·ε·ω*·C(ω*)`` at the headroom numerator's frequency, not at ``min(f)``.
     upper_bound: float = float("nan")
+    #: Where the ceiling was evaluated, and on what basis — the keys of
+    #: :class:`SigmaCeiling`. NaN / ``"unavailable"`` means no ceiling could be
+    #: stated, which is **not** the same claim as a small one (``SUBAGENT_RULES``
+    #: §3.1(a)); in particular it must never be re-spelled as the ``min(f)`` number.
+    upper_bound_f_hz: float = float("nan")
+    upper_bound_basis: str = "unavailable"
+    #: ``cell.sigma(R_reported_ohm)`` — carried in the **bound** branch too, where the
+    #: pairing used to be thrown away. A ceiling and the fit that contradicts it are
+    #: only comparable if both travel; see :meth:`as_text`.
+    fit_implied_sigma: float = float("nan")
     rel_uncertainty: float = float("nan")
     provisional: bool = False
 
@@ -157,12 +178,33 @@ class SigmaReport:
         return self.mode == "value"
 
     def as_text(self) -> str:
-        """Operator-facing rendering — ``1.2e-04 ±8%`` or ``≲ 4.0e-07 (provisional)``."""
+        """Operator-facing rendering — ``1.2e-04 ±8%``, or for a bound::
+
+            σ ≲ 4.2e-06 S/cm @1.03 kHz; fit implies 3.2e-07 (provisional)
+            σ ≲ 3.2e-07 S/cm @1.03 kHz; fit implies 4.2e-06 — loss ceiling below the fit
+
+        (``(provisional)`` is appended last in both cases; it is shown on one line only
+        to keep the other inside the line length.)
+
+        The frequency is named because the ceiling is proportional to ω and therefore
+        means nothing without it, and the fit-implied σ is named because the two are
+        different estimators of different quantities. When the ceiling sits *below*
+        the fit it does not cover it, and the text says so rather than choosing — the
+        disagreement is a flag (``ceiling_below_fit``), never a refusal.
+        """
         if self.mode == "unavailable":
             return "σ unavailable"
         tag = " (provisional)" if self.provisional else ""
         if self.is_bound:
-            return f"σ ≲ {self.upper_bound:.2g} S/cm{tag}"
+            f_hz = self.upper_bound_f_hz
+            at = f" @{_format_hz(f_hz)}" if f_hz == f_hz else ""
+            fit = self.fit_implied_sigma
+            clause = ""
+            if fit == fit:
+                clause = f"; fit implies {fit:.2g}"
+                if self.upper_bound == self.upper_bound and self.upper_bound < fit:
+                    clause += " — loss ceiling below the fit"
+            return f"σ ≲ {self.upper_bound:.2g} S/cm{at}{clause}{tag}"
         unc = (
             f" ±{self.rel_uncertainty * 100:.0f}%"
             if self.rel_uncertainty == self.rel_uncertainty else ""
@@ -439,6 +481,21 @@ class HeadroomDecision:
     window_f_lo_hz: float = float("nan")
     window_f_hi_hz: float = float("nan")
     n_tand_used: int = 0
+    #: The floor this decision divided by, and where it came from. ``floor_rows_used``
+    #: is a **count**: 2 for a bracketed pair, 1 for a one-decade extension, 0 for the
+    #: legacy single anchor — which is also how a reader tells the three apart.
+    floor_tand: float = float("nan")
+    floor_eps_deg: float = float("nan")
+    floor_rows_used: int = 0
+    floor_z_anchor_ohm: float = float("nan")
+    #: The local *capacitive* rows disagree with the resistive floor by more than the
+    #: reference part's own rated loss. **Orthogonal to** :attr:`provisional`, which
+    #: means "out of band"; this one means "in band, and the two load classes do not
+    #: agree here". Neither changes :attr:`mode` — it is recorded, not acted on.
+    floor_class_provisional: bool = False
+    #: ``cap_eps − res_eps`` in degrees. NaN means *no comparison was possible*, which
+    #: is not the same fact as a gap of zero (``SUBAGENT_RULES`` §3.1(a)).
+    floor_class_gap_deg: float = float("nan")
 
 
 def decide_report_mode(
@@ -464,6 +521,16 @@ def decide_report_mode(
       10⁴ Ω resistive characterisation, and an instrument constant carried three
       decades without comment is how the withdrawn ``Z_φ`` ceiling was born.
     * ``ε`` unmeasured → provisional bound. Never a value.
+
+    **The floor is per-impedance, and it comes from the resistor ladder** (T11.41).
+    :meth:`~softae.analysis.eis.envelope.InstrumentEnvelope.floor_at` brackets ``z_med``
+    between the two nearest characterised *resistive* rows and takes the larger of the
+    pair; one decade past the outermost row that row stands alone, and beyond it there
+    is no floor and the result is ``bound_unqualified``. An envelope with no rows
+    returns its single anchor from the same call, so nothing changes for one. The local
+    *capacitive* rows never set the floor — they only flag
+    :attr:`~HeadroomDecision.floor_class_provisional` when they disagree with it by more
+    than the reference part's rated loss.
 
     **The numerator is a WINDOWED minimum — the most pessimistic five-point region of
     the spectrum, not its single smallest reading.** Two rules are at work here and they
@@ -546,25 +613,69 @@ def decide_report_mode(
     # an envelope that cannot answer "was the phase floor measured, and does it apply
     # here?" makes this result **provisional**, never qualified.
     #
-    # `gates.py:385` takes the opposite default on the same predicate — `lambda _z: True`
-    # — so a missing capability makes the gate assume the floor applies and pass. The
-    # two are not interchangeable and this asymmetry is currently undocumented at the
-    # other site ([p96] §3, parallel's to resolve; `gates.py` is theirs).
+    # `gates.py`'s `_gate_phase_noise_extrapolated` now takes the same default on the
+    # same predicate (`lambda _z: False`, with its own note recording that the two sites
+    # were reconciled toward this one). The earlier note here said it took
+    # `lambda _z: True`; that has not been so since the reconciliation, and a stale
+    # cross-reference to another session's file is worse than none.
     #
-    # If the two are ever reconciled, reconcile TOWARD THIS ONE. `SUBAGENT_RULES` §3.1(a)
+    # If they ever diverge again, reconcile TOWARD THIS ONE. `SUBAGENT_RULES` §3.1(a)
     # already condemns the permissive direction on this exact subject: the envelope's
     # `phase_noise_measured` once defaulted True, "so the guard that exists to force a
     # provisional result when the floor was never measured can never fire". A default
     # that answers the safe-sounding question when it has no information is the failure
     # this whole module is written against.
-    in_band = bool(
-        getattr(envelope, "phase_noise_valid_at", lambda _z: False)(z_med))
-    floor = getattr(envelope, "tand_floor", float("nan"))
+    #
+    # `floor_at` is the per-impedance floor (T11.41) and subsumes both scalars: with no
+    # characterised rows it returns the single-anchor answer, so ONE path serves the
+    # commissioned and the uncommissioned envelope alike and the fallback is reachable
+    # from a test. The `getattr` chain below stays for hand-built envelope stand-ins
+    # that predate the method.
+    floor_at = getattr(envelope, "floor_at", None)
+    if callable(floor_at):
+        at = floor_at(z_med)
+        in_band = bool(at.in_band)
+        floor_eps_deg = float(at.eps_deg)
+        floor_rows_used = len(at.rows_used)
+        floor_z_anchor_ohm = float(at.z_anchor_ohm)
+        floor = (math.tan(math.radians(floor_eps_deg))
+                 if floor_eps_deg == floor_eps_deg else float("nan"))
+    else:
+        in_band = bool(
+            getattr(envelope, "phase_noise_valid_at", lambda _z: False)(z_med))
+        floor = getattr(envelope, "tand_floor", float("nan"))
+        floor_eps_deg = float(getattr(envelope, "phase_noise_deg", float("nan")))
+        floor_rows_used = 0
+        floor_z_anchor_ohm = float(
+            getattr(envelope, "phase_noise_at_ohm", float("nan")))
+
+    # A flag, never a floor and never a refusal: where the local capacitor rows exceed
+    # the resistive floor by more than the reference part's rated loss, the verdict
+    # says so and keeps the resistive number (T11.41 §3.3).
+    consistency = getattr(envelope, "class_consistency", None)
+    if callable(consistency):
+        class_provisional, class_gap_deg, cap_eps_deg, cap_rows = consistency(z_med)
+    else:
+        class_provisional, class_gap_deg = False, float("nan")
+        cap_eps_deg, cap_rows = float("nan"), ()
 
     if not measured or not (floor == floor) or floor <= 0:
         logger.info("eis_reported_as_bound",
                     reason="phase noise unmeasured", provisional=True)
         return HeadroomDecision("bound_unqualified", True, float("nan"))
+
+    if class_provisional:
+        from softae.analysis.eis.envelope import PHASE_CLASS_CONSISTENCY_BUDGET_DEG
+
+        logger.info(
+            "eis_phase_floor_class_disagreement", z_median_ohm=z_med,
+            resistive_eps_deg=floor_eps_deg, capacitive_eps_deg=cap_eps_deg,
+            gap_deg=class_gap_deg, budget_deg=PHASE_CLASS_CONSISTENCY_BUDGET_DEG,
+            capacitive_rows=list(cap_rows),
+            msg="the local capacitor rows exceed the resistive floor by more than the "
+                "reference part's rated loss — recorded as provisional provenance, "
+                "not applied: the resistor ladder remains the floor",
+        )
 
     tand_all = loss_tangent(Z)
     finite = np.isfinite(tand_all)
@@ -617,6 +728,12 @@ def decide_report_mode(
         numerator_phase_saturated=bool(n_saturated),
         n_saturated_in_window=n_saturated,
         n_tand_used=n,
+        floor_tand=float(floor),
+        floor_eps_deg=floor_eps_deg,
+        floor_rows_used=floor_rows_used,
+        floor_z_anchor_ohm=floor_z_anchor_ohm,
+        floor_class_provisional=bool(class_provisional),
+        floor_class_gap_deg=float(class_gap_deg),
     )
 
     def _decide(mode: str, provisional: bool) -> HeadroomDecision:
@@ -630,6 +747,12 @@ def decide_report_mode(
             window_f_lo_hz=float(f_s[lo]),
             window_f_hi_hz=float(f_s[hi]),
             n_tand_used=n,
+            floor_tand=float(floor),
+            floor_eps_deg=floor_eps_deg,
+            floor_rows_used=floor_rows_used,
+            floor_z_anchor_ohm=floor_z_anchor_ohm,
+            floor_class_provisional=bool(class_provisional),
+            floor_class_gap_deg=float(class_gap_deg),
         )
 
     # Emitted whatever the mode, because a *value* decided at the rail is exactly as
@@ -664,46 +787,116 @@ def decide_report_mode(
     return _decide("value", not in_band)
 
 
-def sigma_upper_bound(
+@dataclass(frozen=True)
+class SigmaCeiling:
+    """What :func:`sigma_loss_ceiling` concluded, and what it concluded it from.
+
+    A bare float could not distinguish *"the ceiling is 3.9e-10"* from *"no ceiling
+    could be stated"*, and the second was being spelled as the first
+    (``SUBAGENT_RULES`` §3.1(a)). The basis is the discriminator, and it is also the
+    label: only ``magnitude_ceiling`` is a ceiling on σ itself.
+    """
+
+    #: ``K·ε·ω*·C(ω*)`` for the loss basis, ``K/Z_max`` for the magnitude basis.
+    value: float = float("nan")
+    #: The frequency it was evaluated at — a real measured point, not an interpolation.
+    f_hz: float = float("nan")
+    #: The apparent capacitance **at that frequency**, not the top-decade median.
+    c_farad: float = float("nan")
+    #: The ε that went in, recorded even when no ceiling came out.
+    eps_rad: float = float("nan")
+    #: ``"loss_at_numerator"`` | ``"magnitude_ceiling"`` | ``"unavailable"``.
+    #: ``magnitude_ceiling`` is reachable **only** when ε is unmeasured; every other
+    #: way of failing to produce a number is ``unavailable`` with a :attr:`reason`.
+    basis: str = "unavailable"
+    #: Why, when :attr:`basis` is ``"unavailable"``. Empty otherwise. An unknown has to
+    #: say which unknown it is, or it reads as a checked answer (``SUBAGENT_RULES``
+    #: §3.1(a)) — the exact failure this class was introduced to end.
+    reason: str = ""
+
+
+def _capacitance_at(freq: np.ndarray, Z: np.ndarray, f_hz: float) -> float:
+    """``C_app`` at the measured point nearest ``f_hz`` in log-frequency, or NaN.
+
+    Nearest rather than exact because nothing guarantees the caller's frequency is a
+    member of the array it passes; on the production path it always is, since
+    ``numerator_f_hz`` is read out of this same sweep.
+    """
+    from softae.analysis.eis.admittance import apparent_capacitance
+
+    f = np.asarray(freq, dtype=float)
+    C = apparent_capacitance(f, Z)
+    ok = np.isfinite(f) & np.isfinite(C) & (f > 0) & (C > 0)
+    idx = np.flatnonzero(ok)
+    if not idx.size:
+        return float("nan")
+    j = idx[int(np.argmin(np.abs(np.log10(f[idx]) - np.log10(float(f_hz)))))]
+    return float(C[j])
+
+
+def sigma_loss_ceiling(
     freq: np.ndarray,
     Z: np.ndarray,
     *,
     envelope: Any,
     cell: Any,
-) -> float:
-    """The defensible ceiling ``σ ≲ ε·ω·C·K`` when the loss is below the phase floor.
+    at_f_hz: float,
+) -> SigmaCeiling:
+    """A ceiling on the dielectric-loss conductance, ``K·ε·ω*·C(ω*)`` (T11.34).
 
-    A spectrum whose loss sits under the instrument's resolution still yields a
-    rigorous statement, and refusing to make it would throw away a real result.
+    **This is not a bound on σ_DC, and it is not evaluated at ``min(f)``.** Its
+    predecessor, ``sigma_upper_bound``, was a second copy of
+    :meth:`InstrumentEnvelope.sigma_min` — the *detection floor* — taken at the
+    frequency that makes a floor smallest and rendered with a ``≲``. On the eleven
+    bound spectra of ``20260915T172522Z_rung3a_fake_cast`` it read 3.9e-10 S/cm
+    against a fit-implied 3.1e-06…4.9e-05: three to five decades under the point
+    estimate it was supposed to cap.
 
-    Evaluated at the **lowest** usable frequency in the spectrum, not the median: the
-    bound scales with ω, so the tightest defensible ceiling is the one at the bottom of
-    the sweep. That is the same reason the updated envelope favours low-frequency
-    sweeps — ``σ_min`` runs from ~1e-9 S/cm at 1 Hz to ~1e-7 S/cm at 100 Hz.
+    The physics fixes ω. The bound branch fires because ``tan δ = G/(ωC)`` fell below
+    the instrument's resolvable floor ε **at one frequency**, so what that licenses is
+    ``G(ω*) ≤ ε·ω*·C(ω*)`` at *that* ω — the headroom numerator's. Asserting it at
+    ``min(f)`` asserts a comparison that was never made, where the threshold is
+    hundreds to thousands of times smaller. Taking the most favourable ω is right for
+    a floor and inverted for a ceiling (``SUBAGENT_RULES`` §3.3).
 
-    Falls back to what the magnitude ceiling licenses (``K/Z_max``) only when ε is
-    unavailable — never to the withdrawn ``K/Z_φ``.
+    ``at_f_hz`` is therefore **required and has no fallback**: missing ⇒
+    ``basis="unavailable"``, value NaN. Falling back to ``min(f)`` would spell an
+    unknown with the same token as a checked answer, and it is the specific wrong
+    answer this function exists to remove.
+
+    ``K/Z_max`` survives as the ε-unmeasured branch under ``basis="magnitude_ceiling"``
+    — a genuine ceiling on σ, and the only branch entitled to the word. Never the
+    withdrawn ``K/Z_φ``, and **never reached for any reason other than an unmeasured
+    ε**: an earlier revision let a missing capacitance fall through to it, which
+    labelled an unknown with the one basis that means *checked*.
     """
     if cell is None:
-        return float("nan")
+        return SigmaCeiling(reason="no cell constant")
     K = getattr(cell, "K_per_cm", float("nan"))
     if not (K == K):
-        return float("nan")
+        return SigmaCeiling(reason="no cell constant")
 
-    eps = getattr(envelope, "eps_rad", float("nan"))
-    if eps == eps:
-        C = float("nan")
-        try:
-            from softae.analysis.eis.admittance import par_capacitance_estimate
+    eps = float(getattr(envelope, "eps_rad", float("nan")))
 
-            C = par_capacitance_estimate(freq, Z)
-        except Exception:
-            C = float("nan")
-        f = np.asarray(freq, dtype=float)
-        f = f[np.isfinite(f) & (f > 0)]
-        if C == C and f.size:
-            omega = 2.0 * math.pi * float(np.min(f))
-            return float(eps * omega * C * K)
+    # ε unmeasured is the ONLY route to the magnitude ceiling. Every other way of
+    # failing to produce a loss ceiling is ``unavailable``: falling through to
+    # ``K/Z_max`` because some *other* input was missing would answer a question
+    # nobody asked and label it a checked result.
+    if eps != eps:
+        z_max = float(getattr(envelope, "z_max_ohm", float("nan")))
+        if z_max == z_max and z_max > 0:
+            return SigmaCeiling(value=float(K) / z_max, eps_rad=eps,
+                                basis="magnitude_ceiling")
+        return SigmaCeiling(reason="epsilon unmeasured and no magnitude window")
 
-    z_max = float(getattr(envelope, "z_max_ohm", float("nan")))
-    return K / z_max if z_max == z_max and z_max > 0 else float("nan")
+    if not (at_f_hz == at_f_hz and at_f_hz > 0):
+        return SigmaCeiling(eps_rad=eps, reason="no numerator frequency")
+
+    C = _capacitance_at(freq, Z, at_f_hz)
+    if not (C == C and C > 0):
+        return SigmaCeiling(f_hz=float(at_f_hz), eps_rad=eps,
+                            reason="no capacitance at the numerator frequency")
+
+    omega = 2.0 * math.pi * float(at_f_hz)
+    return SigmaCeiling(value=float(eps * omega * C * K), f_hz=float(at_f_hz),
+                        c_farad=C, eps_rad=eps, basis="loss_at_numerator")

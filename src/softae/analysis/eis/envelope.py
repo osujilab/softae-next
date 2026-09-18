@@ -68,7 +68,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 import structlog
 
@@ -128,6 +128,21 @@ DEFAULT_C_CELL_F = 1.0e-9
 #: acquisition is not at risk — this value exists to catch a future change to it.
 DEFAULT_MAX_AMPLITUDE_MV = 25.0
 
+#: How far a *capacitive* row may exceed the local *resistive* floor before the verdict
+#: is flagged provisional (degrees). See :meth:`InstrumentEnvelope.class_consistency`.
+#:
+#: **A rated loss, not a chosen threshold.** A C0G/NP0 reference is specified at
+#: ``tan δ < 1e-3``, i.e. its own contribution to the measured angle is 0.06°; anything
+#: past the resistor floor plus that is by construction not the part. The neighbouring
+#: ``commissioning.PHASE_REFERENCE_MAX_EPS_DEG`` (15.0°) answers a *different* question
+#: — "is this part a low-loss capacitor at all" — and reused here it would be a check
+#: that cannot fail, since the largest capacitive ε ever recorded on this rig is 4.536°
+#: (``SUBAGENT_RULES`` §3.1(e)).
+#:
+#: It lives here rather than beside its sibling because :mod:`softae.workflows` imports
+#: :mod:`softae.analysis`, never the reverse, and this module is the one that reads it.
+PHASE_CLASS_CONSISTENCY_BUDGET_DEG = 0.06
+
 #: Measurement roles judged against the commissioned **sample** ``|Z|`` window.
 #:
 #: An allow-list rather than a list of exemptions, because an undeclared or unrecognised
@@ -164,6 +179,40 @@ def magnitude_window_applies(role: str | None) -> bool:
 
 
 @dataclass(frozen=True)
+class PhaseFloorRow:
+    """One characterised ``(|Z|, ε)`` point, with the class and part behind it.
+
+    Defined here rather than imported from :mod:`softae.analysis.eis.calibration` so
+    this module keeps importing nothing from ``calibration*``: the dependency runs one
+    way, lazily, from ``calibration_set.envelope()`` into this module.
+    """
+
+    z_ohm: float
+    eps_deg: float
+    #: ``"resistive"`` or ``"capacitive"`` — which family of part measured this row.
+    load_kind: str = "resistive"
+    #: Acquisition this row was derived from; ``-1`` where none was recorded. Provenance
+    #: only, so it gates nothing and a ``-1`` never suppresses a floor.
+    source_measurement_id: int = -1
+
+
+class PhaseFloorAt(NamedTuple):
+    """What :meth:`InstrumentEnvelope.floor_at` concluded, and what concluded it.
+
+    :attr:`z_anchor_ohm` is carried beyond the bare verdict because it is the first
+    thing an operator asks of a floor — *measured where?* — and it is unrecoverable
+    downstream once the rows have been reduced to one number.
+    """
+
+    eps_deg: float = float("nan")
+    in_band: bool = False
+    #: ``source_measurement_id`` of every row that decided this floor, low ``|Z|``
+    #: first. Empty on the legacy single-anchor path, where there are no rows to name.
+    rows_used: tuple[int, ...] = ()
+    z_anchor_ohm: float = float("nan")
+
+
+@dataclass(frozen=True)
 class InstrumentEnvelope:
     """The measured envelope, with provenance flags that gate how it may be used.
 
@@ -187,6 +236,13 @@ class InstrumentEnvelope:
     phase_noise_measured: bool = True
     magnitude_window_measured: bool = False
     measured_at: str = ""
+    #: Every characterised row, with its own load class — the per-impedance floor.
+    #:
+    #: **Appended last, and defaulted empty on purpose.** Empty means "this envelope
+    #: predates the column", which :meth:`floor_at` answers with the legacy
+    #: single-anchor result rather than with a refusal; it must never read as "no row
+    #: qualifies here" (``SUBAGENT_RULES`` §3.1(a)).
+    phase_rows: tuple[PhaseFloorRow, ...] = ()
 
     def amplitude_is_safe(self, amplitude_mV: float | None) -> bool | None:
         """Whether an excitation amplitude sits below the measured saturation limit.
@@ -239,6 +295,101 @@ class InstrumentEnvelope:
         return abs(math.log10(z / self.phase_noise_at_ohm)) <= float(
             self.phase_noise_valid_decades)
 
+    # ── The floor, by load class and locality ────────────────────────────────
+
+    def floor_at(self, z_ohm: float, *,
+                 load_kind: str = "resistive") -> PhaseFloorAt:
+        """The phase floor at this ``|Z|``, from the rows of one load class.
+
+        **Resistive by default**, because the resistor ladder *is* the instrument
+        characterisation: a resistor's true phase is exactly zero, so what the
+        instrument reports on one is its own error. The capacitor family is measured
+        with its own loss unknown at the 0.06° level and off the mux16 board, so it
+        checks the answer (:meth:`class_consistency`) and never sets it.
+
+        Three regimes, in order:
+
+        1. **No rows** — the legacy single-anchor answer, so one path serves both the
+           commissioned and the uncommissioned envelope and the fallback is reachable
+           from a test rather than merely believed.
+        2. **Bracketed** — the nearest row below and the nearest above, and the floor
+           is the ``max`` of that *pair*. **No interpolant**: two load classes and a
+           fixture make a smooth curve between adjacent rows a fiction, and the live
+           table's interpolant crosses 4.35° → 0.18° between neighbours.
+        3. **Outside by at most** ``phase_noise_valid_decades`` — the outermost row of
+           the class stands alone. Beyond that, ``NaN`` and ``in_band = False``, which
+           is what puts :func:`~softae.analysis.eis.report.decide_report_mode` onto
+           ``bound_unqualified``.
+        """
+        rows = tuple(self.phase_rows)
+        if not rows:
+            return PhaseFloorAt(self.phase_noise_deg,
+                                self.phase_noise_valid_at(z_ohm),
+                                (), self.phase_noise_at_ohm)
+        try:
+            z = abs(float(z_ohm))
+        except (TypeError, ValueError):
+            return PhaseFloorAt()
+        if not (z > 0):
+            return PhaseFloorAt()
+
+        want = str(load_kind).strip().lower()
+        candidates = sorted(
+            (r for r in rows
+             if str(r.load_kind).strip().lower() == want
+             and r.z_ohm > 0 and r.eps_deg == r.eps_deg),
+            key=lambda r: r.z_ohm,
+        )
+        if not candidates:
+            return PhaseFloorAt()
+
+        below = [r for r in candidates if r.z_ohm <= z]
+        above = [r for r in candidates if r.z_ohm >= z]
+        if below and above:
+            lo, hi = below[-1], above[0]
+            pair = (lo,) if lo is hi else (lo, hi)
+            win = max(pair, key=lambda r: r.eps_deg)
+            return PhaseFloorAt(
+                float(win.eps_deg), True,
+                tuple(int(r.source_measurement_id) for r in pair),
+                float(win.z_ohm))
+
+        edge = candidates[0] if not below else candidates[-1]
+        if abs(math.log10(z / edge.z_ohm)) <= float(self.phase_noise_valid_decades):
+            return PhaseFloorAt(float(edge.eps_deg), True,
+                                (int(edge.source_measurement_id),), float(edge.z_ohm))
+        return PhaseFloorAt()
+
+    def tand_floor_at(self, z_ohm: float, *,
+                      load_kind: str = "resistive") -> float:
+        """:meth:`floor_at`'s ε as a loss tangent — ``NaN`` where there is no floor."""
+        eps = self.floor_at(z_ohm, load_kind=load_kind).eps_deg
+        return math.tan(math.radians(eps)) if eps == eps else float("nan")
+
+    def class_consistency(
+        self, z_ohm: float, *,
+        budget_deg: float = PHASE_CLASS_CONSISTENCY_BUDGET_DEG,
+    ) -> tuple[bool, float, float, tuple[int, ...]]:
+        """``(provisional, gap_deg, cap_eps_deg, cap_rows)`` — a flag, never a floor.
+
+        The local capacitor rows are bracketed by the same rule and compared against
+        the local resistor floor. Past that floor plus the part's own *rated* loss
+        (:data:`PHASE_CLASS_CONSISTENCY_BUDGET_DEG`) the excess is not the part; which
+        of instrument or auxiliary fixture it is has been ruled unclear, so it is
+        **recorded rather than acted on**. This never returns a floor and never refuses.
+
+        A ``NaN`` gap means *no comparison was possible* — no rows at all, or no
+        capacitive coverage here — which must not be spelled like a gap of zero.
+        """
+        if not self.phase_rows:
+            return False, float("nan"), float("nan"), ()
+        res = self.floor_at(z_ohm, load_kind="resistive")
+        cap = self.floor_at(z_ohm, load_kind="capacitive")
+        if not (res.eps_deg == res.eps_deg and cap.eps_deg == cap.eps_deg):
+            return False, float("nan"), float(cap.eps_deg), cap.rows_used
+        gap = float(cap.eps_deg) - float(res.eps_deg)
+        return bool(gap > float(budget_deg)), gap, float(cap.eps_deg), cap.rows_used
+
     def sigma_min(self, K_per_cm: float, freq_hz: float,
                   c_cell_F: float | None = None) -> float:
         """Smallest detectable conductivity, ``σ_min ≈ K·ε·ω·C_cell`` (S/cm).
@@ -248,6 +399,11 @@ class InstrumentEnvelope:
         two decades more pessimistic. At K = 50 /cm, ε = 2.6e-3 rad and a 1.5 nF cell
         this runs from ~1e-9 S/cm at 1 Hz to ~1e-7 S/cm at 100 Hz, which is why even
         weakly conducting films may be reachable if the sweep goes low enough.
+
+        **This is a detection FLOOR at the most favourable ω, and a ceiling must never
+        be re-derived from it** — :func:`softae.analysis.eis.report.sigma_loss_ceiling`
+        owns that, evaluated at the frequency where the comparison was actually made.
+        Taking the smallest ω is correct here and inverted there (T11.34).
         """
         eps = self.eps_rad
         C = float(c_cell_F if c_cell_F is not None else self.c_cell_F)

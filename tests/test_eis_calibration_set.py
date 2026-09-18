@@ -21,7 +21,12 @@ import math
 import numpy as np
 import pytest
 
-from softae.analysis.eis.calibration import CalibrationSet
+from softae.analysis.eis.calibration import (
+    CalibrationSet,
+    hardware_hash,
+    resolve_calibration,
+    save_calibration,
+)
 
 
 def _post_rederive(**over):
@@ -160,3 +165,43 @@ class TestTheContractHoldsAgainstTheRealDeriver:
         # ... while the open-derived spread is untouched by the same re-derive.
         assert cal.measured_spread("C_stray_F") == pytest.approx(
             53.22 / 10.20, rel=1e-6)
+
+
+class TestStalenessSurvivesPastTheLogLine:
+    """T11.40 Part B: why the constants read empty, on the artifact itself.
+
+    ``resolve_calibration`` already computes the fact; it used to spend it on a warning
+    and hand back a set indistinguishable from one that was never commissioned. Those
+    are different states -- "not measured yet" against "measured, and it no longer
+    applies" -- and a caller holding the object could not tell them apart.
+    """
+
+    def _set(self, **over) -> CalibrationSet:
+        base = dict(fixture_id="mux16", hardware_hash="abc123",
+                    R_short_ohm={1: 5.4}, L_lead_H={1: 1.2e-6})
+        base.update(over)
+        return CalibrationSet(**base)
+
+    def test_a_fresh_set_declares_no_stale_reason(self):
+        assert CalibrationSet().stale_reason == ""
+        assert self._set().stale_reason == ""
+
+    def test_a_stale_set_records_both_hashes_on_the_artifact(self, tmp_path):
+        save_calibration(self._set(), root=tmp_path)
+        resolved = resolve_calibration(
+            "mux16", root=tmp_path, config={"pcb": {"changed": True}})
+
+        assert resolved is not None
+        assert resolved.R_short_ohm == {}                # dropped, as before ...
+        assert resolved.stale_reason                     # ... and now it says why
+        assert "abc123" in resolved.stale_reason
+        assert hardware_hash({"pcb": {"changed": True}}) in resolved.stale_reason
+
+    def test_a_matching_hash_leaves_the_reason_empty(self, tmp_path):
+        cfg = {"pcb": {"a": 1}}
+        save_calibration(self._set(hardware_hash=hardware_hash(cfg)), root=tmp_path)
+
+        resolved = resolve_calibration("mux16", root=tmp_path, config=cfg)
+
+        assert resolved.R_short_ohm == {1: 5.4}
+        assert resolved.stale_reason == ""
