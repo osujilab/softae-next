@@ -787,6 +787,32 @@ def decide_report_mode(
     return _decide("value", not in_band)
 
 
+#: Basis token for the fit-free ceiling refusal (a) reports on an unclosed arc:
+#: ``σ ≤ K·max(Re Y)``, i.e. ``K / model_free_r_bulk(Z)`` (T11.46).
+#:
+#: **Beside** ``magnitude_ceiling`` because it copies that branch's shape exactly — a
+#: constant over a measured extremum of the spectrum, no fit anywhere in it — and
+#: **apart from** it because the two cap different quantities from different evidence:
+#: ``magnitude_ceiling`` is ``K/Z_max`` off the *instrument's* magnitude window and is
+#: reachable only when ε is unmeasured, while this one is ``K·max(Re Y)`` off *this
+#: spectrum's* admittance and is reachable only when the arc did not close. Spelling
+#: them with one token would make a ceiling's provenance unreadable, which is the
+#: failure :class:`SigmaCeiling` exists to end (``SUBAGENT_RULES`` §3.1(a)).
+#:
+#: **Why the admittance and not the fit.** ``Re Y(0) = G_DC`` and ``Re Y`` is
+#: non-decreasing in ω for every registry model, so ``max(Re Y) ≥ G_DC`` and
+#: ``1/max(Re Y)`` is a LOWER bound on R — hence ``K·max(Re Y)`` is an UPPER bound on
+#: σ, and ``CellConstant.sigma`` is monotone decreasing so the direction survives the
+#: conversion. The fit cannot supply this: on an unclosed arc an extrapolated ``R₁`` is
+#: on this rig a median **2.752× OVER**-estimate, so a ceiling built from it sits
+#: *below* the truth — the one direction a ceiling must never take.
+#:
+#: **It carries no frequency**: a maximum over the band is not a reading at one
+#: frequency, so :attr:`SigmaCeiling.f_hz` stays NaN and :meth:`SigmaReport.as_text`
+#: drops its ``@f`` clause.
+ARC_OPEN_CEILING = "admittance_ceiling"
+
+
 @dataclass(frozen=True)
 class SigmaCeiling:
     """What :func:`sigma_loss_ceiling` concluded, and what it concluded it from.
@@ -805,9 +831,11 @@ class SigmaCeiling:
     c_farad: float = float("nan")
     #: The ε that went in, recorded even when no ceiling came out.
     eps_rad: float = float("nan")
-    #: ``"loss_at_numerator"`` | ``"magnitude_ceiling"`` | ``"unavailable"``.
-    #: ``magnitude_ceiling`` is reachable **only** when ε is unmeasured; every other
-    #: way of failing to produce a number is ``unavailable`` with a :attr:`reason`.
+    #: ``"loss_at_numerator"`` | ``"magnitude_ceiling"`` | :data:`ARC_OPEN_CEILING`
+    #: | ``"unavailable"``. ``magnitude_ceiling`` is reachable **only** when ε is
+    #: unmeasured and :data:`ARC_OPEN_CEILING` **only** from ``engine.py``'s refusal
+    #: (a) — this function never produces the latter; every other way of failing to
+    #: produce a number is ``unavailable`` with a :attr:`reason`.
     basis: str = "unavailable"
     #: Why, when :attr:`basis` is ``"unavailable"``. Empty otherwise. An unknown has to
     #: say which unknown it is, or it reads as a checked answer (``SUBAGENT_RULES``

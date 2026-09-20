@@ -53,6 +53,7 @@ from softae.analysis.eis.engine_support import (
 from softae.analysis.eis.geometry import CellConstant
 from softae.analysis.eis.policy import build_context, reduce_gates
 from softae.analysis.eis.report import (
+    ARC_OPEN_CEILING,
     SigmaCeiling,
     SigmaReport,
     SpectrumReport,
@@ -94,6 +95,25 @@ __all__ = [
 TWO_POINT = "two_point_debye"
 
 
+def _cell_fields(cell: CellConstant) -> dict[str, Any]:
+    """The seven geometry-provenance fields every :class:`SigmaReport` carries.
+
+    One place rather than two, because :func:`_sigma_from_R` now builds a report on
+    **two** paths that both have a cell — the ordinary one, and the bound that
+    survives a NaN R₁ — and a second copy of this list is how the two come to disagree
+    about which provenance a row carries.
+    """
+    return dict(
+        K_per_cm=cell.K_per_cm,
+        K_route=cell.K_route,
+        thickness_method=cell.thickness_method,
+        electrode_config=cell.electrode_config,
+        k_config_factor=cell.k_config_factor,
+        config_factor_verified=cell.config_factor_verified,
+        re_contact_verified=cell.re_contact_verified,
+    )
+
+
 def _sigma_from_R(
     R_ohm: float,
     cell: CellConstant | None,
@@ -106,11 +126,34 @@ def _sigma_from_R(
     R_se: float = float("nan"),
     R_basis: str = "split_bulk",
     rho: float = float("nan"),
+    bound_without_fit: bool = False,
 ) -> SigmaReport:
     # A non-finite resistance is not a small conductivity, it is no conductivity:
     # `cell.sigma(nan)` would return a NaN wearing `mode="value"`, which reads as a
     # measurement to anything that branches on the mode before checking the number.
     if not (R_ohm == R_ohm):
+        # …*unless* the ceiling beside it never came from a fit. `bound_without_fit`
+        # is set by refusal (a) alone, whose `K·max(Re Y)` is read straight off the
+        # admittance, so refusal (b) removing the number does not remove the claim the
+        # measurement still supports. Returning "unavailable" here would spell "(b)
+        # took the value away, and a true ceiling survives it" with the same token as
+        # "there is no cell constant" (`SUBAGENT_RULES` §3.1(a)) — and would throw away
+        # the only thing an unclosed arc can honestly say about σ.
+        #
+        # Narrow on purpose: every other route to a NaN R₁ — a railed fit, a
+        # non-converged one — is untouched and still reports "unavailable", so this
+        # branch cannot be entered by a path that did not ask for it.
+        if (bound_without_fit and cell is not None
+                and mode in ("bound", "bound_unqualified")
+                and ceiling.value == ceiling.value):
+            return SigmaReport(
+                mode=mode, upper_bound=ceiling.value,
+                upper_bound_f_hz=ceiling.f_hz, upper_bound_basis=ceiling.basis,
+                provisional=provisional,
+                R_reported_ohm=float("nan"), R_reported_se_ohm=float(R_se),
+                R_basis=R_basis, rho=rho, model_free_R_ohm=model_free_R,
+                phase_headroom=phase_headroom, **_cell_fields(cell),
+            )
         return SigmaReport(mode="unavailable", R_reported_ohm=float("nan"),
                            R_reported_se_ohm=R_se, R_basis=R_basis, rho=rho,
                            model_free_R_ohm=model_free_R,
@@ -133,16 +176,10 @@ def _sigma_from_R(
         R_reported_se_ohm=float(R_se),
         R_basis=R_basis,
         rho=rho,
-        K_per_cm=cell.K_per_cm,
-        K_route=cell.K_route,
-        thickness_method=cell.thickness_method,
-        electrode_config=cell.electrode_config,
-        k_config_factor=cell.k_config_factor,
-        config_factor_verified=cell.config_factor_verified,
-        re_contact_verified=cell.re_contact_verified,
         model_free_R_ohm=model_free_R,
         cross_check_pct=cross,
         phase_headroom=phase_headroom,
+        **_cell_fields(cell),
     )
 
     if mode in ("bound", "bound_unqualified"):
@@ -172,6 +209,134 @@ def _sigma_from_R(
 
 #: Front-2 flag raised when the loss ceiling does not cover the fit-implied σ.
 CEILING_BELOW_FIT = "ceiling_below_fit"
+
+#: How far the model-free ``1/max(Re Y)`` may sit **above** the reported resistance
+#: before the pair is read as a contradiction rather than as imprecision (T11.46).
+#:
+#: **One-sided, and the side is not a preference.** ``model_free_r_bulk`` is a LOWER
+#: bound on R by construction — ``Re Y`` is non-decreasing in ω, so ``max(Re Y) ≥
+#: G_DC`` — and it is measured low: ``admittance.py`` records 9 % low with the plateau
+#: in band degrading to 75 % low as it leaves, and ``model_free_R ≤ R1`` holds on 203
+#: of 203 stored closed-arc rows. So *below* the reported R it carries no information
+#: at all: a **correct** fit of ``reference_spectrum(R_bulk=1e7)`` reports 1.0033e7
+#: against a model-free 6.3e4, 159× low, and a two-sided test at this factor would
+#: demote it. Above the reported R the same estimator is arithmetically impossible —
+#: a lower bound two decades over the number it bounds — which is the only direction
+#: that is evidence.
+MODEL_FREE_CONTRADICTION = 100.0
+
+
+def _arc_open_unmild(arc: Any, pregate: Any) -> bool:
+    """Refusal (a)'s trigger: did the arc fail to close, *severely*? (T11.46)
+
+    :func:`~softae.analysis.eis.engine_support.blocking_open`'s pair — ``state`` is
+    ``OPEN`` and the response at the sweep floor is still essentially capacitive —
+    **with its NaN branch inverted**, and the inversion is the whole of the
+    difference between the two callers. ``blocking_open`` chooses a *route*, so an
+    absent phase conservatively means "take the usual route"; this chooses a *claim
+    class*, and there ``state == OPEN`` has already said that R₁ was reached by
+    extrapolating off the high-frequency side. An unknown severity cannot turn an
+    extrapolation back into a reading.
+
+    ``UNKNOWN`` is never refused: *could not judge* is not *judged open*
+    (``SUBAGENT_RULES`` §3.1(a)). Mild-open is exempt — ``phase_low_deg`` finite and
+    above ``[eis.pregate] phase_low_max_deg`` (−60°) — because a response already
+    two-thirds resistive at the floor is an arc a modestly lower floor would close,
+    and on the stored corpus that is 14 of the 87 open rows.
+    """
+    from softae.analysis.eis.arc import OPEN
+
+    if getattr(arc, "state", None) != OPEN:
+        return False
+    phase = float(getattr(arc, "phase_low_deg", float("nan")))
+    return not (phase == phase and phase > float(pregate.phase_low_max_deg))
+
+
+def _admittance_ceiling(cell: CellConstant | None, model_free_R: float,
+                        loss: SigmaCeiling) -> SigmaCeiling:
+    """``σ ≤ K·max(Re Y)`` — refusal (a)'s ceiling, and it never touches the fit.
+
+    ``K / model_free_r_bulk(Z)``, which is ``K·max(Re Y)``: see
+    :data:`~softae.analysis.eis.report.ARC_OPEN_CEILING` for why that is an upper
+    bound on σ and why the fit cannot supply one here.
+
+    Where a **loss** ceiling is also finite the smaller of the two is reported and
+    ``basis`` names the winner. Both are valid ceilings on the same σ, and for a
+    ceiling conservatism points down (``SUBAGENT_RULES`` §3.3) — the direction is the
+    opposite of a detection floor's, which is exactly the rule §3.3 says must not be
+    carried across.
+
+    Falls back to *loss* — never to a fabricated number — when there is no cell
+    constant or no usable ``max(Re Y)``. The caller still forces the bound: a ceiling
+    that could not be computed must not promote the row back to ``value``.
+    """
+    if cell is None or not (model_free_R == model_free_R and model_free_R > 0):
+        return loss
+    value = cell.sigma(model_free_R)
+    if not (value == value):
+        return loss
+    if loss.value == loss.value and loss.value < value:
+        return loss
+    return SigmaCeiling(value=float(value), basis=ARC_OPEN_CEILING)
+
+
+def _demote_if_undetermined(fit: Any, R: float, R_se: float,
+                            model_free_R: float) -> str:
+    """Refusal (b): the reported resistance carries no information, so report none.
+
+    Two arithmetic triggers, no tuned threshold on either:
+
+    ``SE ≥ |R|``
+        The interval covers zero and therefore both signs, so the number has neither
+        magnitude nor sign. On the designed ladder this separates the good rung from
+        the collapsed ones by **21 orders** (3e-7 against ~1e15) and fires on 1 of 236
+        stored rows carrying an SE — where ``|ρ| ≥ 0.95`` fires on 215 of 236 and
+        ``r² < 0.95`` on 207 of 295, which is why neither of those is the test.
+    ``model_free_R ≥ 100·|R|``
+        A model-free *lower* bound on R sitting two decades above the number reported.
+        See :data:`MODEL_FREE_CONTRADICTION` for why this clause is one-sided. It
+        covers the case the first misses: ``cov is None`` on the ``legacy_fit_failed``
+        fallback, 41 % of one measured run, where there is no SE to compare at all.
+
+    **The shape is** :func:`~softae.analysis.eis.engine_support._demote_if_railed`'s,
+    exactly — ``success`` cleared, ``error_msg`` naming the undetermined measurand,
+    ``R1`` set to NaN — and the third is not decoration: ``DataStore.record_fit``
+    derives σ from ``fit_result.R1`` and never consults ``success``, so a fit left with
+    its collapsed R₁ in place would store a conductivity twenty orders out while the
+    row beside it said the fit had failed.
+
+    ``parameters``, ``z_fit`` and ``quality`` are untouched, on the same grounds
+    ``_demote_if_railed`` leaves them: they are the *evidence* for the demotion.
+    """
+    if not bool(getattr(fit, "success", False)) or not (R == R):
+        return ""
+
+    reason = ""
+    if R_se == R_se and abs(R_se) >= abs(R):
+        reason = (f"reported resistance {R:.4g} Ω is not determined — its own standard "
+                  f"error {R_se:.4g} Ω is at least as large, so the interval covers "
+                  f"zero and the value carries neither magnitude nor sign")
+    elif (model_free_R == model_free_R and model_free_R > 0
+            and model_free_R >= MODEL_FREE_CONTRADICTION * abs(R)):
+        reason = (f"reported resistance {R:.4g} Ω is contradicted by the model-free "
+                  f"1/max(Re Y) = {model_free_R:.4g} Ω, which is a LOWER bound on R — "
+                  f"the two cannot both describe this cell")
+    if not reason:
+        return ""
+
+    # One string for both the fit's ``error_msg`` and ``quality.issues``, prefix
+    # included. ``_demote_if_railed`` returns a bare reason and lets the caller
+    # prefix the message, which leaves the *issue* an unlabelled sentence — an
+    # operator reading `quality.issues` then sees a claim with no word for what
+    # kind of claim it is.
+    detail = f"undetermined fit: {reason}"
+    fit.success = False
+    fit.error_msg = detail
+    fit.R1 = float("nan")
+    logger.info("eis_split_undetermined", model=getattr(fit, "model_name", "?"),
+                r_reported_ohm=float(R), r_se_ohm=float(R_se),
+                model_free_R_ohm=float(model_free_R), reason=reason)
+    return detail
 
 
 def _note_sigma_ceiling(sigma: SigmaReport, ceiling: SigmaCeiling,
@@ -847,11 +1012,58 @@ def analyze_spectrum(
 
     R, R_se, basis, rho = _resolve_reported_resistance(
         fit, rho_degenerate=gate_cfg.rho_degenerate)
+    model_free_R = model_free_r_bulk(Z_ok)
+
+    # ── Two arithmetic refusals (T11.46), and NEITHER reads ``gate_cfg.enabled`` ──
+    #
+    # Same footing as the empty-survivor refusal above, and for the same reason it
+    # gives: an operator may choose to *observe* a verdict rather than enforce it;
+    # nobody can choose to fit nothing — and nobody can choose to report an
+    # extrapolation as a reading, or a number whose error bar is larger than itself.
+    # Both of these are arithmetic on quantities already in hand, not policies with
+    # thresholds, so there is no verdict here for an operator to observe.
+    #
+    # Neither arms the gates wholesale. The P4 ruling stands — the gate stack is
+    # advisory and has never been validated on real data — and every Front-2 detector
+    # that saw these conditions (``gate_degeneracy``, ``gate_model_free_crosscheck``,
+    # ``gate_relative_standard_error``) goes on spending its answer on a log line.
+    # Neither touches the fitter: the optimiser runs exactly as it did, and what
+    # changes is only what the engine is willing to *say* about what came back.
+    arc_open = _arc_open_unmild(arc, pre_cfg)
+    if arc_open:
+        # (a). The claim class drops to a bound whether or not a ceiling could be
+        # computed: a ceiling that failed to evaluate must not promote the row back to
+        # a value (``SUBAGENT_RULES`` §3.1(a)).
+        ceiling = _admittance_ceiling(cell, model_free_R, ceiling)
+        # Promote a value to a bound and NEVER re-label a bound that already exists.
+        # ``bound_unqualified`` means the phase floor this row cleared was
+        # extrapolated, and that provenance has nothing to do with the arc: writing
+        # ``"bound"`` over it would assert a floor had been measured when it had not
+        # (``SUBAGENT_RULES`` §3.1(a)) — caught by
+        # ``test_an_unmeasured_phase_noise_yields_a_bound_never_a_value``, which is
+        # the pin for exactly that claim.
+        if mode not in ("bound", "bound_unqualified"):
+            mode = "bound"
+        logger.info("eis_arc_open_bound",
+                    channel=getattr(eis_result, "channel", None),
+                    phase_low_deg=float(getattr(arc, "phase_low_deg", float("nan"))),
+                    f_peak_hz=float(getattr(arc, "f_peak_hz", float("nan"))),
+                    ceiling_S_per_cm=ceiling.value, basis=ceiling.basis,
+                    model_free_R_ohm=float(model_free_R),
+                    msg="arc did not close in band — R1 is an extrapolation, so the "
+                        "row reports a ceiling on sigma and never a fitted value")
+    # (b) runs after (a) and the order is free: (a) reads the arc and the admittance
+    # and never the fit, (b) rewrites the fit and never the ceiling. That is what
+    # lets them compose — (b) removes the value, (a) supplies the bound that stands
+    # without one.
+    undetermined = _demote_if_undetermined(fit, R, R_se, model_free_R)
+
     sigma = _sigma_from_R(
         R if fit.success else float("nan"),
         cell, mode=mode, provisional=provisional, ceiling=ceiling,
-        phase_headroom=headroom, model_free_R=model_free_r_bulk(Z_ok),
+        phase_headroom=headroom, model_free_R=model_free_R,
         R_se=R_se, R_basis=basis, rho=rho,
+        bound_without_fit=arc_open,
     )
     # The numerator's provenance is decided upstream and has nothing to do with the
     # resistance `_sigma_from_R` converts, so it is attached here rather than threaded
@@ -893,6 +1105,8 @@ def analyze_spectrum(
     quality.issues.extend(fit_report.issues)
     if railed:
         quality.issues.append(railed)
+    if undetermined:
+        quality.issues.append(undetermined)
     if not arc.closed:
         quality.issues.append(arc.detail)
     _note_sigma_ceiling(sigma, ceiling, quality)

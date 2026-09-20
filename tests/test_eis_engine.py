@@ -1811,3 +1811,296 @@ class TestAZeroSurvivorSpectrumIsRefusedInBothFlagStates:
             assert metrics["n_surviving"] == 0, enabled
             assert metrics["enforced"] is enabled, enabled
             assert metrics["fit_ok"] is False, enabled
+
+
+# ── T11.46: two arithmetic refusals for an unclosed / undetermined arc ───────
+#
+# The gated engine reported ``success=True`` with a resistance wrong by twenty orders
+# on a designed 1e7 Ω arc: no gate masked a point (``blocked_pts = 0``,
+# ``n_surviving = 27`` on every rung), every Front-2 detector that saw it spent its
+# answer on a log line, and ``_resolve_reported_resistance`` correctly reported a *sum*
+# that was itself collapsed. Two refusals close it, both arithmetic on quantities
+# already in hand, and both **outside** ``[eis.gates] enabled`` on the footing the
+# empty-survivor refusal above already occupies.
+#
+#   (a) the arc did not close in band, severely  → the row reports a **bound**, from
+#       ``K·max(Re Y)`` and never from the extrapolated R₁
+#   (b) the reported resistance is not determined → ``fit.success`` cleared, R₁ NaN
+
+#: The envelope every test below judges against, **stated rather than resolved**.
+#:
+#: ``analyze_spectrum`` otherwise resolves the *commissioned* envelope through
+#: ``_resolved_calibration``, which depends on a calibration asset and on
+#: ``hardware_hash()``. Both of those legitimately move, and neither is what is under
+#: test: what is under test is what the engine does with an arc that did not close.
+#: Stating the uncommissioned envelope here keeps the phase-headroom half of the
+#: report constant so the arc half is the only thing that varies.
+UNCOMMISSIONED = InstrumentEnvelope()
+
+#: Stray capacitance of the Debye ladder, matching ``test_eis_validate.py``'s
+#: ``_SWEEP_C0_F`` and inside ``simpleSalt``'s own ``C0`` bounds.
+_LADDER_C0_F = 1e-9
+
+
+def _debye_sweep(r_ohms: float):
+    """An ideal ``R ∥ C₀`` Debye arc of *r_ohms* on the shipped ``Quick`` grid.
+
+    A local copy of ``test_eis_validate.py``'s ``_sweep_at`` — 27 points,
+    200 kHz → 6.475 Hz — rather than an import across test modules, because that file
+    installs an autouse canned fitter over ``analyze_spectrum`` and everything here
+    must see the real engine.
+
+    **THIS LADDER IS NOW THE ONLY COVERAGE AT OR ABOVE 1e7 Ω, and that is new.**
+    ``tests/test_rung3_fake_cast.py``'s mock film used to cross the cliff incidentally;
+    T11.45 lowered its R₁ to ≈1.9e6 Ω — *below* it — so nothing else in the suite enters
+    the regime where the ``simpleSalt`` split loses identifiability. The relaxation
+    corner slides under the sweep floor as R grows (``f_c = 1/(2πRC₀)``:
+    22.7 → 15.9 → 7.96 → 1.59 Hz against a 6.475 Hz floor), which is what collapses the
+    fit. Delete this helper and the cliff goes untested.
+    """
+    freq = np.geomspace(200_000.0, 6.475, 27)
+    tau = float(r_ohms) * _LADDER_C0_F
+    z = float(r_ohms) / (1.0 + 1j * 2.0 * np.pi * freq * tau)
+    return SimpleNamespace(frequency=freq, z_real=z.real, z_imag_neg=-z.imag,
+                           phase=np.degrees(np.angle(z)), channel=1)
+
+
+def _refusal_report(eis, *, enabled: bool = False):
+    return analyze_spectrum(eis, cell=CELL, envelope=UNCOMMISSIONED,
+                            settings=_gated(enabled=enabled))
+
+
+def _ladder(r_ohms: float, *, enabled: bool = False):
+    return _refusal_report(_debye_sweep(r_ohms), enabled=enabled)
+
+
+def _reference(*, enabled: bool = False, **kwargs):
+    return _refusal_report(as_eis_result(*reference_spectrum(**kwargs)),
+                           enabled=enabled)
+
+
+class TestAnUndeterminedResistanceIsNotReported:
+    """Refusal (b): ``SE ≥ |R|`` means the interval covers zero, so there is no number.
+
+    Not ρ and not r², because both refuse the corpus: ``|ρ| ≥ 0.95`` holds on 215 of
+    236 stored rows carrying a ρ — the *good* 7e6 rung included, at +0.9999999 — and
+    ``r² < 0.95`` on 207 of 295. ``SE ≥ |R|`` fires on 1 of 236 and separates this
+    ladder by twenty-one orders.
+    """
+
+    def test_engine_the_resistance_ladder_refuses_where_it_collapses(self):
+        good = _ladder(7e6)
+        assert good.fit.success is True
+        assert good.sigma.R_basis == "sum"
+        assert abs(good.sigma.R_reported_ohm - 7e6) / 7e6 < 0.01
+        # The good rung's ceiling is the pre-existing loss ceiling, untouched: its arc
+        # closed, so refusal (a) never looked at it.
+        assert good.sigma.upper_bound_basis == "loss_at_numerator"
+        assert "undetermined fit" not in str(getattr(good.fit, "error_msg", "") or "")
+
+        for r_ohms in (1e7, 2e7, 1e8):
+            report = _ladder(r_ohms)
+            assert report.fit.success is False, r_ohms
+            assert report.fit.R1 != report.fit.R1, r_ohms      # NaN, not a small R
+            msg = str(report.fit.error_msg)
+            assert "undetermined fit" in msg, (r_ohms, msg)
+            assert "standard error" in msg, (r_ohms, msg)
+            assert any("undetermined fit" in issue
+                       for issue in report.quality.issues), r_ohms
+
+    def test_engine_a_nan_r1_never_becomes_a_conductivity(self):
+        """The third of ``_demote_if_railed``'s three actions, and why it is required.
+
+        ``DataStore.record_fit`` derives σ from ``fit_result.R1`` and never consults
+        ``success``, so a demoted fit that kept its collapsed R₁ would store a
+        conductivity twenty orders out beside a row saying the fit had failed.
+        """
+        report = _ladder(2e7)
+        assert report.fit.R1 != report.fit.R1
+        assert report.sigma.is_value is False
+        assert report.sigma.value != report.sigma.value
+
+    def test_engine_the_refusal_is_logged_with_both_estimators(self):
+        import structlog
+
+        with structlog.testing.capture_logs() as logs:
+            _ladder(1e7)
+        events = [e for e in logs if e["event"] == "eis_split_undetermined"]
+        assert len(events) == 1, [e["event"] for e in logs]
+        assert events[0]["model_free_R_ohm"] > 1e6
+        assert abs(events[0]["r_se_ohm"]) >= abs(events[0]["r_reported_ohm"])
+
+
+class TestAnUnclosedArcReportsACeilingAndNeverAFittedValue:
+    """Refusal (a), and the direction of its ceiling is the whole design.
+
+    ``model_free_r_bulk`` is a LOWER bound on R — ``Re Y`` is non-decreasing in ω, so
+    ``max(Re Y) ≥ G_DC`` — hence ``K·max(Re Y)`` is an UPPER bound on σ. The fit cannot
+    supply one: on this rig an extrapolated R₁ off an unclosed arc is a median
+    **2.752×** over-estimate, so a ceiling built from it would sit *below* the truth.
+    """
+
+    def test_engine_an_open_arc_reports_a_ceiling_not_a_fitted_value(self):
+        report = _ladder(1e8)
+        arc = report.fit.arc_closure
+        assert arc.state == "open"
+        assert arc.phase_low_deg < -60.0          # not the mild-open exemption
+        sigma = report.sigma
+        # ``is_bound`` rather than ``== "bound"``: this rung's phase floor is
+        # extrapolated, so ``decide_report_mode`` had already said
+        # ``bound_unqualified`` and refusal (a) must not overwrite that provenance —
+        # it promotes a *value* to a bound and never re-labels a bound. ``is_bound``
+        # is what the DataStore's ``sigma_is_bound`` column and every downstream
+        # reader actually branch on.
+        assert sigma.is_bound is True
+        assert sigma.mode in ("bound", "bound_unqualified")
+        assert sigma.upper_bound_basis == "admittance_ceiling"
+        # (b) also fires here, and the bound survives it: the ceiling never needed
+        # the fit, so removing the number does not remove the claim.
+        assert report.fit.success is False
+        assert sigma.R_reported_ohm != sigma.R_reported_ohm
+        # THE DIRECTION. The margin is the measured ~0.01 % overshoot an ideal R∥C
+        # produces after fixture correction, not a fudge factor.
+        assert CELL.sigma(1e8) <= sigma.upper_bound * (1 + 1e-3)
+        assert "arc did not close in band" in " ".join(report.quality.issues)
+
+    def test_engine_the_ceiling_can_be_exceeded(self):
+        """Check the check (``SUBAGENT_RULES`` §3.1): the inequality must be able to fail.
+
+        A ceiling of ``inf`` — or a NaN slipping through the comparison — would pass
+        the direction assertion above for every σ ever fabricated, so the assertion
+        would certify nothing. A film a thousand times more conductive than this
+        spectrum's own admittance allows must break it.
+        """
+        ceiling = _ladder(1e8).sigma.upper_bound
+        assert np.isfinite(ceiling) and ceiling > 0
+        fabricated = CELL.sigma(1e8 / 1000.0)
+        assert not (fabricated <= ceiling * (1 + 1e-3))
+
+    def test_engine_an_unknown_arc_state_is_not_refused(self):
+        """*Could not judge* is not *judged open* (``SUBAGENT_RULES`` §3.1(a)).
+
+        ``stuck_instrument`` reports one constant impedance, so ``arc_closure``
+        cannot locate a peak and answers ``UNKNOWN`` with the reason "degenerate
+        sweep". Refusal (a) must leave it alone — the row is then refused, or not, on
+        whatever else the engine finds, and never on a closure verdict that was never
+        reached. (``pure_series_rc`` answers the same question and costs 78 s in this
+        file by its own note above; this fixture costs ~2 s.)
+        """
+        import structlog
+
+        with structlog.testing.capture_logs() as logs:
+            report = _refusal_report(as_eis_result(*stuck_instrument()))
+        assert report.fit.arc_closure.state == "unknown"
+        assert report.sigma.upper_bound_basis != "admittance_ceiling"
+        # The direct pin: (a) did not run. Asserting only on the basis would stay
+        # green if the trigger widened to ``state != CLOSED`` and the loss ceiling
+        # happened to win the min() anyway — a check that cannot fail
+        # (``SUBAGENT_RULES`` §3.1(e)).
+        assert not [e for e in logs if e["event"] == "eis_arc_open_bound"]
+
+    def test_engine_a_closed_arc_still_returns_a_fitted_value(self):
+        """Positive control, and deliberately **not** the 7e6 ladder rung.
+
+        With a ``CellConstant`` in hand every rung of that ladder already reports
+        ``bound_unqualified`` before any of this lands — that is
+        ``decide_report_mode``'s phase-headroom verdict against this rig's floor and
+        has nothing to do with the arc, so it cannot discriminate a forced bound from
+        an ordinary one. ``reference_spectrum`` carries a CPE limb, closes its arc and
+        reports ``value``.
+        """
+        report = _reference(R_bulk=1e6)
+        assert report.fit.arc_closure.state == "closed"
+        assert report.fit.success is True
+        assert report.sigma.mode == "value"
+        assert report.sigma.is_bound is False
+        assert report.sigma.upper_bound_basis != "admittance_ceiling"
+        assert abs(report.sigma.R_reported_ohm - 1e6) / 1e6 < 0.01
+
+    def test_engine_a_noisy_closed_arc_is_not_refused(self):
+        """Negative control: a real-shaped spectrum with a closed arc stays a value.
+
+        Deliberately **not** ``_debye_sweep(1e4)``, which ``gate_valley_feature``
+        blocks outright (an ideal single arc has no interior −Z″ minimum), so it could
+        not be run in both flag states.
+        """
+        for enabled in (False, True):
+            report = _reference(R_bulk=1e6, noise_pct=2.0, seed=7, enabled=enabled)
+            assert report.fit.success is True, enabled
+            assert report.fit.R1 == report.fit.R1, enabled
+            assert report.sigma.upper_bound_basis != "admittance_ceiling", enabled
+            assert "undetermined fit" not in str(
+                getattr(report.fit, "error_msg", "") or ""), enabled
+
+
+class TestBothRefusalsRunOutsideTheGateFlag:
+    """``[eis.gates] enabled`` must not reach either refusal.
+
+    Same reasoning as the empty-survivor refusal: an operator may choose to *observe*
+    a verdict rather than enforce it, but nobody can choose to report an extrapolation
+    as a reading, or a number whose error bar is larger than itself. Neither refusal
+    arms the gate stack — the P4 ruling stands — and neither touches the fitter.
+    """
+
+    def test_refusal_a_fires_identically_in_both_flag_states(self):
+        """``reference_spectrum(R_bulk=2e4)`` is the fixture that can carry this.
+
+        Measured at HEAD: it is admitted in **both** flag states (the CPE limb gives
+        ``gate_valley_feature`` its interior minimum), fits ``R₁ = 2.0e4`` with
+        ``SE ≪ |R|``, and its arc is open at ``phase_low_deg = −66.9°`` — past the
+        −60° mildness exemption. Before this refusal it reported ``mode='value'``.
+
+        The ``_debye_sweep`` ladder **cannot** be used here: with ``enabled=True``
+        every rung of it, the good ones included, is refused by ``gate_valley_feature``
+        at the R18 early return, so ``fit`` is ``None`` and no post-fit refusal can
+        fire at all.
+        """
+        import structlog
+
+        seen = []
+        for enabled in (False, True):
+            with structlog.testing.capture_logs() as logs:
+                report = _reference(R_bulk=2e4, enabled=enabled)
+            assert report.fit is not None, enabled          # the premise, checked
+            assert report.fit.arc_closure.state == "open", enabled
+            assert report.fit.arc_closure.phase_low_deg < -60.0, enabled
+            # ``== "bound"`` and not merely ``is_bound`` here, and that IS the
+            # discriminator: this fixture's floor is measured, so before refusal (a)
+            # it reported ``mode='value'``. The promotion is the whole observation.
+            assert report.sigma.mode == "bound", enabled
+            assert report.sigma.is_value is False, enabled
+            # (a) alone: it demotes the CLAIM, never the fit.
+            assert report.fit.success is True, enabled
+            assert report.fit.R1 == report.fit.R1, enabled
+            assert [e for e in logs if e["event"] == "eis_arc_open_bound"], enabled
+            seen.append((report.sigma.mode, report.sigma.upper_bound,
+                         report.sigma.upper_bound_basis, report.fit.R1))
+        assert seen[0] == seen[1], seen
+
+    def test_refusal_b_never_comes_back_weaker_when_the_gates_enforce(self):
+        """The one-sided pin, and why it is one-sided rather than an equality.
+
+        No synthetic fixture found is *both* gate-admitted under ``enabled=True`` *and*
+        collapsed enough to trip ``SE ≥ |R|``: the two come from the same physics — the
+        relaxation corner leaving the band — and the Front-1 gates refuse first. So the
+        property pinned is the one that would actually be lost if the refusal read the
+        flag: enforcing must never turn a refused rung back into a determined value.
+        """
+        for r_ohms in (1e7, 2e7, 1e8):
+            observing, enforcing = _ladder(r_ohms), _ladder(r_ohms, enabled=True)
+            assert observing.fit.success is False, r_ohms
+            assert observing.sigma.is_value is False, r_ohms
+            assert enforcing.fit is None or enforcing.fit.success is False, r_ohms
+            assert enforcing.sigma.is_value is False, r_ohms
+
+    def test_the_gate_verdict_still_obeys_the_flag_even_though_the_refusals_do_not(self):
+        """The boundary, stated as the empty-survivor section states it.
+
+        Dropping ``enabled`` from the refusals must not drop it from the *policy*:
+        ``reduce_gates`` still downgrades a would-be REJECT to SUSPECT under
+        observation, and that is untouched.
+        """
+        observing = _ladder(1e8)
+        assert observing.quality.verdict is Verdict.SUSPECT
+        assert "gates observing only" in observing.quality.issues
+        assert _ladder(1e8, enabled=True).quality.verdict is Verdict.REJECT
