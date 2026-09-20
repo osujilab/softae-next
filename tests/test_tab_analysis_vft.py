@@ -56,23 +56,56 @@ def test_worker_uses_selected_thermal_model():
     assert w._thermal_model == "vft"
 
 
+#: The grid the shipped default preset actually sweeps — `[eis_presets.Quick]` in
+#: `softae_config.toml`: 200 kHz → 6.475 Hz in 27 points. Paired with the shipped
+#: mock film (`eis_validate_mock.synthesize`: the board's 48.1 kΩ series term, its
+#: CPE and its 0.11 nF cell capacitance), and **both halves are load-bearing — each
+#: was measured, not assumed (T11.45).**
+#:
+#: This fixture used to sweep its own 100 kHz → 0.1 Hz grid over a 50 Ω-series film,
+#: and the commissioned pipeline refused every spectrum of it, twice over:
+#:
+#: 1. *Loss.* The windowed-minimum tan δ ran 0.0394 → 0.1945 across 25–85 °C against
+#:    a floor of 0.1072 — headroom 0.37–1.81, where a value needs 3 — so every σ came
+#:    back `bound_unqualified` and the thermal fit saw 0 of its 4 points.
+#: 2. *Arc.* Two decades below the preset's floor the blocking CPE dominates, so the
+#:    −Z″ maximum sat at the sweep floor at −68.6°: the arc never closes, and T11.46's
+#:    refusal (a) reports a ceiling on σ **whatever the loss is**. Raising the loss
+#:    alone (σ prefactor ×10) clears (1) and leaves (2) standing — measured: headroom
+#:    3.05–3.14, still 0 of 4 usable σ.
+#:
+#: On the shipped film and the shipped band the same statistic is 0.5443 at the
+#: coldest, most resistive end (headroom 5.08, rising to 9.99 at 85 °C). That clears
+#: 3× today's single-anchor fallback floor (3 × 0.1072 = 0.3216) **and** 3× the
+#: post-re-derive resistor ladder's (~0.026), so one fixture holds under both regimes
+#: and wants no re-tune when the ladder lands. **The floor is never loosened to suit
+#: a fixture**; it is the fixture that is made realistic.
+PRESET_F_HI_HZ, PRESET_F_LO_HZ, PRESET_NPTS = 200_000.0, 6.475, 27
+
+
 def _sim_eis(Tc, ch=1):
-    """Synthetic simpleSalt EIS whose R1 follows a VFT σ(T) trend."""
+    """Synthetic simpleSalt EIS whose R1 follows a VFT σ(T) trend.
+
+    ``R0-CPE0-p(R1,C0)`` with the board's own constants (see the preset note
+    above); only ``R1`` moves with temperature, so σ stays monotonic in T and
+    VFT-shaped by construction — the VFT fit returns R² = 0.99994 against
+    Arrhenius's 0.9926, which is the model selection the test below is about.
+    """
     import math
 
     import numpy as np
-    from impedance.models.circuits import CustomCircuit
 
     from softae.analysis.eis_data import EISResult
+    from softae.tools.eis_validate_mock import synthesize
 
-    freq = np.logspace(5, -1, 41)
+    freq = np.geomspace(PRESET_F_HI_HZ, PRESET_F_LO_HZ, PRESET_NPTS)
     A, B, T0, L, t, w = 1.0, 600.0, 180.0, 0.2, 0.175, 0.2
     sigma = A * math.exp(-B / (Tc + 273.15 - T0)) * 1e-3
     R1 = L / (sigma * t * w)
-    cc = CustomCircuit("R0-CPE0-p(R1,C0)", initial_guess=[50.0, 1e-7, 0.8, R1, 1e-10])
-    cc.parameters_ = np.array([50.0, 1e-7, 0.8, R1, 1e-10])
-    Z = cc.predict(freq, use_initial=True)
-    return EISResult.from_arrays(channel=ch, f=freq, z_real=Z.real, z_imag_neg=-Z.imag)
+    # Seeded on the temperature: the mock's shipped 0.5 % noise, deterministic.
+    cols = synthesize(freq, r1_ohm=R1, seed=int(Tc))
+    return EISResult.from_arrays(channel=ch, f=cols[:, 0], z_real=cols[:, 3],
+                                 z_imag_neg=cols[:, 4])
 
 
 @pytest.mark.parametrize("thermal_model", ["arrhenius", "vft"])

@@ -35,6 +35,7 @@ from softae.core.formulation import (
 )
 from softae.core.task_catalog import TaskCatalog
 from softae.drivers.mock_factory import create_mock_manager
+from softae.tools.eis_validate_mock import MockRig, install_mock_picos
 
 # Composition axes the optimizer searches (not raw volumes).
 SPACE = {
@@ -42,6 +43,18 @@ SPACE = {
     "silica_vol_frac": {"type": "float", "low": 0.0, "high": 0.2},
 }
 POINT = {"eo_li_ratio": 10.0, "silica_vol_frac": 0.1}
+
+#: The -Z'' apex the mock films are synthesised at, and the reason they are
+#: synthesised here at all (T11.45). ``mock_espico``'s shipped films are far too
+#: resistive for the COMMISSIONED phase floor: ch21/ch22 land at a
+#: windowed-minimum tan δ of 0.0555/0.0888 against a floor of 0.1072, so every σ
+#: comes back a *bound*, ``_sigma_from_eis_raw`` declines it as unmeasured, and
+#: three declined trials trip the loop's own safety park. At 750 Hz the same
+#: statistic is 0.3723 — clear of 3x today's single-anchor fallback floor
+#: (3 x 0.1072 = 0.32) and of 3x the post-re-derive resistor ladder's (~0.026),
+#: so one value holds in both regimes. **The floor is never loosened to suit a
+#: fixture**; it is the fixture that is made lossy.
+LOSSY_APEX_HZ = 750.0
 
 
 def _context(*, budget_uL=None, target=6.0) -> FormulationContext:
@@ -113,6 +126,12 @@ def catalog() -> TaskCatalog:
 @pytest.fixture
 async def connected():
     mgr = create_mock_manager(config={})
+    # The grid-aware rig `tests/test_rung3_fake_cast.py` installs, for the reason
+    # `LOSSY_APEX_HZ` gives. Swapped HERE rather than in `mock_espico.py`, whose
+    # `_synthetic_eis` backs ~71 test files. BEFORE `connect_all`: these picos are
+    # brand new and disconnected, and a connected manager will not connect them
+    # again.
+    install_mock_picos(mgr, MockRig(default_apex_hz=LOSSY_APEX_HZ))
     await mgr.connect_all()
     yield mgr
     await mgr.disconnect_all()

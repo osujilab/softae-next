@@ -87,8 +87,15 @@ CEILING_HOLD_S = 80.0
 SETTLE_N_ROUNDS = 2
 
 #: Quiet and well-resolved: the arc closes inside the preset's band and the
-#: fitted R1 repeats to within ~0.5 %. Rung 2's value, for the same reason.
-QUIET_APEX_HZ = 30.0
+#: fitted R1 repeats to within ~0.5 %. **Raised from rung 2's 30 Hz (T11.45): a
+#: mock film must clear 3x the COMMISSIONED phase floor, or every sigma is a
+#: bound, the objective declines it, and three declined trials park the loop.**
+#: At 30 Hz the windowed-minimum tan δ is 0.0803; at 750 Hz it is 0.3723, which
+#: clears 3x today's single-anchor fallback floor (3 x 0.1072 = 0.32) AND 3x the
+#: post-re-derive resistor ladder's (~0.026) — one value, stable in both regimes,
+#: so this does not want re-tuning when the ladder lands. The floor is never
+#: touched: loosening it would spend the instrument's honesty on a fixture.
+QUIET_APEX_HZ = 750.0
 
 NOMINAL_UM = 50.0
 
