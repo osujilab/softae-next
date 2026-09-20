@@ -102,6 +102,41 @@ __all__ = [
 PRODUCTION_STEP_PREFIX = "production"
 
 
+def _stamp_settle_tags(
+    wf: "Workflow", extra_tags_by_channel: Mapping[int, Mapping[str, str]]
+) -> None:
+    """Tag every channel-bearing step with its T11.33 settle-relay verdict.
+
+    Same copy-on-write discipline as
+    :func:`~softae.core.autonomous_wiring._stamp_sample_uuids`:
+    :meth:`~softae.workflows.workflow_model.WorkflowStep.with_tags` returns a new
+    object, and ``Workflow.resolve_steps`` hands out the *setup* list's own
+    objects, so mutating ``step.tags`` in place would edit steps that other
+    references also see. Rebuilding the lists keeps that impossible.
+
+    A sibling of ``_stamp_sample_uuids`` rather than a call to it: that one
+    stamps a single fixed key, this one stamps a whole *dict* of tags per
+    channel, and folding the two together would make the shared one take a
+    vocabulary it has no use for.
+
+    Present-only, like the router's geometry: a channel absent from the mapping —
+    or mapped to an empty dict — gets no tag at all, so ``tags.get(...)``
+    downstream distinguishes *unrecorded* from *recorded as nothing*.
+    """
+    by_channel = {int(ch): dict(tags)
+                  for ch, tags in extra_tags_by_channel.items() if tags}
+
+    def _stamp(step: WorkflowStep) -> WorkflowStep:
+        if "channel" not in step.tags:
+            return step
+        extra = by_channel.get(int(step.tags["channel"]))
+        return step.with_tags(**extra) if extra else step
+
+    wf.setup = [_stamp(s) for s in wf.setup]
+    wf.loop_steps = [_stamp(s) for s in wf.loop_steps]
+    wf.teardown = [_stamp(s) for s in wf.teardown]
+
+
 def production_step_name(measure_step_name: str) -> str:
     """``'production_measure_eis_ch3'`` — the modality's own step name, prefixed.
 
@@ -133,6 +168,7 @@ def build_production_read_workflow(
     *,
     measurement: "MeasurementSpec | None" = None,
     sample_uuid_by_channel: Mapping[int, str] | None = None,
+    extra_tags_by_channel: Mapping[int, Mapping[str, str]] | None = None,
 ) -> "Workflow | None":
     """The one-round workflow :func:`take_production_read` runs, or ``None``.
 
@@ -202,6 +238,12 @@ def build_production_read_workflow(
         from softae.core.autonomous_wiring import _stamp_sample_uuids
 
         _stamp_sample_uuids(wf, sample_uuid_by_channel)
+    if extra_tags_by_channel:
+        # T11.33: the settle phase's board certification and per-well verdict,
+        # relayed onto the row this read is about to write. Stamped here rather
+        # than by the caller for the same reason the uuids are — the steps this
+        # function built are the only ones that reach `router.py`.
+        _stamp_settle_tags(wf, extra_tags_by_channel)
     return wf
 
 
@@ -212,6 +254,7 @@ async def take_production_read(
     executor: Any,
     measurement: "MeasurementSpec | None" = None,
     sample_uuid_by_channel: Mapping[int, str] | None = None,
+    extra_tags_by_channel: Mapping[int, Mapping[str, str]] | None = None,
 ) -> dict[int, Any]:
     """Take the authoritative post-settle sweep; return ``{channel: raw}``.
 
@@ -227,7 +270,8 @@ async def take_production_read(
     channels = [int(ch) for ch in channels]
     wf = build_production_read_workflow(
         spec, channels, measurement=measurement,
-        sample_uuid_by_channel=sample_uuid_by_channel)
+        sample_uuid_by_channel=sample_uuid_by_channel,
+        extra_tags_by_channel=extra_tags_by_channel)
     if wf is None:
         return {}
 

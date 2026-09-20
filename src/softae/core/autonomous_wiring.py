@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Sequence
 import structlog
 
 if TYPE_CHECKING:  # annotation-only; the settle criterion is imported on use
-    from softae.analysis.equilibration import RoundFit
+    from softae.analysis.equilibration import RoundFit, WellVerdict
     from softae.core.composition_axes import CompositionAxis
 
 from softae.config import loader
@@ -2112,6 +2112,14 @@ class SettleOutcome:
     #: silently stops working while still appearing to be wired.
     rh_limited: bool = False       # would have certified but for moving humidity
     rh_unreadable: bool = False    # the RH channel could not be judged at all
+    #: One :class:`~softae.analysis.equilibration.WellVerdict` per channel judged
+    #: in the LAST window (T11.33 Design C). Empty when the criterion never
+    #: computed a ``RateCheck`` — i.e. under the shipped default
+    #: ``criterion="deviation"`` (:attr:`~softae.core.run_plan.SettlePlan.criterion`),
+    #: :attr:`SettleTracker.last_rate` is always ``None`` and this stays ``{}``.
+    #: Only ``criterion="rate"`` or ``"both"`` populate it. See
+    #: :attr:`~softae.analysis.equilibration.RateCheck.by_well`.
+    by_channel: dict[int, "WellVerdict"] = field(default_factory=dict)
 
     @property
     def settled(self) -> bool:
@@ -2134,6 +2142,15 @@ class SettleOutcome:
             "rh_stability_pct": self.rh_stability_pct,
             "rh_limited": self.rh_limited,
             "rh_unreadable": self.rh_unreadable,
+            # A compact projection rather than `dataclasses.asdict(wv)`:
+            # `WellVerdict.forgiven_round` is an `ExcludedRound` object, not
+            # trivially JSON-safe, and `settle.json` / the `settle_verdict` event
+            # need only the word plus T11.17's pair.
+            "by_channel": {
+                str(ch): {"word": wv.word, "rate_per_hour": wv.rate_per_hour,
+                          "upper_bound_per_hour": wv.upper_bound_per_hour}
+                for ch, wv in self.by_channel.items()
+            },
         }
 
     def describe(self) -> str:
@@ -2219,6 +2236,12 @@ async def drive_settle_phase(
         tol_rel=plan.settle_tol_rel,
         n_rounds=plan.settle_n_rounds,
         min_channels=plan.settle_min_channels,
+        # T11.33 ruling: no board-level minimum on the campaign path. Every well
+        # is judged individually, so no board is ever "narrower than the
+        # criterion needs"; `min_channels` above survives for the two TOOL paths
+        # (`tools/eis_validate_hold.py`, `workflows/equilibration.py`), which
+        # keep their int minimum by explicit operator ruling.
+        board_minimum=None,
         # THE correctness detail of this whole change. Without it a board whose
         # fits railed on the R₁ floor reports the same σ every round and settles
         # on round three, under-conditioning the entire campaign.
@@ -2294,6 +2317,12 @@ async def drive_settle_phase(
         rh_limited=tracker.rh_blocked_settle,
         rh_unreadable=bool(tracker.rh_unreadable
                            and verdict == SETTLE_NOT_EVALUABLE),
+        # T11.33 Design C. `last_rate` is `RateCheck | None` and `by_well`
+        # covers EVERY channel in the window, judged or not — but only the rate
+        # criterion ever computes one, so this is `{}` under the shipped
+        # deviation default rather than a silently empty board.
+        by_channel=(dict(tracker.last_rate.by_well)
+                    if tracker.last_rate is not None else {}),
     )
     logger.info("campaign_settle_verdict", channels=list(channels),
                 **outcome.as_dict())
@@ -3547,20 +3576,29 @@ async def run_autonomous_campaign(
                                    for f in _SETTLE_FIELDS},
                  criterion=str(settle_plan.criterion),
                  rate_tol_dec_per_h=settle_plan.rate_tol_dec_per_h)
-            # Said once, at the start, rather than discovered eight hours in: a
-            # board narrower than `settle_min_channels` can never make the
-            # criterion evaluable, so every trial would run to its ceiling. That
-            # is the SAFE direction and the run proceeds — but silently spending
-            # `max_hold_s` per trial for a reason nobody can see is not.
-            if len(channels) < settle_plan.settle_min_channels:
-                emit("settle_unevaluable_board", channels=len(channels),
-                     settle_min_channels=settle_plan.settle_min_channels)
-                logger.warning(
-                    "settle_min_channels_exceeds_board", campaign=spec.name,
-                    channels=len(channels),
-                    settle_min_channels=settle_plan.settle_min_channels,
-                    detail="fewer channels than the criterion needs; every trial "
-                           "will run to max_hold_s and record 'not_evaluable'")
+            # T11.33 ruling (`docs/SubAgent docs/t11_33_every_well_followed_
+            # through.md` §3, "Retirements and the config key"): the narrow-board
+            # warning that stood here is retired, because its premise is gone —
+            # `drive_settle_phase` passes `board_minimum=None`, so no board is
+            # ever narrower than the criterion needs and every well is judged
+            # individually.
+            #
+            # What replaces it: `settle_min_channels` is a per-tracker POLICY
+            # now, so an explicitly-set key does nothing on THIS path. Said once,
+            # loudly, rather than silently dropped. The key still matters on the
+            # two tool paths (`tools/eis_validate_hold.py`,
+            # `workflows/equilibration.py`), which is why it is IGNORED here,
+            # never refused — every committed campaign spec sets it, and refusing
+            # at load would break files nobody has been asked about.
+            if spec.settle_min_channels is not SPEC_UNSET:
+                emit("settle_min_channels_ignored", campaign=spec.name,
+                     settle_min_channels=spec.settle_min_channels)
+                logger.info(
+                    "settle_min_channels_ignored", campaign=spec.name,
+                    settle_min_channels=spec.settle_min_channels,
+                    detail="the campaign path judges every well individually "
+                           "(board_minimum=None); this key applies only to "
+                           "eis-validate and the equilibration CLI")
 
         # Electrode/board management: when a capacity is set, electrodes are
         # single-use and allocated sequentially; a full board triggers a prompted
@@ -3945,6 +3983,31 @@ async def run_autonomous_campaign(
                 rh_for_round=_settle_round_rh,
                 on_round=_on_settle_round,
             )
+            # T11.33: every well's BOARD certification, and its own word / slope
+            # / bound where the criterion computed one, ride onto the production
+            # row through the step's tags — the same funnel `fixture_id`,
+            # `electrode_mode` and `sample_uuid` already use (see
+            # `analysis/eis/router.py`'s `record_measurement` call).
+            #
+            # Two words and not one, deliberately: a quiet well on a board that
+            # timed out is (`ceiling`, `rate_quiet`), and collapsing them loses
+            # exactly the distinction the deferred optimizer-weighting ruling
+            # will need. String-valued only — `WorkflowStep.with_tags` is typed
+            # `**extra: str` — and `router.py` parses the two numbers back with
+            # `float()`, mirroring its own existing `nominal` parse.
+            settle_tags_by_channel: dict[int, dict[str, str]] = {}
+            for ch in round_channels:
+                ch_tags = {"certification": outcome.outcome}
+                verdict = outcome.by_channel.get(ch)
+                if verdict is not None:
+                    ch_tags["well_verdict"] = verdict.word
+                    if verdict.rate_per_hour is not None:
+                        ch_tags["rate_per_hour"] = str(verdict.rate_per_hour)
+                    if verdict.upper_bound_per_hour is not None:
+                        ch_tags["upper_bound_per_hour"] = str(
+                            verdict.upper_bound_per_hour)
+                settle_tags_by_channel[ch] = ch_tags
+
             # THE reading the campaign records: a real `measurement="primary"`
             # sweep taken *after* the driver returns, not the last
             # `measurement="settle"` round recycled under the trial's own step
@@ -3957,7 +4020,8 @@ async def run_autonomous_campaign(
                     spec, round_channels, measurement=production_measurement,
                     executor=WorkflowExecutor(manager, data_store=data_store,
                                               run_id=run_id),
-                    sample_uuid_by_channel=trial_sample_uuids)
+                    sample_uuid_by_channel=trial_sample_uuids,
+                    extra_tags_by_channel=settle_tags_by_channel)
             except Exception as exc:
                 # A read that RAISES is a failed read, and gets the same answer as
                 # one that returns `None` — per channel, labelled, below. Letting

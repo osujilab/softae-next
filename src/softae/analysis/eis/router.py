@@ -373,6 +373,27 @@ class EISResultRouter:
             role = str(tags.get("role", "sample"))
             default_re = "bridged_by_sample" if role == "sample" else "unverified"
 
+            # T11.33. The settle phase's BOARD certification and this well's own
+            # verdict, stamped onto the production step's tags by
+            # `core/production_read.py`. Present-only on both sides: a step from
+            # any other path carries none of these and the columns stay NULL,
+            # which is the distinction they exist to make — "this read was not
+            # taken under a settle phase" must not read like "it settled".
+            # The two numbers are parsed with the same try/except the `nominal`
+            # tag above uses, because a tag is a string from an untyped mapping.
+            certification = tags.get("certification")
+            well_verdict = tags.get("well_verdict")
+            try:
+                rate_per_hour = (float(tags["rate_per_hour"])
+                                 if "rate_per_hour" in tags else None)
+            except (TypeError, ValueError):
+                rate_per_hour = None
+            try:
+                upper_bound_per_hour = (float(tags["upper_bound_per_hour"])
+                                        if "upper_bound_per_hour" in tags else None)
+            except (TypeError, ValueError):
+                upper_bound_per_hour = None
+
             measurement_id = ctx.data_store.record_measurement(
                 ctx.run_id,
                 eis_result,
@@ -396,6 +417,14 @@ class EISResultRouter:
                 # record time and must survive a failed payload write, which is
                 # exactly when a row's provenance matters most.
                 sample_uuid=_sample_uuid(step),
+                # T11.33 Design C. `certification` is the BOARD word the read was
+                # taken under; `well_verdict` is this well's own, verbatim — two
+                # words because a quiet well on a board that timed out is
+                # (`ceiling`, `rate_quiet`), and one column cannot say that.
+                certification=certification,
+                well_verdict=well_verdict,
+                rate_per_hour=rate_per_hour,
+                upper_bound_per_hour=upper_bound_per_hour,
             )
 
             logger.info(

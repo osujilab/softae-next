@@ -2184,3 +2184,268 @@ def test_spectrum_report_from_raw_real_palmsens_shape_builds_report():
     assert 1.0e4 < report.fit.R1 < 3.0e4, f"R1={report.fit.R1:g} is not the fed-in one"
     assert report.sigma.is_value
     assert 5.0e-3 < report.sigma.value < 5.0e-2
+
+
+# ── T11.33: every well is followed through ───────────────────────────────────
+#
+# The settle phase's per-well record, and the board minimum coming off the
+# campaign path. Spec: `docs/SubAgent docs/t11_33_every_well_followed_through.md`.
+# These drive `drive_settle_phase` directly against fabricated rounds — no rig,
+# no store, no clock — because what is under test is the criterion's wiring, and
+# `test_campaign_settle_phase.py` already owns the end-to-end shape.
+
+
+class _FakeClock:
+    """A clock the injected ``sleep`` advances, so rounds have a real span.
+
+    The rate criterion regresses ``ln sigma`` against elapsed seconds, so a
+    stopped clock makes every window ``rate_span_too_short`` and the test would
+    pass on a refusal rather than on a verdict.
+    """
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    async def sleep(self, seconds: float) -> None:
+        self.t += float(seconds)
+
+
+def _settle_plan(**over):
+    """A settle plan wound down to test speed, with the RH gate off.
+
+    ``rh_stability_pct=None`` because these rounds carry no humidity: with the
+    gate on, every window would (correctly) report the room unreadable and the
+    tests would stop being about the criterion.
+    """
+    from softae.core.run_plan import SettlePlan
+
+    base = dict(round_period_s=600.0, min_hold_s=0.0, max_hold_s=6000.0,
+                rh_stability_pct=None)
+    base.update(over)
+    return SettlePlan(**base)
+
+
+async def _drive(plan, channels, sigma_for, *, r1_bound_ohms=None):
+    """Run ``drive_settle_phase`` over fabricated rounds; return the outcome.
+
+    ``sigma_for(channel, round_index)`` returns that cell's sigma for that round,
+    or ``None`` to make the round absent for it.
+    """
+    from softae.analysis.equilibration import RoundFit
+    from softae.core.autonomous_wiring import drive_settle_phase
+
+    clock = _FakeClock()
+
+    async def measure_round(index: int):
+        return {int(ch): index for ch in channels}
+
+    def fits_from(raws):
+        fits = []
+        for ch, index in raws.items():
+            sigma = sigma_for(int(ch), int(index))
+            if sigma is None:
+                continue
+            fits.append(RoundFit(channel=int(ch), sigma=sigma, r1_ohms=4000.0))
+        return fits
+
+    outcome, _ = await drive_settle_phase(
+        plan, channels=list(channels), measure_round=measure_round,
+        fits_from=fits_from, r1_bound_ohms=r1_bound_ohms,
+        sleep=clock.sleep, now=clock)
+    return outcome
+
+
+@pytest.mark.asyncio
+async def test_settle_outcome_by_channel_is_empty_under_the_default_deviation_criterion():
+    """The shipped default computes no ``RateCheck``, so there is nothing to relay.
+
+    ``{}`` here is an *absence of the question*, not a board on which every well
+    was unjudgeable — the tracker's ``last_rate`` is only ever populated under
+    ``criterion="rate"`` or ``"both"``. Spelling the two alike is how a reader
+    concludes a board was judged when it never was.
+    """
+    outcome = await _drive(_settle_plan(), (21, 22, 23, 24),
+                           lambda ch, i: 1.0e-4)
+
+    assert outcome.settled, outcome.describe()
+    assert outcome.by_channel == {}
+    # And the projection survives the round trip into `settle.json`.
+    assert outcome.as_dict()["by_channel"] == {}
+
+
+@pytest.mark.asyncio
+async def test_settle_outcome_by_channel_carries_the_last_windows_well_verdicts_under_rate_criterion():
+    """Every channel in the last window leaves the phase with a word."""
+    from softae.analysis.equilibration import (
+        SETTLE_CRITERION_RATE,
+        SETTLE_SETTLED,
+        WellVerdict,
+    )
+
+    plan = _settle_plan(criterion=SETTLE_CRITERION_RATE,
+                        rate_tol_dec_per_h=0.20, max_hold_s=12000.0)
+    outcome = await _drive(plan, (21, 22, 23, 24), lambda ch, i: 1.0e-4)
+
+    assert outcome.by_channel, "the rate criterion ran but relayed no verdict"
+    assert set(outcome.by_channel) == {21, 22, 23, 24}
+    for channel, verdict in outcome.by_channel.items():
+        assert isinstance(verdict, WellVerdict)
+        assert verdict.channel == channel
+        # A cell whose sigma never moves is quiet, and a quiet cell certifies.
+        assert verdict.word == SETTLE_SETTLED, verdict.reason
+
+    # The projection carries the word and T11.17's pair, keyed by string for
+    # `settle.json`; `forgiven_round` is deliberately not in it.
+    projected = outcome.as_dict()["by_channel"]
+    assert set(projected) == {"21", "22", "23", "24"}
+    assert projected["21"]["word"] == SETTLE_SETTLED
+    assert set(projected["21"]) == {"word", "rate_per_hour", "upper_bound_per_hour"}
+
+
+@pytest.mark.asyncio
+async def test_settle_outcome_by_channel_gives_a_partly_absent_well_a_word_too():
+    """A well that missed some rounds is still followed through.
+
+    The T11.33 ruling's other half: no well's state is dropped for being
+    unjudgeable, so the optimizer's record says what happened to each of its
+    samples rather than listing the survivors.
+    """
+    from softae.analysis.equilibration import (
+        EXCLUDED_ABSENT,
+        SETTLE_CRITERION_RATE,
+        SETTLE_SETTLED,
+    )
+
+    plan = _settle_plan(criterion=SETTLE_CRITERION_RATE,
+                        rate_tol_dec_per_h=0.20, max_hold_s=12000.0)
+    # ch24 fits on the first round only; the other three are quiet throughout.
+    outcome = await _drive(
+        plan, (21, 22, 23, 24),
+        lambda ch, i: 1.0e-4 if (ch != 24 or i == 0) else None)
+
+    assert 24 in outcome.by_channel, "the absent well left the phase unrecorded"
+    assert outcome.by_channel[24].word == EXCLUDED_ABSENT
+    assert outcome.by_channel[24].rate_per_hour is None
+    assert outcome.by_channel[21].word == SETTLE_SETTLED
+
+
+@pytest.mark.asyncio
+async def test_settle_outcome_by_channel_omits_a_well_that_never_fit_at_all():
+    """The documented edge of "every well": the criterion has no board roster.
+
+    ``RateCheck.by_well`` covers every channel **in the window**, and the window
+    is built from the fits — so a well that produced no ``RoundFit`` in any round
+    is not a well the criterion ever learned exists, and it gets no word. A well
+    that fit *once* and then stopped does (the test above).
+
+    Pinned rather than asserted away, because it is the gap between the spec's
+    "every well on the board carries a word" and what ``equilibration.py`` can
+    actually deliver. **What closes it on the write path is
+    ``_equilibrate``**: the board word is stamped from ``round_channels`` — the
+    roster the driver does have — so such a well still records its
+    ``certification`` and leaves only ``well_verdict`` NULL, which is the honest
+    record of a criterion that had nothing to say about it.
+    """
+    from softae.analysis.equilibration import SETTLE_CRITERION_RATE
+
+    plan = _settle_plan(criterion=SETTLE_CRITERION_RATE,
+                        rate_tol_dec_per_h=0.20, max_hold_s=12000.0)
+    outcome = await _drive(plan, (21, 22, 23, 24),
+                           lambda ch, i: None if ch == 24 else 1.0e-4)
+
+    assert set(outcome.by_channel) == {21, 22, 23}
+    assert 24 not in outcome.by_channel
+
+
+@pytest.mark.asyncio
+async def test_drive_settle_phase_never_refuses_a_narrow_board_on_count():
+    """T11.33: the campaign tracker passes ``board_minimum=None``.
+
+    Two quiet wells on a plan asking for five used to be ``not_evaluable`` — a
+    statement about the board's *width*, not about the sample. Now each well is
+    judged on its own evidence, so a narrow board settles on the same evidence a
+    wide one would.
+
+    This is the test that would go green on the safe answer if the change had not
+    landed, so it asserts the *positive*: settled, not merely "not refused".
+    """
+    from softae.analysis.equilibration import SETTLE_NOT_EVALUABLE
+
+    outcome = await _drive(_settle_plan(settle_min_channels=5), (21, 22),
+                           lambda ch, i: 1.0e-4)
+
+    assert outcome.outcome != SETTLE_NOT_EVALUABLE, outcome.describe()
+    assert outcome.settled, outcome.describe()
+    assert sorted(outcome.participating) == [21, 22]
+
+
+@pytest.mark.asyncio
+async def test_drive_settle_phase_still_reports_not_evaluable_when_no_well_is_judgeable():
+    """The board word keeps its meaning: nothing judgeable, nothing to judge.
+
+    Without this, the test above could be passing because the phase now certifies
+    everything — which would make ``not_evaluable`` unreachable and the word a
+    lie rather than a policy change.
+    """
+    from softae.analysis.equilibration import SETTLE_NOT_EVALUABLE
+
+    outcome = await _drive(_settle_plan(), (21, 22), lambda ch, i: None)
+
+    assert outcome.outcome == SETTLE_NOT_EVALUABLE, outcome.describe()
+
+
+def _settle_campaign_spec(**over):
+    """A settling campaign wound down to test speed (one trial, tiny holds)."""
+    base = dict(equilibration_method="settle", round_period_s=0.01,
+                min_hold_s=0.0, max_hold_s=0.2, budget=1, channels=(21, 22))
+    base.update(over)
+    return _spec(**base)
+
+
+@pytest.mark.asyncio
+async def test_campaign_start_emits_settle_min_channels_ignored_when_the_spec_sets_it(
+    connected, tmp_path: Path
+):
+    """An ignored key is said once, loudly, rather than silently dropped.
+
+    ``settle_min_channels`` is a per-tracker policy after T11.33 and the campaign
+    path passes ``board_minimum=None``, so a spec that sets it is stating
+    something this path will not do. Ignored rather than refused: every committed
+    campaign spec sets the key, and it still governs the two tool paths.
+    """
+    store = DataStore(tmp_path / "proj")
+    events: list[dict] = []
+    await run_autonomous_campaign(
+        _settle_campaign_spec(settle_min_channels=3), manager=connected,
+        data_store=store, on_event=events.append)
+
+    ignored = [e for e in events if e["type"] == "settle_min_channels_ignored"]
+    assert ignored, "the spec set a key this path ignores and said nothing"
+    assert ignored[0]["settle_min_channels"] == 3
+    # A `not of_type("settle_unevaluable_board")` line stood here and was retired
+    # (T11.51, `SUBAGENT_RULES` §3.1(e)): T11.33 step 3 removed the last emitter
+    # from `src/` — zero hits, verified by grep — so the negative could no longer
+    # fail for any reason. The two assertions above are what this test needs: the
+    # replacement event fires, with the right payload, and it fires *instead*.
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_campaign_start_does_not_emit_settle_min_channels_ignored_when_unset(
+    connected, tmp_path: Path
+):
+    """No key, no complaint — otherwise every campaign carries a warning."""
+    store = DataStore(tmp_path / "proj")
+    events: list[dict] = []
+    await run_autonomous_campaign(
+        _settle_campaign_spec(), manager=connected,
+        data_store=store, on_event=events.append)
+
+    # The phase really ran, so the absence below is about the key and not about
+    # a settle block that never happened.
+    assert [e for e in events if e["type"] == "settle_mode"]
+    assert not [e for e in events if e["type"] == "settle_min_channels_ignored"]
+    store.close()

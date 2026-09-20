@@ -278,6 +278,77 @@ def test_take_production_read_stamps_the_sample_uuids_it_was_given():
     assert tags == {"21": "uuid-a", "22": "uuid-b"}
 
 
+def test_take_production_read_stamps_the_settle_tags_it_was_given():
+    """T11.33: the board word and this well's own verdict ride onto the row.
+
+    The tags are the only route these four values have to ``record_measurement``
+    — ``analysis/eis/router.py`` reads them off the step it is handed — so a step
+    that does not carry them writes four NULLs.
+    """
+    executor = FakeExecutor()
+    asyncio.run(take_production_read(
+        _spec(), [21, 22], executor=executor,
+        extra_tags_by_channel={
+            21: {"certification": "settled", "well_verdict": "rate_quiet",
+                 "rate_per_hour": "0.004", "upper_bound_per_hour": "0.019"},
+            22: {"certification": "settled", "well_verdict": "rate_moving"},
+        }))
+    tags = {s.tags["channel"]: s.tags for s in executor.workflows[0].setup}
+    assert tags["21"]["certification"] == "settled"
+    assert tags["21"]["well_verdict"] == "rate_quiet"
+    assert tags["21"]["rate_per_hour"] == "0.004"
+    assert tags["21"]["upper_bound_per_hour"] == "0.019"
+    # Present-only *within* a channel too: ch22 was judged but never reached a
+    # rate estimate, and an absent slope must not become a zero.
+    assert tags["22"]["well_verdict"] == "rate_moving"
+    assert "rate_per_hour" not in tags["22"]
+
+
+def test_take_production_read_leaves_a_channel_absent_from_the_settle_tags_alone():
+    """Present-only: an unmapped channel gets no tag, not an empty one.
+
+    ``tags.get("certification")`` downstream must distinguish *this read was not
+    taken under a settle phase* from *it settled*, which is exactly the
+    distinction a blank string would destroy.
+    """
+    executor = FakeExecutor()
+    asyncio.run(take_production_read(
+        _spec(), [21, 22], executor=executor,
+        extra_tags_by_channel={21: {"certification": "ceiling"}, 22: {}}))
+    tags = {s.tags["channel"]: s.tags for s in executor.workflows[0].setup}
+    assert tags["21"]["certification"] == "ceiling"
+    assert "certification" not in tags["22"]
+
+
+def test_take_production_read_without_settle_tags_changes_no_tag():
+    """The regression guard: omitting the parameter is byte-identical to before."""
+    plain = FakeExecutor()
+    asyncio.run(take_production_read(_spec(), [21, 22], executor=plain))
+    explicit_none = FakeExecutor()
+    asyncio.run(take_production_read(_spec(), [21, 22], executor=explicit_none,
+                                     extra_tags_by_channel=None))
+
+    assert ([dict(s.tags) for s in plain.workflows[0].setup]
+            == [dict(s.tags) for s in explicit_none.workflows[0].setup])
+    for step in plain.workflows[0].setup:
+        assert not {"certification", "well_verdict", "rate_per_hour",
+                    "upper_bound_per_hour"} & set(step.tags)
+
+
+def test_take_production_read_settle_tags_do_not_disturb_the_sample_uuids():
+    """Both stampers run on one workflow; neither may erase the other's tags."""
+    executor = FakeExecutor()
+    asyncio.run(take_production_read(
+        _spec(), [21], executor=executor,
+        sample_uuid_by_channel={21: "uuid-a"},
+        extra_tags_by_channel={21: {"certification": "settled"}}))
+    step = executor.workflows[0].setup[0]
+    assert step.tags["sample_uuid"] == "uuid-a"
+    assert step.tags["certification"] == "settled"
+    # And the tags the modality itself set are still there.
+    assert step.tags["measurement"] == "primary"
+
+
 def test_take_production_read_restores_the_executors_previous_callback():
     """A caller may hand over a live executor; the capture hook is borrowed."""
     executor = FakeExecutor()

@@ -34,7 +34,7 @@ from softae.core.autonomous_wiring import (
     resolve_objective,
 )
 from softae.errors import CampaignError
-from tests.eis_synthetic import pure_series_rc, reference_spectrum
+from tests.eis_synthetic import log_frequencies, pure_series_rc, reference_spectrum
 from tests.test_autonomous_composition import SPACE as COMPOSITION_SPACE
 from tests.test_autonomous_composition import _context
 
@@ -43,6 +43,70 @@ def _raw(f: np.ndarray, Z: np.ndarray) -> list[np.ndarray]:
     """The 5-column array an EIS step returns: ``[f, |Z|, phase, Z', -Z'']``."""
     return [np.column_stack([f, np.abs(Z), np.degrees(np.angle(Z)),
                              Z.real, -Z.imag])]
+
+
+#: The sweep the rig actually runs — ``[eis_presets.Quick]`` in ``softae_config.toml``
+#: (``npts = 27``, ``f_hi = 200_000``, ``f_lo_mHz = 6_475``), which is ``DEFAULT_PRESET``
+#: and what the equilibration runs use. ``eis_synthetic``'s own default grid is the
+#: 20 Hz–200 kHz/41-point sweep `Quick` had through 2026-08-13, so a fixture built on it
+#: sweeps a band the instrument no longer sweeps and will disagree with the pipeline no
+#: matter how its physics is tuned.
+_QUICK_GRID = log_frequencies(f_lo=6.475, f_hi=200_000, npts=27)
+
+
+def _measurable_spectrum(**over) -> tuple[np.ndarray, np.ndarray]:
+    """One spectrum both engines can actually report a σ *value* for.
+
+    Every test below that wants a real conductivity needs the objective to clear two
+    conditions ``_sigma_from_eis_raw`` applies and ``report_sigma`` does not:
+    ``report.ok`` (the gates) and ``report.sigma.is_value`` (a value, not a bound).
+    Under the **gated** engine T11.46 makes the second one bite: an arc that does not
+    close in band yields a ceiling on σ, and the objective declines a bound.
+
+    **Two independent bounds have to be cleared, and they pull opposite ways.**
+
+    *Arc closure.* ``arc_closure`` reads ``argmax(−Z″)`` and calls the arc open when the
+    maximum sits at the lowest frequency — on a blocking cell that is decided by how far
+    the CPE tail has risen there, so ``C_par`` alone moves nothing and ``Q`` is the
+    lever. ``engine_support`` then gates on *severity* (``phase_low_deg ≤ −60°``), not on
+    the state itself. This wants the corner frequency **inside** the band.
+
+    *Loss-tangent floor* (the bound added with the sigma loss-ceiling work). σ is
+    reported as a ceiling when tan δ falls below the extrapolated phase floor. For this
+    topology tan δ at the top of the band is ≈ ``f_c / f``, so this wants the corner
+    frequency **high**. ``f_c = 50 kHz`` is the window where both hold.
+
+    Measured on this fixture (not computed), seeds 0-7, all three call shapes the tests
+    below use — the shipped config unpatched, and ``_use_engine``-patched either way:
+
+    ==========================  =====================================================
+    arc state                   ``closed``, apex interior at ~61 kHz
+    ``phase_low_deg``           −5.4°, i.e. **54.6° clear** of the −60° gate
+    σ, shipped config           ~1.33e-4 S/cm, a value in every seed
+    σ, forced ``gated``         ~1.33e-4 S/cm, a value in every seed
+    σ, forced ``legacy``        ~1.53e-4 S/cm, a value in every seed
+    legacy/gated                1.1458-1.1505 — ~150x the ``rel=1e-3`` pin below
+    ``C_par`` tolerance         contiguous pass over 0.9-1.2x this value
+    ==========================  =====================================================
+
+    ``R_bulk`` is 5.0e5 rather than the 2.0e3 these tests used before T11.46. That is not
+    a free choice: measured across ``Q`` from 1e-7 to 1e-4 at two corner frequencies, a
+    2 kΩ bulk gives the **legacy** engine no working point at all on this grid — every
+    cell either fails to converge or blows the 15 % RMS-residual gate — so the two
+    engines cannot both report on it, and
+    ``test_flipping_the_engine_moves_the_number_so_the_agreement_is_not_vacuous`` needs
+    both. Legacy's acceptance really is patchy in this space, which is why the ``C_par``
+    tolerance above is stated: this point was chosen for sitting in a contiguous basin
+    rather than on the spikes its neighbours sit on.
+
+    The spectra still cast with ``reference_spectrum()``'s defaults elsewhere in this
+    file all assert ``None``, so none of this reaches them.
+    """
+    params = dict(freq=_QUICK_GRID, R_bulk=5.0e5,
+                  # f_c = 1/(2*pi*R_bulk*C_par) = 50 kHz.
+                  C_par=6.3662e-12, Q=1.0e-6, noise_pct=1.0, seed=3)
+    params.update(over)
+    return reference_spectrum(**params)
 
 
 class _Settings:
@@ -207,7 +271,7 @@ class TestSigmaExtractor:
 
 class TestThicknessIsRequiredForSigma:
     def test_a_channel_with_a_recorded_thickness_yields_a_conductivity(self):
-        f, Z = reference_spectrum(R_bulk=2000.0, noise_pct=1.0, seed=3)
+        f, Z = _measurable_spectrum()
         value = _scalar_from_eis_raw(_raw(f, Z), channel=5, thickness_um=150.0,
                                      kind="sigma")
         assert value is not None and value > 0
@@ -216,13 +280,13 @@ class TestThicknessIsRequiredForSigma:
         # Under a σ campaign a missing thickness is *unmeasured*, and specifically not
         # mean |Z|: handing a maximiser an impedance for one channel would score the
         # worst conductor in the trial as its best result.
-        f, Z = reference_spectrum(R_bulk=2000.0, noise_pct=1.0, seed=3)
+        f, Z = _measurable_spectrum()
         assert _scalar_from_eis_raw(_raw(f, Z), channel=5, kind="sigma") is None
 
     def test_the_same_channel_is_perfectly_measurable_under_a_volume_campaign(self):
         # The measurement is not deficient — mean |Z| needs no thickness. This is the
         # difference between "impossible" and "missing".
-        f, Z = reference_spectrum(R_bulk=2000.0, noise_pct=1.0, seed=3)
+        f, Z = _measurable_spectrum()
         value = _scalar_from_eis_raw(_raw(f, Z), channel=5, kind="mean_abs_z")
         assert value is not None and value > 0
 
@@ -292,7 +356,7 @@ class TestOneSigmaEverywhere:
     def test_the_objective_and_the_gui_agree_under_the_shipped_legacy_engine(
             self, monkeypatch):
         self._use_engine(monkeypatch, "legacy")
-        f, Z = reference_spectrum(R_bulk=2000.0, noise_pct=1.0, seed=3)
+        f, Z = _measurable_spectrum()
 
         objective = _sigma_from_eis_raw(_raw(f, Z), channel=5, thickness_um=150.0)
 
@@ -302,7 +366,7 @@ class TestOneSigmaEverywhere:
 
     def test_the_objective_and_the_gui_agree_under_the_gated_engine(self, monkeypatch):
         self._use_engine(monkeypatch, "gated")
-        f, Z = reference_spectrum(R_bulk=2000.0, noise_pct=1.0, seed=3)
+        f, Z = _measurable_spectrum()
 
         objective = _sigma_from_eis_raw(_raw(f, Z), channel=5, thickness_um=150.0)
 
@@ -314,10 +378,15 @@ class TestOneSigmaEverywhere:
             self, monkeypatch):
         # The positive control. Both engines agreeing across the two surfaces is only
         # meaningful if the config reaches the objective at all — and it does: the
-        # legacy fitter and the gated one differ by more than a factor of two on this
-        # spectrum. That gap IS the divergence the user ruled out; it was previously
+        # legacy fitter and the gated one land ~14.8 % apart on this spectrum
+        # (measured, 1.1458-1.1505 over seeds 0-7), which is ~150x the `rel=1e-3` pin
+        # below. That gap IS the divergence the user ruled out; it was previously
         # invisible because the objective always took one side of it.
-        f, Z = reference_spectrum(R_bulk=2000.0, noise_pct=1.0, seed=3)
+        #
+        # The margin used to be stated as "more than a factor of two". That was true of
+        # the pre-T11.46 fixture, whose gated arm returns no value at all now, so the
+        # claim was unverifiable rather than merely large; this one is measured.
+        f, Z = _measurable_spectrum()
 
         self._use_engine(monkeypatch, "legacy")
         legacy = _sigma_from_eis_raw(_raw(f, Z), channel=5, thickness_um=150.0)
@@ -350,7 +419,7 @@ class TestOneSigmaEverywhere:
             return real(*args, **kwargs)
 
         monkeypatch.setattr(engine, "analyze_spectrum", spy)
-        f, Z = reference_spectrum(R_bulk=2000.0, noise_pct=1.0, seed=3)
+        f, Z = _measurable_spectrum()
         _sigma_from_eis_raw(_raw(f, Z), channel=5, thickness_um=150.0)
 
         assert seen, "the σ extractor did not reach analyze_spectrum at all"
@@ -368,7 +437,7 @@ class TestAggregateObjective:
             def predicted_thickness_um(self, run_id, channel):
                 return 150.0 if channel == 5 else None
 
-        f, Z = reference_spectrum(R_bulk=2000.0, noise_pct=1.0, seed=3)
+        f, Z = _measurable_spectrum()
         raw = _raw(f, Z)
         lookup = make_thickness_lookup(_Store(), "run1")
 
@@ -390,7 +459,7 @@ class TestAggregateObjective:
 
     def test_one_trial_is_averaged_in_one_metric_even_when_thickness_is_patchy(self):
         # The hazard the settle-once rule exists for: were the metric decided per
-        # channel, ch6 would contribute a mean |Z| of order 10³ Ω to an average of
+        # channel, ch6 would contribute a mean |Z| of order 10⁵ Ω to an average of
         # conductivities of order 10⁻⁴ S/cm and swamp it entirely.
         from softae.core.autonomous_wiring import (
             eis_impedance_objective,
@@ -401,7 +470,7 @@ class TestAggregateObjective:
             def predicted_thickness_um(self, run_id, channel):
                 return 150.0 if channel == 5 else None
 
-        f, Z = reference_spectrum(R_bulk=2000.0, noise_pct=1.0, seed=3)
+        f, Z = _measurable_spectrum()
         raw = _raw(f, Z)
         value = eis_impedance_objective(
             {"measure_eis_ch5": raw, "measure_eis_ch6": raw}, {},
