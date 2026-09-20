@@ -1249,6 +1249,186 @@ class TestRequiredMetadataE6:
         assert "cycles_per_point" not in cols
 
 
+#: A `measurements` table in the oldest shape still reachable on disk — the
+#: baseline `_DDL` block, before any migration added a column to it. Old shape on
+#: purpose; the FK clause is dropped for the reason
+#: `_LEGACY_CONDITIONS_DDL_PRE_STAGE_PV` drops its own: the migration does not
+#: read it, and a forward reference would only complicate the fixture.
+_LEGACY_MEASUREMENTS_DDL = """\
+CREATE TABLE measurements (
+    measurement_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id              TEXT    NOT NULL,
+    channel             INTEGER NOT NULL,
+    electrode_x_mm      REAL,
+    electrode_y_mm      REAL,
+    timestamp           TEXT    NOT NULL,
+    npts                INTEGER,
+    f_min_hz            REAL,
+    f_max_hz            REAL,
+    measurement_time_s  REAL,
+    eis_file_path       TEXT,
+    eis_params_json     TEXT    NOT NULL DEFAULT '{}'
+)"""
+
+#: The four columns T11.33 adds, with the SQL type each must land as.
+_SETTLE_COLUMNS = {
+    "certification": "TEXT",
+    "well_verdict": "TEXT",
+    "rate_per_hour": "REAL",
+    "upper_bound_per_hour": "REAL",
+}
+
+
+class TestSettleVerdictAnnotation:
+    """T11.33 — a stored σ says how strong its own claim is.
+
+    Two words, not one: ``certification`` is what the phase concluded about the
+    **board**, ``well_verdict`` what it concluded about **this well**, and the
+    two routinely disagree. The rest of the class is the usual discipline for
+    this file — *a default must not look like an answer* — with one extra edge
+    the floats bring: ``0.0`` is a real rate, so the "unrecorded" encoding must
+    not swallow it.
+    """
+
+    def _measurement_columns(self, store: DataStore) -> dict:
+        return {
+            r[1]: r
+            for r in store._conn.execute(
+                "PRAGMA table_info(measurements)").fetchall()
+        }
+
+    def _row(self, store: DataStore, mid: int) -> tuple:
+        return tuple(store._conn.execute(
+            "SELECT certification, well_verdict, rate_per_hour, "
+            "upper_bound_per_hour FROM measurements WHERE measurement_id = ?",
+            (mid,)).fetchone())
+
+    # ── migration ────────────────────────────────────────────────────────────
+
+    def test_a_legacy_measurements_table_gains_the_four_settle_columns(
+            self, tmp_path: Path) -> None:
+        project = tmp_path / "legacy_settle"
+        _build_legacy_conditions_db(
+            project,
+            _LEGACY_MEASUREMENTS_DDL,
+            "INSERT INTO measurements (run_id, channel, timestamp, npts) "
+            "VALUES ('old_run', 7, '2026-01-01T00:00:00Z', 25)",
+        )
+        with DataStore(project) as store:
+            assert set(_SETTLE_COLUMNS) <= set(self._measurement_columns(store))
+
+    def test_a_legacy_row_survives_the_migration_and_reads_null_on_all_four(
+            self, tmp_path: Path) -> None:
+        # NULL is the honest record for a row written before anyone was asked:
+        # it means *never annotated*, which is not a word in either vocabulary.
+        project = tmp_path / "legacy_settle_row"
+        _build_legacy_conditions_db(
+            project,
+            _LEGACY_MEASUREMENTS_DDL,
+            "INSERT INTO measurements (run_id, channel, timestamp, npts) "
+            "VALUES ('old_run', 7, '2026-01-01T00:00:00Z', 25)",
+        )
+        with DataStore(project) as store:
+            row = store._conn.execute(
+                "SELECT channel, npts, certification, well_verdict, "
+                "rate_per_hour, upper_bound_per_hour FROM measurements"
+            ).fetchall()
+            assert len(row) == 1
+            assert tuple(row[0]) == (7, 25, None, None, None, None)
+
+    def test_the_four_columns_are_nullable_with_no_sql_default(
+            self, store: DataStore) -> None:
+        # The schema-level half of "a default must not look like an answer": a
+        # DEFAULT here would stamp a verdict onto every row nobody ever judged,
+        # and a NOT NULL would make *unrecorded* unspellable.
+        cols = self._measurement_columns(store)
+        for name, sql_type in _SETTLE_COLUMNS.items():
+            _, _, declared, notnull, default, _ = cols[name]
+            assert declared == sql_type, name
+            assert notnull == 0, name
+            assert default is None, name
+
+    def test_reopening_a_migrated_database_is_a_noop(
+            self, tmp_path: Path) -> None:
+        project = tmp_path / "legacy_settle_reopen"
+        _build_legacy_conditions_db(
+            project,
+            _LEGACY_MEASUREMENTS_DDL,
+            "INSERT INTO measurements (run_id, channel, timestamp) "
+            "VALUES ('old_run', 7, '2026-01-01T00:00:00Z')",
+        )
+        with DataStore(project) as store:
+            first = set(self._measurement_columns(store))
+        with DataStore(project) as store:
+            assert set(self._measurement_columns(store)) == first
+
+    # ── record_measurement ───────────────────────────────────────────────────
+
+    def test_the_settle_annotation_round_trips(self, store_with_run) -> None:
+        store, run_id = store_with_run
+        mid = store.record_measurement(
+            run_id, _make_eis_result(channel=4),
+            certification="settled", well_verdict="rate_moving",
+            rate_per_hour=0.031, upper_bound_per_hour=0.048)
+        assert self._row(store, mid) == (
+            "settled", "rate_moving", 0.031, 0.048)
+
+    def test_an_unannotated_read_leaves_all_four_null_not_a_sentinel(
+            self, store_with_run) -> None:
+        # A manual sweep or a commissioning blank has no settle phase behind it.
+        # Such a row must say *not annotated*, never '' or 0.0 -- both of which
+        # a reader would have to guess the meaning of.
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        assert self._row(store, mid) == (None, None, None, None)
+
+    def test_a_measured_rate_of_zero_is_stored_rather_than_erased(
+            self, store_with_run) -> None:
+        # The edge the two words do not have: 0.0 is the *best possible* rate --
+        # a sample that did not move at all -- so the falsy-to-NULL shorthand the
+        # neighbouring fields use would erase the strongest evidence in the file.
+        store, run_id = store_with_run
+        mid = store.record_measurement(
+            run_id, _make_eis_result(),
+            rate_per_hour=0.0, upper_bound_per_hour=0.0)
+        assert self._row(store, mid)[2:] == (0.0, 0.0)
+
+    def test_the_board_word_and_the_well_word_are_stored_separately(
+            self, store_with_run) -> None:
+        # The entire point of the T11.33 design: a board that ran to its ceiling
+        # can still carry a well that certified on its own evidence. One column
+        # could hold only one of these two facts.
+        from softae.analysis.equilibration import SETTLE_CEILING, SETTLE_SETTLED
+
+        store, run_id = store_with_run
+        mid = store.record_measurement(
+            run_id, _make_eis_result(),
+            certification=SETTLE_CEILING, well_verdict=SETTLE_SETTLED)
+        certification, well_verdict, _, _ = self._row(store, mid)
+        assert certification == SETTLE_CEILING
+        assert well_verdict == SETTLE_SETTLED
+        assert certification != well_verdict
+
+    def test_the_certification_surfaces_through_query_measurements_untranslated(
+            self, store_with_run) -> None:
+        # This is the surface `test_rung2_four_well_rehearsal.py` pins: that test
+        # reads `production[0]["certification"]` off a raw `query_measurements`
+        # row dict, so the column must arrive under its own name with no mapping
+        # layer in between.
+        from softae.analysis.equilibration import SETTLE_SETTLED
+
+        store, run_id = store_with_run
+        store.record_measurement(
+            run_id, _make_eis_result(),
+            certification=SETTLE_SETTLED, well_verdict=SETTLE_SETTLED,
+            rate_per_hour=0.004, upper_bound_per_hour=0.009)
+        rows = store.query_measurements(run_id=run_id)
+        assert len(rows) == 1
+        assert rows[0]["certification"] == SETTLE_SETTLED
+        assert rows[0]["well_verdict"] == SETTLE_SETTLED
+        assert rows[0]["upper_bound_per_hour"] == 0.009
+
+
 class TestRunIdCollision:
     """`run_id` is a one-second timestamp — ample for a rig run, not for a batch.
 

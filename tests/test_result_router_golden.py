@@ -184,6 +184,13 @@ async def test_golden_eis_routing_rows_and_files(connected_manager, data_store):
             "payload_format": "netcdf4",
             # Minting is T2.6; until then the honest value is NULL.
             "sample_uuid": None,
+            # T11.33's settle annotation, and NULL is the assertion: this route
+            # runs no settle phase, so the autorouter must leave all four
+            # unrecorded rather than invent a verdict for a read nobody judged.
+            "certification": None,
+            "well_verdict": None,
+            "rate_per_hour": None,
+            "upper_bound_per_hour": None,
             "workflow_name": "golden_eis_route",
             "pcb_name": None,
         },
@@ -216,6 +223,10 @@ async def test_golden_eis_routing_rows_and_files(connected_manager, data_store):
             ),
             "payload_format": "netcdf4",
             "sample_uuid": None,
+            "certification": None,
+            "well_verdict": None,
+            "rate_per_hour": None,
+            "upper_bound_per_hour": None,
             "workflow_name": "golden_eis_route",
             "pcb_name": None,
         },

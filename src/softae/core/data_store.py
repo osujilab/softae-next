@@ -980,6 +980,9 @@ class DataStore:
         # Tier 2 component 6: the sample-identity spine's other two anchors.
         self._migrate_formulation_sample_uuid()
         self._migrate_doe_outcome()
+        # T11.33: the settle evidence a measurement was taken under, board-level
+        # and per-well, so a stored row says how strong its own claim is.
+        self._migrate_measurement_settle_verdict()
         # The per-campaign escalation counters, which the resume path reads by name.
         self._migrate_campaign_checkpoint_counters()
         # LAST, always: the ledger records the epochs every migration above has
@@ -1217,6 +1220,10 @@ class DataStore:
         payload_path: str | None = None,
         payload_format: str | None = None,
         sample_uuid: str | None = None,
+        certification: str | None = None,
+        well_verdict: str | None = None,
+        rate_per_hour: float | None = None,
+        upper_bound_per_hour: float | None = None,
     ) -> int:
         """Persist one EIS measurement row.
 
@@ -1254,6 +1261,21 @@ class DataStore:
         written *after* this row exists, so that the file can name the row it belongs
         to, and :meth:`set_measurement_payload` attaches it. ``sample_uuid`` is
         accepted now and minted in T2.6.
+
+        The final four are T11.33's settle annotation (see
+        :meth:`_migrate_measurement_settle_verdict`). *certification* is the
+        **board's** ``SETTLE_*`` word and *well_verdict* **this well's own**
+        ``WellVerdict.word``; they are separate parameters because they answer
+        different questions and routinely disagree. *rate_per_hour* and
+        *upper_bound_per_hour* are stored exactly as ``WellVerdict`` carries them
+        — ln-units per hour — with no rescaling.
+
+        All four default to ``None`` and are stored as NULL, which means *this
+        read was not annotated*: a caller with no settle phase behind it (a manual
+        sweep, a commissioning blank) passes nothing and the row says so, rather
+        than claiming a verdict nobody reached. There is no sentinel; ``None`` in
+        is NULL out, including for the two floats, where ``0.0`` would be a
+        perfectly settled sample.
 
         :raises ValueError: if *role* is one of
             :data:`~softae.analysis.eis.calibration.TWO_TERMINAL_ROLES` and
@@ -1319,9 +1341,11 @@ class DataStore:
                 measurement_time_s, eis_file_path, eis_params_json,
                 role, fixture_id, nominal_value, electrode_mode,
                 thermal_history, sweep_order, re_connection, re_contact_verified,
-                modality, payload_path, payload_format, sample_uuid)
+                modality, payload_path, payload_format, sample_uuid,
+                certification, well_verdict, rate_per_hour,
+                upper_bound_per_hour)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run_id,
                 eis_result.channel,
@@ -1351,6 +1375,16 @@ class DataStore:
                 payload_path or None,
                 payload_format or None,
                 sample_uuid or None,
+                # T11.33. `or None` on the two words, matching the three lines
+                # above: '' is not a verdict, and a reader checking `is None`
+                # must not be handed one. The two floats take an explicit
+                # `is not None` instead — 0.0 is a real rate (a sample that did
+                # not move at all), and `or None` would silently erase it.
+                certification or None,
+                well_verdict or None,
+                float(rate_per_hour) if rate_per_hour is not None else None,
+                float(upper_bound_per_hour)
+                if upper_bound_per_hour is not None else None,
             ),
         )
         self._conn.commit()
@@ -2995,6 +3029,79 @@ class DataStore:
                 "ON measurements(role)"
             )
             self._conn.commit()
+
+    def _migrate_measurement_settle_verdict(self) -> None:
+        """Annotate ``measurements`` with the settle evidence a read was taken under (T11.33).
+
+        A σ taken at ``ceiling`` is a weaker claim than one taken at ``settled``,
+        and until now that distinction lived only in the run's sidecar events —
+        so a reader holding a row could not tell which. Four columns, and the
+        first two are **deliberately not one**:
+
+        ``certification``
+            The **board-level** outcome word, verbatim one of
+            :mod:`softae.analysis.equilibration`'s ``SETTLE_*`` constants
+            (``'settled'``, ``'ceiling'``, ``'unsettleable'``, …). What the
+            phase concluded about the board this well sat on.
+        ``well_verdict``
+            **This well's own** word, verbatim from ``WellVerdict.word``, whose
+            vocabulary is the union of the two that exist today — ``SETTLE_SETTLED``
+            for a well that certified, the ``RATE_*`` refusals for one that was
+            judged and did not, and the ``EXCLUDED_*`` / ``WELL_FIT_FAILED`` words
+            for one that could not be judged at all.
+
+        The pair is the whole point of the T11.33 ruling: a board may be
+        ``certification='ceiling'`` while *this* well was quiet the entire time,
+        or ``'settled'`` while this one was excluded as absent. Collapsing them
+        into a single column would discard exactly the per-well evidence the
+        optimizer is now being given.
+
+        ``rate_per_hour`` / ``upper_bound_per_hour``
+            The well's own fitted rate and its one-sided 95 % upper bound
+            (T11.17), stored **verbatim from the** ``WellVerdict`` **pair and
+            therefore in ln-units per hour**, not decades — the gate's unit, not
+            the operator's. No conversion happens here on purpose: a column that
+            rescaled on the way in would disagree with the sidecar it was copied
+            from, and ``_rate_tol_ln_per_hour`` is the one place that translation
+            belongs.
+
+        **All four nullable with NO DEFAULT**, following ``sweep_order`` and
+        :meth:`_migrate_doe_outcome`: NULL means *this row was never annotated* —
+        it predates the column, or its writer ran no settle phase — which is not
+        the same fact as any word in either vocabulary. A default of
+        ``'not_evaluable'`` or ``0.0`` would stamp a verdict onto rows nobody
+        ever judged, which is the one claim this annotation exists to stop the
+        store making.
+
+        **No backfill and no new** ``SCHEMA_EPOCHS`` **row**, for
+        :meth:`_migrate_doe_outcome`'s reason: this is a shape change, and no
+        stored number changes meaning. The verdicts are unrecoverable after the
+        event anyway — the window they were fitted over is gone.
+
+        A sibling of :meth:`_migrate_measurement_role` rather than four more
+        branches inside it: that method's trailing ``if changed`` block creates
+        ``idx_measurements_role``, so adding an unrelated column there would make
+        a settle annotation trigger a role index, and its ``changed`` flag would
+        stop meaning what its name says. No index here — nothing queries by
+        verdict; these columns are read off a row already selected by run.
+        """
+        cols = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(measurements)"
+            ).fetchall()
+        }
+        for column, sql_type in (
+            ("certification", "TEXT"),
+            ("well_verdict", "TEXT"),
+            ("rate_per_hour", "REAL"),
+            ("upper_bound_per_hour", "REAL"),
+        ):
+            if column not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE measurements ADD COLUMN {column} {sql_type}"
+                )
+        self._conn.commit()
 
     def _migrate_eis_calibrations(self) -> None:
         """Append-only calibration history (E2).
