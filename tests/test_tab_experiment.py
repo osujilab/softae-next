@@ -1289,6 +1289,45 @@ def _fit(R0: float = 50.0, R1: float = 1000.0, model: str = "simpleSalt"):
     )
 
 
+def _stub_analyze(fit=None):
+    """A stand-in for ``eis.engine.analyze_spectrum`` that stubs only the FIT.
+
+    ``_on_fit_all_eis`` calls ``analyze_spectrum(eis, cell=self._fit_cell(ch),
+    model_name=...)`` and renders ``report.fit`` plus ``report_sigma(report)``.
+    These tests are about what the tab *renders*; they are not about whether
+    ``_eis()``'s 3-point spectrum is fittable — it is not, and deliberately so
+    (the real gated engine refuses it: "3 surviving points (need 8)", and since
+    T11.46 also ``SE >= |R|``). Supplying the fit is what the ``_fit`` fixture
+    always meant by "the fit itself is stubbed in these tests".
+
+    **Only the fit is stubbed.** ``cell`` still arrives from ``_fit_cell`` — real
+    board geometry, real recorded-thickness lookup — and σ is still computed by
+    real ``CellConstant.sigma`` arithmetic, never a literal, so the geometry and
+    no-thickness assertions below keep their subject.
+
+    The σ rule mirrors the legacy engine's own (``eis/engine.py``: a value when
+    there is a cell and the fit converged, ``"unavailable"`` otherwise), which is
+    the rule ``report_sigma`` reads via ``sigma.mode``.
+    """
+    from softae.analysis.eis.report import SigmaReport, SpectrumReport
+
+    fit = _fit() if fit is None else fit
+
+    def analyze(eis_result, *, cell=None, model_name="simpleSalt", **kwargs):
+        sigma = SigmaReport(mode="unavailable", R_reported_ohm=float(fit.R1),
+                            R_basis="split_bulk")
+        if cell is not None and fit.success:
+            sigma = SigmaReport(
+                mode="value", value=cell.sigma(fit.R1),
+                R_reported_ohm=float(fit.R1), R_basis="split_bulk",
+                K_per_cm=cell.K_per_cm, K_route=cell.K_route,
+                thickness_method=cell.thickness_method,
+            )
+        return SpectrumReport(engine="legacy", fit=fit, sigma=sigma, cell=cell)
+
+    return analyze
+
+
 class TestFitAllEIS:
     """The HT tab's post-run circuit fit: operator-chosen model, honest σ."""
 
@@ -1344,11 +1383,11 @@ class TestFitAllEIS:
         assert idx >= 0
         tab._combo_fit_model.setCurrentIndex(idx)
 
-        with patch("softae.analysis.circuit_fitting.fit_circuit",
-                   return_value=_fit()) as fake:
+        with patch("softae.analysis.eis.engine.analyze_spectrum",
+                   side_effect=_stub_analyze()) as fake:
             tab._on_fit_all_eis()
 
-        assert fake.call_args.args[1] == "flexSalt"
+        assert fake.call_args.kwargs["model_name"] == "flexSalt"
         assert "flexSalt" in tab._txt_fit_output.toPlainText()
 
     def test_sigma_is_dashed_when_no_thickness_was_recorded_rather_than_computed_from_a_placeholder(
@@ -1366,7 +1405,8 @@ class TestFitAllEIS:
         tab._eis_results = [_eis(3)]
 
         # (a) nothing recorded at all
-        with patch("softae.analysis.circuit_fitting.fit_circuit", return_value=_fit()):
+        with patch("softae.analysis.eis.engine.analyze_spectrum",
+                   side_effect=_stub_analyze()):
             tab._on_fit_all_eis()
         assert "σ=—" in tab._txt_fit_output.toPlainText()
         assert "S/cm" not in tab._txt_fit_output.toPlainText()
@@ -1378,7 +1418,8 @@ class TestFitAllEIS:
                               deposit_area_mm2=None)
         tab._data_store = ds
         tab._run_id_by_channel[3] = run_id
-        with patch("softae.analysis.circuit_fitting.fit_circuit", return_value=_fit()):
+        with patch("softae.analysis.eis.engine.analyze_spectrum",
+                   side_effect=_stub_analyze()):
             tab._on_fit_all_eis()
         assert "σ=—" in tab._txt_fit_output.toPlainText()
         ds.close()
@@ -1405,8 +1446,8 @@ class TestFitAllEIS:
         # L=0.5, w=0.1, t=20 µm=0.002 cm, R1=1000 Ω → σ = 0.5/(1000·0.002·0.1) = 2.5
         with patch.object(tab, "_active_pcb_config",
                           return_value={"electrode_L_cm": 0.5, "electrode_w_cm": 0.1}), \
-             patch("softae.analysis.circuit_fitting.fit_circuit",
-                   return_value=_fit(R1=1000.0)):
+             patch("softae.analysis.eis.engine.analyze_spectrum",
+                   side_effect=_stub_analyze(_fit(R1=1000.0))):
             tab._on_fit_all_eis()
 
         text = tab._txt_fit_output.toPlainText()
@@ -1425,8 +1466,8 @@ class TestFitAllEIS:
         """
         tab._eis_results = [_eis(7)]
         with patch.object(tab, "_active_pcb_config", return_value={}), \
-             patch("softae.analysis.circuit_fitting.fit_circuit",
-                   return_value=_fit(R0=42.0, R1=1234.0)):
+             patch("softae.analysis.eis.engine.analyze_spectrum",
+                   side_effect=_stub_analyze(_fit(R0=42.0, R1=1234.0))):
             tab._on_fit_all_eis()
 
         text = tab._txt_fit_output.toPlainText()
@@ -1473,7 +1514,8 @@ class TestFitAllEIS:
         tab._txt_preview.setPlainText("PREVIEW SENTINEL")
         tab._eis_results = [_eis(1)]
 
-        with patch("softae.analysis.circuit_fitting.fit_circuit", return_value=_fit()):
+        with patch("softae.analysis.eis.engine.analyze_spectrum",
+                   side_effect=_stub_analyze()):
             tab._on_fit_all_eis()
 
         assert tab._txt_preview.toPlainText() == "PREVIEW SENTINEL"
