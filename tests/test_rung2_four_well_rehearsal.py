@@ -54,13 +54,24 @@ run to find:
    ``test_campaign_settle_phase.py`` and ``test_equilibration_analysis.py``,
    against fabricated fits.
 
-**Sentinels.** One strict ``xfail`` remains — T11.8's ``certification`` field on
-a measurement row, whose name parallel has confirmed. T11.7's sentinel has been
-retired: the criterion pass-through landed, and the test that guarded it is live
-below. It is worth knowing *why* it was replaced rather than simply un-marked —
-it asserted on rendered prose that could never contain the token it looked for,
-so it could not have flipped to XPASS when the feature arrived. A sentinel is
-only a sentinel if the thing it waits for can actually trip it.
+**Sentinels.** There are **none left**, and the count is the point: this module
+carries no ``xfail`` mark of any kind, so every assertion below is live evidence
+rather than a promise. Both of the sentinels it used to carry were *discharged*,
+and each left a different lesson.
+
+T11.7's went first, and it was replaced rather than simply un-marked because it
+**could never have fired**: it asserted on rendered prose that could not contain
+the token it looked for, so the feature arriving would not have flipped it. A
+sentinel is only a sentinel if the thing it waits for can actually trip it — see
+``test_a_rate_plan_routes_on_the_rate_gate_and_a_deviation_plan_does_not``, which
+is asserted on typed fields for exactly that reason.
+
+T11.8's ``certification`` sentinel went second, on the wave that landed T11.33
+step 2's four ``measurements`` settle columns. That one *did* fire, as a strict
+XPASS, which is what a sentinel is for and also what made it a commit seam: the
+column and this module had to move together, or every session's suite went red
+on the flip. See
+``test_the_production_row_carries_the_certification_it_was_taken_under``.
 """
 
 from __future__ import annotations
@@ -181,6 +192,20 @@ class Rehearsal:
         return [os.path.basename(str(r.get("eis_file_path") or ""))
                 for r in ordered]
 
+    def production_rows(self) -> list[dict[str, Any]]:
+        """The post-settle read's own rows, ordered by ``measurement_id``.
+
+        Separated from the trial's ``measure_eis_*`` sweeps and the rounds'
+        ``settle_eis_*`` ones by step-name prefix, because that is the only
+        discriminator that reaches the database: ``measurements`` has no column
+        for the measurement tag. Ordered so ``[0]`` is a stable well rather than
+        whichever row the store happened to return first.
+        """
+        rows = [r for r in self.rows
+                if os.path.basename(str(r.get("eis_file_path") or ""))
+                .startswith(f"{PRODUCTION_STEP_PREFIX}_")]
+        return sorted(rows, key=lambda r: int(r["measurement_id"]))
+
 
 def _settle_plan(max_hold_s: float, **over: Any) -> SettlePlan:
     base = dict(round_period_s=0.05, min_hold_s=0.0, max_hold_s=max_hold_s,
@@ -254,15 +279,18 @@ def _spec(max_hold_s: float, *, measurement: MeasurementSpec | None = None,
 #: slowdown says *why* it failed rather than merely that it did.
 CEILING_HOLD_S = 80.0
 
-#: The three boards, the ceiling each needs, and which wells are swept at all
+#: The four boards, the ceiling each needs, and which wells are swept at all
 #: during the hold. See the module docstring on why the ceilings are tens of
 #: seconds rather than the fractions of a second the neighbouring fast-settle
 #: fixture uses, and why the unjudgeable wells are silenced outright rather than
 #: driven to the R1 floor.
 #:
-#: Every well is quiet in all three and every well has a thickness: what
-#: separates the boards is the DRIFT (does sigma move?) and the ABSENCE (did the
-#: well produce a round fit at all?), and both of those are deterministic.
+#: Every well that is swept at all is quiet on all four boards, and every well
+#: has a thickness: what separates the boards is the DRIFT (does sigma move?)
+#: and the ABSENCE (did the well produce a round fit at all?), and both of those
+#: are deterministic. Absence now spans the full range — none, two of four, all
+#: four — because since T11.33 step 3 it is absence alone that decides how wide
+#: a board the criterion sees.
 SCENARIOS: dict[str, dict[str, Any]] = {
     # Four wells, all measurable, none moving -> the criterion says settled.
     "settled": dict(
@@ -279,20 +307,39 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         absent_channels=(),
     ),
     # Two wells are never swept, so they carry no round fit at all and cannot
-    # vote: 2 participants against settle_min_channels=3. Their thickness is the
-    # same as everyone else's — withholding it stopped silencing anything at
-    # T11.33 Design A, which regresses 1/R1 and needs no geometry.
+    # vote. Their thickness is the same as everyone else's — withholding it
+    # stopped silencing anything at T11.33 Design A, which regresses 1/R1 and
+    # needs no geometry.
     #
-    # **Scheduled rewrite.** This board leans on the board minimum, and T11.33
-    # step 3 takes it off the campaign path (`board_minimum=None`, judge per
-    # well). When that lands, two absent wells of four will settle on the other
-    # two, and the scenario has to become "no well is judgeable at all" — every
-    # channel absent — which is spec section 7's test 17.
-    "not_evaluable": dict(
-        max_hold_s=CEILING_HOLD_S,
+    # **The scheduled rewrite, carried out.** This board used to be the
+    # `not_evaluable` fixture: 2 participants against `settle_min_channels=3`.
+    # T11.33 step 3 landed, and `drive_settle_phase` now builds its tracker with
+    # `board_minimum=None`, so the count is no longer a gate and the two quiet
+    # survivors settle the board on their own. Identical fixture, opposite
+    # verdict — which is exactly the ruling, so the board is kept for it.
+    "two_quiet": dict(
+        max_hold_s=90.0,
         drift_decades_per_hour=0.0,
         thickness_channels=CHANNELS,
         absent_channels=(23, 24),
+    ),
+    # No well is judgeable in any window — under `board_minimum=None` the ONLY
+    # route left to `not_evaluable`. Every channel is silenced, so every round is
+    # all-`absent` and `participating` is empty on every window.
+    #
+    # Its ceiling is seconds where the other three need tens of them, and that is
+    # the module docstring's rule applied rather than an exception to it:
+    # `max_hold_s` is sized against ROUND cost, and a round here costs
+    # approximately nothing. With every step withheld
+    # `build_settle_round_workflow` returns `None`, `_settle_round` returns `{}`
+    # without ever reaching the executor, and no fit runs at all. At
+    # `round_period_s=0.05` a 2 s ceiling is ~40 rounds against the `n_rounds >=
+    # 3` the test asserts; at CEILING_HOLD_S it would be ~1600 rounds of nothing.
+    "not_evaluable": dict(
+        max_hold_s=2.0,
+        drift_decades_per_hour=0.0,
+        thickness_channels=CHANNELS,
+        absent_channels=CHANNELS,
     ),
 }
 
@@ -300,8 +347,8 @@ SCENARIOS: dict[str, dict[str, Any]] = {
 def _no_settle_sweep_for(channels: Sequence[int]) -> Any:
     """``settle_measure_step``, minus the step for each of *channels*.
 
-    **The lever the unjudgeable board runs on, and it is the sweep rather than
-    the geometry.** A channel with no step in the round's workflow produces no
+    **The lever BOTH narrowed boards run on, and it is the sweep rather than the
+    geometry.** A channel with no step in the round's workflow produces no
     result for the executor to capture, so ``_settle_round`` hands
     ``settle_round_fits`` a ``None`` raw for it, that builds an all-``None``
     :class:`RoundFit`, and ``_exclusion`` reads exactly that shape as
@@ -311,12 +358,21 @@ def _no_settle_sweep_for(channels: Sequence[int]) -> Any:
     demand: ``1/R1`` fits without a thickness, so withholding one no longer
     silences anybody.
 
+    **Two boards, two channel counts, one mechanism.** ``two_quiet`` silences two
+    of four and keeps two survivors; ``not_evaluable`` silences all four, which
+    takes ``build_settle_round_workflow`` to ``None`` and ``_settle_round`` to an
+    empty mapping. ``settle_round_fits`` still returns one all-``None``
+    ``RoundFit`` per channel from that — it is documented to return one entry per
+    channel whatever the raws contain — so the criterion sees a full board of
+    ``absent`` wells rather than no board at all. That difference is also why the
+    all-silent board's ceiling is seconds: its rounds never reach the executor.
+
     **Not a raise, deliberately.** A mock pico that threw for those channels
     would fail the step, exhaust its retries and abort the whole round through
-    ``WorkflowExecutor``, losing the two wells that are supposed to survive; the
-    board would then be empty rather than narrow, which is a different verdict
-    reached for a different reason. Withholding the step is the one shape that
-    silences two channels and leaves the rest of the round untouched.
+    ``WorkflowExecutor``, losing any well that was supposed to survive; the board
+    would then be empty for a reason the criterion cannot see, which is a
+    different verdict reached differently. Withholding the step is the one shape
+    that silences a chosen subset and leaves the rest of the round untouched.
 
     Patched at ``wiring.settle_measure_step`` and not at the workflow builder,
     because the builder is what has to stay real: the surviving channels go
@@ -426,6 +482,11 @@ def settled_run(tmp_path_factory) -> Rehearsal:
 @pytest.fixture(scope="module")
 def ceiling_run(tmp_path_factory) -> Rehearsal:
     return asyncio.run(_drive("ceiling", tmp_path_factory.mktemp("ceiling")))
+
+
+@pytest.fixture(scope="module")
+def two_quiet_run(tmp_path_factory) -> Rehearsal:
+    return asyncio.run(_drive("two_quiet", tmp_path_factory.mktemp("two_quiet")))
 
 
 @pytest.fixture(scope="module")
@@ -629,38 +690,131 @@ def test_no_settle_round_was_filed_under_the_trials_own_measure_step(
                    for s in stems)
 
 
+# ── Retired here, and where it went (T11.45) ─────────────────────────
+#
+# `test_a_board_that_is_wide_enough_is_not_announced_as_narrow` stood at this point
+# and asserted `not settled_run.of_type("settle_unevaluable_board")`. The emitter it
+# watched is gone: T11.33 step 3 took the board-level minimum off the campaign path
+# (`drive_settle_phase` passes `board_minimum=None`), so no board is announced as too
+# narrow, and the negative could no longer fail for any reason — `SUBAGENT_RULES`
+# §3.1(e), a check that cannot cry.
+#
+# **Re-pointing it at the replacement would have been a second vacuous assertion, on
+# this fixture specifically.** `settle_min_channels_ignored` is gated on the FLAT
+# `spec.settle_min_channels`, and this module says its settle parameters structurally,
+# on the EQUILIBRATE phase — `CampaignSpec.settle_plan` *raises* on a spec that says it
+# both ways, so here the flat field is not merely unset, it is unsettable, and the
+# event can never fire.
+#
+# Where the claim lives now, all of it off this module's rig time:
+#   * `tests/test_autonomous_wiring.py` —
+#     `test_campaign_start_emits_settle_min_channels_ignored_when_the_spec_sets_it`
+#     and its `..._when_unset` twin: both arms, on a spec that *can* set the flat
+#     field. The first used to carry a `settle_unevaluable_board` negative beside
+#     them; T11.51 retired that too, for the same §3.1(e) reason and a stronger
+#     one — T11.33 step 3 left the emitter with zero hits anywhere in `src/`, so
+#     the negative was vacuous on *every* fixture, not just this module's. What
+#     stands there now is the positive pair: the replacement event fires, with the
+#     right payload, and it fires instead. The retired name survives there only in
+#     that test's own comment.
+#   * `tests/test_campaign_settle_phase.py` —
+#     `test_settle_mode_announces_the_deviation_default_and_its_absent_band`, which
+#     pins `settle_min_channels` still travelling in the `settle_mode` payload: the key
+#     is ignored on this path, never silently dropped.
+#   * This module's own `test_every_well_that_could_be_judged_was_counted_as_evidence`
+#     is the positive form of what was asserted here — all four wells participate and
+#     nothing is excluded — and it can fail, which is why it is the one kept.
+
+
 @pytest.mark.slow
-def test_a_board_that_is_wide_enough_is_not_announced_as_narrow(
-    settled_run: Rehearsal
-):
-    """Four channels clear ``settle_min_channels=3``, so the warning must be silent.
-
-    The narrow-board announcement itself is covered by
-    ``test_campaign_settle_phase.py``; what this board establishes is its
-    absence, which is the half that would otherwise go unchecked.
-    """
-    assert not settled_run.of_type("settle_unevaluable_board")
-
-
-@pytest.mark.slow
-@pytest.mark.xfail(strict=True,
-                   reason="T11.8 (parallel): no certification field exists on a "
-                          "measurement row yet")
 def test_the_production_row_carries_the_certification_it_was_taken_under(
     settled_run: Rehearsal
 ):
     """A sigma taken at ``ceiling`` is a weaker claim than one taken at ``settled``.
 
-    Today the verdict lives only in the sidecar, so a reader holding a row
-    cannot tell which. When T11.8 lands this flips to a loud XPASS. **If that
-    column ships under a name other than ``certification``, this assertion moves
+    Live since T11.33 step 2 landed the column. It was a strict ``xfail`` until
+    then and flipped to a loud XPASS on the wave that built it, which is what
+    made the two a commit seam rather than a follow-up.
+
+    What it guards from here is the **funnel**, which has five hops and no other
+    test in this module crosses all of them: ``SettleOutcome.outcome`` to the
+    per-channel tag dict ``_equilibrate`` builds, to
+    ``production_read._stamp_settle_tags``, to the router's
+    ``tags.get("certification")``, to the ``measurements`` column. Break any hop
+    and the column goes NULL — and NULL is not a loud failure here, because it
+    reads downstream exactly like a row from a read that was never taken under a
+    settle phase at all. **If that column is ever renamed, this assertion moves
     with it** rather than being left to rot.
+
+    Asserted on **every** production row rather than on the first: the tag is
+    stamped per channel, so a stamp that reached one well and missed three is a
+    shape ``production[0]`` alone cannot see.
     """
-    production = [r for r in settled_run.rows
-                  if os.path.basename(str(r.get("eis_file_path") or ""))
-                  .startswith(f"{PRODUCTION_STEP_PREFIX}_")]
+    production = settled_run.production_rows()
+    assert sorted(int(r["channel"]) for r in production) == list(CHANNELS)
+    assert ([r["certification"] for r in production]
+            == [SETTLE_SETTLED] * len(CHANNELS))
+
+
+@pytest.mark.slow
+def test_a_ceiling_board_stamps_its_own_word_rather_than_settled(
+    ceiling_run: Rehearsal
+):
+    """The column carries the board's OWN word, not a constant that agrees with it.
+
+    The settled board above cannot distinguish those two: ``SETTLE_SETTLED`` is
+    also what a hard-coded stamp, or a default, would say. This is that test's
+    positive control — same funnel, different verdict — and it costs no extra rig
+    time, because the ceiling fixture already exists for the test below.
+
+    It is also the claim T11.8 was actually for. A reader holding a row is meant
+    to be able to tell a sigma measured on a board that certified from one
+    measured on a board that merely ran out of hold, and ``ceiling`` is the word
+    that says so.
+    """
+    production = ceiling_run.production_rows()
+    assert sorted(int(r["channel"]) for r in production) == list(CHANNELS)
+    assert ([r["certification"] for r in production]
+            == [SETTLE_CEILING] * len(CHANNELS))
+
+
+@pytest.mark.slow
+def test_the_per_well_settle_columns_are_null_under_the_deviation_criterion(
+    settled_run: Rehearsal
+):
+    """The other three of T11.33's four columns — NULL here is a fact, not a gap.
+
+    Step 2 writes **four** columns, and they carry two different facts, which is
+    why they are four and not one. ``certification`` is the **board's**
+    ``SETTLE_*`` word; ``well_verdict`` / ``rate_per_hour`` /
+    ``upper_bound_per_hour`` are **this well's own**. A quiet well on a board
+    that timed out is ``(ceiling, rate_quiet)``, and one column cannot say that.
+
+    All three are NULL on this board, legitimately and by construction. The
+    chain: ``_settle_plan`` never names a ``criterion``, so the plan carries the
+    shipped ``SETTLE_CRITERION_DEVIATION`` default; under it
+    ``SettleTracker.observe`` leaves ``last_rate`` at ``None``; so
+    ``SettleOutcome.by_channel`` is ``{}``; so ``_equilibrate`` stamps the
+    ``certification`` tag and **no** per-well tag; so the router's present-only
+    ``tags.get`` leaves the three columns unset. Only ``criterion="rate"`` or
+    ``"both"`` ever populates them, and no board in this module runs one — the
+    populated case belongs where the rate criterion is actually driven, in
+    ``test_campaign_settle_phase.py`` and ``test_equilibration_rate_criterion.py``.
+
+    Asserted rather than left alone, because an unchecked column is how a column
+    nothing ever writes stays invisible. If the deviation path ever begins
+    stamping a per-well word, that arrives here as a red rather than as a value
+    nobody had looked at.
+    """
+    production = settled_run.production_rows()
     assert production
-    assert production[0]["certification"] == SETTLE_SETTLED
+    for row in production:
+        assert row["well_verdict"] is None, row
+        assert row["rate_per_hour"] is None, row
+        assert row["upper_bound_per_hour"] is None, row
+    # The board word is present on these same rows, so "all four NULL" — the
+    # shape a broken tag funnel produces — cannot masquerade as this result.
+    assert all(r["certification"] == SETTLE_SETTLED for r in production)
 
 
 # ── The other two outcomes ───────────────────────────────────────────────────
@@ -689,44 +843,88 @@ def test_a_drifting_board_runs_to_the_ceiling_without_parking_the_campaign(
 
 
 @pytest.mark.slow
-def test_two_absent_wells_leave_the_criterion_unable_to_judge(
-    not_evaluable_run: Rehearsal
+def test_a_two_well_board_settles_when_both_wells_are_quiet(
+    two_quiet_run: Rehearsal
 ):
-    """*"Could not judge"* and *"judged, not settled"* want opposite actions.
+    """T11.33's ruling, at the one surface this module can see it: the verdict.
 
-    Two participants against ``settle_min_channels=3``: the phase runs to its
-    ceiling and says it could not be evaluated, rather than reporting a drift it
-    never measured. The two silent wells get no settle sweep at all
-    (:func:`_no_settle_sweep_for`), so every round builds an all-``None``
-    ``RoundFit`` for them and the criterion reads that as ``absent`` — a real
-    production state (an unmeasured well, or a step that never completed,
-    reaches the criterion the same way), and the only exclusion reason this rig
-    can produce on demand now that ``1/R1`` needs no thickness.
+    *"Each individual well valued equally"*. Two of the four wells are never
+    swept and are excluded ``absent`` (:func:`_no_settle_sweep_for`), and the
+    board settles anyway, on the two that spoke. This identical fixture reported
+    ``not_evaluable`` before T11.33 step 3, because two participants did not
+    clear ``settle_min_channels=3``; the plan still carries that key and the
+    tracker still resolves it, but ``drive_settle_phase`` passes
+    ``board_minimum=None`` and the count stops being a gate on this path. The two
+    tool paths keep theirs, which is why the key became a policy rather than a
+    deletion.
 
-    **Scheduled rewrite, named here so it is not discovered as a red.** This
-    board leans on the board minimum, and T11.33 step 3 takes that off the
-    campaign path (``board_minimum=None``, judge per well). When it lands, two
-    absent wells of four will settle on the other two, and this scenario must
-    become *no judgeable well at all* — every channel absent — which is spec
-    section 7's test 17.
+    The excluded pair is asserted beside the verdict on purpose: *"settled on two
+    of four"* and *"settled on four of four"* are the same word, and only the
+    participant list separates a board that survived a narrowing from one that
+    was never narrowed. Without it this test would pass just as happily if the
+    silencing patch quietly stopped working.
     """
-    verdicts = not_evaluable_run.of_type("settle_verdict")
+    verdicts = two_quiet_run.of_type("settle_verdict")
     assert len(verdicts) == 1
-    # Diagnosis before assertion. A phase that stopped before the tracker had a
-    # full window also reports `not_evaluable` — with no participants and no
-    # exclusions — and that is the *ceiling being too low*, not the board being
-    # too narrow. The two are the same word for opposite facts.
+    # Diagnosis before assertion, as on every board here: a verdict reached on
+    # fewer than `settle_n_rounds` rounds is the ceiling speaking, not the
+    # criterion.
     assert verdicts[0]["n_rounds"] >= 3, (
-        f"only {verdicts[0]['n_rounds']} round(s) fitted inside "
-        f"max_hold_s={CEILING_HOLD_S:g}s, so no window was ever judged; this "
+        f"only {verdicts[0]['n_rounds']} round(s) fitted inside max_hold_s; this "
         f"verdict is the ceiling firing early, not the criterion speaking"
     )
-    assert verdicts[0]["settle_outcome"] == SETTLE_NOT_EVALUABLE
+    assert verdicts[0]["settle_outcome"] == SETTLE_SETTLED
     assert sorted(verdicts[0]["participating"]) == [21, 22]
     # `settle.json` round-trips the mapping through JSON, so its keys are
     # strings; the event's are not. Compared as strings on both sides.
     excluded = {str(k): v for k, v in verdicts[0]["excluded"].items()}
     assert excluded == {"23": EXCLUDED_ABSENT, "24": EXCLUDED_ABSENT}
+    assert not two_quiet_run.of_type("park")
+
+
+@pytest.mark.slow
+def test_a_board_with_no_judgeable_well_reports_not_evaluable(
+    not_evaluable_run: Rehearsal
+):
+    """*"Could not judge"* and *"judged, not settled"* want opposite actions.
+
+    Under ``board_minimum=None`` there is exactly one route left to this word,
+    and this board is it: **no** well was ever judgeable in **any** window. All
+    four channels are silenced by :func:`_no_settle_sweep_for`, so every round
+    builds an all-``None`` ``RoundFit`` for every channel and ``_exclusion``
+    reads each as ``absent`` — a real production state, since an unmeasured well
+    and a step that never completed reach the criterion the same way.
+
+    This is the rewrite the previous version of this test announced as scheduled.
+    It forced the word with *two* absent wells against ``settle_min_channels=3``;
+    step 3 took that gate off the campaign path and the board it described now
+    settles — kept, for its new verdict, as
+    :func:`test_a_two_well_board_settles_when_both_wells_are_quiet`. The
+    announcement was worth what it cost: the flip arrived as a named rewrite
+    rather than as an unexplained red.
+
+    Reaching the end of the hold with nothing to judge is not a fault. The
+    campaign proceeds, the verdict is still recorded, and nothing parks.
+    """
+    verdicts = not_evaluable_run.of_type("settle_verdict")
+    assert len(verdicts) == 1
+    # Diagnosis before assertion. A phase that stopped before the tracker had a
+    # full window ALSO reports `not_evaluable` — that is the ceiling sized below
+    # the round cost, not the board being unjudgeable, and they are the same word
+    # for opposite facts. On this board the two are easy to keep apart: a round
+    # with no sweeps never reaches the executor, so a shortfall here would mean
+    # the 2 s ceiling itself was wrong rather than that the fits were slow.
+    assert verdicts[0]["n_rounds"] >= 3, (
+        f"only {verdicts[0]['n_rounds']} round(s) ran inside max_hold_s, so no "
+        f"window was ever judged; this verdict is the ceiling firing early, not "
+        f"the criterion speaking"
+    )
+    assert verdicts[0]["settle_outcome"] == SETTLE_NOT_EVALUABLE
+    assert verdicts[0]["participating"] == []
+    # `settle.json` round-trips the mapping through JSON, so its keys are
+    # strings; the event's are not. Compared as strings on both sides.
+    excluded = {str(k): v for k, v in verdicts[0]["excluded"].items()}
+    assert excluded == {str(ch): EXCLUDED_ABSENT for ch in CHANNELS}
     # Still recorded, and still not a reason to stop.
     assert not_evaluable_run.settle_records
     assert not not_evaluable_run.of_type("park")
