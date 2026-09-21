@@ -486,22 +486,60 @@ async def test_a_ceiling_does_not_park_the_campaign(
     store.close()
 
 
+# T11.52: this test was `..._is_announced_not_discovered` and watched the retired
+# `settle_unevaluable_board` emitter. **Re-pointing it at the replacement would
+# have been vacuous.** `settle_min_channels_ignored` fires on
+# `spec.settle_min_channels is not SPEC_UNSET` — a property of the *spec*, which
+# `_fast_settle_spec` sets for every test in this file — so it has nothing to say
+# about board width: run verbatim with the default four channels, the old body
+# emitted the same event, returned the same `n_trials`, and recorded the same
+# `not_evaluable`. Every assertion passed without a narrow board, which is
+# `SUBAGENT_RULES` §3.1(e). The ignored-key claim is covered directly, both arms,
+# by `test_autonomous_wiring.py::test_campaign_start_emits_settle_min_channels_
+# ignored_when_the_spec_sets_it` and its `..._when_unset` twin, so it is not
+# re-asserted here.
+#
+# What is kept is the claim T11.33 actually made and nothing pinned: a board
+# narrower than the criterion's channel count is *judged*, well by well, rather
+# than refused board-wide. That is what `board_minimum=None` buys, and the
+# assertion below could not pass under the behaviour it replaced — the old path
+# returned `not_evaluable` with `participating == []` for exactly this board.
 @pytest.mark.asyncio
-async def test_a_board_narrower_than_the_criterion_is_announced_not_discovered(
+async def test_a_board_narrower_than_the_criterion_is_judged_well_by_well(
     connected, tmp_path: Path
 ):
-    """It still runs — to the ceiling — but not silently."""
+    """One channel is a board like any other: judged, not refused.
+
+    ``settle_min_channels=3`` against a single-channel board used to be a
+    board-level refusal. After T11.33 the campaign path passes
+    ``board_minimum=None``, so the one well present is tracked on its own merits
+    and reaches an ordinary verdict.
+    """
     store = DataStore(tmp_path / "proj")
     events: list[dict] = []
+    # `max_hold_s` must clear `settle_n_rounds` rounds or the hold ends before
+    # the criterion has any history and *every* board — narrow or wide — reports
+    # `not_evaluable` for want of rounds, which would make the assertion below
+    # about the ceiling rather than about board width. RH gate off for the same
+    # reason the σ-ceiling test above turns it off: the subject here is the
+    # channel count, not the room.
     result = await wiring.run_autonomous_campaign(
-        _fast_settle_spec(channels=(21,), budget=1),
+        _fast_settle_spec(channels=(21,), budget=1, max_hold_s=120.0,
+                          rh_stability_pct=None),
         manager=connected, data_store=store, on_event=events.append)
 
-    warned = [e for e in events if e["type"] == "settle_unevaluable_board"]
-    assert warned and warned[0]["settle_min_channels"] == 3
-    assert result.n_trials == 1          # announced, not fatal
+    assert result.n_trials == 1          # judged, not fatal
     verdicts = [e for e in events if e["type"] == "settle_verdict"]
-    assert all(v["settle_outcome"] == SETTLE_NOT_EVALUABLE for v in verdicts)
+    assert verdicts, "the phase ran but recorded nothing"
+    for verdict in verdicts:
+        # The load-bearing assertion: the sole well participated. Board-level
+        # refusal produced `participating == []` here, so this line is the one
+        # that could not have passed before.
+        assert verdict["participating"] == [21]
+        # Not merely "something other than `not_evaluable`": the well is judged
+        # on its own merits and the mock's rounds are identical, so the deviation
+        # criterion has one deterministic answer.
+        assert verdict["settle_outcome"] == SETTLE_SETTLED
     store.close()
 
 
