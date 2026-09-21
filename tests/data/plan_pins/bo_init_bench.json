@@ -1,0 +1,676 @@
+{
+  "provenance": {
+    "pinned_at_HEAD": "251b64d9959cd6147e4285592bb2ca0ce54e3f51",
+    "this_example_uncommitted_when_pinned": "?? examples/bo_init_bench.toml",
+    "compiled_by": "softae.core.autonomous_wiring.build_trial_workflow — a compiled Workflow, never a projection",
+    "catalogs": [
+      "tests/data/plan_pins/fixture_tasks.toml",
+      "tests/data/plan_pins/fixture_chemicals.csv",
+      "tests/data/plan_pins/fixture_solutions.csv"
+    ],
+    "params": "parameter-space midpoint, as preflight.project_campaign derives it",
+    "working_tree_when_pinned": [
+      "M README.md",
+      " M calibration/eis/mux16.toml",
+      " M docs/USER_GUIDE.md",
+      " M docs/index.md",
+      " M examples/bench_instance.toml",
+      " M examples/rung3a_fake_cast.toml",
+      " M src/softae/analysis/eis/gates.py",
+      " M src/softae/analysis/equilibration.py",
+      " M src/softae/core/autonomous_wiring.py",
+      " M src/softae/drivers/mock_espico.py",
+      " M src/softae/tools/eis_validate_mock.py",
+      " M tests/conftest.py",
+      " M tests/test_campaign_settle_phase.py",
+      " M tests/test_campaign_spec_run_plan.py",
+      " M tests/test_eis_envelope.py",
+      " M tests/test_eis_gates.py",
+      " M tests/test_eis_phase_floor_rows.py",
+      " M tests/test_eis_validate.py",
+      " M tests/test_equilibration_rate_criterion.py",
+      " M tests/test_equilibration_workflow.py",
+      "?? examples/bo_init_bench.toml",
+      "?? tests/data/",
+      "?? tests/test_plan_pins.py"
+    ],
+    "dirty_source_participation": "none — verified by compiling this example in a pristine `git archive HEAD` tree with no data/ directory: every pin reproduces, so no other session's uncommitted source takes part. A non-false `this_example_uncommitted_when_pinned` above is the one input that does: the pin then records a state HEAD does not yet hold, and becomes reproducible from HEAD only once that file commits.",
+    "note": "Regenerate only for an INTENDED behaviour change, and say which pin changed and why in the commit message."
+  },
+  "workflow": {
+    "name": "bo_init_bench_trial",
+    "iterations": 1,
+    "setup": [
+      {
+        "name": "conditions_baseline_temp_sp_baseline",
+        "instrument": "temp_controller",
+        "method": "write_sp",
+        "params": {
+          "T_SP": 25.0,
+          "print_flag": 0
+        },
+        "timeout_s": 30.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "axis": "temperature",
+          "baseline": "true",
+          "condition": "baseline",
+          "phase": "conditions"
+        }
+      },
+      {
+        "name": "conditions_baseline_rh_sp_baseline",
+        "instrument": "rh_controller",
+        "method": "set_setpoint",
+        "params": {
+          "val": 22.0
+        },
+        "timeout_s": 30.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "axis": "humidity",
+          "baseline": "true",
+          "condition": "baseline",
+          "phase": "conditions"
+        }
+      },
+      {
+        "name": "conditions_baseline_rh_start_baseline",
+        "instrument": "rh_controller",
+        "method": "start",
+        "params": {},
+        "timeout_s": 30.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "axis": "humidity",
+          "baseline": "true",
+          "condition": "baseline",
+          "phase": "conditions"
+        }
+      },
+      {
+        "name": "startup_flush",
+        "instrument": "liquid_handler",
+        "method": "startup_flush",
+        "params": {
+          "disp_rate": 200.0,
+          "disp_vol": 150,
+          "disp_vols": [
+            80.0,
+            80.0,
+            80.0
+          ],
+          "flush_x": -50.0,
+          "flush_y": 50.0,
+          "ids": [
+            0,
+            1,
+            2
+          ],
+          "post_flush_dwell_s": 60.0,
+          "res_vol": 1000,
+          "settle_factor": 1.5,
+          "time_scale": 1.0,
+          "wick_dwell_s": 5.0,
+          "wick_x": -50.0,
+          "wick_y": -25.0
+        },
+        "timeout_s": 900.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {}
+      },
+      {
+        "name": "conditions_casting_temp_sp_ch1",
+        "instrument": "temp_controller",
+        "method": "write_sp",
+        "params": {
+          "T_SP": 25.0,
+          "print_flag": 0
+        },
+        "timeout_s": 30.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "axis": "temperature",
+          "condition": "casting",
+          "phase": "conditions"
+        }
+      },
+      {
+        "name": "conditions_casting_temp_wait_ch1",
+        "instrument": "temp_controller",
+        "method": "wait",
+        "params": {
+          "timeout": 1800.0,
+          "within": 2.0
+        },
+        "timeout_s": 2310.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "axis": "temperature",
+          "condition": "casting",
+          "phase": "conditions"
+        }
+      },
+      {
+        "name": "conditions_casting_rh_sp_ch1",
+        "instrument": "rh_controller",
+        "method": "set_setpoint",
+        "params": {
+          "val": 22.0
+        },
+        "timeout_s": 30.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "axis": "humidity",
+          "condition": "casting",
+          "phase": "conditions"
+        }
+      },
+      {
+        "name": "conditions_casting_rh_start_ch1",
+        "instrument": "rh_controller",
+        "method": "start",
+        "params": {},
+        "timeout_s": 30.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "axis": "humidity",
+          "condition": "casting",
+          "phase": "conditions"
+        }
+      },
+      {
+        "name": "conditions_casting_rh_wait_ch1",
+        "instrument": "rh_controller",
+        "method": "wait",
+        "params": {
+          "raise_on_timeout": true,
+          "target": 22.0,
+          "timeout": 1800.0,
+          "tol": 2.0
+        },
+        "timeout_s": 2310.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "axis": "humidity",
+          "condition": "casting",
+          "phase": "conditions"
+        }
+      },
+      {
+        "name": "deposit_ch1",
+        "instrument": "liquid_handler",
+        "method": "single_drop_simul",
+        "params": {
+          "deadvols": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "disp_rate": 75.0,
+          "elution_wait_s": 240.0,
+          "ids": [
+            0,
+            1,
+            2
+          ],
+          "res_vol": 10000,
+          "time_scale": 1.0,
+          "vols": [
+            83.19227634552729,
+            13.978125000000015,
+            0.5771941368501707
+          ],
+          "wick_dwell_s": 5.0,
+          "wick_x": -50.0,
+          "wick_y": -25.0,
+          "x": 43.5,
+          "y": 50.0
+        },
+        "timeout_s": 600.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "channel": "1",
+          "phase": "deposit"
+        }
+      },
+      {
+        "name": "deposit_ch2",
+        "instrument": "liquid_handler",
+        "method": "single_drop_simul",
+        "params": {
+          "deadvols": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "disp_rate": 75.0,
+          "elution_wait_s": 240.0,
+          "ids": [
+            0,
+            1,
+            2
+          ],
+          "res_vol": 10000,
+          "time_scale": 1.0,
+          "vols": [
+            83.19227634552729,
+            13.978125000000015,
+            0.5771941368501707
+          ],
+          "wick_dwell_s": 5.0,
+          "wick_x": -50.0,
+          "wick_y": -25.0,
+          "x": 33.5,
+          "y": 50.0
+        },
+        "timeout_s": 600.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "channel": "2",
+          "phase": "deposit"
+        }
+      },
+      {
+        "name": "deposit_ch3",
+        "instrument": "liquid_handler",
+        "method": "single_drop_simul",
+        "params": {
+          "deadvols": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "disp_rate": 75.0,
+          "elution_wait_s": 240.0,
+          "ids": [
+            0,
+            1,
+            2
+          ],
+          "res_vol": 10000,
+          "time_scale": 1.0,
+          "vols": [
+            83.19227634552729,
+            13.978125000000015,
+            0.5771941368501707
+          ],
+          "wick_dwell_s": 5.0,
+          "wick_x": -50.0,
+          "wick_y": -25.0,
+          "x": 23.5,
+          "y": 50.0
+        },
+        "timeout_s": 600.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "channel": "3",
+          "phase": "deposit"
+        }
+      },
+      {
+        "name": "deposit_ch4",
+        "instrument": "liquid_handler",
+        "method": "single_drop_simul",
+        "params": {
+          "deadvols": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "disp_rate": 75.0,
+          "elution_wait_s": 240.0,
+          "ids": [
+            0,
+            1,
+            2
+          ],
+          "res_vol": 10000,
+          "time_scale": 1.0,
+          "vols": [
+            83.19227634552729,
+            13.978125000000015,
+            0.5771941368501707
+          ],
+          "wick_dwell_s": 5.0,
+          "wick_x": -50.0,
+          "wick_y": -25.0,
+          "x": 13.5,
+          "y": 50.0
+        },
+        "timeout_s": 600.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "channel": "4",
+          "phase": "deposit"
+        }
+      },
+      {
+        "name": "conditions_anneal_temp_sp_all",
+        "instrument": "temp_controller",
+        "method": "write_sp",
+        "params": {
+          "T_SP": 25.0,
+          "print_flag": 0
+        },
+        "timeout_s": 30.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "axis": "temperature",
+          "condition": "anneal",
+          "phase": "conditions"
+        }
+      },
+      {
+        "name": "conditions_anneal_temp_wait_all",
+        "instrument": "temp_controller",
+        "method": "wait",
+        "params": {
+          "timeout": 1800.0,
+          "within": 2.0
+        },
+        "timeout_s": 2310.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "axis": "temperature",
+          "condition": "anneal",
+          "phase": "conditions"
+        }
+      },
+      {
+        "name": "conditions_anneal_rh_sp_all",
+        "instrument": "rh_controller",
+        "method": "set_setpoint",
+        "params": {
+          "val": 22.0
+        },
+        "timeout_s": 30.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "axis": "humidity",
+          "condition": "anneal",
+          "phase": "conditions"
+        }
+      },
+      {
+        "name": "conditions_anneal_rh_start_all",
+        "instrument": "rh_controller",
+        "method": "start",
+        "params": {},
+        "timeout_s": 30.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "axis": "humidity",
+          "condition": "anneal",
+          "phase": "conditions"
+        }
+      },
+      {
+        "name": "conditions_anneal_rh_wait_all",
+        "instrument": "rh_controller",
+        "method": "wait",
+        "params": {
+          "raise_on_timeout": true,
+          "target": 22.0,
+          "timeout": 14400.0,
+          "tol": 2.0
+        },
+        "timeout_s": 18060.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "axis": "humidity",
+          "condition": "anneal",
+          "phase": "conditions"
+        }
+      },
+      {
+        "name": "anneal_to_flush_all",
+        "instrument": "stage",
+        "method": "move_to",
+        "params": {
+          "x": -50.0,
+          "y": 50.0
+        },
+        "timeout_s": null,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "phase": "anneal"
+        }
+      },
+      {
+        "name": "anneal_rest_all",
+        "instrument": "syringe",
+        "method": "head_descend",
+        "params": {},
+        "timeout_s": null,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "phase": "anneal"
+        }
+      },
+      {
+        "name": "anneal_all",
+        "instrument": "temp_controller",
+        "method": "anneal",
+        "params": {
+          "hold_time_s": 28800,
+          "ramp_rate": 5,
+          "target_temp_C": 85,
+          "tolerance": 1.0
+        },
+        "timeout_s": 36900.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "phase": "anneal",
+          "purge_window": "concurrent"
+        }
+      },
+      {
+        "name": "anneal_leave_rest_all",
+        "instrument": "syringe",
+        "method": "head_retract",
+        "params": {},
+        "timeout_s": null,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "phase": "anneal"
+        }
+      },
+      {
+        "name": "conditions_equilibrate_temp_sp_all",
+        "instrument": "temp_controller",
+        "method": "write_sp",
+        "params": {
+          "T_SP": 25.0,
+          "print_flag": 0
+        },
+        "timeout_s": 30.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "axis": "temperature",
+          "condition": "equilibrate",
+          "phase": "conditions"
+        }
+      },
+      {
+        "name": "conditions_equilibrate_temp_wait_all",
+        "instrument": "temp_controller",
+        "method": "wait",
+        "params": {
+          "timeout": 10800.0,
+          "within": 2.0
+        },
+        "timeout_s": 13560.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "axis": "temperature",
+          "condition": "equilibrate",
+          "phase": "conditions"
+        }
+      },
+      {
+        "name": "conditions_equilibrate_rh_sp_all",
+        "instrument": "rh_controller",
+        "method": "set_setpoint",
+        "params": {
+          "val": 22.0
+        },
+        "timeout_s": 30.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "axis": "humidity",
+          "condition": "equilibrate",
+          "phase": "conditions"
+        }
+      },
+      {
+        "name": "conditions_equilibrate_rh_start_all",
+        "instrument": "rh_controller",
+        "method": "start",
+        "params": {},
+        "timeout_s": 30.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "axis": "humidity",
+          "condition": "equilibrate",
+          "phase": "conditions"
+        }
+      },
+      {
+        "name": "conditions_equilibrate_rh_wait_all",
+        "instrument": "rh_controller",
+        "method": "wait",
+        "params": {
+          "raise_on_timeout": true,
+          "target": 22.0,
+          "timeout": 1800.0,
+          "tol": 2.0
+        },
+        "timeout_s": 2310.0,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {
+          "axis": "humidity",
+          "condition": "equilibrate",
+          "phase": "conditions"
+        }
+      },
+      {
+        "name": "measure_eis_ch1",
+        "instrument": "pico1",
+        "method": "sendscript_getdata",
+        "params": {
+          "chan": 1,
+          "mscrpath": "C:\\Users\\Osuji\\AppData\\Local\\Temp\\softae_ch1.mscr",
+          "outdir": "C:\\Users\\Osuji\\AppData\\Local\\Temp\\softae_eis_output"
+        },
+        "timeout_s": 600,
+        "retry": 1,
+        "depends_on": [],
+        "tags": {
+          "channel": "1",
+          "measurement": "primary",
+          "purge_window": "concurrent"
+        }
+      },
+      {
+        "name": "measure_eis_ch2",
+        "instrument": "pico1",
+        "method": "sendscript_getdata",
+        "params": {
+          "chan": 2,
+          "mscrpath": "C:\\Users\\Osuji\\AppData\\Local\\Temp\\softae_ch2.mscr",
+          "outdir": "C:\\Users\\Osuji\\AppData\\Local\\Temp\\softae_eis_output"
+        },
+        "timeout_s": 600,
+        "retry": 1,
+        "depends_on": [],
+        "tags": {
+          "channel": "2",
+          "measurement": "primary",
+          "purge_window": "concurrent"
+        }
+      },
+      {
+        "name": "measure_eis_ch3",
+        "instrument": "pico1",
+        "method": "sendscript_getdata",
+        "params": {
+          "chan": 3,
+          "mscrpath": "C:\\Users\\Osuji\\AppData\\Local\\Temp\\softae_ch3.mscr",
+          "outdir": "C:\\Users\\Osuji\\AppData\\Local\\Temp\\softae_eis_output"
+        },
+        "timeout_s": 600,
+        "retry": 1,
+        "depends_on": [],
+        "tags": {
+          "channel": "3",
+          "measurement": "primary",
+          "purge_window": "concurrent"
+        }
+      },
+      {
+        "name": "measure_eis_ch4",
+        "instrument": "pico1",
+        "method": "sendscript_getdata",
+        "params": {
+          "chan": 4,
+          "mscrpath": "C:\\Users\\Osuji\\AppData\\Local\\Temp\\softae_ch4.mscr",
+          "outdir": "C:\\Users\\Osuji\\AppData\\Local\\Temp\\softae_eis_output"
+        },
+        "timeout_s": 600,
+        "retry": 1,
+        "depends_on": [],
+        "tags": {
+          "channel": "4",
+          "measurement": "primary",
+          "purge_window": "concurrent"
+        }
+      }
+    ],
+    "loop_steps": [],
+    "teardown": [
+      {
+        "name": "final_flush",
+        "instrument": "syringe",
+        "method": "single_pump",
+        "params": {
+          "ID": 0,
+          "dispense_vol": 80,
+          "rate": 200,
+          "res_vol": 1000
+        },
+        "timeout_s": null,
+        "retry": 0,
+        "depends_on": [],
+        "tags": {}
+      }
+    ]
+  }
+}

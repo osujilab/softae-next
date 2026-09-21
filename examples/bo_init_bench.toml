@@ -1,0 +1,345 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# BO INIT BENCH — a dry run of the optimizer's WARM-UP, and of nothing else.
+#
+#   softae-campaign check examples/bo_init_bench.toml
+#   softae-campaign run   examples/bo_init_bench.toml --head-up --yes \
+#       --project <project>
+#
+# WHY THIS FILE EXISTS: `examples/bench_instance.toml` CANNOT EXERCISE THE INIT
+# PHASE. It sets `optimizer = "grid"` over a single `[parameter_space.replicate]`
+# int axis, and `GridSearchOptimizer` has no warm-up branch at all — it
+# enumerates its lattice deterministically from the first call to the last. The
+# warm-up is a `BayesianOptimizer` property and lives in exactly one place,
+# `BayesianOptimizer._propose` (`optimizers/bayesian.py`):
+#
+#     if len(self._history) < self._n_initial:
+#         return self._random_point()
+#
+# So a file that means to rehearse the init phase must say `bayesian`, and must
+# arrange for that branch to be the only one taken.
+#
+# THE ARITHMETIC THAT MAKES THE WHOLE RUN WARM-UP, AND IT IS DELIBERATE:
+#
+#   `build_optimizer` (`core/autonomous_wiring.py`) constructs the optimizer as
+#   `BayesianOptimizer(..., n_initial=min(5, spec.budget), ...)`. There is no
+#   spec field for `n_initial` — `min(5, budget)` is the whole rule — so:
+#
+#       budget = 4  →  n_initial = min(5, 4) = 4
+#
+#   and the campaign spends its entire budget before `len(_history)` can ever
+#   reach `_n_initial`. NO GP IS EVER FIT. That is not a truncated campaign that
+#   ran out of plate: it is the point of the file. Four suggestions, four
+#   uniform random points in the box below, zero surrogate fits, zero
+#   acquisition evaluations.
+#
+#   `batch = true` with four channels makes those four suggestions ONE round:
+#   `batch_size = len(channels)` (`run_autonomous_campaign`) and
+#   `_run_batch_round` asks `suggest_batch(4)`. The batch strategy appends a
+#   *fantasy* to `_history` after each pick (`_SequentialFantasyStrategy.propose`),
+#   so the history the branch tests against grows 0 → 1 → 2 → 3 across the round
+#   — still strictly below 4 on every ask, so all four picks are warm-up picks
+#   too. Raising `budget` past 5 is what breaks this: the fifth ask is the first
+#   with `len(_history) >= n_initial`, and the fifth ask is where the GP starts.
+#
+# TO TURN THIS INTO THE FULL BO RUN, CHANGE `budget` AND NOTHING ELSE. Every
+# other key here is already what a searching campaign wants. `budget = 32` fills
+# a board over eight rounds of four; the first round is still the warm-up this
+# file rehearses, and rounds 2-8 fit the GP. See
+# `docs/SubAgent docs/bo_init_bench_spec.md`.
+#
+# WHAT A FRESH CHECKOUT NEEDS BEFORE THIS FILE WILL LOAD. `data/` — `tasks.toml`,
+# `recipes.toml` and the chemicals/solutions CSVs — is gitignored **by policy**:
+# each new instance of this system needs users to develop their own processes,
+# recipes and workflows that best reflect the integrated hardware. This file
+# names three stocks and one catalog task, so on a fresh clone it needs
+# `data/chemicals.csv` to carry `Ethylene oxide`, `Lithium chloride` and
+# `Fumed silica`; `data/solutions.csv` to carry the three `[general_formulation]
+# stocks` below (`load_campaign_spec` REFUSES the file outright — *"stock '…' is
+# not in the solution catalog"* — when they are absent); and `data/tasks.toml` to
+# carry `anneal_85C_8h`. Build your own catalog in the Process Studio tab
+# (Tab 13), or copy one from another instance and edit it against your hardware;
+# the catalog-loading tests are not green on a fresh clone by construction. The
+# plan-pin harness compiles this example against COMMITTED fixture catalogs
+# instead (`tests/data/plan_pins/`), which is why its pin reproduces with no
+# `data/` directory at all.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name     = "bo_init_bench"
+pcb_name = "SoftAE_EIS_4Stripe"
+
+# Direction is DERIVED, never stated. Composition mode, so the objective
+# resolves to conductivity and `objective = "auto"` maximises it. An explicit
+# direction that disagrees is refused rather than preferred.
+objective = "auto"
+
+# The one line that separates this file from `bench_instance.toml`.
+optimizer = "bayesian"
+
+# WRITTEN OUT EVEN THOUGH IT IS THE DEFAULT (`CampaignSpec.seed = 42`). Under
+# `grid` the seed is irrelevant — `bench_instance.toml` says so and leaves it
+# off. Here it is the ONLY thing that determines where the four warm-up points
+# land, because `_random_point()` draws from the optimizer's seeded RNG. A dry
+# run whose four compositions are not reproducible from the file is not a dry
+# run of anything.
+seed = 42
+
+# Four wells, four suggestions, one physical round. `batch = true` casts one
+# DISTINCT suggestion per channel rather than replicating one across all four —
+# which is what a warm-up rehearsal needs, since the whole question is whether
+# four independent random draws land somewhere the rig can cast.
+channels = [1, 2, 3, 4]
+batch    = true
+
+# THE BUDGET IS THE EXPERIMENT. See the arithmetic in the header: 4 → n_initial
+# = min(5, 4) = 4 → every ask takes the warm-up branch.
+budget = 4
+
+# THREE STOCKS NEEDS THREE PUMP IDS, AND THE DEFAULT IS TWO. `CampaignSpec.pump_ids`
+# defaults to `(0, 1)` and `deposition_settings` only ever TRIMS it, so without
+# this line the first deposit dies with `[liquid_handler] ids/vols/deadvols/
+# disp_rates length mismatch: 2/3/2/2` AFTER the startup flush has already pushed
+# fluid (measured 2026-09-15, T11.25). The order matches `pump_assignment` below.
+pump_ids = [0, 1, 2]
+
+# `acquisition`, `kappa`, `batch_strategy`, `prior_mean` and `exclusion_radius`
+# are ALL DELIBERATELY ABSENT. Not one of them is read on the path this file
+# exercises: the acquisition function and kappa are scored only after the GP is
+# fit, the prior mean only enters as a residual against that fit, and the
+# exclusion radius filters candidates the warm-up never generates. The shipped
+# `batch_strategy = "constant_liar"` default is the one that matters here and it
+# is the right one — its fantasy is `min(observed)` over an EMPTY history, i.e.
+# 0.0, requiring no surrogate; `kriging_believer` would instead ask an unfit
+# backend for a posterior mean four times and fall back through an exception
+# path. Writing a value nothing reads would read as a knob the run honours.
+
+# EVERY top-level key must stay ABOVE the first `[table]` header: TOML assigns a
+# bare key to the most recently opened table, so a key written below
+# `[parameter_space.…]` silently becomes a *parameter attribute*.
+
+# ── The search space: two REAL composition axes ──────────────────────────────
+#
+# BOTH COMPOSITION TARGETS ARE SEARCHED AND NEITHER IS PINNED — the exact
+# inverse of `bench_instance.toml`, where both are pinned (`low == high`) and the
+# only searched dimension is an int replicate counter. `CompositionAxis.is_fixed`
+# is `high <= low`, so each axis below is searched, and `check_pinning`
+# (`core/pinned_recipe.py`, called from `spec_from_dict`) then REQUIRES a
+# `parameter_space` entry under the axis's own generated name — otherwise every
+# trial would silently cast at the axis's `low` on a `logger.warning`, a fixed
+# recipe wearing a search's clothes.
+#
+# The names are generated, not chosen: `CompositionAxis.name` slugs the species,
+# so a molar-ratio axis over ("Ethylene oxide", "Lithium chloride") is
+# `ratio_Ethylene_oxide_Lithium_chloride` and a dried-fraction axis over
+# "Fumed silica" is `driedfrac_Fumed_silica`. A typo here is not a typo in a
+# label — it is an axis the optimizer never suggests, and `check_pinning` is
+# what turns that into a refusal at load.
+#
+# THE BOUNDS ARE WRITTEN TWICE AND NOTHING CHECKS THAT THEY AGREE. `check_pinning`
+# tests membership by NAME only; `axes_parameter_space()` would emit exactly the
+# pair below from the axes, but a file states both halves by hand. Keep them
+# identical: the axis bounds are what `describe_axes` and `softae-campaign check`
+# print to the operator, while the `parameter_space` bounds are what the
+# optimizer actually samples between, and a disagreement would print one box and
+# search another.
+
+# EO:Li = 10..30, straddling `bench_instance.toml`'s pinned 20. Midpoint 20, so
+# the plan pin (taken at the parameter-space midpoint) compiles the SAME
+# composition `bench_instance` pins — the two workflows then differ only where
+# this file genuinely differs.
+[parameter_space.ratio_Ethylene_oxide_Lithium_chloride]
+type = "float"
+low  = 10.0
+high = 30.0
+
+# Silica as a fraction of the DRIED film volume, 0.05..0.20, straddling
+# `bench_instance.toml`'s pinned 0.10. Midpoint 0.125.
+[parameter_space.driedfrac_Fumed_silica]
+type = "float"
+low  = 0.05
+high = 0.20
+
+# ── The recipe, SEARCHED ─────────────────────────────────────────────────────
+#
+# Stock names resolve against the shared solution catalog (the same CSVs the
+# deposition twin and the consumables ledger read) — a name the catalog does not
+# know is refused at load, since the solver cannot turn a target into volumes.
+#
+# `pump_assignment` puts the silica on pump 1 because `[dropcast]
+# particulate_pumps = [1]` in softae_config.toml: pump 1 is the line with the
+# anti-clog purge window, and the silica sol is the particulate stock.
+#
+# `target_deposition_uL` is the DRIED-film volume, carried unchanged from
+# `bench_instance.toml`. THE WHOLE BOX WAS SWEPT AGAINST IT before these bounds
+# were chosen: at 4.5 µL dried, the wet cast runs 94.9 µL (EO:Li 10, silica 0.05)
+# to 99.4 µL (EO:Li 30, silica 0.20) against the 4-stripe well's ~118.8 µL
+# capacity — every corner feasible, with the worst corner ~19 µL clear. So the
+# warm-up cannot draw a point that refuses. `budget_uL` below is the hard stop
+# that turns an overflow into a `FormulationInfeasibleError` rather than a spill,
+# and it is what the feasibility filter in the optimizer would key off if these
+# bounds were ever widened.
+[general_formulation]
+stocks               = ["5wt% 20k PEO stock", "10 wt% silica solution", "LiCl 10M"]
+target_deposition_uL = 4.5
+budget_uL            = 118.0
+
+[general_formulation.pump_assignment]
+"5wt% 20k PEO stock"     = 0
+"10 wt% silica solution" = 1
+"LiCl 10M"               = 2
+
+# SEARCHED: EO:Li over 10..30. `low != high` is what makes it searched, and every
+# key is written out because an omitted one would silently take a default and
+# search a different composition.
+[[general_formulation.axes]]
+kind  = "molar_ratio"
+a     = "Ethylene oxide"
+b     = "Lithium chloride"
+low   = 10.0
+high  = 30.0
+basis = "volume"
+
+# SEARCHED: silica dried volume fraction over 0.05..0.20.
+[[general_formulation.axes]]
+kind  = "dried_fraction"
+a     = "Fumed silica"
+b     = ""
+low   = 0.05
+high  = 0.20
+basis = "volume"
+
+[measurement]
+modality = "eis"
+enabled  = true
+
+# `Extended` reaches 1.2 Hz — `[eis.instrument] f_verified_lo_hz`, the lowest
+# frequency this instrument has been shown to hold at 1e4 Ω. `Quick` bottoms out
+# at 20 Hz, which is not enough band for the gated engine to judge a film.
+preset = "Extended"
+
+# ── The chamber BEFORE the first phase speaks (T11.28) ───────────────────────
+#
+# Campaign-level baseline, carried from `bench_instance.toml` unchanged.
+# Established once at the top of the first trial workflow, BEFORE the piezo event
+# step and the startup flush. It commands both axes and WAITS FOR NEITHER: a
+# floor, not a gate. Without it the pumps run before any axis is driven, and a
+# campaign following a park starts from `safe_park`'s 10 °C and a zeroed humidity
+# setpoint with nothing driving until the first phase that carries [conditions].
+#
+# 22 %RH is the ruled baseline (operator ruling 2026-09-17), extended by the
+# ruling of 2026-09-19/20 to ALL FOUR commanded humidities in `bench_instance` —
+# and this file, which rehearses against the same chamber, commands the same four
+# values. That agreement suppresses nothing: `_condition_steps` compares the
+# whole PhaseSetpoints, `name` included, so "baseline" and "casting" are still two
+# establishes at the bench and the cast is still GATED on arrival. What changes is
+# that each approach arrives on the first poll instead of ramping.
+#
+# An omitted axis is an axis NOT DRIVEN, and `rh_setpoint_pct = 0.0` is NOT
+# "leave it alone" — it is a commanded dry purge (`ctrl == 0` shuts both Aalborg
+# PSVs; bench-verified 2026-08-21). `approach_timeout_s` / `rh_approach_timeout_s`
+# are REFUSED here rather than accepted in silence, because nothing waits.
+[conditions]
+name            = "baseline"
+temp_setpoint_C = 25.0
+rh_setpoint_pct = 22.0
+
+# ── The run plan: cast all four, cure once, settle, then read ────────────────
+#
+# CARRIED FROM `bench_instance.toml` WITHOUT A SINGLE CHANGE, ON PURPOSE. The
+# question this file asks is about the optimizer, not about the process, so every
+# thermal and humidity number below is `bench_instance`'s own — nothing here is
+# invented for the rehearsal. The consequence is worth stating: the compiled
+# workflow of this example and of `bench_instance` differ ONLY in the per-pump
+# deposit volumes the composition solve produces, which is exactly what the two
+# plan pins make readable side by side.
+#
+# `scope` is written on EVERY phase and is never inferred — not from `batch`, not
+# from the kind. `per_sample` does the phase to each well as it is cast;
+# `per_batch` does it to the whole plate at once. FORMULATE is always
+# `per_sample` (`RunPlan.__post_init__` refuses anything else), and the engine
+# runs the whole per-sample segment before opening the per-batch block. That is
+# what makes this "cast every sample, then anneal once" rather than four cure
+# cycles.
+
+[[run_plan.phases]]
+kind  = "formulate"
+scope = "per_sample"
+  # Casting environment. An omitted axis is an axis NOT DRIVEN — there is no
+  # other way to say it in TOML — so both are written here deliberately. Casting
+  # at the humidity the board is then annealed and measured at means the films
+  # never cross a humidity step mid-campaign; the phase keeps its own block, and
+  # its wait, because the ROLE is still distinct.
+  [run_plan.phases.conditions]
+  name            = "casting"
+  temp_setpoint_C = 25.0
+  rh_setpoint_pct = 22.0
+
+[[run_plan.phases]]
+kind  = "anneal"
+scope = "per_batch"
+# The cure DURATION lives in the catalog task's name and params
+# (`data/tasks.toml` → `anneal_85C_8h`: 85 °C, hold 28 800 s, timeout 29 400 s).
+# D1 was ruled (d): `hold_s` is the typed per-run spelling of the task's
+# `hold_time_s`, and is refused if `anneal_params` also spells it. This example
+# leaves the hold with the catalog task, exactly as `bench_instance.toml` does —
+# shortening it would make this a different process from the one being rehearsed
+# against, and the thing under rehearsal is the optimizer, not the cure.
+anneal_task = "anneal_85C_8h"
+  [run_plan.phases.conditions]
+  name            = "anneal"
+  # The RESTORE target: where the chamber rests when the hold ENDS, not the cure
+  # (`anneal_85C_8h` owns that). 25 °C, not 85 — equal to the cure is the one
+  # combination that is certainly a mis-read of this field, and
+  # `warn_if_resting_at_the_cure_temperature` says so at check time.
+  temp_setpoint_C = 25.0
+  # HELD THROUGH THE 85 °C HOLD: the anneal task drives temperature only and
+  # never rewrites the humidity setpoint. A commanded 15 returned a PV of
+  # 19.5–23.2 during the warming flush basin's humidification (2026-08-11), so 22
+  # sits near the middle of the observed band. Stated honestly: no run has yet
+  # commanded 22 THROUGH an 85 °C hold. See `analysis/rh_floor.py`, whose own
+  # warning forbids fitting an absolute threshold to either number.
+  rh_setpoint_pct = 22.0
+  # 4 h, and a CEILING rather than a budget: the wait ends when the chamber
+  # arrives. Casting and this rest state are both 22 %RH, so this plan commands
+  # no humidity descent here and the approach should end on the first poll. The
+  # ceiling STAYS because it costs nothing when the approach is instant, and
+  # because it is what stands between a drifted enclosure and an 8 h cure at an
+  # unknown RH with four wet samples already cast: `rh_wait` carries
+  # `raise_on_timeout`, and that refusal is the point.
+  rh_approach_timeout_s = 14400.0
+
+[[run_plan.phases]]
+kind  = "equilibrate"
+scope = "per_batch"
+  # The three durations are REQUIRED and have no defaults: `min_hold_s` is the
+  # cure tail and belongs to the recipe, `max_hold_s` is the ceiling that makes
+  # the phase terminate at all, `round_period_s` is instrument time per sample.
+  [run_plan.phases.settle]
+  round_period_s = 240.0
+  min_hold_s     = 1500.0
+  max_hold_s     = 14400.0
+  [run_plan.phases.conditions]
+  name            = "equilibrate"
+  temp_setpoint_C = 25.0
+  # THE MEASUREMENT CONDITION — σ is read at this humidity, both in the settle
+  # window above and in the MEASURE phase that follows. Conductivity in these
+  # films is strongly humidity-dependent, so this is a PROCESS boundary: σ read
+  # at 22 is not one series with σ read at anything else. Every measurement
+  # stores its own `rh_sp_pct` beside its PV, so comparing across the boundary is
+  # a query.
+  rh_setpoint_pct = 22.0
+  # 3 h, because THIS approach is a DESCENT. The stage is heater-only: cooling
+  # from the 85 °C cure to 25 °C is passive and no time constant has been
+  # measured. The temperature `wait` RETURNS on timeout rather than raising — so
+  # this is a budget, not a gate. At the shipped 1 800 s default the settle phase
+  # would begin on a still-cooling board and the criterion would read thermal
+  # drift as sample drift.
+  approach_timeout_s = 10800.0
+
+[[run_plan.phases]]
+kind  = "measure"
+scope = "per_batch"
+  # OPTIONAL. The production read is the authoritative measurement by its ROLE,
+  # not by its parameters — it runs after settling either way. This block only
+  # makes the acquisition denser than the campaign's own `[measurement]`.
+  [run_plan.phases.measurement]
+  preset = "Extended"
