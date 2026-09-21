@@ -49,6 +49,55 @@ class TestResolution:
         meta = EISParams.from_preset("NoSuchPreset").as_metadata()
         assert meta["eis_npts"] == DEFAULT_NPTS
 
+    def test_canonical_longest_is_not_the_default_grid(self):
+        """Guards the case-insensitivity tests below from being vacuous.
+
+        If ``Longest`` ever resolved to the defaults, every "casing X equals
+        canonical" assertion would pass whether the lookup worked or not.
+        """
+        canonical = EISParams.from_preset("Longest")
+        assert canonical != EISParams()
+        assert canonical.npts != DEFAULT_NPTS
+
+    @pytest.mark.parametrize("spelling", ["longest", "LONGEST", "LoNgEst"])
+    def test_preset_lookup_is_case_insensitive(self, spelling):
+        """``softae-eis-validate --help`` tells operators to type ``longest``.
+
+        A case miss used to log ``eis_preset_unknown`` and silently hand back
+        the defaults — a grid that is not any registered preset.
+        """
+        assert EISParams.from_preset(spelling) == EISParams.from_preset("Longest")
+
+    def test_default_preset_also_resolves_lowercased(self):
+        assert EISParams.from_preset("quick") == EISParams.from_preset("Quick")
+
+    def test_exact_case_still_resolves_unchanged(self):
+        """The fast path: an exactly-spelled name must not be perturbed."""
+        assert EISParams.from_preset("Standard").npts == 34
+        assert EISParams.from_preset("Longest").f_lo_mHz == 228
+
+    def test_a_genuinely_unknown_preset_still_warns(self, monkeypatch):
+        """The casefold fallback must not swallow the typo warning."""
+        import softae.core.eis_scripts as mod
+
+        warnings: list[tuple] = []
+
+        class _Recorder:
+            def warning(self, event, **kw):
+                warnings.append((event, kw))
+
+            def __getattr__(self, name):
+                return lambda *a, **kw: None
+
+        monkeypatch.setattr(mod, "logger", _Recorder())
+
+        assert mod.EISParams.from_preset("NoSuchPreset").npts == DEFAULT_NPTS
+        assert ("eis_preset_unknown", {"preset": "NoSuchPreset"}) in warnings
+
+        warnings.clear()
+        mod.EISParams.from_preset("longest")
+        assert warnings == []
+
 
 class TestScriptBuilding:
     def test_writes_one_script_per_channel(self, tmp_path, monkeypatch):

@@ -109,7 +109,15 @@ class EISParams:
             try:
                 from softae.config.loader import eis_presets
 
-                section = eis_presets().get(preset) or {}
+                presets = eis_presets()
+                section = presets.get(preset)
+                if section is None:
+                    # Operators are told to type `longest` by eis_validate's own
+                    # --help; a case miss used to fall through to defaults, which
+                    # are not any real preset.
+                    folded = {k.casefold(): v for k, v in presets.items()}
+                    section = folded.get(preset.casefold())
+                section = section or {}
             except Exception:
                 section = {}
             if not section:
