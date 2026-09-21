@@ -1724,24 +1724,100 @@ def test_report_arc_state_returns_empty_for_a_fit_never_annotated():
 _SETTLE_THICKNESS_UM = 50.0
 
 
+#: Where the rail is planted, in Hz — NOT a free choice, and the reason is the
+#: defect this fixture silently carried (2026-09-20). A railed point's Re Z is
+#: ``|Z|·cos θ``, and the engine subtracts the fixture's own ``R_short`` (6.46 Ω on
+#: mux16) before anything else looks at the spectrum. The previous placement was
+#: ``Z[0:3]`` — the three HIGHEST-frequency points, where this circuit's |Z| is only
+#: ~0.95 kΩ — so a −89.999° rail left Re Z ≈ 0.02 Ω, the correction drove it
+#: negative, and `decide_report_mode` dropped all three as non-positive tan δ
+#: *before* the windowed median ever saw them. Measured consequence: the corrupted
+#: and uncorrupted spectra produced byte-identical headroom (24.457), i.e. the
+#: corruption did nothing at all. Here |Z| ≈ 48–50 kΩ, so Re Z ≈ 41 Ω clears the
+#: correction ~6×, while staying off the low-frequency plateau that carries R_bulk —
+#: railing THAT costs both engines ~20 % of R₁ and breaks the `rel=0.1` agreement.
+_RAIL_BAND_HZ = (600.0, 1010.0)
+
+#: The rail's loss tangent as a FRACTION OF THE COMMITTED FLOOR, never an absolute
+#: angle. `decide_report_mode` bounds when ``tan δ / tan ε < tand_headroom_mult``
+#: (3.0), so 0.1 plants the rail 30× inside the bound region and re-derives itself
+#: the next time the asset does. An absolute angle is what let this fixture decay:
+#: it was tuned against a floor that has since been re-measured twice, and nothing
+#: connected the two ([a338]'s standing-trap note).
+_RAIL_HEADROOM_TARGET = 0.1
+
+
+def _committed_phase_floor_tand(z_ohm: float) -> float:
+    """``tan ε`` from the CURRENTLY COMMITTED mux16 asset, at this spectrum's z_med.
+
+    Resolved the way `engine.analyze_spectrum` resolves it, so the fixture is pinned
+    to the same number the decision uses rather than to a copy of it that ages.
+
+    Raises rather than falling back. A fixture that cannot see the floor cannot know
+    whether it is demonstrating a bound, and a quiet fallback here would be exactly
+    the "could not check, and said fine" shape `SUBAGENT_RULES.md` §3.1(a) names.
+    """
+    import numpy as np
+
+    from softae.analysis.eis.engine import _resolved_envelope
+    from softae.analysis.eis.settings import eis_settings
+
+    at = _resolved_envelope(eis_settings().fixture, role="film").floor_at(float(z_ohm))
+    assert at.in_band and at.eps_deg == at.eps_deg, (
+        f"no committed phase floor at z = {z_ohm:.4g} Ω (eps_deg={at.eps_deg}, "
+        f"in_band={at.in_band}) — calibration/eis/mux16.toml did not resolve, so this "
+        f"fixture cannot demonstrate a phase-floor bound")
+    return float(np.tan(np.radians(at.eps_deg)))
+
+
 def _phase_saturated_raw():
     """A closed arc with THREE adjacent readings pinned at the phase rail.
 
-    [a280]'s root cause, updated for T11.31 ([a285]): `decide_report_mode` no
-    longer takes a bare minimum tan δ across the sweep — it takes the minimum of
-    a 5-point running median, which a single saturated point cannot pull under
-    the phase floor (the other four points in its window outvote it). Three
-    adjacent rail points are enough to drag a 5-point window's median down too.
-    The other points are untouched, and the fit still recovers R₁ ≈ 50 kΩ on
-    both engines — which is the point: the spectrum is measurable, and only the
-    gated engine declines to say so.
+    [a280]'s root cause, and the rail angle is now **derived from the committed
+    floor** instead of written down. `decide_report_mode` (T11.31, [a285]) takes the
+    minimum of a 5-point running median of tan δ, so a single saturated point cannot
+    pull the numerator under the floor — three adjacent ones can, because the median
+    of a 5-wide window holding three of them IS one of them. The other points are
+    untouched, and both engines still recover R₁ within ~2.4 % of the 50 kΩ truth:
+    the spectrum is measurable, and only the gated engine declines to say so.
+
+    Two things are pinned relative to the instrument rather than to a constant, each
+    bought by a way this fixture has already failed:
+
+    * **The angle** comes from `_RAIL_HEADROOM_TARGET` × the committed floor at this
+      spectrum's own z_med (≈ 42.8 kΩ, bracketed by the 9.92 kΩ and 100.1 kΩ resistor
+      rows). It lands near −89.95°, but it lands there *because the floor says so*.
+    * **The placement** comes from `_RAIL_BAND_HZ`, where |Z| is large enough that the
+      fixture's `R_short` correction cannot annihilate the corruption.
+
+    The test asserts `numerator_phase_saturated`, which is the outcome-level check
+    that the rail actually decided the verdict — the assertion the 2026-09-20 landing
+    showed was missing, because without it a fully neutralised corruption reads
+    exactly like a working one.
     """
     import numpy as np
     from tests.eis_synthetic import reference_spectrum
+    from softae.analysis.eis.report import PHASE_SATURATION_DEG
 
     f, Z = reference_spectrum(Q=0.0, R_series=500.0, R_bulk=50000.0, C_par=1e-9)
     Z = Z.copy()
-    Z[0:3] = np.abs(Z[0:3]) * np.exp(1j * np.radians(-89.999))
+
+    # |Z| is untouched by a phase rotation, so the z_med the engine will score this
+    # spectrum at is the uncorrupted one — taken here rather than guessed.
+    tand_rail = _RAIL_HEADROOM_TARGET * _committed_phase_floor_tand(
+        float(np.median(np.abs(Z))))
+    phase_deg = -float(np.degrees(np.arctan2(1.0, tand_rail)))
+
+    rail = (f >= _RAIL_BAND_HZ[0]) & (f <= _RAIL_BAND_HZ[1])
+    assert int(rail.sum()) == 3, (
+        f"expected 3 rail points in {_RAIL_BAND_HZ} Hz, got {int(rail.sum())} — the "
+        f"reference sweep grid moved, and a 5-point window needs three to shift")
+    assert abs(phase_deg) >= PHASE_SATURATION_DEG, (
+        f"derived rail phase {phase_deg:.4f}° does not reach the saturation threshold "
+        f"{PHASE_SATURATION_DEG}° — the floor has risen far enough that this fixture "
+        f"no longer demonstrates a RAIL, whatever else it demonstrates")
+
+    Z[rail] = np.abs(Z[rail]) * np.exp(1j * np.radians(phase_deg))
     return _eis_raw(f, Z)
 
 
@@ -1770,6 +1846,21 @@ def test_settle_round_fits_admits_a_converged_fit_with_a_bound_sigma_label():
     assert gated is not None
     assert gated.sigma.is_bound and not gated.sigma.is_value
 
+    # The control ON THE CONTROL, added 2026-09-20 because its absence hid a dead
+    # fixture for three days. `is_bound` above says only THAT it bound; these two say
+    # the RAIL is why, which is the whole claim the fixture makes:
+    #
+    #   (a) the window that decided the headroom is the saturated one — when the rail
+    #       points were being dropped as non-positive tan δ this read False while
+    #       everything else still looked reasonable; and
+    #   (b) the same circuit WITHOUT the corruption reports a value, so the bound is
+    #       the pathology's doing and not the spectrum's (`SUBAGENT_RULES.md` §3.1(e)).
+    assert gated.sigma.numerator_phase_saturated
+    uncorrupted = wiring._spectrum_report_from_raw(
+        _closed_arc_raw(), channel=7, thickness_um=_SETTLE_THICKNESS_UM, engine="gated")
+    assert uncorrupted is not None
+    assert uncorrupted.sigma.is_value and not uncorrupted.sigma.is_bound
+
     legacy = wiring._spectrum_report_from_raw(
         raw, channel=7, thickness_um=_SETTLE_THICKNESS_UM, engine="legacy")
     assert legacy is not None
@@ -1790,13 +1881,21 @@ def test_settle_round_fits_admits_a_converged_fit_with_a_bound_sigma_label():
     assert wiring._report_sigma(legacy) != pytest.approx(legacy.sigma.value)
 
     # The label rides beside it, verbatim, for the one engine that can produce it.
-    # T11.39 (2026-09-17): "bound" narrows to "bound_unqualified" now that the mux16
-    # calibration genuinely applies (it was silently stale since `744e034`, `[a307]`)
-    # — this fixture's z_med sits outside the interim single-anchor `valid_decades`
-    # window, so the bound is real but extrapolated rather than locally measured.
-    # `gated.sigma.is_bound` above already pins "still some kind of bound"; T11.41's
-    # per-row, locality-bracketed floor is expected to move this back toward "bound".
-    assert wiring._report_sigma_mode(gated) == "bound_unqualified"
+    # T11.39 (2026-09-17): "bound" narrowed to "bound_unqualified" once the mux16
+    # calibration genuinely applied (it was silently stale since `744e034`, `[a307]`)
+    # — the asset then carried ONE characterisation point, at 10.1 MΩ, and this
+    # fixture's 42.8 kΩ z_med sat 2.4 decades outside its `valid_decades` window, so
+    # the bound was real but extrapolated rather than locally measured. That comment
+    # predicted T11.41 would move it back toward "bound", and the 2026-09-20 mux16
+    # re-derive did exactly that: z_med is now BRACKETED by two commissioned resistor
+    # rows (9.92 kΩ → 0.211°, 100.1 kΩ → 0.482°, the larger winning), so the floor is
+    # locally measured and the bound is qualified.
+    #
+    # What the same re-derive also exposed, and the prediction did not anticipate: the
+    # single 6.12° anchor had been inflating the floor ~12.7× at this impedance, which
+    # is what had been bounding this spectrum. The rail was contributing nothing — see
+    # `_phase_saturated_raw`. Both halves moved; only the fixture was wrong.
+    assert wiring._report_sigma_mode(gated) == "bound"
     assert wiring._report_sigma_mode(legacy) == "value"
 
     # Both engines fit the same film; only the reporting decision differed.
@@ -1932,17 +2031,28 @@ def test_sigma_from_eis_raw_still_resolves_the_configured_engine(monkeypatch):
     assert called == []
     assert len(seen) == 1
     assert seen[0].get("engine") is None
-    # T11.39 (2026-09-17): the mux16 calibration now genuinely applies (it had been
-    # silently stale since `744e034` and every gated spectrum was scored on the
-    # uncalibrated fallback envelope, `[a307]`). Under the real, applied phase floor
-    # this closed-arc fixture on ch7 is honestly resolution-limited and the objective
-    # correctly declines it (`None`) rather than reporting a value — a decline is
-    # still "not the criterion's 1/R₁ proxy", which is what this assertion actually
-    # guards against; a proxy leak would show up as a *finite* number here, not as
-    # `None`. This is the interim state T11.41 (per-row, locality-bracketed floor)
-    # is expected to move again, since the fixture's z_med now sits between
-    # commissioned resistor rows the interim single-anchor rule cannot see.
-    assert sigma is None
+    # T11.39 (2026-09-17) asserted `sigma is None` here: the mux16 calibration had
+    # just started genuinely applying (`[a307]`), and under it this closed arc read as
+    # resolution-limited, so the objective declined it. That comment named itself an
+    # interim state and expected T11.41's per-row floor to move it. It did — and the
+    # 2026-09-20 mux16 re-derive shows the decline was never honest:
+    #
+    #   the interim asset carried ONE point, 6.12° measured on the 10.1 MΩ reference
+    #   resistor, applied 2.4 decades down at this fixture's 42.8 kΩ. That inflated
+    #   the floor ~12.7×, and this perfectly healthy arc came out at headroom 1.93 —
+    #   just under the 3.0 bound threshold. Scored against the rows that actually
+    #   bracket it (9.92 kΩ and 100.1 kΩ), the same spectrum clears the floor 24.5×.
+    #
+    # So the honest verdict is a value, and the assertion moves to what this test has
+    # always been for. The guard is that the objective must not return the settle
+    # feeder's `1/R₁` proxy: the two differ by exactly the cell constant (K = 200 cm⁻¹
+    # at 50 µm), so a leak reads ~2.0e-5 where the geometry-resolved σ reads ~4.0e-3 —
+    # two orders apart, and no tolerance can confuse them. `called == []` above is the
+    # structural half; this is the numeric half, and it is now a stronger guard than
+    # `is None` was, because `None` was also what a fully broken analysis would return.
+    assert sigma is not None
+    assert sigma == pytest.approx(200.0 / 50_000.0, rel=0.05)
+    assert sigma != pytest.approx(1.0 / 50_000.0, rel=0.5)
 
 
 def test_settle_round_fits_requests_the_legacy_engine():

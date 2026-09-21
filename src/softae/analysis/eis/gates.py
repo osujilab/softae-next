@@ -383,27 +383,66 @@ def gate_phase_noise_extrapolated(
 
     env = ctx.get("envelope")
     z_med = float(np.median(mag[finite]))
-    # Deliberately CONSERVATIVE, and matching `report.py`'s `_reporting_mode` on the
-    # same predicate: an envelope that cannot say whether the phase floor applies here
-    # must not be read as saying it does (`SUBAGENT_RULES` §3.1(a) condemns exactly this
-    # direction, on exactly this subject). The two sites previously disagreed.
+    # ONE predicate, TWO sites. This gate and `report.py`'s `decide_report_mode` judge
+    # the same spectrum through the same envelope object — `engine.analyze_spectrum`
+    # resolves the commissioned envelope once and hands it to `build_context` here and
+    # to the reporting decision — so they must answer "does the phase floor apply at
+    # this |Z|?" identically. The branching below MIRRORS that function's, branch for
+    # branch, so the two read as one idiom.
     #
-    # This is a RECONCILIATION, not a repair: the branch has no known caller. Every path
-    # into this gate builds `ctx` through `policy.build_context`, which substitutes
-    # `instrument_envelope()` when none is passed, and the only hand-built envelope
-    # stand-in in the tree (`tests/test_eis_engine.py`) supplies the method. Nothing in
-    # `src/` or `tests/` reaches this fallback, so the behaviour change is zero.
-    valid = bool(getattr(env, "phase_noise_valid_at", lambda _z: False)(z_med))
-    at = float(getattr(env, "phase_noise_at_ohm", float("nan")))
+    # `floor_at` is the per-impedance floor (T11.41): it brackets `z_med` between the
+    # nearest characterised *resistive* rows instead of measuring log-distance from one
+    # anchor, and it SUBSUMES the single-anchor rule — an envelope with no rows returns
+    # `phase_noise_valid_at`'s own answer from the same call.
+    #
+    # This supersedes an earlier pass that reconciled only the missing-envelope DEFAULT
+    # and deliberately left the predicate on the old rule, reasoning that the fallback
+    # had no caller. That held for the fallback and still does; it never covered the
+    # PRIMARY path, and the 2026-09-20 re-derive made the gap live. Measured against the
+    # committed mux16 rows: a film at 4×10⁴ Ω is bracketed by resistive rows 3898/4293
+    # and in band, while the single anchor at 1.01×10⁷ Ω calls it 2.40 decades out and
+    # "extrapolated" — the same spectrum flagged here and reported in band there.
+    #
+    # Both fallbacks stay CONSERVATIVE (`lambda _z: False`). An envelope that cannot say
+    # whether the floor applies must not be read as saying it does (`SUBAGENT_RULES`
+    # §3.1(a), on exactly this subject). The fallback is now reachable in principle for a
+    # hand-built stand-in predating `floor_at`, and unreachable in production, where
+    # `build_context` substitutes `instrument_envelope()`. If the two sites ever diverge
+    # again, reconcile toward `report.py`.
+    floor_at = getattr(env, "floor_at", None)
+    if callable(floor_at):
+        at = floor_at(z_med)
+        valid = bool(at.in_band)
+        rows_used = len(at.rows_used)
+        # The BRACKETING row, not the single characterisation point: with rows in play
+        # the anchor is usually a different row entirely (100 kΩ, not 10 MΩ, for a film).
+        # NaN only where no row was named — the out-of-band branch — and the single
+        # anchor is then the one impedance left worth naming in the message.
+        anchor = float(at.z_anchor_ohm)
+        if anchor != anchor:
+            anchor = float(getattr(env, "phase_noise_at_ohm", float("nan")))
+    else:
+        valid = bool(getattr(env, "phase_noise_valid_at", lambda _z: False)(z_med))
+        rows_used = 0
+        anchor = float(getattr(env, "phase_noise_at_ohm", float("nan")))
+
+    if valid:
+        bracket = (f" — bracketed by {rows_used} characterised row"
+                   f"{'' if rows_used == 1 else 's'} near {anchor:.3g} Ω"
+                   if rows_used else "")
+        detail = (f"median |Z| {z_med:.3g} Ω within the band where phase noise "
+                  f"was measured{bracket}")
+    else:
+        detail = (f"median |Z| {z_med:.3g} Ω is far from the {anchor:.3g} Ω at which "
+                  f"phase noise was characterised — any loss-tangent floor here is "
+                  f"extrapolated")
 
     return GateResult(
-        "phase_noise_extrapolated", FLAG, valid,
-        f"median |Z| {z_med:.3g} Ω within the band where phase noise was measured"
-        if valid else
-        f"median |Z| {z_med:.3g} Ω is far from the {at:.3g} Ω at which phase noise "
-        f"was characterised — any loss-tangent floor here is extrapolated",
-        ok,
-        {"z_median": z_med, "phase_noise_valid": float(valid)},
+        "phase_noise_extrapolated", FLAG, valid, detail, ok,
+        {"z_median": z_med, "phase_noise_valid": float(valid),
+         # Which branch spoke, and from where: 0 rows names the single anchor, exactly
+         # as `HeadroomDecision.floor_rows_used` does on the reporting side.
+         "floor_rows_used": float(rows_used), "floor_z_anchor_ohm": anchor},
     )
 
 

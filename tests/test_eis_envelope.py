@@ -343,7 +343,7 @@ class TestTheCommittedCalibrationAsset:
         env = self._committed().envelope()
         assert env.phase_noise_at_ohm == pytest.approx(1.01178e7, rel=1e-4)
         assert env.phase_noise_deg == pytest.approx(6.1200, rel=1e-4)
-        assert env.phase_noise_load == "capacitive"
+        assert env.phase_noise_load == "resistive"
 
     def test_the_committed_anchor_is_not_the_lowest_impedance_row(self):
         cal = self._committed()

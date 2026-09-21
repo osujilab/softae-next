@@ -19,11 +19,9 @@ adjacent rows, because those rows are different load classes.
 **Permissive only.** The largest resistor ε is the 6.120° the single anchor already
 used, so no floor anywhere rises, and the band's upper edge is bit-identical to today's.
 
-The tables below are the live ``calibration/eis/mux16.toml`` rows with the per-row
-provenance the deriver knew and the asset does not yet carry — recomputed read-only from
-the stored spectra, exact float match to the asset. Tests that need the *asset* to carry
-the columns are marked ``xfail(strict=True)`` so they flip to a failure the moment
-``softae-commission derive`` re-writes it.
+The tables below are the live ``calibration/eis/mux16.toml`` rows, carrying the per-row
+provenance since the 2026-09-20 re-derive (T11.41 §4) — recomputed read-only from the
+stored spectra, exact float match to the asset.
 """
 
 from __future__ import annotations
@@ -49,12 +47,6 @@ from softae.analysis.eis.report import decide_report_mode
 from softae.workflows.commissioning import PHASE_REFERENCE_MAX_EPS_DEG
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-
-#: Why the asset-dependent tests are expected to fail until the re-derive lands.
-ASSET_NOT_REDERIVED = (
-    "asset not yet re-derived with per-row load_kind "
-    "(parallel-session runs `softae-commission derive`; T11.41 §4)"
-)
 
 #: The committed 22 rows, ``(z_ohm, eps_deg, load_kind, source_measurement_id)``.
 #:
@@ -411,18 +403,13 @@ class TestTheCapacitiveCheckFlagsWithoutDeciding:
 
 
 class TestTheCommittedAssetOnceItIsReDerived:
-    """Against ``calibration/eis/mux16.toml`` itself — ``xfail`` until §4's re-derive.
-
-    ``strict=True`` so these flip to a failure, not to a silent pass, the moment
-    ``softae-commission derive --fixture mux16`` writes the two arrays.
-    """
+    """Against ``calibration/eis/mux16.toml`` itself, since the 2026-09-20 re-derive."""
 
     def _committed(self) -> CalibrationSet:
         cal = load_calibration("mux16", root=REPO_ROOT / "calibration" / "eis")
         assert cal is not None, "the committed mux16 calibration must travel with the code"
         return cal
 
-    @pytest.mark.xfail(strict=True, reason=ASSET_NOT_REDERIVED)
     def test_the_real_film_is_qualified_by_the_resistor_ladder(self):
         env = self._committed().envelope()
 
@@ -435,7 +422,6 @@ class TestTheCommittedAssetOnceItIsReDerived:
         assert env.tand_floor_at(1.0e7) == pytest.approx(0.10722215041207023, rel=1e-12)
         assert env.floor_at(1.0e7).rows_used[-1] == 3897
 
-    @pytest.mark.xfail(strict=True, reason=ASSET_NOT_REDERIVED)
     def test_the_committed_rows_carry_the_provenance_the_derive_knew(self):
         rows = self._committed().phase_acc.rows()
 
@@ -448,7 +434,6 @@ class TestTheCommittedAssetOnceItIsReDerived:
         # `phase_reference_is_plausible` refused it, so it is in neither set.
         assert 1933 not in resistive | capacitive
 
-    @pytest.mark.xfail(strict=True, reason=ASSET_NOT_REDERIVED)
     def test_the_committed_table_publishes_the_headline_rows_own_load_kind(self):
         """The live asset mislabels the 6.120° anchor: it was a 10 MΩ resistor."""
         env = self._committed().envelope()

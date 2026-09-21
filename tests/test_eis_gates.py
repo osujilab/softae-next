@@ -47,6 +47,7 @@ from softae.analysis.eis.admittance import (
 from softae.analysis.eis.policy import build_context
 from softae.analysis.eis.settings import GateSettings
 from tests.test_eis_kk import RIG_FREQ
+from tests.test_eis_phase_floor_rows import CELL, FILM_Z_OHM, _spectrum_at
 
 
 def _ctx(**overrides):
@@ -1431,7 +1432,10 @@ class TestPhaseNoiseFallbackIsConservative:
         from softae.analysis.eis.gates import gate_phase_noise_extrapolated
 
         env = SimpleNamespace()
+        # BOTH absences are the premise: the stand-in must miss `floor_at` as well, or
+        # this exercises the per-row branch and pins nothing about the fallback.
         assert not hasattr(env, "phase_noise_valid_at"), "premise of this test"
+        assert not hasattr(env, "floor_at"), "premise of this test"
 
         f, Z = reference_spectrum()
         ctx = _ctx()
@@ -1440,15 +1444,127 @@ class TestPhaseNoiseFallbackIsConservative:
         r = gate_phase_noise_extrapolated(f, Z, ctx)
         assert not r.passed
         assert r.metrics["phase_noise_valid"] == 0.0
+        assert r.metrics["floor_rows_used"] == 0.0
 
     def test_phase_noise_real_envelope_still_judges_by_band(self):
         # Positive control for the test above: with a real envelope the gate still
         # answers from the measurement, so the fallback is what changed and nothing
-        # else.
+        # else. `instrument_envelope()` carries no `phase_rows` — it parses
+        # `[eis.instrument]` and nothing else — so this runs `floor_at`'s own no-rows
+        # regime, which returns the single-anchor answer from the same call.
         from softae.analysis.eis.envelope import instrument_envelope
         from softae.analysis.eis.gates import gate_phase_noise_extrapolated
 
         f, Z = reference_spectrum(R_bulk=1.0e4, noise_pct=0.0)
         ctx = _ctx()
-        ctx["envelope"] = instrument_envelope()
-        assert gate_phase_noise_extrapolated(f, Z, ctx).passed
+        env = instrument_envelope()
+        assert env.phase_rows == (), "premise: the configured estimate has no rows"
+        ctx["envelope"] = env
+
+        r = gate_phase_noise_extrapolated(f, Z, ctx)
+        assert r.passed
+        assert r.metrics["floor_rows_used"] == 0.0, "0 names the single anchor"
+
+
+class TestPhaseNoiseConsultsThePerRowFloor:
+    """One predicate, two sites — this gate and ``decide_report_mode`` must agree.
+
+    T11.41 gave the envelope a *per-impedance* floor: ``floor_at`` brackets ``|Z|``
+    between the nearest characterised **resistive** rows instead of measuring
+    log-distance from one anchor. ``decide_report_mode`` moved onto it; this gate did
+    not. Once ``calibration/eis/mux16.toml`` carried real per-row provenance (the
+    2026-09-20 re-derive) that gap went live — the same real film reported *in band* on
+    the reporting side and flagged *extrapolated* here, in one run.
+    """
+
+    def _committed_envelope(self):
+        """The tracked asset, loaded **by path**.
+
+        Not ``resolve_calibration``: that one drops the rows when the hardware hash has
+        moved, which would turn this into a test of the local machine's config rather
+        than of the committed table.
+        """
+        from pathlib import Path
+
+        from softae.analysis.eis.calibration import load_calibration
+
+        root = Path(__file__).resolve().parents[1] / "calibration" / "eis"
+        cal = load_calibration("mux16", root=root)
+        assert cal is not None, "the committed mux16 calibration travels with the code"
+        return cal.envelope()
+
+    def test_the_two_predicates_genuinely_disagree_on_the_committed_asset(self):
+        """POSITIVE CONTROL. Without this divergence the tests below cannot fail.
+
+        If the asset ever loses its rows, or the two rules converge, this goes red and
+        says which — rather than the tests below passing for the wrong reason.
+        """
+        env = self._committed_envelope()
+
+        assert env.phase_rows, "the re-derived asset must carry per-row provenance"
+        # 4.3e4 Ω against the 1.0118e7 Ω single anchor is 2.37 decades out of band...
+        assert env.phase_noise_valid_at(FILM_Z_OHM) is False
+        # ...and squarely bracketed by the 9.92 kΩ and 100.1 kΩ resistor rows.
+        at = env.floor_at(FILM_Z_OHM)
+        assert at.in_band is True
+        assert at.rows_used == (3898, 4293)
+
+    def test_a_real_film_is_judged_by_the_bracketing_rows_not_the_single_anchor(self):
+        from softae.analysis.eis.gates import gate_phase_noise_extrapolated
+
+        env = self._committed_envelope()
+        freq, Z = _spectrum_at(FILM_Z_OHM, 0.05)
+        ctx = _ctx()
+        ctx["envelope"] = env
+
+        r = gate_phase_noise_extrapolated(freq, Z, ctx)
+
+        assert r.passed, "the resistor ladder brackets this film; the old anchor did not"
+        assert r.metrics["phase_noise_valid"] == 1.0
+        assert r.metrics["floor_rows_used"] == 2.0
+        # The anchor is the BRACKETING row (100.1 kΩ), not the characterisation point
+        # (10.1 MΩ) — two decades apart, and the message now names the right one.
+        assert r.metrics["floor_z_anchor_ohm"] == pytest.approx(100088.6159931681)
+        assert "bracketed by 2 characterised rows" in r.detail
+
+    def test_the_gate_and_the_reporting_decision_agree_on_that_film(self):
+        """The seam itself: one envelope, two sites, one verdict."""
+        from softae.analysis.eis.gates import gate_phase_noise_extrapolated
+        from softae.analysis.eis.report import decide_report_mode
+
+        env = self._committed_envelope()
+        freq, Z = _spectrum_at(FILM_Z_OHM, 0.05)
+        ctx = _ctx()
+        ctx["envelope"] = env
+
+        r = gate_phase_noise_extrapolated(freq, Z, ctx)
+        decision = decide_report_mode(freq, Z, envelope=env, cell=CELL)
+
+        # `provisional` is exactly `not in_band` on both of that function's returns,
+        # so this compares the two sites' answers to the same question.
+        assert decision.provisional is False
+        assert r.passed is True
+        assert r.metrics["floor_rows_used"] == float(decision.floor_rows_used)
+        assert r.metrics["floor_z_anchor_ohm"] == pytest.approx(
+            decision.floor_z_anchor_ohm)
+
+    def test_past_every_row_the_gate_still_refuses_and_so_does_the_report(self):
+        """The gate did not merely become permissive — the band still has an edge."""
+        from softae.analysis.eis.gates import gate_phase_noise_extrapolated
+        from softae.analysis.eis.report import decide_report_mode
+
+        env = self._committed_envelope()
+        freq, Z = _spectrum_at(1.0e10, 0.05)      # >1 decade past the 1.45e8 Ω top row
+        ctx = _ctx()
+        ctx["envelope"] = env
+
+        r = gate_phase_noise_extrapolated(freq, Z, ctx)
+        decision = decide_report_mode(freq, Z, envelope=env, cell=CELL)
+
+        assert not r.passed
+        assert decision.provisional is True
+        assert r.metrics["floor_rows_used"] == 0.0, "no row was named out here"
+        # No row means a NaN anchor, and a NaN must never reach the operator's message:
+        # the single characterisation point is the one impedance left worth naming.
+        assert "nan" not in r.detail.lower()
+        assert "far from the 1.01e+07 Ω" in r.detail
