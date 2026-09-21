@@ -1,35 +1,55 @@
 """A mock EmStat Pico that reads the ``.mscr`` it was handed.
 
-**The shipped mock cannot exercise this tool.**
-:meth:`softae.drivers.mock_espico.MockESPico.sendscript_getdata` ignores
-*mscrpath* entirely and returns a fixed 41-point 50 kHz -> 1 Hz sweep seeded
+**The grid-reading generator now lives in the driver, and this module
+re-exports it.** ``literal_to_hz``, ``parse_mscr_grid``, ``grid_frequencies``,
+``r1_for_apex`` and ``synthesize`` are imported from
+:mod:`softae.drivers.mock_espico` and re-exported here unchanged, so every
+existing importer of this module's names keeps working. What moved is the
+definition, not the surface.
+
+**Why it moved (T11.56).** This module's earlier docstring said the opposite --
+*"this lives in the tool, not in mock_espico.py; the whole tree shares that
+double"* -- and that was an **ownership** argument: the driver was unclaimed and
+shared, and a tool had no business moving anything underneath anyone. The
+operator assigned ``mock_espico.py`` to this module's own session, which
+discharged it. The argument that replaced it does not expire: this module
+imports *from* ``drivers`` and the repository has **no** ``drivers`` -> ``tools``
+edge at all, so a shared generator can only sit on the driver's side of that
+line. The alternative was to keep two generators, which is what T11.56 was filed
+about -- the tree carried a measurable one and an unmeasurable one, and nothing
+made them agree.
+
+**The shipped mock used to be unable to exercise this tool.**
+:meth:`softae.drivers.mock_espico.MockESPico.sendscript_getdata` ignored
+*mscrpath* entirely and returned a fixed 41-point 50 kHz -> 1 Hz sweep seeded
 from the channel number. Under it, the validation harness's reference arm and
-its adaptive arm return **bit-identical spectra regardless of which script
+its adaptive arm returned **bit-identical spectra regardless of which script
 ran**, so:
 
-- every ``Delta`` is exactly 0;
-- verdicts do not respond to the grid, so ``extend_low`` never fires and no
-  follow-up is ever built;
-- ``Delta_hold`` is identically 0, so the hold-integrity criterion H3 always
-  passes;
-- **a mock run prints a perfect null indistinguishable from a real result.**
+- every ``Delta`` was exactly 0;
+- verdicts did not respond to the grid, so ``extend_low`` never fired and no
+  follow-up was ever built;
+- ``Delta_hold`` was identically 0, so the hold-integrity criterion H3 always
+  passed;
+- **a mock run printed a perfect null indistinguishable from a real result.**
 
-That is worse than no mock. It is the failure mode
+That was worse than no mock. It is the failure mode
 :func:`softae.tools.eis_timing._print_report` guards against in prose -- *"a
 mock run measures how fast this host can write a .mscr file and nothing
-whatever about the rig"* -- except that here it would be silently fabricating
-the science rather than merely the timings.
+whatever about the rig"* -- except that here it was silently fabricating the
+science rather than merely the timings. The driver now parses the emitted script
+**back**, inverting ``mscr_freq_literal`` via
+:data:`palmsens.mscript.SI_PREFIX_FACTOR`, and evaluates the circuit on *those*
+bounds and *those* point counts. Reading the planned grid off the planner
+instead would test everything except the one unit with a **silent 1000x failure
+mode**: a frequency literal whose suffix is wrong produces a spectrum in the
+wrong band that the instrument executes without complaint.
 
-So this module parses the emitted script **back**, inverting
-``mscr_freq_literal`` via :data:`palmsens.mscript.SI_PREFIX_FACTOR`, and
-evaluates the circuit on *those* bounds and *those* point counts. Reading the
-planned grid off the planner instead would test everything except the one unit
-with a **silent 1000x failure mode**: a frequency literal whose suffix is wrong
-produces a spectrum in the wrong band that the instrument executes without
-complaint.
-
-**This lives in the tool, not in ``mock_espico.py``.** The whole tree shares
-that double; nothing there moves underneath anyone because of this file.
+:class:`GridAwareMockPico` is therefore **no longer the only grid-aware
+backend**, and it is kept rather than retired because it is still the seam that
+binds a sweep to a :class:`MockRig` -- the shared sample, its drift clock and
+its ``_designed_r1`` register. The base class reads the grid; this subclass is
+what makes two picos observe *one* sample.
 
 **The** ``MockRig._designed_r1`` **register is a test-only seam.** Every sweep
 :meth:`MockRig.measure` returns is recorded against its own spectrum bytes,
@@ -65,8 +85,6 @@ presets rather than hard-coding these numbers.)
 from __future__ import annotations
 
 import hashlib
-import math
-import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,21 +93,25 @@ from typing import Any, ClassVar
 import numpy as np
 import structlog
 
-from softae.drivers.mock_espico import _C0, _CPE_A, _CPE_Q, MockESPico
+from softae.drivers.mock_espico import (
+    MOCK_NOISE_REL,
+    MOCK_R0_OHM,
+    MockESPico,
+    grid_frequencies,
+    literal_to_hz,
+    parse_mscr_grid,
+    r1_for_apex,
+    synthesize,
+)
 from softae.drivers.mock_rh_controller import MockRHController
 from softae.drivers.mock_temp_controller import MockTempController
 
 logger = structlog.get_logger(__name__)
 
-#: Bulk (series) resistance. Fixed, because the harness's every statistic is a
-#: within-cell ratio in which the cell constant cancels; what has to move
-#: between cells is the interfacial arc, not the series term.
-MOCK_R0_OHM = 4.81e4
-
-#: Relative rms of the multiplicative noise, matching the shipped mock. This is
-#: what puts a floor under the CONTROL population's ``|Delta_scout|`` -- with
-#: noise at 0 the noise floor would measure nothing and D3 would pass vacuously.
-MOCK_NOISE_REL = 0.005
+# `MOCK_R0_OHM` and `MOCK_NOISE_REL` are imported above rather than defined
+# here. They were duplicated between this module and the driver as a matter of
+# comment -- "matching the shipped mock" -- with nothing enforcing it, which is
+# precisely the coupling T11.56 found broken elsewhere in the same pair.
 
 #: The name under which :class:`MockRig` records the ``R1`` it designed into a
 #: spectrum, drift included. **A register key, not an** ``eis_params`` **stamp**,
@@ -105,114 +127,6 @@ MOCK_NOISE_REL = 0.005
 #: (the mock synthesises ``R0 + CPE + R1||C0`` plus noise). Nothing in ``src/``
 #: reads it, and nothing should.
 MOCK_DESIGNED_R1_KEY = "eis_mock_designed_r1_ohms"
-
-#: ``meas_loop_eis <f> <r> <j> <mVac> <f_start> <f_end> <npts> <mVdc>``.
-#: Both emitters -- :func:`~softae.drivers.mscr_library.eis_run_mscrbuild` and
-#: :func:`~softae.drivers.mscr_library.eis_segmented_mscrbuild` -- write exactly
-#: this line, which is why one parser covers the plain and the segmented script.
-_MEAS_LOOP = re.compile(
-    r"^\s*meas_loop_eis\s+\S+\s+\S+\s+\S+\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$"
-)
-
-_LITERAL = re.compile(r"^([+-]?\d+)([a-zA-Z ]?)$")
-
-
-def literal_to_hz(token: str) -> float:
-    """Invert :func:`~softae.drivers.mscr_library.mscr_freq_literal`.
-
-    ``"6475m"`` -> 6.475, ``"200000"`` -> 200000.0. Raises rather than guessing:
-    a token this cannot read is a script this backend must not pretend to have
-    run, and a silently mis-scaled frequency is the exact defect the emitter's
-    own docstring calls its highest risk.
-    """
-    match = _LITERAL.match(str(token).strip())
-    if match is None:
-        raise ValueError(f"not a MethodSCRIPT numeric literal: {token!r}")
-    mantissa, suffix = match.groups()
-
-    from softae.drivers.palmsens.mscript import SI_PREFIX_FACTOR
-
-    factor = SI_PREFIX_FACTOR.get(suffix or " ")
-    if factor is None:
-        raise ValueError(f"unknown SI prefix {suffix!r} in literal {token!r}")
-    return float(mantissa) * float(factor)
-
-
-def parse_mscr_grid(path: str | Path) -> tuple[tuple[float, float, int], ...]:
-    """Read a ``.mscr`` back as the segment list it will actually measure.
-
-    Returns ``((f_start_hz, f_end_hz, npts), ...)`` in emission order, which is
-    descending. A one-block script yields one segment, so the plain and the
-    segmented emitters come back through the same door.
-    """
-    text = Path(path).read_text(encoding="utf-8", errors="replace")
-    segments: list[tuple[float, float, int]] = []
-    for line in text.splitlines():
-        match = _MEAS_LOOP.match(line)
-        if match is None:
-            continue
-        _mv_ac, f_start, f_end, npts, _mv_dc = match.groups()
-        segments.append(
-            (literal_to_hz(f_start), literal_to_hz(f_end), int(str(npts).strip()))
-        )
-    if not segments:
-        raise ValueError(f"no meas_loop_eis block in {path}")
-    return tuple(segments)
-
-
-def grid_frequencies(
-    segments: tuple[tuple[float, float, int], ...],
-) -> np.ndarray:
-    """The frequency axis the instrument would return for *segments*.
-
-    One log-spaced block per ``meas_loop_eis``, concatenated in emission order.
-    ``get_values_by_column(..., icurve=None)`` extends across curves, so a
-    descending non-overlapping segment list arrives at the parser as one
-    monotonic sweep -- which is the property ``resolve_segments`` exists to
-    keep, and this reproduces it rather than re-sorting.
-    """
-    blocks = [
-        np.geomspace(float(f_start), float(f_end), int(npts))
-        for f_start, f_end, npts in segments
-    ]
-    return np.concatenate(blocks) if blocks else np.empty(0)
-
-
-def r1_for_apex(f_apex_hz: float, *, c0_farad: float = _C0) -> float:
-    """The interfacial resistance that puts the ``-Z''`` apex at *f_apex_hz*.
-
-    The parallel branch peaks at ``f = 1 / (2*pi*R1*C0)``; ``C0`` is the board's
-    and stays put, so ``R1`` is the free parameter. See the module docstring.
-    """
-    if not (math.isfinite(f_apex_hz) and f_apex_hz > 0):
-        raise ValueError(f"apex frequency must be finite and positive: {f_apex_hz!r}")
-    return 1.0 / (2.0 * math.pi * float(c0_farad) * float(f_apex_hz))
-
-
-def synthesize(
-    freq: np.ndarray,
-    *,
-    r1_ohm: float,
-    r0_ohm: float = MOCK_R0_OHM,
-    c0_farad: float = _C0,
-    noise_rel: float = MOCK_NOISE_REL,
-    seed: int | None = None,
-) -> np.ndarray:
-    """``R0 - CPE0 - p(R1, C0)`` on *freq*. Columns ``[f, |Z|, phase, Z', -Z'']``.
-
-    The same circuit and the same CPE constants the shipped mock uses -- what
-    changes here is only that the frequency axis is the script's rather than a
-    module-level constant.
-    """
-    omega = 2.0 * np.pi * np.asarray(freq, dtype=float)
-    z_cpe = 1.0 / (_CPE_Q * (1j * omega) ** _CPE_A)
-    z_arc = float(r1_ohm) / (1.0 + 1j * omega * float(r1_ohm) * float(c0_farad))
-    z = float(r0_ohm) + z_cpe + z_arc
-    if noise_rel:
-        z = z * np.random.default_rng(seed).normal(1.0, noise_rel, z.size)
-    return np.column_stack(
-        [freq, np.abs(z), np.degrees(np.angle(z)), z.real, -z.imag]
-    )
 
 
 @dataclass

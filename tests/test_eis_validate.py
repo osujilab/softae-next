@@ -3379,35 +3379,106 @@ def test_mock_grid_actually_changes_the_spectrum(tmp_path):
     assert spectra["Extended"][-1, 0] == pytest.approx(1.351, rel=1e-6)
 
 
-def test_shipped_mock_espico_would_have_faked_a_null(tmp_path):
-    """**Why deliverable (c) exists.** Under `MockESPico` every Delta is exactly 0.
+def test_shipped_mock_espico_reads_the_script_it_was_handed(tmp_path):
+    """Both mock backends answer the `.mscr`, so a Delta of 0 is a real 0.
 
-    It ignores the `.mscr` and returns a fixed 41-point 50 kHz -> 1 Hz sweep
-    seeded from the channel, so a reference sweep and a scout sweep on the same
-    channel are bit-identical and a mock report is a perfect, meaningless null.
+    **This test used to assert the opposite, and the inversion is the point.**
+    It was named `..._would_have_faked_a_null` and it pinned the defect: the
+    shipped `MockESPico` ignored *mscrpath* and returned a fixed 41-point
+    50 kHz -> 1 Hz sweep seeded from the channel, so a reference sweep and a
+    scout sweep on one channel came back **bit-identical**, every Delta was
+    exactly 0, and a mock report was a perfect null indistinguishable from a
+    real result. That was the whole justification for building
+    `GridAwareMockPico`.
+
+    T11.56 fixed the shipped mock instead, so the old assertion now pins a
+    behaviour that no longer exists. What survives is the property actually
+    worth holding — **a Delta of zero must mean the two sweeps agreed, never
+    that the backend could not tell them apart** — and it is now asserted of
+    both backends rather than used to tell them apart.
+
+    `GridAwareMockPico` is still exercised here because it is no longer
+    redundant for the reason it was built: its remaining job is to bind a sweep
+    to a shared `MockRig` (one sample, one drift clock, one `_designed_r1`
+    register across both picos), which the base class does not do.
     """
     from softae.core.eis_scripts import EISParams
     from softae.drivers.mock_espico import MockESPico
     from softae.drivers.mscr_library import eis_run_mscrbuild
 
     shipped = MockESPico("pico2", {})
-    paths = []
+    paths, expected_npts = [], []
     for preset in ("Quick", "Extended"):
         grid = EISParams.from_preset(preset)
         path = tmp_path / f"{preset}.mscr"
         eis_run_mscrbuild(str(path), mux_ch=18, mVac=grid.mv_ac, f_hi=grid.f_hi,
                           f_lo=grid.f_lo_mHz, npts=grid.npts, mVdc=grid.mv_dc)
         paths.append(str(path))
+        expected_npts.append(grid.npts)
 
     a = shipped.sendscript_getdata(paths[0], str(tmp_path), 18)[0]
     b = shipped.sendscript_getdata(paths[1], str(tmp_path), 18)[0]
-    assert a.shape == b.shape == (41, 5)
-    assert np.array_equal(a, b)                    # bit-identical: Delta == 0
+    # The script's own point counts, not the module's fixed 41.
+    assert (a.shape[0], b.shape[0]) == tuple(expected_npts)
+    assert a.shape[0] != b.shape[0]                # the grid reached the sweep
+    assert not np.array_equal(a[:, 0], b[: a.shape[0], 0])   # and the axis differs
 
     grid_aware = M.GridAwareMockPico("pico2", {}, rig=M.MockRig())
     c = grid_aware.sendscript_getdata(paths[0], str(tmp_path), 18)[0]
     d = grid_aware.sendscript_getdata(paths[1], str(tmp_path), 18)[0]
-    assert c.shape != d.shape                      # the grid reached the sweep
+    assert c.shape != d.shape
+
+    # The fallback is the one path that still returns the fixed grid, and it is
+    # reachable: many callers hand over a path that was never written. It must
+    # stay a LOUD fallback, not a silent substitution.
+    fallback = shipped.sendscript_getdata(str(tmp_path / "never_written.mscr"),
+                                          str(tmp_path), 18)[0]
+    assert fallback.shape == (41, 5)
+
+
+def test_shipped_mock_espico_produces_a_measurable_sigma(tmp_path):
+    """The mock's channels reach the engine as sigma VALUES, not bounds.
+
+    T11.56's actual subject. Before it, **every** channel the mock produced came
+    back `sigma_S_per_cm = NULL` under the shipped gated engine — the R1 family
+    was drawn log-uniform in [1e6, 1e9] (a floor above the real-film mean of
+    6.8e5), the CPE exponent was fixed at the real population's least-lossy
+    quartile, and the sweep ignored the script. Every mock-rig rehearsal in the
+    tree was therefore silently sigma-free, and nothing was red.
+
+    This asserts the property directly rather than the constants behind it, so
+    it stays true if the family is retuned again and goes red if the mock stops
+    being measurable. It fails on the pre-T11.56 generator (0 of 4).
+    """
+    from softae.analysis.eis.engine import analyze_spectrum
+    from softae.analysis.eis.geometry import CellConstant
+    from softae.analysis.eis_data import EISResult
+    from softae.core.eis_scripts import EISParams
+    from softae.drivers.mock_espico import MockESPico
+    from softae.drivers.mscr_library import eis_run_mscrbuild
+
+    grid = EISParams.from_preset("Quick")
+    cell = CellConstant(L_gap_cm=0.2, L_stripe_cm=0.2, thickness_cm=0.05,
+                        thickness_method="nominal")
+    pico = MockESPico("pico1", {})
+
+    modes, sigmas = [], []
+    for chan in (3, 9, 17, 26):
+        path = tmp_path / f"ch{chan}.mscr"
+        eis_run_mscrbuild(str(path), mux_ch=chan, mVac=grid.mv_ac,
+                          f_hi=grid.f_hi, f_lo=grid.f_lo_mHz, npts=grid.npts,
+                          mVdc=grid.mv_dc)
+        raw = pico.sendscript_getdata(str(path), str(tmp_path), chan)
+        assert np.asarray(raw[0]).shape[0] == grid.npts
+        report = analyze_spectrum(
+            EISResult.from_raw(raw, channel=chan), cell=cell, engine="gated")
+        modes.append(report.sigma.mode)
+        sigmas.append(report.sigma.value)
+
+    assert modes == ["value"] * 4, f"expected four sigma values, got {modes}"
+    # The measured real-film population's own scale: mean sigma 2.8e-5 S/cm.
+    # A decade either side, so this pins the order of magnitude and not a fit.
+    assert all(2.8e-6 < s < 2.8e-4 for s in sigmas), sigmas
 
 
 def test_mock_apex_places_a_cell_in_each_population(tmp_path):
