@@ -453,6 +453,20 @@ class CampaignSpec:
     #: leaving to be inferred from silence. Same type as a phase's conditions —
     #: see :mod:`softae.core.phase_setpoints`.
     conditions: "PhaseSetpoints | None" = None
+    #: Named condition sets (T11.28b, operator-ruled 2026-09-20, spec
+    #: ``t11_28b_one_config_level_for_humidity.md`` §4.4.2a) — declared at the top
+    #: level, beside :attr:`parameter_space` and :attr:`budget`, so a phase opts
+    #: in by NAME (``conditions="casting"``) rather than repeating an inline
+    #: block. An arbitrary number of sets, open-ended by design (§4.4.5) — no
+    #: fixed four, no fixed names. Omission still means *not driven*: a phase
+    #: acquires conditions only by naming a set, so a spec with no
+    #: ``condition_sets`` table behaves exactly as before. Declared here only so
+    #: the top-level key is not refused as unknown by :func:`spec_from_dict`'s
+    #: field check; the cross-key resolution that turns a raw table into
+    #: :class:`~softae.core.phase_setpoints.PhaseSetpoints` instances and wires
+    #: named references into ``run_plan`` lives in ``core/campaign_spec_io.py``
+    #: (afl-session), not here.
+    condition_sets: dict[str, "PhaseSetpoints"] = field(default_factory=dict)
     budget: int = 12
     #: What this campaign measures, and how (T2.4). One block naming a
     #: **modality** alongside its preset/overrides, so a second modality needs no

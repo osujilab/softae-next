@@ -180,6 +180,15 @@ def spec_from_dict(data: dict[str, Any], *, source: str = "<dict>") -> Any:
         if key in supplied and isinstance(supplied[key], list):
             supplied[key] = tuple(supplied[key])
 
+    # Named condition sets (T11.28b) resolve BEFORE the loop below, and that
+    # ordering is the whole cost of the operator's top-level placement ruling:
+    # the loop decodes each field as `codec.decode(supplied[key])` -- one
+    # argument -- so the `run_plan` codec never sees a sibling top-level key.
+    # A reference is therefore rewritten into the inline table it stands for
+    # here, where both keys are visible, and `decode_run_plan` below goes on
+    # seeing nothing but tables.
+    _resolve_condition_sets(supplied, source)
+
     # Live objects rebuilt from what the file *names* (S5.K). A decode that
     # cannot mean what the file says raises here rather than substituting a
     # default, for the reason the unknown-key check exists one block above.
@@ -267,6 +276,62 @@ def _pop_explicit_none(
             f"'{_EXPLICIT_NONE_KEY}' — the file says two things about the same "
             f"field, and neither can be preferred silently")
     return tuple(raw)
+
+
+def _resolve_condition_sets(supplied: dict[str, Any], source: str) -> None:
+    """Rewrite each ``conditions = "<name>"`` reference into that set's table.
+
+    In place, on *supplied*, before :data:`OBJECT_FIELDS` decodes ``run_plan``.
+
+    **Omission is untouched by all of this**, which is the property the design
+    was chosen for: a phase acquires conditions only by *naming* a set, so a file
+    with no ``[condition_sets]`` table and a phase with no ``conditions`` key
+    reach this function and leave it byte-identical. Absence keeps its single
+    meaning -- *do not drive that axis* -- rather than acquiring a second one.
+
+    A declared set nothing references is **warned about, not refused**: keeping
+    one around while A/B-ing which set a phase points at is a real workflow, and
+    an unused set emits no steps and runs no experiment. But it is not ignored
+    either -- an unused set is usually one half of a typo -- so the two counts
+    are logged **even when they agree**, because "declared and never used" must
+    not be spelled the same way as "everything is wired"
+    (``SUBAGENT_RULES.md`` section 3.1(a)).
+    """
+    from softae.core.campaign_spec_run_plan import (
+        decode_condition_sets,
+        resolve_condition_references,
+    )
+
+    raw_sets = supplied.get("condition_sets")
+    if raw_sets is None and "run_plan" not in supplied:
+        return
+
+    try:
+        sets = decode_condition_sets(raw_sets) if raw_sets is not None else {}
+    except (TypeError, ValueError) as exc:
+        raise SpecLoadError(f"{source}: 'condition_sets': {exc}") from exc
+
+    if "run_plan" not in supplied:
+        referenced: frozenset[str] = frozenset()
+    else:
+        try:
+            supplied["run_plan"], referenced = resolve_condition_references(
+                supplied["run_plan"], sets)
+        except (TypeError, ValueError) as exc:
+            raise SpecLoadError(f"{source}: 'run_plan': {exc}") from exc
+
+    if not sets:
+        return
+    unreferenced = sorted(set(sets) - referenced)
+    logger.info(
+        "condition_sets_resolved", source=source, n_declared=len(sets),
+        n_referenced=len(referenced), unreferenced=unreferenced,
+    )
+    if unreferenced:
+        logger.warning(
+            "condition_sets_unreferenced", source=source,
+            unreferenced=unreferenced,
+        )
 
 
 def _validate_parameter_space(space: dict[str, Any], source: str) -> None:

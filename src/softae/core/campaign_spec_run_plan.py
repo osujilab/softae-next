@@ -120,13 +120,18 @@ logger = structlog.get_logger(__name__)
 
 __all__ = [
     "BASELINE_CONDITIONS_WHY_NOT",
+    "CONDITION_SETS_WHY_NOT",
     "RUN_PLAN_WHY_NOT",
     "baseline_conditions_codec",
+    "condition_sets_codec",
     "decode_baseline_conditions",
+    "decode_condition_sets",
     "decode_run_plan",
     "encode_baseline_conditions",
+    "encode_condition_sets",
     "encode_run_plan",
     "field_codec",
+    "resolve_condition_references",
 ]
 
 #: Why an encode can answer ``UNREPRESENTABLE``, in an operator's words. Read
@@ -167,6 +172,22 @@ BASELINE_CONDITIONS_WHY_NOT = (
     "a baseline carrying an approach tolerance or timeout, which the campaign "
     "baseline waits for nothing and so cannot carry"
 )
+
+#: Why an encode of the named sets can answer ``UNREPRESENTABLE``. The one shape
+#: a file cannot spell is a set whose key and whose ``PhaseSetpoints.name``
+#: disagree: in a file there is only one place either is written — the TOML key
+#: **is** the name — so a Python-built spec that separates them describes
+#: something no file can say, and writing either half would be a guess.
+CONDITION_SETS_WHY_NOT = (
+    "a named condition set whose key and whose own name disagree, which a file "
+    "cannot express because the key is the name"
+)
+
+#: The key a phase writes to reference a named set. Identical to the key an
+#: inline table uses, deliberately: a phase says ``conditions`` and the *type* of
+#: what follows says which form it is. Two keys would let a file carry both and
+#: make the loader pick one.
+CONDITION_REFERENCE_KEY = "conditions"
 
 _SETTLE_REQUIRED = ("round_period_s", "min_hold_s", "max_hold_s")
 _SETTLE_OPTIONAL = ("settle_tol_rel", "settle_n_rounds", "settle_min_channels",
@@ -453,6 +474,184 @@ def decode_baseline_conditions(value: Any) -> PhaseSetpoints:
     return _conditions_from_table(value, "[conditions]", tuning=False)
 
 
+# -- named condition sets (T11.28b) -------------------------------------------
+#
+# ``[condition_sets.<name>]`` at the TOP level of the file, beside
+# ``parameter_space`` and ``budget`` (operator ruling 2026-09-20; spec
+# ``t11_28b_one_config_level_for_humidity.md`` section 4.4.2a), referenced from a
+# phase by name: ``conditions = "casting"``.
+#
+# Three properties decide the shape, and each one is a refusal somewhere below:
+#
+#   * **Omission still means NOT DRIVEN.** A phase acquires conditions only by
+#     *naming* a set, so absence keeps the single meaning
+#     :mod:`softae.core.phase_setpoints`'s module docstring gives it. This is why
+#     the operator chose named sets over campaign-level inheritance: inheritance
+#     re-spells absence as "take the campaign value", and ``SUBAGENT_RULES.md``
+#     section 3.1(a) forbids one token meaning two things. Nothing here has an
+#     ``else`` branch that supplies a default set.
+#
+#   * **A named set is only ever a PHASE's conditions, never the baseline.** So
+#     :data:`_CONDITION_KEYS` applies unconditionally -- the approach bands and
+#     timeouts are legal here, because a phase waits. That is the one asymmetry
+#     with :func:`decode_baseline_conditions`, and it is why the baseline's
+#     *"NOTHING WAITS HERE"* refusal is untouched by any of this.
+#
+#   * **The TOML key IS the name**, table-of-tables rather than array-of-tables.
+#     TOML's own duplicate-key refusal gives uniqueness for free, and there is
+#     exactly one place a name is written, so the reference and
+#     ``PhaseSetpoints.name`` cannot disagree. An explicit ``name`` *inside* a set
+#     is refused for that reason: two spellings of one thing, where preferring
+#     either silently is the guess this module never makes.
+
+
+def _named_set_table(name: Any, body: Any, where: str) -> dict[str, Any]:
+    """One named set's body as the inline conditions table it is equivalent to.
+
+    The TOML key supplies ``name``, which is why an explicit one in the body is
+    refused rather than preferred: :func:`_conditions_from_table` requires a
+    name, and a set carrying its own could name itself something the phase
+    reference does not -- one thing spelled two ways, with no rule for which wins
+    that is not a guess.
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(
+            f"{where}: a condition set's name must be a non-empty string -- it "
+            f"is what a phase writes to reference it (got {name!r})")
+    if not isinstance(body, dict):
+        raise ValueError(
+            f"[condition_sets.{name}] must be a table of setpoints "
+            f"(got {type(body).__name__})")
+    if "name" in body:
+        raise ValueError(
+            f"[condition_sets.{name}] sets its own 'name'. The table key IS the "
+            f"name -- it is what a phase writes as conditions = \"{name}\" -- so a "
+            f"second spelling could disagree with it and neither could be "
+            f"preferred silently. Drop the 'name' key.")
+    # Checked here rather than left to `_conditions_from_table`, which would
+    # report `name` among the valid keys one line after refusing it: a message
+    # that contradicts the refusal above sends an operator round the loop again.
+    unknown = sorted(set(body) - (_CONDITION_KEYS - {"name"}))
+    if unknown:
+        raise ValueError(
+            f"[condition_sets.{name}] has unknown key(s) {unknown}; valid keys: "
+            f"{sorted(_CONDITION_KEYS - {'name'})} — 'name' is the table key")
+    return {"name": name, **body}
+
+
+def decode_condition_sets(value: Any) -> dict[str, PhaseSetpoints]:
+    """The top-level ``[condition_sets]`` table as ``{name: PhaseSetpoints}``.
+
+    Arbitrary N, names the operator chooses: the legal set of names is TOML's key
+    syntax and nothing else. There is no vocabulary, no enum and no count
+    anywhere in this function -- one set and nine take the identical path.
+    """
+    if not isinstance(value, dict):
+        raise ValueError(
+            "expected a [condition_sets] table of named tables, e.g. "
+            "[condition_sets.casting]")
+    out: dict[str, PhaseSetpoints] = {}
+    for name, body in value.items():
+        table = _named_set_table(name, body, "[condition_sets]")
+        out[str(name)] = _conditions_from_table(
+            table, f"[condition_sets.{name}]", tuning=True)
+    return out
+
+
+def encode_condition_sets(value: Any) -> Any:
+    """``{name: PhaseSetpoints}`` as a ``[condition_sets]`` table, or
+    :data:`UNREPRESENTABLE`.
+
+    ``name`` is dropped from each body because the key carries it and the decoder
+    refuses it inside -- writing both would produce a file this module's own
+    decoder rejects, which is worse than a field reported missing by
+    ``spec_toml_completeness``.
+    """
+    from softae.core.campaign_spec_fields import UNREPRESENTABLE
+
+    if not isinstance(value, dict):
+        return UNREPRESENTABLE
+    out: dict[str, Any] = {}
+    for name, setpoints in value.items():
+        if not isinstance(name, str) or not isinstance(setpoints, PhaseSetpoints):
+            logger.warning("condition_sets_not_encodable", key=str(name))
+            return UNREPRESENTABLE
+        if str(setpoints.name) != name:
+            logger.warning("condition_sets_name_disagrees",
+                           key=name, name=str(setpoints.name))
+            return UNREPRESENTABLE
+        table = _conditions_to_table(setpoints)
+        table.pop("name")
+        out[name] = table
+    return out
+
+
+def resolve_condition_references(
+    run_plan: Any, condition_sets: dict[str, PhaseSetpoints],
+) -> "tuple[Any, frozenset[str]]":
+    """*run_plan* with every ``conditions = "<name>"`` replaced by that set's table.
+
+    This is the cross-key pre-pass the top-level placement costs.
+    ``OBJECT_FIELDS`` decodes each field as ``codec.decode(supplied[key])`` --
+    **one argument** -- so the ``run_plan`` codec is handed the ``run_plan``
+    sub-table and nothing else in the file. A *sibling* top-level
+    ``[condition_sets]`` is invisible to it, and resolution therefore has to
+    happen before it is called, in the one place that can see both keys.
+
+    Substituting the **encoded table** rather than the object keeps one decode
+    authority: :func:`_conditions_to_table` is the exact inverse of
+    :func:`_conditions_from_table` with ``tuning=True``, so a resolved phase is
+    indistinguishable from one that wrote the block inline -- which is what makes
+    migrating a file to references a pure edit with no behaviour attached.
+
+    Returns the rewritten plan and the names actually referenced, so the caller
+    can say how many declared sets nothing points at. Anything this function does
+    not recognise is passed through untouched for :func:`decode_run_plan` to
+    refuse with its own message; refusing twice, in two vocabularies, for one
+    defect is how a loader grows two disagreeing error surfaces.
+    """
+    if not isinstance(run_plan, dict):
+        return run_plan, frozenset()
+    phases = run_plan.get("phases")
+    if not isinstance(phases, list):
+        return run_plan, frozenset()
+
+    referenced: set[str] = set()
+    resolved: list[Any] = []
+    for index, row in enumerate(phases, start=1):
+        if not isinstance(row, dict) or CONDITION_REFERENCE_KEY not in row:
+            resolved.append(row)
+            continue
+        raw = row[CONDITION_REFERENCE_KEY]
+        if isinstance(raw, dict):
+            resolved.append(row)            # inline, exactly as before
+            continue
+        if not isinstance(raw, str):
+            raise ValueError(
+                f"phase #{index}: 'conditions' must be either the NAME of a "
+                f"declared condition set (conditions = \"casting\") or an inline "
+                f"[run_plan.phases.conditions] table -- got "
+                f"{type(raw).__name__}. Those are the only two forms, and a "
+                f"phase carries one or the other, never both.")
+        if raw not in condition_sets:
+            declared = sorted(condition_sets)
+            names = (str(declared) if declared
+                     else "none -- the file declares no [condition_sets] at all")
+            raise ValueError(
+                f"phase #{index}: 'conditions' names {raw!r}, which no "
+                f"[condition_sets.{raw}] declares. Declared set(s): {names}. "
+                f"A name that resolves to nothing is refused at load rather than "
+                f"at the bench: this refusal is the whole reason a name beats a "
+                f"repeated number, because it turns a typo into a parse-time "
+                f"failure that says what was probably meant.")
+        referenced.add(raw)
+        resolved.append({
+            **row,
+            CONDITION_REFERENCE_KEY: _conditions_to_table(condition_sets[raw]),
+        })
+    return {**run_plan, "phases": resolved}, frozenset(referenced)
+
+
 def _settle_from_dict(raw: Any, index: int) -> SettlePlan:
     where = f"phase #{index}: [settle]"
     if not isinstance(raw, dict):
@@ -579,3 +778,25 @@ def baseline_conditions_codec() -> Any:
             encode_baseline_conditions, decode_baseline_conditions,
             BASELINE_CONDITIONS_WHY_NOT)
     return _BASELINE_CODEC
+
+
+_CONDITION_SETS_CODEC: Any = None
+
+
+def condition_sets_codec() -> Any:
+    """The ``condition_sets`` codec, built on first call for ``field_codec``'s reason.
+
+    Registered like any other field even though the *decode* half is also
+    reached by :func:`spec_from_dict`'s pre-pass: the registration is what gives
+    ``spec_to_dict`` an **encoder**, and without one ``spec_toml_completeness``
+    would hand ``tomli_w`` a dict of :class:`PhaseSetpoints` objects and report
+    the whole representable part as invalid TOML.
+    """
+    global _CONDITION_SETS_CODEC
+    if _CONDITION_SETS_CODEC is None:
+        from softae.core.campaign_spec_fields import FieldCodec
+
+        _CONDITION_SETS_CODEC = FieldCodec(
+            encode_condition_sets, decode_condition_sets,
+            CONDITION_SETS_WHY_NOT)
+    return _CONDITION_SETS_CODEC

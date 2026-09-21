@@ -38,6 +38,9 @@ import structlog
 from softae.core.campaign_spec_run_plan import (
     baseline_conditions_codec as _baseline_conditions_codec,
 )
+from softae.core.campaign_spec_run_plan import (
+    condition_sets_codec as _condition_sets_codec,
+)
 from softae.core.campaign_spec_run_plan import field_codec as _run_plan_codec
 
 logger = structlog.get_logger(__name__)
@@ -379,6 +382,14 @@ OBJECT_FIELDS: dict[str, FieldCodec] = {
     # have no reader. Built through `baseline_conditions_codec()` for the same
     # import-order reason as `run_plan` above.
     "conditions": _baseline_conditions_codec(),
+    # Named condition sets (T11.28b): a table of tables, decoded by the same
+    # module, with the phase key set rather than the baseline's -- a named set is
+    # only ever a PHASE's conditions, so an approach band or timeout on one has a
+    # reader. Registered here for the ENCODE half above all: the decode is also
+    # reached by `spec_from_dict`'s cross-key pre-pass (the top-level placement's
+    # cost), but only this entry gives `spec_to_dict` a way to write the field
+    # back out as TOML.
+    "condition_sets": _condition_sets_codec(),
     "general_formulation": FieldCodec(
         encode_general_formulation, decode_general_formulation,
         "a composition context whose targets are a Python callable rather than "
