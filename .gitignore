@@ -33,15 +33,17 @@ softae-next.code-workspace
 # catalogs (tasks.toml, recipes.toml) + chemicals/solutions CSVs
 # BY POLICY, not oversight: each instance develops its own catalog for its own hardware.
 /data/
-tests/data/plan_pins/fixture_*
 # real experimental results DB at repo root
 softae_results.db
 # workflow run logs (*.jsonl)
 logs/
 # ms_plot_*.txt and other run dumps
 output/
-# data exports; no CSV outside data/ exists today
+# data exports. The ONLY tracked CSVs are the placeholder catalog below.
 *.csv
+# EXCEPTION: a placeholder catalog ships inside the package so a clone can compile the
+# examples. It is a demonstration, not guaranteed to work on any rig; data/ stays untracked.
+!src/softae/catalog_defaults/*.csv
 # repo-root only: a test artifact from a DataStore built on a relative path
 # instead of tmp_path. Ignored so it cannot be committed by accident.
 /softae_data/
