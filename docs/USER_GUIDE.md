@@ -1,680 +1,371 @@
 # SoftAE User Guide
 
-> Soft-matter Autonomous Experimentation Platform  
-> Version 0.1.0 · Python ≥ 3.11 · PySide6
+Soft-matter Autonomous Experimentation Platform · v0.1.0 · Python ≥ 3.11 · PySide6
 
----
+**Before you start.** The repository ships no process catalog: `data/` (`tasks.toml`,
+`recipes.toml`, `chemicals.csv`, `solutions.csv`) is gitignored by policy. Build one in Process
+Studio (Tab 13, writes the TOMLs) and Catalogs (Tab 11, writes the CSVs), or by hand against
+`core/task_catalog.py`, `core/recipe_registry.py` and `core/formulation.py`. A missing catalog
+file loads as an empty catalog rather than raising, so catalog-loading tests are red on a fresh
+clone by construction.
 
-> **Before you start: this repository ships no process catalog.** `data/` — `tasks.toml`,
-> `recipes.toml` and the chemicals/solutions CSVs — is gitignored **by policy**: each new
-> instance of this system needs users to develop their own processes, recipes and workflows
-> that best reflect the integrated hardware. A fresh checkout therefore has no tasks to name
-> in `anneal_task`, and the catalog-loading tests are **not green on a fresh clone by
-> construction**. Build your own catalog in the Process Studio tab (Tab 13), or copy one from
-> another instance and edit it against your hardware.
+## Contents
 
-## Table of Contents
-
-1. [Installation](#1-installation)
-2. [Configuration](#2-configuration)
-3. [Launching the GUI](#3-launching-the-gui)
-4. [Tab Reference](#4-tab-reference)
-5. [CLI Workflow Runner](#5-cli-workflow-runner)
-6. [Writing Workflow YAML Files](#6-writing-workflow-yaml-files)
-7. [EIS Analysis Pipeline](#7-eis-analysis-pipeline)
-8. [Emergency Stop & Safe Exit](#8-emergency-stop--safe-exit)
-9. [Error Reference](#9-error-reference)
-10. [Instruments Reference](#10-instruments-reference)
-11. [Troubleshooting](#11-troubleshooting)
-12. [Documentation Site](#12-documentation-site)
-13. [Data Persistence (DataStore)](#13-data-persistence-datastore)
-14. [Deposition Digital Twin](#14-deposition-digital-twin)
-15. [Autonomous Campaigns](#15-autonomous-campaigns)
-16. [EIS Commissioning & Calibration](#16-eis-commissioning--calibration)
-17. [EIS Analysis Engine & Gates](#17-eis-analysis-engine--gates)
-18. [Unattended Operation & Safety](#18-unattended-operation--safety)
-19. [Extending: a New Measurement Modality](#19-extending-a-new-measurement-modality)
-20. [Shadow Campaign Review](#20-shadow-campaign-review)
-21. [Thickness Series](#21-thickness-series)
-22. [Equilibration Characterization](#22-equilibration-characterization)
-23. [Environment Hold — `softae-env`](#23-environment-hold--softae-env)
-24. [Adaptive-Acquisition Validation — `softae-eis-validate`](#24-adaptive-acquisition-validation--softae-eis-validate)
+1 [Installation](#1-installation) · 2 [Configuration](#2-configuration) · 3 [Launching the GUI](#3-launching-the-gui) ·
+4 [Tab reference](#4-tab-reference) · 5 [Command-line tools](#5-command-line-tools) ·
+6 [`softae-run` and workflow YAML](#6-softae-run-and-workflow-yaml) · 7 [EIS analysis API](#7-eis-analysis-api) ·
+8 [Stopping, safe exit, interlock, head state](#8-stopping-safe-exit-interlock-head-state) ·
+9 [Errors and troubleshooting](#9-errors-and-troubleshooting) · 10 [DataStore](#10-datastore) ·
+11 [Deposition twin and catalogs](#11-deposition-twin-and-catalogs) · 12 [`softae-campaign`](#12-softae-campaign) ·
+13 [`softae-commission`](#13-softae-commission) · 14 [EIS engine, gates, cell constant, fixture correction](#14-eis-engine-gates-cell-constant-fixture-correction) ·
+15 [`softae-shadow`](#15-softae-shadow) · 16 [`softae-thickness`](#16-softae-thickness) ·
+17 [`softae-equilibration`](#17-softae-equilibration) · 18 [`softae-env`](#18-softae-env) ·
+19 [`softae-eis-validate`](#19-softae-eis-validate) · 20 [Adding a measurement modality](#20-adding-a-measurement-modality) ·
+21 [Documentation site](#21-documentation-site)
 
 ---
 
 ## 1. Installation
 
-### Prerequisites
-- Python 3.11+
-- Git
-- (Optional) NI-DAQmx runtime, ThorLabs TSI SDK, PalmSens SDK for hardware
-
-### Install from source
+Python 3.11+, Git. Optional for hardware: NI-DAQmx runtime, ThorLabs TSI SDK, PalmSens SDK.
 
 ```powershell
 cd softae-next
 python -m venv .venv
 .venv\Scripts\activate
 
-pip install -e .              # core dependencies — headless: all 11 CLI tools + analysis
+pip install -e .              # core: the 13 headless console scripts + analysis + DataStore
 pip install -e ".[gui]"       # + PySide6, opencv, qasync — required for the desktop GUI
-pip install -e ".[dev]"       # + test/lint tools (includes [gui]; ~50 test files import PySide6)
+pip install -e ".[dev]"       # + test/lint tools (self-references [gui])
 pip install -e ".[hardware]"  # + NI-DAQ, Blinka, HID for real instruments
-pip install -e ".[web]"       # + Dash/Plotly for the EIS web visualizer
+pip install -e ".[web]"       # + Dash/Plotly for softae-web
+pip install -e ".[docs]"      # + mkdocs, mkdocs-material, mkdocstrings[python]
 ```
 
-**What the bare `pip install -e .` gives you**, since 2026-08-20: the eleven headless console
-scripts — `softae-run`, `softae-campaign`, `softae-commission`, `softae-method`, `softae-web`,
-`softae-shadow`, `softae-thickness`, `softae-equilibration`, `softae-env`, `softae-eis-timing`,
-`softae-eis-validate` — plus the whole EIS analysis pipeline and the DataStore. The Qt stack is
-**no longer a core dependency**. Only the three GUI entry points need the extra:
+Only `softae-gui`, `softae-deposition` and `softae` (the `gui_scripts` launcher) need `[gui]`. An
+existing venv keeps its PySide6 until it is rebuilt, so verify the headless path in a new venv.
 
-| Entry point | Needs `[gui]`? |
-|---|---|
-| `softae-gui`, `softae-deposition`, `softae` (the `gui_scripts` launcher) | **yes** |
-| the other eleven console scripts | no |
-
-So a **fresh** install on a headless analysis box or a CI runner now skips PySide6 and OpenCV
-entirely. `.[dev]` self-references `softae[gui]`, so the developer install string is unchanged —
-if you have been typing `pip install -e ".[dev]"`, keep typing it and nothing about your
-environment changes.
-
-> **An existing venv keeps working until you reinstall.** Making a dependency optional does not
-> uninstall it. A venv created before this change still has PySide6 in it and still launches the
-> GUI from a bare `pip install -e .`; the split takes effect on the next fresh install or
-> reinstall into a clean environment. If you want to *verify* the headless path, build a new venv
-> — testing it in the current one proves nothing.
-
-### Verify installation
-
-```powershell
-softae-gui --help     # GUI entry point   (needs .[gui])
-softae-run --help     # CLI workflow runner
-pytest tests/ -v      # run test suite    (needs .[dev])
-```
+Verify with `softae-gui --help` (needs `[gui]`), `softae-run --help`, `pytest tests/ -v` (needs
+`[dev]`).
 
 ---
 
 ## 2. Configuration
 
-All instrument addresses, safety limits, EIS presets, and PCB layouts are defined in `softae_config.toml` at the repository root.
+Everything configurable lives in `softae_config.toml` at the repository root. The loader searches:
 
-### Config Lookup Chain
-
-The config loader searches in this order:
 1. Explicit path passed to `config.load(path=...)`
 2. `SOFTAE_CONFIG` environment variable
 3. `softae_config.toml` in the current working directory
-4. `softae_config.toml` in the package install root
+4. `softae_config.toml` in the package install root — under an editable install, the repo root
 
-### Key Sections
+### Sections
 
-| Section | Purpose | Example Keys |
+| Section | Purpose | Keys |
 |---|---|---|
-| `[paths]` | SDK / DLL locations | `thorlabs_dll`, `data_root` |
-| `[instruments.*]` | Per-instrument connection details | port, baud, address |
-| `[pcb.*]` | Printed circuit board layouts | channels, grid, spacing, electrode_dims |
-| `[eis_presets.*]` | EIS measurement presets | npts, f_hi, f_lo, mv_ac |
-| `[channel_routing]` | Channel → potentiostat mapping | `pico1_range = [1, 16]` |
-| `[piezo]` | Piezo driver defaults and manual profile | `enabled`, `frequency_hz`, `sweep_on_s` |
-| `[piezo.liquid_events]` | Optional event-driven piezo behavior for HT workflows | `enabled`, `settings_source`, `channel_a` |
-| `[safety]` | Operational limits, gate timeouts, anneal watchdog bands | `temp_max_C`, `pump_rate_max`, `step_timeout_s`, `anneal_temp_band_C` |
-| `[deposition]` | Drop-cast engine defaults | `evaporation_pct`, recipe defaults |
-| `[dropcast]` | Two-phase cast rates and dwell | precondition flush, proportional rate |
-| `[liquid_handling]` | Optional per-line volume correction | `enabled`, `beta`, `eta_ref_mpas` |
-| `[quality]` | Measurement accept/suspect/reject grading | `enabled`, `max_residual_pct`, `max_abs_z` |
-| `[purge]` | Anti-clog purge harness | `actuate`, cadence, particulate pump |
+| `[paths]` | SDK/DLL locations, catalog root | `thorlabs_dll`, `palmsens_sdk`, `data_root` |
+| `[data]` | Project store | `project_dir`, `db_filename`, `auto_save_eis` |
+| `[instruments.*]` | Per-instrument connection | `driver`, `port`, `baud`, address |
+| `[pcb.*]` | Board layouts | `channels`, grid, spacing, electrode dims |
+| `[eis_presets.*]` | EIS sweep presets | `npts`, `f_hi`, `f_lo_mHz`, `mv_ac` |
+| `[channel_routing]` | Channel → potentiostat | `pico1_range = [1,16]`, `pico2_range = [17,32]` |
+| `[piezo]`, `[piezo.liquid_events]` | Piezo defaults, event profile | `enabled`, `frequency_hz`, `sweep_on_s`, `sweep_rest_s`, `channel_a`, `settings_source` |
+| `[safety]` | Limits, timeouts, watchdogs | see below |
+| `[deposition]`, `[dropcast]` | Cast engine defaults | `evaporation_pct`, flush + proportional rate |
+| `[liquid_handling]`, `[liquid_handling.line.<id>]` | Volume correction | `enabled`, `beta`, `eta_ref_mpas`, `cracking_kpa_per_valve`, `compliance_uL_per_kpa`, `alpha_base`, `viscosity_mpas` |
+| `[quality]` | Measurement grading | `enabled`, `max_residual_pct`, `max_abs_z`, `min_r_squared` |
+| `[purge]` | Anti-clog purge | `actuate`, cadence, particulate pump |
 | `[eis]` | Analysis engine + campaign objective | `engine`, `objective` |
-| `[eis.gates]` | Admission-gate thresholds | `enabled`, `min_fit_pts`, `rho_degenerate` |
-| `[eis.instrument]` | **Measured** instrument envelope | `phase_noise_deg`, `z_max_ohm`, `max_amplitude_mV` |
-| `[eis.cell]` | Cell geometry + electrode configuration | `L_gap_cm`, `dead_height_um`, `k_config_verified` |
-| `[eis.fixture]` | Fixture correction (series-only) | `mode`, `fixture_id`, `load_tolerance_pct` |
-| `[stage_calibration]` | Saved stage origin / skew | persisted by Tab 1 |
-| `[logging]`, `[web]`, `[webcam]` | Log level and optional web/camera services | `level`, `port` |
+| `[eis.gates]` | Admission-gate thresholds | `enabled`, `min_fit_pts`, `kk_resid_pct`, `kk_c`, `rho_degenerate` |
+| `[eis.instrument]` | Measured instrument envelope | `phase_noise_deg`, `z_max_ohm`, `max_amplitude_mV` |
+| `[eis.cell]` | Geometry + electrode config | `L_gap_cm`, `dead_height_um`, `electrode_configuration`, `k_config_verified`, `blocking` |
+| `[eis.fixture]` | Fixture correction | `mode`, `fixture_id`, `load_tolerance_pct` |
+| `[stage_calibration]` | Stage origin / skew | persisted by Tab 1 |
+| `[logging]`, `[web]`, `[webcam]` | Log level, optional services | `level`, `port` |
 
-Three of these ship **deliberately disabled** — `[quality] enabled`, `[purge] actuate`, and
-`[eis.gates] enabled`. Each governs a mechanism that removes or reshapes data, and each ships
-inert until its thresholds have been reviewed against real runs on *this* rig. See
-[§17](#17-eis-analysis-engine--gates) and [§18](#18-unattended-operation--safety).
+`[quality] enabled`, `[purge] actuate` and `[eis.gates] enabled` all ship **false**: each removes
+or reshapes data and waits on thresholds reviewed against this rig's runs.
 
-### Instruments Configured
+### Instruments
 
-| Config Key | Instrument | Default Port |
-|---|---|---|
-| `instruments.stage` | Newport ESP301 linear stage | `ASRL7::INSTR` |
-| `instruments.syringe` | Harvard Apparatus syringe pump | `ASRL4::INSTR` |
-| `instruments.temp_controller` | Novus N1040 temperature controller | `com6` |
-| `instruments.pico1` / `pico2` | PalmSens EmStat Pico (×2) | `auto` |
-| `instruments.piezo` | Trinket piezo controller | `COM16` |
-| `instruments.camera` | ThorLabs Zelux camera | (SDK discovery) |
-
-> **Hardware note — dual Pico port assignment:**  
-> When `port = "auto"`, `pico1` binds to the first enumerated EmStat Pico (`ports[0]`) and `pico2` binds to the second (`ports[1]`). This relies on the OS enumerating COM ports in stable ascending order between reboots. If your two Picos are assigned COM port numbers inconsistently, channel routing will be wrong (channels 17–32 will run on the wrong device). To make the mapping deterministic, assign explicit ports in `softae_config.toml`:
->
-> ```toml
-> [instruments.pico1]
-> port = "COM5"
->
-> [instruments.pico2]
-> port = "COM7"
-> ```
-| `instruments.lamp` | MCP4728 quad-DAC lamp (I²C via MCP2221) | channel `A` @ `0x60` |
-| `instruments.keithley` | Keithley 2700 DMM | USB VISA address |
-| `instruments.ht_sensor` | SHT31-D humidity/temp sensor | MCP2221 HID |
-| `instruments.rh_controller` | Trinket M0 RH PID controller | `COM11` |
-
-### EIS Presets
-
-| Preset | Points | Freq Range | AC Amplitude |
+| Config key | Instrument | Default port | Methods |
 |---|---|---|---|
-| Standard | 35 | 200 kHz – 4 Hz | 10 mV |
-| Quick | 25 | 200 kHz – 20 Hz | 10 mV |
-| Extended | 45 | 200 kHz – 1.2 Hz | 10 mV |
-| Longest | 35 | 200 kHz – 200 mHz | 10 mV |
+| `instruments.stage` | Newport ESP301 stage | `ASRL7::INSTR` | `stage_init`, `move_to`, `move_by`, `home_stage`, `live_position`, `stage_end` |
+| `instruments.syringe` | Harvard Apparatus pump | `ASRL4::INSTR` | `single_pump`, `head_flip`, `head_retract`, `head_descend`, `head_check`, `syr_end` |
+| `instruments.temp_controller` | Novus N1040 | `com6` | `write_sp`, `get_sp`, `get_pv`, `get_pv_surf`, `wait`, `ramp_linear`, `anneal` |
+| `instruments.pico1` / `pico2` | PalmSens EmStat Pico (×2) | `auto` | `sendscript_getdata`, `eis_extractdata`, `eis_plotdata` |
+| `instruments.piezo` | Trinket M0 piezo controller | `COM16` | `set_channel`, `set_frequency`, `set_sweep`, `apply_profile`, `standby`, `reset_config` |
+| `instruments.camera` | ThorLabs Zelux | SDK discovery | `snap`, `acquire_n_frames`, `save_image` |
+| `instruments.lamp` | MCP4728 quad-DAC via MCP2221 | ch `A` @ `0x60` | `on`, `off`, `set_eeprom_defaults` |
+| `instruments.keithley` | Keithley DAQ6510 — **mock driver only** | USB VISA | `singleCh_measure(ch, nplc)`, `multi_measure(ch_start, ch_end, nplc)` |
+| `instruments.ht_sensor` | SHT31-D | MCP2221 HID | `get_T`, `get_H` |
+| `instruments.rh_controller` | Trinket M0 RH PID | `COM11` | `set_setpoint`, `start`, `stop`, `get_H`, `wait` |
 
-### Safety Limits
+With `port = "auto"`, `pico1` binds to the first enumerated EmStat Pico and `pico2` to the
+second, so unstable COM enumeration puts channels 17–32 on the wrong device. Pin them with
+explicit `port = "COM5"` / `"COM7"` entries.
 
-| Parameter | Limit |
-|---|---|
-| Temperature | 5 – 200 °C |
-| Pump rate | 0.05 – 2120 µL/min |
-| Reservoir warning | 500 µL |
-| Step timeout | 900 s |
+### EIS presets
 
-### Piezo Configuration (optional)
+| Preset | Points | f_hi | f_lo | AC amplitude |
+|---|---|---|---|---|
+| Standard | 34 | 200 kHz | 3.912 Hz | 10 mV |
+| Quick (`DEFAULT_PRESET`) | 27 | 200 kHz | 6.475 Hz | 10 mV |
+| Extended | 53 | 200 kHz | 1.351 Hz | 10 mV |
+| Longest | 39 | 200 kHz | 228 mHz | 10 mV |
 
-Piezo control is disabled by default. Enable it explicitly in `softae_config.toml`.
+`f_lo` is a conductivity floor: the −Z″ apex sits at `f = 1/(2πRC_cell)`, so a preset that does
+not reach the apex extrapolates `R1` instead of measuring it. Editing a preset retires its
+stopwatch anchor in `core/preflight.py`, and durations then report as extrapolated. **Preset names
+are looked up case-sensitively.**
+
+### `[safety]`
+
+| Key | Value | Governs |
+|---|---|---|
+| `temp_min_C` / `temp_max_C` | 5.0 / 200.0 °C | Heater setpoint band |
+| `pump_rate_min` / `pump_rate_max` | 0.05 / 2120.0 µL/min | Syringe rate (14.4 mm syringe) |
+| `reservoir_soft_warn_uL` | 1000.0 | Alert; run continues |
+| `reservoir_hard_stop_uL` | 250.0 | Dispense refused |
+| `step_timeout_s` | 900 | Ceiling for a step declaring no `timeout_s`; `0` = unbounded |
+| `stage_x_min_mm` / `x_max` / `y_min` / `y_max` | −100 / 100 / −50 / 50 mm | Stage travel |
+| `anneal_deviation_warn_C` | 2.0 | Anneal watchdog: report |
+| `anneal_deviation_fault_C` | 5.0 | Anneal watchdog: abort after the grace period |
+| `anneal_deviation_grace_s` | 120.0 | Continuous fault time before abort |
+| `anneal_poll_interval_s` | 30.0 | Watchdog poll cadence |
+
+Reservoir levels are declared by the operator through Refill, never inferred from `single_pump`'s
+`res_vol` (that is syringe volume declared to the pump firmware, not stock).
+
+### Piezo
+
+Disabled by default; enable explicitly.
 
 ```toml
 [instruments.piezo]
-driver  = "piezo"
-port    = "COM16"
-baud    = 115200
+driver = "piezo"
+port = "COM16"
+baud = 115200
 enabled = false
 
 [piezo]
-enabled      = false
-channel      = "A"
+enabled = false
+channel = "A"
 frequency_hz = 500
-sweep_on_s   = 2.0
+sweep_on_s = 2.0
 sweep_rest_s = 3.0
 
 [piezo.liquid_events]
-enabled         = false
-settings_source = "manual_profile"  # manual_profile | liquid_event_profile
-channel_a       = true
-frequency_hz    = 500
-sweep_on_s      = 2.0
-sweep_rest_s    = 3.0
+enabled = false
+settings_source = "manual_profile"   # manual_profile | liquid_event_profile
+channel_a = true
+frequency_hz = 500
+sweep_on_s = 2.0
+sweep_rest_s = 3.0
 ```
 
-Notes:
-- Event profile values are validated to match protocol limits: frequency `10..5000` Hz and sweep timings `0.01..120.0` s.
-- CFG commands require firmware capability support (`CAPS PIEZO_CFG_V1`); legacy firmware still supports channel on/off.
-- Real hardware requires serial dependencies (`pyserial`) and a reachable configured COM port.
+Event profile values are validated against protocol limits: frequency `10..5000` Hz, sweep timings
+`0.01..120.0` s. CFG commands need firmware capability `CAPS PIEZO_CFG_V1`; legacy firmware still
+supports channel on/off. Real hardware needs `pyserial` and a reachable COM port.
 
 ---
 
 ## 3. Launching the GUI
 
 ```powershell
-# Standard (auto-detects real hardware, falls back to mocks)
-softae-gui
-
-# Force mock instruments (no hardware needed)
+softae-gui              # auto-detects real hardware, falls back to mocks per instrument
 python -m softae.gui    # equivalent
 ```
 
-The GUI opens a window titled **"SoftAE — Soft-matter Autonomous Experimentation"** (1200×800 minimum) with 9 tabs and a persistent emergency stop button in the toolbar.
+The window is titled "SoftAE — Soft-matter Autonomous Experimentation" (1200×800 minimum),
+carries **13 tabs**, and has emergency-stop and safe-exit buttons in the toolbar.
 
-### Mock vs Real Mode
-
-| Mode | Behavior |
+| Mode | Behaviour |
 |---|---|
 | Auto-detect (default) | Tries each real driver; falls back to mock per instrument |
-| Mock (`mock=True`) | All 10 instruments use simulated drivers |
-| Real (`mock=False`) | Demands real hardware; raises error if unavailable |
+| Mock (`mock=True`) | Every configured instrument uses a simulated driver |
+| Real (`mock=False`) | Demands real hardware; raises if unavailable |
 
 ---
 
-## 4. Tab Reference
+## 4. Tab reference
 
-### Tab 1: Init & Calibration
+**Tab 1 — Init & Calibration.** Instrument table (name, type, state, details; 2 s refresh).
+Connect/Disconnect All or Selected. Stage calibration: Home and Dep-1, "Set Current →" captures
+live position, "Go Home"/"Go Dep-1" move on a background thread. Syringe config: per-pump
+`parallel_syringes` (1 or 2), **Apply + Save** persists to `softae_config.toml`. PCB selector.
+Position map: click an electrode to move there.
 
-**Purpose:** Connect instruments, calibrate the stage, select the PCB layout.
+**Tab 2 — Liquid Model.** System parameters (`beta`, `eta_ref_mpas`, `alpha_growth_per_run`) and
+three line panels (0/1/2) with per-line physics and a live prime-volume estimate. **Apply + Save**
+writes `[liquid_handling]`, `[liquid_handling.line.<id>]` and `[piezo.liquid_events]`. Piezo event
+settings: enable, source (`manual_profile` uses the Manual tab's active profile;
+`liquid_event_profile` injects one `piezo.apply_profile(...)` step), channel A, freq/ON/REST
+(editable only under `liquid_event_profile`).
 
-| Section | What You Can Do |
-|---|---|
-| Instrument Table | View all 10 instruments with name, type, state (green/red), and details. Auto-refreshes every 2 s. |
-| Connect / Disconnect | "Connect All", "Disconnect All", or select a row and use "Connect Selected" / "Disconnect Selected" |
-| Stage Calibration | Set Home and Dep-1 (deposition start) coordinates. "Set Current →" captures live position. "Go Home" / "Go Dep-1" moves the stage (dispatched to a background thread; button disabled until complete). |
-| Syringe Config | **Syringe count controls only.** Set the per-pump `parallel_syringes` count (1 or 2) and click **Apply + Save**. This persists to `softae_config.toml`, is applied to the active syringe driver, and propagates to Manual Control readouts via polling (~2 s interval). |
-| PCB Selector | Dropdown of PCB layouts from config. Shows channel count, grid, spacing, electrode geometry. |
-| Position Map | Interactive scatter plot showing electrode positions from the active PCB layout. Click an electrode to move the stage to that position. Current position is polled in a background thread and highlighted in real time. |
+**Tab 3 — Manual Control.**
+- *Stage*: X/Y "Go To" or jog arrows, step 0.01–50 mm, position polled every 2 s.
+- *Temperature*: setpoint (5–200 °C); ramp (target + °C/min); **Anneal** (target + hold seconds,
+  optional ramp rate and tolerance) restores the original setpoint via `finally`.
+- *Relative humidity*: target 0–95 %, Set / Start PID / Stop PID.
+- *Syringe pumps*: three rows, rate µL/min + volume µL → Infuse. Each row shows
+  `Syringes loaded: N` and divides its command by that count. `Apply liquid correction` toggles
+  correction. Retract/Descend with a head indicator (green = retracted, orange = descended).
+- *Piezo (channel A)*: ON/OFF via `set_channel`; Freq/ON/REST + **Apply Settings** via
+  `apply_profile`. Read-only when `[piezo] enabled = false`.
+- *Camera*: exposure 0.001–10 s, Snap, Live Preview (1 FPS), Lamp On/Off, 320×240.
+- *EIS quick run*: channel 1–32, pico auto-routed. A preset populates `f_hi`, `f_lo` (mHz),
+  `npts`, `mVac`, `mVdc`; edits apply to this run only and are never written back to the preset.
+  Optional auto-save to the DataStore run directory and fit overlay; Nyquist + Bode popup.
 
-### Tab 2: Liquid Model
+**Tab 4 — Monitoring.** Rolling 10-min temperature (PV+SP) and humidity (RH+SP) plots; numeric
+readouts (temp PV/SP, RH, RH SP, stage X/Y); ThorLabs camera feed at 1 FPS; USB webcam panel
+(exposure slider −1..−9, timestamp overlay, click-drag zoom, single click resets); workflow
+progress bar; instrument log (last 500 lines).
 
-**Purpose:** View and refine liquid-handling correction parameters in a dedicated workspace.
+**Tab 5 — HT Experiment.** Mode (**Full Protocol** = flush + deposit + EIS, or **Measure Only**) →
+PCB layout and EIS preset → formulation matrix, or **Formulation Manager…** to define stocks and
+compute per-channel volumes → channel selection → **Generate Workflow** to preview → **▶ Start**,
+**⏸ Pause**, **⏹ Abort** → **Save CSV** / **Save EIS Data** / **Fit All EIS** / **Save PDF
+Report**. The preview reports `liquid_correction: enabled|disabled`, prime estimates, and
+per-channel target vs commanded dispense for `p0`/`p1`.
 
-**Display & Controls:**
-- **System Parameters:** Toggle correction on/off and edit shared model values (`beta`, `eta_ref_mpas`, `alpha_growth_per_run`)
-- **Three Line Panels (0/1/2):** Each line has editable `cracking_kpa_per_valve`, `compliance_uL_per_kpa`, `alpha_base`, and `viscosity_mpas`
-- **Prime Estimates:** Live estimated prime volume (`uL`) shown for each line as parameters change
-- **Apply + Save:** Persists edits to `softae_config.toml` (`[liquid_handling]` and `[liquid_handling.line.<id>]`)
+Channel specs everywhere (HT, Arrhenius, Live BO) parse through `core/channel_spec.py`:
+comma-separated channels, `lo-hi` inclusive ranges, whitespace ignored. The HT tab drops a bad
+token silently; the others raise, and Live BO also rejects a channel beyond the selected board's
+electrode count.
 
-**Piezo Event Settings (same tab):**
-- **Enable piezo during liquid-handling events:** maps to `[piezo.liquid_events].enabled`
-- **Settings source:** `manual_profile` or `liquid_event_profile`
-  - `manual_profile`: HT workflow events use the Manual tab profile already active on the device
-  - `liquid_event_profile`: HT workflow injects one `piezo.apply_profile(...)` step before channel events
-- **Use channel A for events:** maps to `[piezo.liquid_events].channel_a` (current workflow integration targets channel A)
-- **Event freq / ON / REST:** enabled only when source is `liquid_event_profile`
-- **Apply + Save:** also persists `[piezo.liquid_events]` via `save_piezo_config(...)`
+Piezo liquid events during Full Protocol need all of `[piezo] enabled`,
+`[piezo.liquid_events] enabled` and `channel_a = true`; the workflow then inserts `piezo_on_chN`
+before each channel's dispense/EIS block, `piezo_off_chN` after it, and `piezo_standby` in
+teardown. Measure-only adds none.
 
-The tab always renders lines 0, 1, and 2 even if config was previously sparse, so the UI remains aligned with the three syringe lines used by Manual Control.
+**Tab 6 — Arrhenius Sweep.** Temperature profile (T start, T stop, T step °C, dwell) → channels →
+instrument names (`pico1`, `temp_controller`) → electrode geometry L, t, w in cm (blank gives NaN
+σ) → EIS preset → **▶ Start Sweep** (builds per-channel `.mscr` files first). The Arrhenius panel
+plots ln(σ) vs 1/T with a linear fit and reports E_a and σ₀; **Export CSV** saves per-temperature
+σ and fit parameters. Pico routing as Tab 5.
 
-### Tab 3: Manual Control
+**Tab 7 — Autonomous.** Placeholder scaffolding, retained deliberately for a future
+multi-objective front end. Closed-loop campaigns run from Tab 10 or `softae-campaign`. Do not
+remove it.
 
-**Purpose:** Hands-on control of every instrument.
+**Tab 8 — Analysis.** *Fit & Export*: **Load File(s)…** (`.txt`, `.csv`, `.dat`) → Nyquist + Bode
+→ circuit model → **Fit All** → L, t, w in cm → results table of R₀, R₁, σ per channel →
+**Save to Database** / **Browse Database** / **Export CSV**. *EIS Browser*: three-pane viewer
+(Overview / Inspection / Conductivity); **↻ Reload from DataStore** opens a dialog with
+run/channel/limit filters and loads or imports selected rows; **⤢ Pop Out Window** detaches it.
+Reload and import never auto-fit. Standalone:
 
-**Stage:**
-- Enter X/Y coordinates and click "Go To", or use arrow buttons for jogging; commands dispatch to a background thread (button disabled during execution)
-- Adjustable step size (0.01–50 mm)
-- Live position display (polled every 2 s off the main thread)
-
-**Temperature:**
-- Set a target temperature (5–200 °C) → "Set" button
-- Or configure a ramp: target + rate (°C/min) → "Start Ramp"
-- **Anneal**: target temp + hold time (s), optional ramp rate and tolerance → "Anneal". Ramps (or jumps) to the target, holds for the specified duration, then automatically restores the original setpoint (guaranteed via `finally`).
-- Live SP and PV readout
-
-**Relative Humidity:**
-- Set target RH (0–95%) → "Set" / "Start PID" / "Stop PID"
-- Live RH readout
-
-**Syringe Pumps:**
-- 3 pump rows (Pump 0/1/2): set rate (µL/min) and volume (µL) → "Infuse"
-- Per-row readout shows `Syringes loaded: N` from live per-pump syringe status (polled every ~2 s and auto-updated when Init counts change)
-- `Apply liquid correction` toggle controls whether entered volume is corrected before dispatch
-- Each pump’s command is divided by its own loaded syringe count before dispatch
-- Last-command feedback shows target→commanded volume and correction state (`on`/`off`)
-- Retract / Descend buttons for the pneumatic head
-- Head status indicator (green = retracted, orange = descended)
-
-**Piezo (Channel A):**
-- `Channel A ON` / `Channel A OFF` sends `piezo.set_channel(channel="A", enabled=...)`
-- Profile controls: `Freq (Hz)`, `ON (s)`, `REST (s)`
-- `Apply Settings` sends `piezo.apply_profile(frequency_hz, on_s, rest_s)`
-- If piezo is disabled in config (`[piezo].enabled = false`), controls are read-only and status indicates config-disabled state
-- CFG-dependent profile updates require compatible firmware; channel on/off continues to work with legacy listener behavior
-
-**Camera:**
-- Exposure control (0.001–10 s)
-- "Snap" for a single frame, "Live Preview" toggle for 1 FPS feed
-- "Lamp On" / "Lamp Off" buttons
-- 320×240 image display
-
-**EIS Quick Run:**
-- Select channel (1–32); pico is auto-routed from config (channels 1–16 → pico1, 17–32 → pico2)
-- Choose a **preset** (Standard, Quick, Extended, Longest) to pre-populate the five editable parameter fields
-- Adjust **f_hi (Hz)**, **f_lo (mHz)**, **npts**, **mVac**, and **mVdc** directly before running — changes are not persisted to the preset, they apply only to the current run
-- "Run EIS" launches measurement on a background thread
-- Optional auto-save to the project DataStore run directory and optional circuit fit overlay
-- When fit succeeds, residual channels are computed and included in saved EIS text output columns
-- Displays Nyquist + Bode popup on completion
-
-### Tab 4: Monitoring
-
-**Purpose:** Real-time dashboard for ongoing experiments.
-
-| Widget | What It Shows |
-|---|---|
-| Temperature plot | Rolling 10-min time series (PV + SP overlay) |
-| Humidity plot | Rolling 10-min time series (RH + SP overlay) |
-| Numeric readouts | Temp PV, Temp SP, RH, RH SP, Stage X/Y |
-| Camera feed | Passive 1 FPS display from shared camera worker |
-| Webcam feed | USB webcam panel (OpenCV `VideoCapture`): exposure slider (-1 to -9), live timestamp overlay, click-drag zoom rectangle, single-click to reset zoom. Visually distinct from ThorLabs feed (separate QGroupBox, different border). |
-| Workflow progress | Progress bar + step label (updated by Experiment/Sandbox tabs) |
-| Instrument log | Scrolling text log (last 500 lines) |
-
-### Tab 5: HT Experiment
-
-**Purpose:** Build and run high-throughput multi-channel EIS experiments.
-
-**Workflow:**
-1. Select a **Workflow Mode**: "Full Protocol" (flush + deposit + EIS) or "Measure Only" (EIS only)
-2. Choose a **PCB layout**; select an **EIS preset** to pre-populate the five editable EIS parameter fields
-3. Optionally adjust **f_hi (Hz)**, **f_lo (mHz)**, **npts**, **mVac**, and **mVdc** for this run
-4. Fill the **Formulation Matrix** — per-channel volumes for each pump
-   - Click **"Formulation Manager..."** to open the formulation dialog: define stock solutions (solute, concentration, solvent), compute per-channel dispense volumes, and manage the chemical/solution catalogs.
-4. Use checkboxes or the channel spec field (`1,3,5-8`) to select active channels
-5. Click **Generate Workflow** to preview the step list
-6. Click **▶ Start** to execute
-7. Use **⏸ Pause** / **⏹ Abort** during execution
-8. Results appear in the table as steps complete (Channel and Duration columns populated)
-9. **Save CSV**, **Save EIS Data**, **Fit All EIS**, or **Save PDF Report** to export
-
-Automatic pico routing: channels 1–16 → pico1, channels 17–32 → pico2 (configurable in `[channel_routing]`).
-
-> **One parser behind every channel field.** The HT tab (`1,3,5-8`), the Arrhenius tab and the
-> Live BO Campaign tab all now delegate to the same `core/channel_spec.py`, so the accepted
-> syntax — comma-separated channels, `lo-hi` inclusive ranges, whitespace ignored — is identical
-> wherever you type it. Each tab keeps its own policy for what to do with a bad token (the HT
-> tab drops silently as it always has; the others raise), and **Live BO now checks entries
-> against the selected board's electrode count** — the bounds check it previously lacked —
-> rejecting an out-of-range channel with a dialog instead of passing it through to
-> `CampaignSpec` unchallenged.
-
-**Formulator + liquid-handling integration:**
-- Volumes applied from **Formulation Manager** feed per-channel dispense steps in generated HT workflows (Pump 0 and Pump 1 are channel-specific; no fixed per-channel dispense constants).
-- Physical liquid-handling correction is optional and controlled by `[liquid_handling]` with `enabled = true|false`.
-- Pump-to-line mapping is configured in `[liquid_handling.pump_line]`; per-line physics are configured under `[liquid_handling.line.<id>]` (for example: `cracking_kpa_per_valve`, `compliance_uL_per_kpa`, `alpha_base`, `viscosity_mpas`) in `softae_config.toml`.
-- Dispense panel shows `Liquid correction: Enabled|Disabled` for immediate correction-state visibility.
-- The correction-model panel is editable, including prime-estimate values used to refine the correction fit.
-- Workflow preview includes `liquid_correction: enabled|disabled`, prime-estimate lines, and per-channel target vs commanded dispense readouts (`p0`/`p1`) for selected channels.
-- When correction is disabled, preview states `correction disabled: commanded == target`.
-
-**Optional piezo liquid events during Full Protocol runs:**
-- Event generation requires all of the following:
-  - `[piezo].enabled = true`
-  - `[piezo.liquid_events].enabled = true`
-  - `[piezo.liquid_events].channel_a = true`
-- Per selected channel, workflow inserts:
-  - `piezo_on_chN` (`piezo.set_channel(A, true)`) before dispense/EIS block
-  - `piezo_off_chN` (`piezo.set_channel(A, false)`) after channel block
-  - `piezo_standby` (`piezo.standby()`) in teardown
-- Profile source behavior:
-  - `settings_source = "manual_profile"`: no event profile step is injected; device uses currently active manual profile
-  - `settings_source = "liquid_event_profile"`: setup includes one `piezo_apply_event_profile` step calling `piezo.apply_profile(...)`
-- Measure-only mode does not add piezo liquid-event steps.
-
-### Tab 6: Arrhenius Sweep
-
-**Purpose:** Automated temperature-dependent EIS to extract ionic conductivity σ(T) and compute Arrhenius activation energy.
-
-**Workflow:**
-1. Set **Temperature Profile** — T start, T stop, T step (°C) and dwell time after equilibration
-2. Enter **channels** to measure (comma-separated, e.g. `1, 2, 4`)
-3. Set **instrument names** for the EIS device and temperature controller (`pico1`, `temp_controller`)
-4. Set **Electrode Geometry** (L, t, w in cm) for conductivity calculation — leaving blank will produce NaN σ values
-5. Choose an **EIS preset** to pre-populate **f_hi**, **f_lo**, **npts**, **mVac**, **mVdc**; adjust as needed
-6. Click **▶ Start Sweep** — per-channel `.mscr` files are built before execution
-7. Live log shows each step with elapsed time; progress bar advances per step
-8. After completion, the **Arrhenius Plot** panel shows ln(σ) vs 1/T with a linear fit
-9. Extracted E_a (activation energy) and pre-exponential σ₀ are displayed
-10. **Export CSV** to save per-temperature σ data and fit parameters
-
-Automatic pico routing follows the same channel-mapping rules as the HT tab.
-
-### Tab 7: Autonomous
-
-**Purpose:** Placeholder scaffolding, kept deliberately.
-
-> **Status:** This tab is **intentional scaffolding, not the working autonomous path.**
-> Closed-loop campaigns run from **Tab 10: Live BO Campaign** (interactive) or
-> `softae-campaign` (headless) — see [§15](#15-autonomous-campaigns). The tab is retained
-> as a placeholder for a future multi-objective / Pareto front-end; it is not dead code and
-> should not be removed.
-
-### Tab 8: Analysis
-
-**Purpose:** Post-experiment EIS data analysis and circuit fitting.  
-The tab has two sub-tabs: **Fit & Export** (existing workflow) and **EIS Browser** (interactive visualizer).
-
-#### Sub-tab: Fit & Export
-
-**Workflow:**
-1. Click **Load File(s)…** to open EIS data files (`.txt`, `.csv`, `.dat`)
-2. Data appears on Nyquist + Bode plots
-3. Select a **circuit model** and click **Fit All**
-4. Set electrode geometry (L, t, w in cm) for conductivity calculation
-5. Results table shows R₀, R₁, σ per channel
-6. **Save to Database** (SQLite), **Browse Database**, or **Export CSV**
-
-**Available Circuit Models:**
-
-| Model | Circuit | Use For |
-|---|---|---|
-| `simpleSalt` | R₀-CPE₀-p(R₁,C₀) | Simple ionic conductors |
-| `flexSalt` | R₀-CPE₀-p(R₁,C₀) with fixed C₀ | Salt solutions with known stray capacitance |
-
-`simpleSaltMembrane` was **retired on 2026-09-02** — it never returned a usable fit
-(one attempt in the entire fit history, and that one failed), and selecting it now
-raises an unknown-model error. Use `simpleSalt` for membrane samples.
-
-#### Sub-tab: EIS Browser
-
-Three-pane interactive viewer (Overview / Inspection / Conductivity) for browsing stored EIS measurements.
-
-| Control | Action |
-|---|---|
-| **↻ Reload from DataStore** | Opens a DataStore browser dialog (run/channel/limit filters), then loads only selected rows into Browser or imports selected rows into Fit & Export |
-| **⤢ Pop Out Window** | Detaches the viewer into a resizable standalone window |
-
-Reload/import does **not** auto-fit selected spectra. Fitting remains explicit via **Fit All** in the **Fit & Export** sub-tab.
-
-The viewer can also be launched independently from a notebook or script — see [SoftAE_ClassTests.ipynb](../../SoftAE_ClassTests.ipynb) (EIS Visualizer section) for runnable examples with synthetic, DataStore, and live-poll modes.
-
-**Standalone usage (script / notebook):**
 ```python
 from softae.gui.widgets.eis_visualizer_widget import EISVisualizerWindow, ListEISSource
-EISVisualizerWindow.open(ListEISSource(entries))   # blocks until window is closed
+EISVisualizerWindow.open(ListEISSource(entries))   # blocks until the window closes
 ```
 
-### Tab 9: BO Simulator
+**Tab 9 — BO Simulator.** Offline Bayesian-optimization sandbox against a simulated conductivity
+landscape; needs no `InstrumentManager`. Acquisition (`ucb`/`ei`) and κ, batch size and strategy,
+seed, budget; optional temperature axis folded into an Arrhenius/VFT parameter; σ map vs
+derived-objective map, convergence trace, suggested-point scatter; JSON export.
 
-**Purpose:** Offline Bayesian-optimization sandbox — no hardware, no instruments.
+**Tab 10 — Live BO Campaign.** The hardware-in-the-loop optimizer.
 
-Runs a campaign against a **simulated** conductivity landscape so you can size a budget,
-compare acquisition functions and batch strategies, and see how a prior changes convergence
-before spending electrodes. Needs no `InstrumentManager` at all.
-
-- Acquisition (`ucb` / `ei`) and κ, batch size and strategy, seed, budget
-- Optional temperature axis, folded into an Arrhenius/VFT parameter as the objective
-- σ map vs derived-objective map, convergence trace, suggested-point scatter
-- Results export to JSON
-
-### Tab 10: Live BO Campaign
-
-**Purpose:** The hardware-in-the-loop optimizer — this is the working autonomous path.
-
-**Search over** (the mode switch, top of the parameter panel):
-
-| Mode | What is searched | Objective |
+| Search-over mode | Searched | Objective |
 |---|---|---|
-| **Raw volumes** | per-pump µL directly | mean \|Z\|, minimised |
-| **Composition targets** | molar ratio / dried fraction / concentration, each Low→High | σ, maximised |
+| Raw volumes | Per-pump µL directly | mean \|Z\|, minimised |
+| Composition targets | Molar ratio / dried fraction / concentration, each Low→High | σ, maximised |
 
-Raw volumes is the easier search — feasibility is native, since a volume limit is just a
-bound — but the twin has no stock identity, so there is no dry thickness and therefore no
-conductivity. Composition targets use the deposition twin's own target vocabulary and give
-every trial a predicted thickness, which is what makes σ available. Stocks and pump
-assignment come from the persisted **pump loadout**, so declare it in the Formulation
-Manager first. A target row with `Low == High` is *pinned*: held constant and kept out of
-the optimizer entirely.
+Raw volumes has no stock identity, hence no dry thickness and no σ; composition targets give every
+trial a predicted thickness. Stocks and pump assignment come from the persisted pump loadout, so
+declare it in the Formulation Manager first. A target row with `Low == High` is pinned: held
+constant, kept out of the optimizer. **Direction** defaults to `auto` and should stay there
+([§12](#12-softae-campaign)). Also here: board-exchange controls and electrode capacity, seed
+observations, an optional prior mean, a pre-run overflow scan, and a projected duration plus
+stock-runway preflight.
 
-**Direction** defaults to `auto` and should normally stay there — it is derived from the
-metric, not chosen alongside it (see [§15](#15-autonomous-campaigns)).
+**Tab 11 — Catalogs.** Read-only browser over the chemical and solution catalogs with an **Edit**
+button opening the Catalog Manager ([§11](#11-deposition-twin-and-catalogs)).
 
-Also on this tab: board-exchange controls and electrode capacity, seed observations
-(warm start), an optional prior mean, a pre-run overflow scan, and a projected
-duration + stock-runway preflight.
+**Tab 12 — Deposition.** The deposition twin embedded in the main window
+([§11](#11-deposition-twin-and-catalogs)).
 
-### Tab 11: Catalogs
-
-Read-only browser over the chemical and solution catalogs, with an **Edit** button opening
-the slim Catalog Manager. See [§14](#14-deposition-digital-twin) for the full catalog story.
-
-### Tab 12: Deposition
-
-The deposition digital twin embedded in the main window — "what ends up in the well?".
-Fully documented in [§14](#14-deposition-digital-twin).
-
-### Tab 13: Process Studio
-
-**Purpose:** Method and recipe library plus an embedded workflow builder.
-
-Supersedes the former standalone **Sandbox** tab, which was retired as a strict subset of
-this one. Browse the task catalog and deposition recipes from `tasks.toml` / `recipes.toml`,
-see each method's **maturity** level, and build/preview/run workflows against connected
-instruments.
-
-> **Maturity** is a warn-and-proceed guard, not a block. A campaign that would run a method
-> below its expected maturity emits `method_below_maturity` and continues — surfacing the
-> risk without stopping an experiment on a judgement call.
+**Tab 13 — Process Studio.** Browse the task catalog and deposition recipes from `tasks.toml` /
+`recipes.toml`, see each method's maturity level, and build, preview and run workflows against
+connected instruments. Maturity is warn-and-proceed: a campaign running a method below its
+expected maturity emits `method_below_maturity` and continues.
 
 ---
 
-## 5. CLI Workflow Runner
+## 5. Command-line tools
 
-### The command set
-
-| Command | Purpose | Documented in |
+| Command | Purpose | Section |
 |---|---|---|
 | `softae-gui` | Launch the desktop application | [§3](#3-launching-the-gui) |
-| `softae-run` | Execute a workflow YAML headlessly | this section |
-| `softae-campaign` | Run / resume an autonomous campaign | [§15](#15-autonomous-campaigns) |
-| `softae-commission` | Acquire and derive the EIS fixture calibration | [§16](#16-eis-commissioning--calibration) |
-| `softae-deposition` | Standalone deposition-twin GUI | [§14](#14-deposition-digital-twin) |
-| `softae-method` | Method-maturity lifecycle (`status`, `test`, `promote`, `sign-off`, `versions`) | `docs/METHOD_MATURITY_PIPELINE.md` |
-| `softae-web` | EIS web visualizer over the DataStore — needs the `[web]` extra | `python -m softae.web --help` |
-| `softae-shadow` | Arm and review a shadow campaign | [§20](#20-shadow-campaign-review) |
-| `softae-thickness` | Plan / record an unconfounded thickness series | [§21](#21-thickness-series) |
-| `softae-equilibration` | Measure σ(t) and derive the conditioning hold | [§22](#22-equilibration-characterization) |
-| `softae-env` | Hold the chamber at a humidity and measure nothing | [§23](#23-environment-hold--softae-env) |
+| `softae-run` | Execute a workflow YAML headlessly | [§6](#6-softae-run-and-workflow-yaml) |
+| `softae-campaign` | Run / resume / control an autonomous campaign | [§12](#12-softae-campaign) |
+| `softae-commission` | Acquire and derive the EIS fixture calibration | [§13](#13-softae-commission) |
+| `softae-deposition` | Standalone deposition-twin GUI | [§11](#11-deposition-twin-and-catalogs) |
+| `softae-method` | Method maturity (`status`, `test`, `promote`, `sign-off`, `versions`) | `docs/METHOD_MATURITY_PIPELINE.md` |
+| `softae-web` | EIS web visualizer over the DataStore; needs `[web]` | `python -m softae.web --help` |
+| `softae-shadow` | Arm, rehearse and review a shadow campaign | [§15](#15-softae-shadow) |
+| `softae-thickness` | Plan and record an unconfounded thickness series | [§16](#16-softae-thickness) |
+| `softae-equilibration` | Measure σ(t) and derive the conditioning hold | [§17](#17-softae-equilibration) |
+| `softae-env` | Hold the chamber at a humidity and measure nothing | [§18](#18-softae-env) |
+| `softae-eis-timing` | Time EIS acquisition grids | `python -m softae.tools.eis_timing --help` |
+| `softae-eis-validate` | Validate the adaptive-acquisition path | [§19](#19-softae-eis-validate) |
 
-> **New commands need a reinstall.** Console scripts are generated at install time, so a
-> newly added entry point resolves only after `pip install -e .`. A "command not recognized"
-> error on a documented command is almost always this — re-run the editable install, or fall
-> back to `python -m softae.tools.<name>`, which resolves whether or not a script was
-> generated.
+`softae` is an additional `gui_scripts` launcher for the GUI.
 
-> **A missing *extra* is a different failure, and it now says so.** `softae-web` on an install
-> without the `[web]` extra used to die with a raw `ModuleNotFoundError` traceback out of a
-> transitive import. It now names the package it is missing and prints the command that fixes
-> it — `pip install "softae[web]"` — then exits **1**, not 2 (argparse owns 2 for usage errors
-> on that parser; an uninstalled extra is an unmet runtime precondition, not a bad invocation).
-> The probe runs *after* argument parsing and before anything reaches stdout, so
-> `softae-web --help` still works on an install with no web extra at all.
-
-**The first ten resolve in this venv, re-verified 2026-08-14** — each of those ten names
-resolves to a generated `.exe` under `.venv/Scripts/`, and `softae-shadow --help` prints its
-three subcommands. `softae-shadow`, `softae-thickness` and `softae-equilibration` were added
-after the previous editable install and were module-only until it was refreshed; the refresh
-generated all three `.exe`s. **`softae-env` is newer than that install** (added 2026-08-19) and
-has no `.exe` yet — use `python -m softae.tools.env_hold` until the editable install is
-re-run. Every section below names the console script first, with the module form given as the
-exact equivalent:
+**Install state in this venv (2026-09-21).** `softae-env`, `softae-eis-timing` and
+`softae-eis-validate` are registered in `pyproject.toml` but have **no generated `.exe` here**;
+they were added after the last editable install. Re-run `pip install -e .`, or use the module
+form, which resolves either way:
 
 ```bash
-softae-shadow --help          # equivalently: python -m softae.tools.shadow_review
-softae-thickness --help       #               python -m softae.tools.thickness
-softae-equilibration --help   #               python -m softae.tools.equilibration
-python -m softae.tools.env_hold --help        # softae-env, once the install is refreshed
+python -m softae.tools.env_hold --help        # softae-env
+python -m softae.tools.eis_timing --help      # softae-eis-timing
+python -m softae.tools.eis_validate --help    # softae-eis-validate
+python -m softae.tools.shadow_review --help   # softae-shadow — module is shadow_review, not shadow
 ```
 
-The module behind `softae-shadow` is **`shadow_review`**, not `shadow` — the one substitution
-that is not mechanical. The arguments are identical either way.
+Console scripts are generated at install time, so "command not recognized" on a documented command
+is almost always a stale install. A missing **extra** is a different failure: `softae-web` without
+`[web]` names the missing package, prints `pip install "softae[web]"` and exits **1** (argparse
+owns 2 for usage errors); `softae-web --help` still works without it.
 
-Anything that drives **real motion hardware** additionally requires the interlock — see
-[§18](#18-unattended-operation--safety).
+**Interlock.** Any command that drives real motion hardware also requires
+`SOFTAE_ALLOW_HARDWARE=1` — see [§8](#8-stopping-safe-exit-interlock-head-state).
 
-### `softae-run`
+---
 
-The `softae-run` command executes workflow YAML files from the command line — useful for scripted experiments, CI testing, and headless operation.
-
-### Usage
+## 6. `softae-run` and workflow YAML
 
 ```
 softae-run <workflow.yaml> [OPTIONS]
 ```
 
-### Options
-
 | Flag | Description |
 |---|---|
-| `--mock` | Force mock instruments (no hardware) |
-| `--real` | Require real instruments (fail if unavailable) |
-| `--dry-run` | Parse and validate only — prints resolved steps |
-| `--validate` | Check all instrument/method names exist against the driver registry (exit 3 on failure) |
-| `--log-dir DIR` | Directory for JSON-lines logs (default: `./logs`) |
-| `--verbose` / `-v` | Print step-by-step progress to stdout |
+| `--mock` | Force mock instruments |
+| `--real` | Require real instruments; fail if unavailable |
+| `--dry-run` | Parse and validate only; print resolved steps |
+| `--validate` | Check instrument/method names against the driver registry (exit 3 on failure) |
+| `--log-dir DIR` | JSON-lines log directory (default `./logs`) |
+| `--verbose` / `-v` | Step-by-step progress to stdout |
 
-`--mock` and `--real` are mutually exclusive. Omitting both uses auto-detect.
+`--mock` and `--real` are mutually exclusive; omit both for auto-detect.
 
-### Exit Codes
-
-| Code | Meaning |
+| Exit | Meaning |
 |---|---|
 | 0 | Success |
 | 1 | Workflow error / instrument failure |
 | 2 | Bad arguments / parse error |
-| 3 | Validation failure (`--validate` found errors) |
-| 130 | Interrupted (Ctrl+C) |
+| 3 | `--validate` found errors |
+| 130 | Interrupted (Ctrl-C) |
 
-### Examples
+Each run writes `logs/<name>_<UTC>.jsonl`, one JSON object per step with `timestamp`, `workflow`,
+`step`, `instrument`, `method`, `params`, `tags`, `duration_s` and `result`.
 
-```powershell
-# Validate a workflow without executing
-softae-run workflows/examples/01_hello_stage.yaml --mock --dry-run
-
-# Check that all instrument/method names are valid
-softae-run workflows/standard_eis_sweep.yaml --validate
-
-# Run a simple stage test
-softae-run workflows/examples/01_hello_stage.yaml --mock --verbose
-
-# Run a 3-channel EIS sweep with logging
-softae-run workflows/examples/03_three_channel_eis.yaml --mock -v --log-dir ./my_logs
-
-# Run against real instruments
-softae-run workflows/standard_eis_sweep.yaml --real -v
-```
-
-### Log Output
-
-Each run produces a JSON-lines file in the log directory:
-
-```
-logs/
-  hello_stage_20260305T214242Z.jsonl
-  three_channel_eis_20260305T214255Z.jsonl
-```
-
-Each line is a JSON object:
-```json
-{
-  "timestamp": "2026-03-05T21:42:55.821Z",
-  "workflow": "three_channel_eis",
-  "step": "startup_flush",
-  "instrument": "syringe",
-  "method": "single_pump",
-  "params": {"res_vol": 1000.0, "ID": 0, "rate": 200.0, "dispense_vol": 100.0},
-  "tags": {},
-  "duration_s": 0.109,
-  "result": "ok"
-}
-```
-
----
-
-## 6. Writing Workflow YAML Files
-
-### Minimal Example
-
-```yaml
-name: my_experiment
-
-setup:
-  - name: set_temp
-    instrument: temp_controller
-    method: write_sp
-    params:
-      T_SP: 40.0
-      print_flag: 0
-```
-
-### Full Schema
+### Schema
 
 ```yaml
 name: "experiment_name"              # REQUIRED
@@ -684,164 +375,89 @@ variables:                           # optional — $var references
   my_value: 42
 metadata: {}                         # optional — logged for provenance
 
-setup:                               # list of steps (at least one section needed)
+setup:                               # at least one phase section is needed
   - name: step_name                  # REQUIRED
-    instrument: instrument_name      # REQUIRED (must match InstrumentManager)
-    method: method_name              # REQUIRED (must be a callable on the driver)
-    params:                          # optional — kwargs passed to method
-      key: "$my_value"               #   $var interpolation
-    timeout_s: 120                   # optional — max seconds
-    retry: 1                         # optional — retry attempts (default 0)
-    depends_on: []                   # optional — Step names that must complete first. Omit for sequential order; use `[]` for explicit parallelism.
-    tags: {}                         # optional — metadata
+    instrument: instrument_name      # REQUIRED — must match InstrumentManager
+    method: method_name              # REQUIRED — must be callable on the driver
+    params: { key: "$my_value" }     # optional — kwargs passed to the method
+    timeout_s: 120                   # optional
+    retry: 1                         # optional (default 0)
+    depends_on: []                   # optional — see below
+    tags: {}                         # optional
 
-loop:                                # optional — dict, NOT a list
-  iterate_over: my_list              # optional — variable name (list→len, int→count)
-  steps:
-    - name: measure
-      instrument: pico1
-      method: sendscript_getdata
-      params:
-        mscrpath: scripts/example_eis.mscr
-        outdir: ./output
-        chan: 1
+loop:                                # optional — a dict, not a list
+  iterate_over: my_list              # list → len(list); int → that count; omitted → 1
+  steps: [...]
 
-teardown:                            # optional — always runs (even on error/abort)
-  - name: cleanup
-    instrument: temp_controller
-    method: write_sp
-    params:
-      T_SP: 10.0
-      print_flag: 0
+teardown:                            # optional — always runs, even on error or abort
+  - ...
 ```
 
-### Variable Interpolation
-
-| Syntax | Behavior | Example |
-|---|---|---|
-| `"$var"` (exact match) | Replaced with variable value, **type preserved** | `"$my_value"` → `42` (int) |
-| `"prefix_$var_suffix"` | String substitution only | `"out_$name.csv"` → `"out_test.csv"` |
-| Nested | Works inside dicts and lists in params | `{"x": "$val"}` |
-
-### Loop Behavior
-
-- `iterate_over` references a variable name
-- If the variable is a **list**: iterations = `len(list)`
-- If the variable is an **int**: iterations = that value
-- If omitted: 1 iteration
-- Loop steps get `__iter0`, `__iter1`, … suffixes and `{"iteration": "0"}` tags
-
-### Parallel Step Execution (`depends_on`)
-
-Steps can declare explicit dependencies to enable parallel execution within a phase:
-
-```yaml
-setup:
-  - name: set_temp
-    instrument: temp_controller
-    method: write_sp
-    params: { T_SP: 40.0, print_flag: 0 }
-
-  - name: init_stage
-    instrument: stage
-    method: stage_init
-    params: {}
-    depends_on: []          # ← explicit empty: no deps, can run in parallel with set_temp
-
-  - name: wait_for_temp
-    instrument: temp_controller
-    method: wait
-    params: { within: 2.0 }
-    depends_on: ["set_temp"]  # waits for set_temp to finish
-```
-
-**How it works:**
-
-| Scenario | Behavior |
+| Interpolation | Behaviour |
 |---|---|
-| No `depends_on` field at all | Step implicitly depends on the previous step → **sequential** (backward-compatible) |
-| `depends_on: []` (explicit empty) | No dependencies → can run in parallel with other independent steps |
-| `depends_on: ["step_a", "step_b"]` | Waits until both `step_a` and `step_b` complete before starting |
+| `"$var"` (exact match) | Replaced with the value, type preserved (`"$my_value"` → `42`) |
+| `"prefix_$var_suffix"` | String substitution only |
+| Nested | Works inside dicts and lists in `params` |
 
-The executor groups steps into **tiers** using topological sorting. Steps in the same tier run concurrently via `asyncio.gather`. Steps in later tiers wait for all their dependencies to complete.
+Loop steps get `__iter0`, `__iter1`, … suffixes and `{"iteration": "N"}` tags.
 
-**Validation:**
-- Circular dependencies (A→B→A) are detected at parse time and raise an error
-- References to non-existent step names are rejected at parse time
-- Dependencies must reference steps within the same phase (setup, loop, or teardown)
+| `depends_on` | Behaviour |
+|---|---|
+| Field absent | Implicitly depends on the previous step — sequential |
+| `depends_on: []` | No dependencies; may run in parallel with other independent steps |
+| `depends_on: ["a", "b"]` | Waits for both |
 
-**Loop steps:** Inside a loop, dependency names resolve within the same iteration. If loop step `"measure"` depends on `"deposit"`, then `measure__iter2` waits for `deposit__iter2`.
+The executor topologically sorts steps into tiers and runs each tier concurrently via
+`asyncio.gather`. Circular dependencies and references to non-existent step names are rejected at
+parse time; dependencies must stay inside one phase. Inside a loop, names resolve within the same
+iteration (`measure__iter2` waits for `deposit__iter2`). If a dependency fails, its dependents are
+skipped and other steps in the tier still complete.
 
-**If a dependency fails:** All steps that depend on the failed step are skipped. Other independent steps in the same tier continue to completion.
+### Driver parameter names
 
-### Important: Param Names Must Match Driver Signatures
+`params` keys are passed as `**kwargs`, so they must match the driver method's signature exactly.
+Check the driver signature before relying on a row.
 
-YAML `params` keys are passed directly as `**kwargs` to the driver method. They must match the Python method's parameter names exactly:
-
-| Instrument | Method | Required Params |
+| Instrument | Method | Params |
 |---|---|---|
-| `stage` | `move_to` | `x`, `y` |
-| `stage` | `move_by` | `dx`, `dy` |
+| `stage` | `move_to` / `move_by` | `x, y` / `dx, dy` |
 | `syringe` | `single_pump` | `res_vol`, `ID`, `rate`, `dispense_vol` |
-| `piezo` | `set_channel` | `channel`, `enabled` |
-| `piezo` | `apply_profile` | `frequency_hz`, `on_s`, `rest_s` |
-| `piezo` | `standby` | (none) |
+| `piezo` | `set_channel` / `apply_profile` / `standby` | `channel, enabled` / `frequency_hz, on_s, rest_s` / — |
 | `temp_controller` | `write_sp` | `T_SP`, `print_flag` |
 | `temp_controller` | `wait` | `within`, `equilibration_time`, `timeout` |
 | `temp_controller` | `ramp_linear` | `start`, `end`, `rate`, `step` |
-| `temp_controller` | `anneal` | `target_temp_C`, `hold_time_s`, `ramp_rate` (opt), `tolerance` (opt, default 1.0) |
-| `pico1`/`pico2` | `sendscript_getdata` | `mscrpath`, `outdir`, `chan` |
+| `temp_controller` | `anneal` | `target_temp_C`, `hold_time_s`, `ramp_rate` (opt), `tolerance` (opt, 1.0) |
+| `pico1` / `pico2` | `sendscript_getdata` | `mscrpath`, `outdir`, `chan` |
 | `rh_controller` | `set_setpoint` | `sp` |
-| `camera` | `snap` | (none) |
-| `lamp` | `on` / `off` | (none) |
+| `camera` | `snap` | — |
+| `lamp` | `on` / `off` | — |
 
-### Bundled Templates
+### Bundled templates
 
-| File | Description | Instruments Used |
-|---|---|---|
-| `workflows/standard_eis_sweep.yaml` | 16-channel EIS sweep with formulation | temp, syringe, pico1 |
-| `workflows/single_drop_and_measure.yaml` | Single-channel deposit + EIS | temp, syringe, pico1 |
-| `workflows/temp_ramp_eis.yaml` | Temperature ramp with EIS at each point | temp, syringe, pico1 |
-| `workflows/examples/piezo_assisted_dispense.yaml` | Piezo on/off around dispense with optional profile apply | piezo, syringe |
-| `workflows/examples/01_hello_stage.yaml` | Stage movement test | stage |
-| `workflows/examples/02_temp_setpoint.yaml` | Temperature set/read | temp_controller |
-| `workflows/examples/03_three_channel_eis.yaml` | 3-channel deposit + EIS loop | stage, syringe, pico1 |
+| File | Description |
+|---|---|
+| `workflows/standard_eis_sweep.yaml` | 16-channel EIS sweep with formulation |
+| `workflows/single_drop_and_measure.yaml` | Single-channel deposit + EIS |
+| `workflows/temp_ramp_eis.yaml` | Temperature ramp with EIS at each point |
+| `workflows/examples/piezo_assisted_dispense.yaml` | Piezo around dispense, optional profile apply |
+| `workflows/examples/01_hello_stage.yaml` | Stage movement test |
+| `workflows/examples/02_temp_setpoint.yaml` | Temperature set/read |
+| `workflows/examples/03_three_channel_eis.yaml` | 3-channel deposit + EIS loop |
 
 ---
 
-## 7. EIS Analysis Pipeline
-
-### Data Container: `EISResult`
+## 7. EIS analysis API
 
 ```python
 from softae.analysis.eis_data import EISResult
 
-# Load from file
 result = EISResult.load("path/to/eisdata.txt")
-
-# Create from arrays
-result = EISResult.from_arrays(
-    channel=1,
-    f=frequencies,
-    z_real=z_prime,
-    z_imag_neg=neg_z_double_prime
-)
-
-# Save
+result = EISResult.from_arrays(channel=1, f=freqs, z_real=z_prime, z_imag_neg=neg_z_dd)
 result.save("output/E1_eisdata.txt", study_name="my_study")
 ```
 
-**File format:** 5-column text with `#`-prefixed metadata header:
-```
-# channel: 1
-# timestamp: 2026-03-05T14:30:00
-# eis_params: {"preset": "Standard", ...}
-f(Hz)	Z_total(Ohm)	phase(deg)	Z'(Ohm)	-Z''(Ohm)
-200000.0	105.2	-5.3	104.8	9.7
-...
-```
-
-### Circuit Fitting
+File format is 5-column text with a `#`-prefixed metadata header
+(`f(Hz) Z_total(Ohm) phase(deg) Z'(Ohm) -Z''(Ohm)`).
 
 ```python
 from softae.analysis.eis.engine import analyze_spectrum
@@ -850,322 +466,213 @@ from softae.analysis.eis.geometry import CellConstant
 # Per-sample geometry in cm: electrode gap L, film thickness t, stripe length w.
 cell = CellConstant.from_legacy(0.2, 0.175, 0.2)
 
-# `engine` is deliberately not passed — `[eis] engine` in softae_config.toml
-# decides whether the legacy or the gated engine runs, for every call site at once.
+# `engine` is deliberately not passed — `[eis] engine` decides, for every call site at once.
 report = analyze_spectrum(eis_result, cell=cell, model_name="simpleSalt")
+print(report.fit.R0, report.fit.R1, report.fit.success)
 
-fit = report.fit
-print(f"R0 = {fit.R0:.1f} Ω, R1 = {fit.R1:.1f} Ω, success = {fit.success}")
-
-# Conductivity is reported, not merely computed: it can be a value, an upper
-# bound, or nothing at all. Always check the mode before reading `.value`.
 if report.sigma.mode == "value":
-    print(f"σ = {report.sigma.value:.3e} S/cm")
+    print(report.sigma.value)                     # S/cm
 elif report.sigma.mode in ("bound", "bound_unqualified"):
-    print(f"σ ≤ {report.sigma.upper_bound:.3e} S/cm  (instrument-limited)")
-else:                                  # "unavailable"
-    print("σ unavailable — no per-sample thickness, or the spectrum was rejected")
+    print(report.sigma.upper_bound)               # instrument-limited upper bound
+else:                                             # "unavailable"
+    print("no per-sample thickness, or the spectrum was rejected")
 ```
 
-> **Deprecated:** `circuit_fitting.z_to_sigma(L, t, w, R1)` and `FitResult.sigma(L, t, w)`
-> both emit a `DeprecationWarning` and have no callers left in the system. They divide by a
-> geometry with no provenance and bypass `[eis] engine` entirely, so a number taken from them
-> cannot be told apart from one the standard suite produced. They are kept only as the
-> independent oracle the parity tests check `CellConstant.sigma` against.
+Always check `report.sigma.mode` before reading `.value`.
 
-### Available Models
+| Registry | Engine | Models |
+|---|---|---|
+| `analysis/circuit_fitting.CIRCUIT_MODELS` | `legacy` | `simpleSalt` (R₀-CPE₀-p(R₁,C₀), 5 free), `flexSalt` (same with fixed C₀, 4 free) |
+| `analysis/eis/models.EIS_CIRCUITS` | `gated` | `blocking_coplanar` (R0-CPE0-p(R1,C0)), `blocking_coplanar_L` (adds L0; ships unused — L must be pinned from a short blank, not fitted) |
 
-| Model | Circuit | Parameters | Use Case |
-|---|---|---|---|
-| `simpleSalt` | R₀-CPE₀-p(R₁,C₀) | 5 free | General ionic conductors |
-| `flexSalt` | R₀-CPE₀-p(R₁,C₀) | 4 free + fixed C₀ | Known stray capacitance |
+The two key spaces deliberately do not collide, so a name cannot be resolved by the wrong engine.
+`simpleSaltMembrane` is retired and `fit_circuit` raises on the name; use `simpleSalt` for membrane
+samples.
 
-`simpleSaltMembrane` was **retired on 2026-09-02** — its 7-element initial guess never
-reconciled against its constants, so the circuit raised before the optimiser was reached
-and it produced no usable fit in its lifetime. `fit_circuit` now rejects the name.
+`circuit_fitting.z_to_sigma(L, t, w, R1)` and `FitResult.sigma(L, t, w)` are **deprecated**, emit a
+`DeprecationWarning`, and have no callers: they divide by a geometry with no provenance and bypass
+`[eis] engine`. They survive only as the oracle the parity tests check `CellConstant.sigma` against.
 
 ---
 
-## 8. Emergency Stop & Safe Exit
+## 8. Stopping, safe exit, interlock, head state
 
-Two stop controls bracket the toolbar, visible on every tab. They are placed at opposite
-ends deliberately: pressing the wrong one of two adjacent buttons is exactly the mistake to
-design out, and an emergency stop is not something to hit on the way to closing the app.
-
-| | Control | When |
+| Toolbar position | Control | When |
 |---|---|---|
-| **left** | red **⛔ EMERGENCY STOP** | something is going wrong, now |
-| **right** | amber **⏻ SAFE EXIT** | you are finished and leaving |
+| Left | red **⛔ EMERGENCY STOP** | Something is going wrong now |
+| Right | amber **⏻ SAFE EXIT** | You are finished and leaving |
 
-Both drive the *same* park sequence — there is deliberately no second path to the hardware:
+Both drive the same park sequence; there is no second path to the hardware.
 
 1. Retract dispenser head
-2. Stop all syringe pumps (0, 1, 2)
+2. Stop syringe pumps 0, 1, 2
 3. Set temperature to 10 °C
-4. Leave the humidifier **purging dry** — PID loop stopped, setpoint 0, duty held at `out_min` (0.01)
-5. Turn lamp off
+4. Leave the humidifier **purging dry** — PID stopped, setpoint 0, duty held at `out_min` (0.01)
+5. Lamp off
 
-Each step is attempted even if others fail. A dialog reports success or lists any errors.
+Each step is attempted even if others fail, and a dialog reports successes and errors. The
+humidifier step is graded *commanded, never verified*: an absent or disconnected RH controller is
+skipped, while a driver exposing no `safe_dry()` or a failed duty write is reported as an error.
 
-**The humidifier joined the sequence on 2026-08-19; what it is parked *to* changed on
-2026-08-24.** Parking a rig that keeps humidifying is not a park, so every route through this
-sequence — E-Stop, Safe Exit, the window's X, a fault-class campaign park, crash and signal
-recovery (Ctrl-C, `SIGTERM`) and the unclean-shutdown recovery park at the next launch — takes
-the humidifier out of PID control. **Until 2026-08-24 they all zeroed the duty; they now all
-leave it purging dry**, and no caller can ask for the other end state. The step sits between the
-heater and the lamp because ordering here only decides what has already been written if the
-process dies partway through: a latched heater outranks a latched humidifier, which outranks a
-lamp. It is graded **commanded, never verified** — nothing reads the Trinket back — and an
-absent or disconnected RH controller is *skipped*, while a driver that exposes no `safe_dry()`,
-or a duty write that failed, is reported as an **error** rather than passed over quietly. See
-[§23](#23-environment-hold--softae-env) for what a park still cannot reach.
+**After an emergency stop the two Aalborg PSVs stay open with dry gas flowing for about 25 s**,
+closing when the Trinket's deadman fires. Heater, pumps and lamp act immediately; only the RH axis
+has this window. The dialog reports `DRY-PURGED … Leaving it commanded is DELIBERATE` — a success,
+not a softened failure. Every route behaves this way: E-Stop, Safe Exit, the window's X, a
+fault-class campaign park, crash and signal recovery (Ctrl-C, `SIGTERM`), and the unclean-shutdown
+recovery park at next launch. No caller can ask for the other end state.
 
-**Why the requirement moved.** The RH control value runs 0–1, and near-0 *is* dry air — but
-`ctrl = 0` **exactly** is the firmware's auto-shutoff, which closes **both** Aalborg PSVs, so
-there is no flow at all. Zeroing therefore did not leave the chamber dry; it left it open to the
-room. A chamber held at 10 %RH re-equilibrated with the ~50 %RH room within tens of seconds, so
-every park threw away hours of descent — including one an operator cleared a minute later. The
-earlier rule read the flowing gas itself as the hazard. **Operator ruling, 2026-08-24: dry gas
-carries very little volatile species**, so it is not. Both end states shut the valves; the dry
-one shuts them ~25 s later, with dry gas in the line meanwhile.
+**Safe Exit and the head.** If the head is down, Safe Exit asks: **Raise head, then exit** (the
+default, selected by Enter); **Leave head down, then exit** (for a head holding a position — an
+anneal hold in the flush basin, a paused cast, a drop it is sitting in); or **Cancel** (nothing is
+touched, the window stays open). A raised head, an absent or disconnected syringe, or a driver that
+does not track head state all exit without the prompt. Every other route out, including the
+window's X, raises the head. Pumps, temperature, humidifier and lamp are parked unconditionally in
+both modes. If any subsystem fails to park, Safe Exit reports what failed and asks before closing.
 
-> **⚠ An emergency stop no longer produces an immediate no-flow state on the RH axis.** After
-> **⛔ EMERGENCY STOP** the two Aalborg PSVs stay **open with dry gas flowing for roughly 25
-> seconds**, closing only when the Trinket's own deadman fires
-> ([§23](#23-environment-hold--softae-env)). The heater still goes to 10 °C immediately, the
-> pumps still halt immediately, the lamp still goes off immediately — **only the RH axis
-> changed.** This **reverses** the previous rule, under which the dry purge was opt-in and
-> E-Stop and every fault-class park deliberately declined it. The dialog now reports the
-> humidifier under **Commanded** as `DRY-PURGED … Leaving it commanded is DELIBERATE`, not as
-> *humidifier off* — that line is a success, not a softer version of a failure.
+**Closing mid-run** cooperatively aborts a running experiment, BO campaign or Arrhenius sweep —
+the same effect as its Abort/Stop button — before the window finishes closing.
 
-### Safe Exit and the dispenser head
+**Hardware interlock.** With a real stage, syringe or piezo present, a headless workflow refuses to
+execute unless the rig is armed for the session:
 
-Safe Exit parks the rig and then closes the window. **If the head is down when you press it,
-you are asked** whether to raise it or leave it lowered:
+```bash
+export SOFTAE_ALLOW_HARDWARE=1        # bash
+$env:SOFTAE_ALLOW_HARDWARE = "1"      # PowerShell
+```
 
-- **Raise head, then exit** — the default, and what Enter selects.
-- **Leave head down, then exit** — for a head that is *holding a position*: an anneal hold in
-  the flush basin, a paused cast, a drop it is sitting in. Raising it would pull the tip clear.
-- **Cancel** — nothing is touched and the window stays open. Discovering the head is down is
-  sometimes itself the reason not to exit.
+Launching the GUI arms its own process. Mock managers never trip the interlock.
 
-The question is asked only when there is a decision to make. A raised head, an absent or
-disconnected syringe, or a driver that does not track head state all exit without prompting —
-you are never asked about hardware whose state nothing actually knows.
+**Dispenser head state.** The up/down state cannot be read back from hardware, so it is asked at
+startup and gates stage motion. The answer is authoritative and is not overwritten by connecting or
+reconnecting instruments; both `softae-campaign` and the GUI re-confirm it before a run that moves
+the stage.
 
-> **Every other route out raises the head, including the window's X button.** That is not an
-> oversight to be fixed by making X ask too. Closing a window is an unattended act — nobody is
-> left to decide — so the safe default applies. Safe Exit is the deliberate path, and being
-> asked is what earns the right to leave the head down.
-
-Only the head is negotiable. Pumps, temperature, humidifier and lamp are parked unconditionally
-in both modes; a stop that skipped them would not be a park.
-
-If any subsystem fails to park, Safe Exit reports what failed and asks before closing —
-closing the window would remove your easiest way to see it.
-
-**Closing the window mid-run:** if you close the application while an experiment, BO campaign, or Arrhenius temperature/EIS sweep is running, the in-progress run is cooperatively aborted (the same effect as its **Abort/Stop** button) before the window finishes closing, so no run keeps issuing instrument commands after the GUI is gone. Close may take up to a few seconds while the run winds down.
+**Faults, consumables, purge, alerts.** A failing trial is retried; a systematic-looking fault parks
+the run, keeping its checkpoint. An unmeasured trial is told to the optimizer as `None`, never
+`0.0`. Stock levels are tracked in a ledger and projected before a run alongside projected duration
+and waste accrual; undeclared stock is "unknown", never "empty". `[purge]` ships `actuate = false`,
+so windows are planned and logged without moving a pump. Parks, gate timeouts, board exchanges and
+stock warnings are written to the DataStore as alerts.
 
 ---
 
-## 9. Error Reference
+## 9. Errors and troubleshooting
+
+Error classes live in `softae.errors`:
 
 ```
-SoftAEError (base)
+SoftAEError
 ├── InstrumentError (message, instrument)
-│   ├── ConnectionError_     — failed to open port
-│   ├── CommunicationError   — timeout / no response
-│   └── SafetyError          — value exceeds configured limit
-│         (requested, limit)
+│   ├── ConnectionError_      — failed to open port
+│   ├── CommunicationError    — timeout / no response
+│   └── SafetyError           — value exceeds a configured limit (requested, limit)
 ├── WorkflowError
-│   ├── StepTimeoutError     — step exceeded timeout_s
-│   ├── AbortedError         — user or agent aborted
-│   └── ValidationError_     — bad YAML / missing field
-└── AnalysisError            — fit failure / data mismatch
+│   ├── StepTimeoutError      — step exceeded timeout_s (step name, timeout)
+│   ├── AbortedError          — user or agent aborted
+│   └── ValidationError_      — bad YAML / missing field
+├── AnalysisError             — fit failure / data mismatch
+├── OptimizerError
+└── CampaignError
 ```
-
-All instrument errors include the instrument name. `SafetyError` includes the requested value and the limit. `StepTimeoutError` includes the step name and timeout duration.
-
----
-
-## 10. Instruments Reference
-
-### Registered Instrument Names
-
-| Name | Driver | Mock Available | Methods |
-|---|---|---|---|
-| `stage` | Newport ESP301 | ✅ | `stage_init`, `move_to`, `move_by`, `home_stage`, `live_position`, `stage_end` |
-| `syringe` | Harvard Apparatus | ✅ | `single_pump`, `head_flip`, `head_retract`, `head_descend`, `head_check`, `syr_end` |
-| `temp_controller` | Novus N1040 | ✅ | `write_sp`, `get_sp`, `get_pv`, `get_pv_surf`, `wait`, `ramp_linear`, `anneal` |
-| `pico1` / `pico2` | PalmSens EmStat Pico | ✅ | `sendscript_getdata`, `eis_extractdata`, `eis_plotdata` |
-| `camera` | ThorLabs Zelux | ✅ | `snap`, `acquire_n_frames`, `save_image` |
-| `lamp` | MCP4728 quad-DAC ch A (`AsyncDACSwitch`) | ✅ | `on`, `off`, `set_eeprom_defaults` |
-| `keithley` | Keithley 2700 | ✅ | `read_resistance` |
-| `ht_sensor` | SHT31-D | ✅ | `get_T`, `get_H` |
-| `rh_controller` | Trinket M0 PID | ✅ | `set_setpoint`, `start`, `stop`, `get_H`, `wait` |
-| `piezo` | Trinket piezo controller | ✅ | `set_channel`, `set_frequency`, `set_sweep`, `apply_profile`, `standby`, `reset_config` |
-
-### Device firmware (the two Trinket M0s)
-
-The last two rows are not ordinary drivers: `rh_controller` and `piezo` each talk to an Adafruit
-Trinket M0 running its own CircuitPython program, which executes continuously from power-on and
-needs no host process to keep running. **Since 2026-08-20 that device-side code is versioned in
-this repository** at [`scripts/trinket_firmware/`](../scripts/trinket_firmware/) — byte-exact
-copies of each device's `code.py`, `boot.py` and `boot_out.txt`, with SHA-256 for every file, the
-protocol each device speaks, and both firmware deadman constants written down beside the code that
-implements them.
-
-| Directory | Volume | Role | Firmware deadman |
-|---|---|---|---|
-| `dac0_rh/` | `DAC0` | RH controller — two Aalborg PSV valves, wet/dry mix | **≈ 25 s**, self-recovering |
-| `pwm0_piezo/` | `PWM0` | Piezo driver — two duty-cycled channels | **600 s**, needs a fresh command to clear |
-
-Two rules govern this directory, and both matter more than they look:
-
-> **The device is the truth about what is running; this directory is a record.** Nothing here is
-> imported by `src/softae/`, executed by the test suite, or synced anywhere. If the repo copy and
-> the `CIRCUITPY` volume ever disagree, the volume is right and the copy is stale — re-copy and
-> re-hash rather than assuming. The two boards do not even run the same CircuitPython build
-> (`DAC0` on 9.2.7, `PWM0` on 10.2.1), which is exactly the sort of fact a record has to be read
-> for rather than guessed at.
-
-> **⚠ Editing a file here does not change the device — and redeploying one is hardware
-> actuation.** There is no build step and no deploy hook; deployment is an operator copying
-> `code.py` onto the volume by hand. CircuitPython then restarts the program *mid-loop*, dropping
-> valve or piezo drive at an arbitrary moment. **Do not redeploy while a campaign, a hold or any
-> experiment is running.**
-
-Why version it at all: the deadman constants above were, until this check-in, unreadable alongside
-the host code — and "the firmware is not in the repository" had quietly degraded in these very
-documents into "the firmware has no deadman", which was false on both devices. See
-[§23](#23-environment-hold--softae-env).
-
----
-
-## 11. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `softae-gui` not found | Not installed in editable mode | `pip install -e .` from `softae-next/` |
-| All instruments show "DISCONNECTED" | Hardware not connected, or auto-detect fell back | Check cables/ports; or run with `--mock` |
-| `SafetyError: requested 250.0 exceeds limit 200.0` | Temperature setpoint above config max | Edit `[safety] temp_max_C` in `softae_config.toml` |
-| Camera preview freezes GUI | Not using CameraWorker thread | Report as bug — SDK must run on dedicated thread |
-| RH shows "nan %" | PID loop not started and no sensor connected | Start PID loop or connect SHT31-D sensor |
-| Workflow step fails with `TypeError` | YAML param names don't match driver method signature | Check [Section 6 param table](#important-param-names-must-match-driver-signatures) |
-| `No module named 'hid'` | Hardware optional deps not installed | `pip install -e ".[hardware]"` |
-| Config not found | TOML not in CWD or env var | Set `SOFTAE_CONFIG` env var or copy `softae_config.toml` to CWD |
-| EIS fit returns `success=False` | Bad initial guess or wrong circuit model | Try a different model; check data quality |
+| `softae-gui` not found | Not installed editable | `pip install -e .` from `softae-next/` |
+| A documented command not found | Entry point added after the last install | `pip install -e .`, or `python -m softae.tools.<module>` |
+| All instruments DISCONNECTED | Hardware absent, or auto-detect fell back | Check cables and ports, or run `--mock` |
+| `SafetyError: requested 250.0 exceeds limit 200.0` | Setpoint above the configured max | Edit `[safety] temp_max_C` |
+| Camera preview freezes the GUI | Not using `CameraWorker` | Report as a bug — the SDK needs its own thread |
+| RH shows `nan %` | PID not started and no sensor connected | Start the PID loop or connect the SHT31-D |
+| Workflow step raises `TypeError` | YAML param names do not match the driver signature | See the table in [§6](#6-softae-run-and-workflow-yaml) |
+| `No module named 'hid'` | Hardware extras absent | `pip install -e ".[hardware]"` |
+| Config not found | TOML not in CWD and no env var | Set `SOFTAE_CONFIG`, or copy `softae_config.toml` to CWD |
+| EIS fit returns `success=False` | Bad initial guess or wrong circuit model | Try another model; check data quality |
+| `ModuleNotFoundError` from `softae-web` | `[web]` extra absent | `pip install "softae[web]"` |
+
+### Device firmware
+
+`rh_controller` and `piezo` each talk to an Adafruit Trinket M0 running its own CircuitPython
+program, versioned at `scripts/trinket_firmware/` with SHA-256 per file and each device's protocol.
+
+| Directory | Volume | Role | Firmware deadman |
+|---|---|---|---|
+| `dac0_rh/` | `DAC0` | RH controller — two Aalborg PSV valves, wet/dry mix | ≈ 25 s, self-recovering |
+| `pwm0_piezo/` | `PWM0` | Piezo driver — two duty-cycled channels | 600 s, needs a fresh command to clear |
+
+The device is the truth; the directory is a record. Nothing there is imported, executed or synced,
+and the two boards run different CircuitPython builds (`DAC0` 9.2.7, `PWM0` 10.2.1). If the repo
+copy and the `CIRCUITPY` volume disagree, the volume is right — re-copy and re-hash.
+
+**Redeploying firmware is hardware actuation**: an operator copies `code.py` onto the volume and
+CircuitPython restarts the program mid-loop, dropping valve or piezo drive at an arbitrary moment.
+Never redeploy while a campaign, hold or experiment is running.
 
 ---
 
----
+## 10. DataStore
 
-## 12. Documentation Site
-
-The project includes a **mkdocs-material** documentation site with auto-generated API reference.
-
-### Building Locally
-
-```powershell
-pip install -e ".[docs]"    # installs mkdocs-material + mkdocstrings
-mkdocs serve                 # live preview at http://127.0.0.1:8000
-mkdocs build                 # static site in site/
-```
-
-API reference pages are auto-generated from docstrings by `mkdocstrings[python]`. Adding or renaming a public module requires a corresponding stub in `docs/api/`.
-
----
-
-## 13. Data Persistence (DataStore)
-
-Every experiment run is automatically persisted in a project-scoped SQLite database.
-
-### Configuration
-
-Set the project directory and database filename in `softae_config.toml`:
+Every run is persisted in a project-scoped SQLite database in WAL mode.
 
 ```toml
 [data]
-project_dir = "~/SoftAE_Data"     # auto-created on first use
-db_filename = "softae_data.db"    # default
-auto_save_eis = true               # auto-save EIS data files
+project_dir   = "~/softae_data"   # default; auto-created on first use
+db_filename   = "softae.db"       # default; the SQLite file sits in project_dir/db/
+auto_save_eis = true
 ```
-
-### What Gets Stored
 
 | Table | Content |
 |---|---|
-| `experiments` | Run lifecycle — name, start/end time, status, config hash, notes |
-| `measurements` | Per-channel raw-data file paths + timestamps, plus `modality`, `payload_path` / `payload_format`, and `sample_uuid` |
-| `conditions` | Multi-stage environmental snapshots (formulation, processing, measurement, anneal) |
-| `fit_results` | Circuit fit parameters (R₀, R₁, model, σ) per measurement |
-| `formulations` | Dispense volumes per channel, deposit area + thickness provenance, `sample_uuid` |
-| `electrode_occupancy` | Which wells are spent, per `(board_id, electrode)` — plus `sample_uuid` |
-| `schema_version` | Append-only **epoch ledger** — records both schema shape and changes of *meaning* (e.g. the 2026-08-07 deposit-area correction, which moved stored thicknesses without moving a column) |
-| `doe_parameters` | *(reserved for Phase 6 optimizer)* |
+| `experiments` | Run lifecycle — name, start/end, status, config hash, notes |
+| `measurements` | Per-channel raw-data paths, `modality`, `payload_path`/`payload_format`, `sample_uuid` |
+| `conditions` | Environmental snapshots (formulation, processing, measurement, anneal) |
+| `fit_results` | Fit parameters, plus `arc_state`, `arc_f_peak_hz`, `arc_f_low_hz`, `arc_phase_low_deg` |
+| `formulations` | Dispense volumes, deposit area + thickness provenance, `sample_uuid` |
+| `electrode_occupancy` | Spent wells per `(board_id, electrode)`, `sample_uuid` |
+| `arrhenius_results` | Per-series E_a and σ₀ |
+| `board_state`, `rig_state` | Board and rig-claim state |
+| `campaign_checkpoints` | Resume checkpoints |
+| `alerts` | Parks, gate timeouts, exchanges, stock warnings |
+| `reservoir_levels` | Declared stock ledger |
+| `eis_calibrations` | Append-only calibration history |
+| `fixture_corrections` | One row per analysed spectrum, including declined ones |
+| `thickness_plans`, `measured_thickness` | Thickness plans and profilometer readings |
+| `schema_version` | Append-only epoch ledger — schema shape and changes of meaning |
+| `doe_parameters` | Reserved |
 
-### Measurement payloads (netCDF)
+**Payloads.** Alongside the transitional `runs/<run_id>/data/eis/<stem>.txt`, every routed
+measurement writes `runs/<run_id>/data/<modality>/<stem>.nc` — a self-describing xarray Dataset
+whose `attrs` carry `run_id`, `measurement_id`, `channel`, electrode geometry and `sample_uuid`.
+The sibling tree per modality means retiring the `.txt` files is not a payload migration. Writing a
+payload is best-effort: on failure the measurement row is still written and `payload_path` /
+`payload_format` stay NULL. A NULL path means *no payload*, never a path to a missing file.
 
-Alongside the transitional `.txt` spectrum, every routed measurement writes a **self-describing
-netCDF payload**:
+**`sample_uuid`** is minted when a well is consumed, one per `(trial, channel)`, and stamped into
+`formulations`, `electrode_occupancy` and `measurements`, into workflow step tags, and into the
+payload `attrs`. It is a **grouping key, not a unique one**: a three-temperature sweep off one film
+is one identity and three rows. A batch round of q wells mints q identities. Rows recorded before
+2026-08-08 carry NULL and are not backfilled; a resumed campaign mints for new trials only.
 
-```
-runs/<run_id>/data/eis/<stem>.txt     # transitional raw text, unchanged
-runs/<run_id>/data/eis/<stem>.nc      # payload — xarray Dataset
-```
-
-Payloads live in a **sibling** tree per modality (`data/<modality>/`), so retiring the `.txt`
-files later is not also a payload migration. The `.nc` file reconstructs the measurement on
-its own: its `attrs` carry `run_id`, `measurement_id`, `channel`, the electrode geometry and
-the `sample_uuid`, so a file found on disk with no database beside it still says what it is
-and what it was measured across.
-
-Writing a payload is **best-effort**. If it fails, the measurement row is still written, and
-`payload_path` / `payload_format` stay NULL — a NULL path means *no payload*, never a path to
-a file that is not there.
-
-### `sample_uuid` — one identity per cast well
-
-A `sample_uuid` is minted when a well is consumed — **one per (trial, channel)** — and stamped
-into the `formulations`, `electrode_occupancy` and `measurements` rows for that well, into the
-workflow step tags, and into the payload `attrs`. It is what joins *what was cast* to *where it
-was cast* to *what was measured*.
-
-- It is a **grouping key, not a unique one.** One sample carries arbitrarily many measurements
-  — a three-temperature sweep off one film is one identity and three independent measurement
-  rows, each with its own timestamp, conditions snapshot and payload.
-- A batch round of q wells mints **q distinct identities**, because four wells cast together
-  dry differently, are measured separately, and can be discarded independently.
-- **Rows recorded before 2026-08-08 carry NULL** and are not backfilled. Inventing an identity
-  per historical row would assert that three rows describing one physical sample are three
-  samples. A resumed campaign mints for new trials only.
-
-### Automatic Integration
-
-- **HT Experiment tab:** Calls `start_run()` on workflow start, `record_measurement()` on each EIS step, `finish_run()` on completion
-- **Manual tab:** Records EIS snapshots to a daily pseudo-run (`manual_YYYYMMDD`)
-- **CLI runner:** Logs config hash as first provenance event
-
-### Programmatic Access
+The HT tab calls `start_run()` / `record_measurement()` / `finish_run()`; the Manual tab records EIS
+snapshots to a daily pseudo-run (`manual_YYYYMMDD`); the CLI runner logs the config hash as its
+first provenance event.
 
 ```python
 from softae.core.data_store import DataStore
 
-ds = DataStore("~/SoftAE_Data")
-runs = ds.list_runs()              # all experiment runs
-meas = ds.get_measurements(run_id) # EIS measurements for a run
-conds = ds.get_conditions(run_id)  # environmental snapshots
-fits = ds.get_fit_results(run_id)  # circuit fit parameters
+ds = DataStore("~/softae_data")
+runs  = ds.query_runs()
+meas  = ds.query_measurements(run_id)
+conds = ds.query_conditions(run_id)
+fits  = ds.query_fits(run_id)
 ```
-
-The database uses WAL mode for concurrent reads during active experiments.
 
 ---
 
-## 14. Deposition Digital Twin
+## 11. Deposition twin and catalogs
 
-The formulation core (see the **Formulation Manager** in [Tab 5](#tab-5-ht-experiment)) answers *"what do I elute?"*. The deposition twin (`softae.core.deposition`) answers *"what ends up in the well?"* — it casts an `ElutionResult` into cylindrical wells, evaporates the carrier (solvent) at a tunable percentage while retaining all dep (solute) volume, and reports flat-disc film thickness plus a full mass balance. Pure math, no hardware.
+The deposition twin (`softae.core.deposition`) casts an `ElutionResult` into cylindrical wells,
+evaporates the carrier at a tunable percentage while retaining all dep volume, and reports
+flat-disc thickness plus a mass balance. Pure math, no hardware.
 
 ```python
 from softae.core.formulation import (
@@ -1178,127 +685,114 @@ catalog.add(Chemical("PEO", density_g_per_mL=1.2))
 catalog.add(Chemical("Water", density_g_per_mL=1.0))
 
 solutions = {"stock": Solution("stock", [
-    SolutionComponent("PEO", "dep", 1.0, "mL"),      # solute — retained
+    SolutionComponent("PEO", "dep", 1.0, "mL"),       # solute — retained
     SolutionComponent("Water", "carrier", 3.0, "mL"), # solvent — evaporates
 ])}
 
 elution = compute_elution_volumes(solutions, catalog, target_deposition_uL=20.0)
-
-well = WellGeometry(diameter_mm=5.0, depth_mm=2.0)   # capacity_uL ≈ 39.3 (1 µL = 1 mm³)
-summary = simulate_plate_deposition(
-    elution, well, evaporation_pct=95.0, n_wells=4,  # dispense_uL=None → equal split
-)
+well    = WellGeometry(diameter_mm=5.0, depth_mm=2.0)   # capacity_uL ~= 39.3
+summary = simulate_plate_deposition(elution, well, evaporation_pct=95.0, n_wells=4)
 
 w = summary.wells[0]
-print(w.wet_thickness_um, w.final_thickness_um)      # flat-disc film thickness
-print(w.overflows, summary.any_overflow)             # wet volume > capacity (flag, not error)
-print(summary.total_eluted_uL, summary.total_dispensed_uL,
-      summary.undeposited_uL, summary.total_evaporated_uL, summary.total_final_uL)
-print("\n".join(summary.summary_lines()))            # human-readable mass balance
+print(w.wet_thickness_um, w.final_thickness_um, w.overflows)
+print(summary.total_eluted_uL, summary.total_dispensed_uL, summary.undeposited_uL,
+      summary.total_evaporated_uL, summary.total_final_uL)
+print("\n".join(summary.summary_lines()))
 ```
 
-- `dispense_uL` may be `None` (equal split of `grand_total_uL`), a single float per well, or a per-well list — total dispensed can never exceed total eluted; the remainder is tracked as `undeposited_uL`.
-- `simulate_well_deposition(...)` is the single-well equivalent, returning one `WellDepositionResult`.
-- Pass `carrier_keys=carrier_component_keys(solutions)` to either function for per-component final-volume breakdowns (`component_final_uL`).
+- `dispense_uL` may be `None` (equal split of `grand_total_uL`), one float per well, or a per-well
+  list. Total dispensed can never exceed total eluted; the remainder is `undeposited_uL`.
+- `simulate_well_deposition(...)` is the single-well equivalent, returning one
+  `WellDepositionResult`.
+- `carrier_keys=carrier_component_keys(solutions)` adds per-component final volumes
+  (`component_final_uL`).
+- Overflow (wet volume above capacity) is a flag, not an error.
 
-### Standalone GUI
+**Standalone GUI:** `softae-deposition`, or `python -m softae.gui.deposition_app`.
 
-The twin is also available as an interactive standalone app — no instruments, no qasync, just the pure math behind a live panel:
+Stock table columns: **Use**, **Auto**, **Solution**, **Fraction**, and read-only **Eluted µL /
+Dep µL / Carrier µL**. **Auto ON** absorbs the remainder so fractions sum to 1; **Auto OFF** takes
+an exact share, with `0` honoured literally. The default is Auto OFF at Fraction 0.00.
+**Auto-balance all** sets Auto ON for every checked stock; **Normalize** rescales explicit
+fractions to sum to 1.00. The Σ-fractions indicator warns without blocking: green Σ = 1; amber
+Σ < 1, Σ > 1 or all-zero; red when explicit fractions exceed 1 while Auto rows are present (those
+get clamped to 0). Carrier-only stocks (`dep_fraction` 0) are excluded from Σ. Equal *dep* share is
+not equal *eluted* volume, because `eluted = dep / dep_fraction`; **Show component breakdown**
+traces each chemical's role and eluted µL.
 
-```powershell
-softae-deposition                        # console script
-python -m softae.gui.deposition_app      # equivalent module launch
-```
+Other inputs: target deposition µL; well diameter and depth (mm); well count and dispense mode;
+evaporation slider (0–100 %, 0.5 % steps). Outputs: per-well table, mass-balance strip, red
+overflow banner, an animated `WellSketch` cross-section, and **Export CSV…** writing `#CONFIG`,
+`#STOCKS`, `#MASS_BALANCE` and `#WELLS` blocks.
 
-> The `softae-deposition` command is registered via `[project.scripts]`; if it is not found after pulling this feature, run `pip install -e .` once to refresh the entry points.
+**Catalogs.** `chemicals.csv` and `solutions.csv` load from `[paths] data_root`, resolved
+**relative to the config file's directory** (absolute paths and `~` honoured); with no config it
+falls back to `./data`, then to empty catalogs with a status message.
 
-**Inputs** (every change recomputes live via `compute_elution_volumes` → `simulate_plate_deposition`):
+Routes to the slim Catalog Manager (catalog CRUD only): the main window's **Catalogs → Edit
+Catalogs…** menu or toolbar button, the **Edit** button on Tab 11, or **Manage Catalogs…** in the
+deposition panel. The full Formulation Manager (catalog editing plus the elution calculator and
+pump controls) opens from Tab 5. Editing anywhere refreshes Tabs 11 and 12 live.
 
-- **Stocks** — check the solutions to include, then set each one's share of the deposition. The stock table has seven columns: **Use**, **Auto**, **Solution**, **Fraction**, and the read-only outputs **Eluted µL / Dep µL / Carrier µL**.
-  - **Auto toggle (per row).** *Auto ON* means "absorb the remainder so all fractions sum to 1" — the row's Fraction is greyed and, after each recompute, shows the resolved share the core assigned it. *Auto OFF* lets you type an exact share; `0` is honoured as a literal zero (elute none of this stock's dep-share). **The default is Auto OFF with Fraction 0.00** (explicit-first) — set fractions or enable Auto to deposit.
-  - **Auto-balance all** — one click sets Auto ON for every checked stock, restoring the equal split that sums to 1.
-  - **Normalize** — rescales your *explicit* (Auto-off) fractions so they sum to exactly 1.00 (the residual from rounding lands on the largest row). This is the one-click fix for the amber `Σ < 1` / `Σ > 1` states; it's enabled only when there is an explicit sum to rescale and the split isn't already balanced (disabled when Auto already covers the remainder or Σ is already 1).
-  - **Σ-fractions indicator** (below the table) is a live, non-blocking sanity check — results always compute; the label only warns. **Green** = Σ = 1 (or auto-balanced). **Amber** = Σ < 1 (deposits short by N µL), Σ > 1 (overshoots the target), or all-zero ("set fractions or enable Auto"). **Red** = explicit fractions already exceed 1 while Auto rows are present (the auto rows get clamped to 0). Carrier-only stocks (`dep_fraction` 0) cannot carry a dep-share, so they are excluded from Σ and flagged separately.
-  - **Eluted / Dep / Carrier µL** columns fill after each recompute. Equal *dep*-share does **not** mean equal *eluted* volume: because `eluted = dep / dep_fraction`, five stocks each carrying an equal `0.20` dep-share elute wildly different totals (the seeded stocks span ~8 → 99 µL). These columns make that spread visible instead of surprising.
-  - **Show component breakdown** (optional toggle) reveals a per-(solution, component) table with each chemical's **Role** (dep or carrier) and its eluted µL — e.g. it traces Silica's ~99 µL total to its ~95 µL of isopropanol carrier.
-- **Target deposition (µL)** — the dep (solute) volume goal passed to the formulation core
-- **Well geometry** — diameter and depth (mm) of the cylindrical well
-- **Wells & dispense mode** — number of wells; equal split of the eluted total, or a fixed µL per well
-- **Evaporation** — slider (0–100 %, 0.5 % steps) twinned with a spinbox
-
-**Outputs:**
-
-- Per-well results table (dispensed / wet / final volumes, film thicknesses, fill fraction)
-- Mass-balance strip: eluted / dispensed / undeposited / evaporated / final
-- Red banner when any well's wet volume exceeds capacity (overflow)
-- `WellSketch` cross-section drawing that animates as you drag the evaporation slider
-- Invalid inputs surface as an inline error label (core `ValueError`s are caught — the panel never crashes)
-- **Export CSV…** — writes the current computed result to a file you choose: a sectioned CSV with `#CONFIG` (inputs), `#STOCKS` (per-stock elution), `#MASS_BALANCE`, and `#WELLS` (per-well) blocks. The button is enabled only once a valid result is cached; a write error (`OSError`) is reported on the status label rather than crashing.
-
-**Catalogs:** chemicals and solutions load from `chemicals.csv` / `solutions.csv` under `[paths] data_root` in `softae_config.toml`, falling back to the repo root, then to empty catalogs with a status message — the app always starts.
-
-### Managing catalogs
-
-softae-next is now the **canonical editor** for the chemical/solution catalogs. They live at `chemicals.csv` / `solutions.csv` under `[paths] data_root` in `softae_config.toml`. The `data_root` path is resolved **relative to the config file's directory** (not the working directory), honoring absolute paths and `~`; when no config is present it falls back to `./data`. The catalogs ship seeded with the legacy bench entries (Water, Glycerol, AETDAB, Isopropanol, Fumed silica, Lithium chloride, PEO 20 kDa and their stocks).
-
-In the main app the catalogs are reachable directly as two tabs: **11. Catalogs** (a read-only browser listing the chemicals and solutions, with an **Edit** button) and **12. Deposition** (the deposition twin embedded in the main window). Editing the catalogs anywhere refreshes both of these **live** — the browser re-lists and the embedded deposition panel re-reads its stocks the moment you save.
-
-Reach the catalog editor several ways: the main window's **Catalogs → Edit Catalogs…** menu (or its toolbar button), the **Edit** button on the Catalogs tab, or the deposition panel's **Manage Catalogs…** button all open a **slim Catalog Manager** dialog (catalog CRUD only — no formulation calculator). The full **Formulation Manager** (catalog editing *plus* the elution calculator and pump controls) still opens from Tab 5. Both share the same editing, validation, and canonical-Save behavior described below.
-
-- The editor auto-loads the current catalogs from `data_root` (no folder dialog needed). The primary **Save** writes back to the canonical `data_root` location (creating the directory if missing); **Save As…** / **Load From…** remain available for ad-hoc files.
-- **Reload catalogs** (deposition app) re-reads the CSVs from disk into the stock list.
-- Edits made in the editor appear **live** in the deposition panel's stock list the moment you save — no restart, and surviving stocks keep their checked state and fractions.
-
-Each solution component's **Chemical** field is a **dropdown** of the current catalog chemicals (including any you just added but haven't saved yet), so a component can't reference a mistyped chemical name; a legacy/unknown reference loaded from disk is preserved and still selectable. **Renaming a chemical cascades**: every solution component that referenced the old name is updated automatically (both in memory and in the on-screen dropdowns). A rename that would collide with another chemical's name is blocked and reverted with a warning; clearing a name is not cascaded (the now-orphaned reference is flagged by validation instead).
-
-Both **Save** and **Calculate** run a validation pass first. If it finds a blank/non-positive **density**, a blank/non-positive component **quantity**, an **unknown-chemical** reference, or a data-bearing row with a blank **name**, it lists the issues in a **Proceed/Cancel** prompt (Cancel aborts — no write and no compute; Proceed continues with the documented defaults) and tints the offending cells light red until you fix them. Blank molar mass or viscosity are legitimate and are not flagged. Validating on Calculate pre-empts the hard error an unknown-chemical reference would otherwise raise mid-computation.
-
-The editable field set is full-fidelity: every chemical field round-trips (including **viscosity** and the **particulate** flag), as does each solution component's **calc mode**. (An earlier version silently dropped these on save; that data-loss bug is fixed.)
+- **Save** writes back to the canonical `data_root` location; **Save As… / Load From…** handle
+  ad-hoc files. **Reload catalogs** re-reads from disk.
+- A component's **Chemical** field is a dropdown of current catalog chemicals; an unknown reference
+  loaded from disk is preserved and selectable.
+- **Renaming a chemical cascades** to every referencing component. A colliding rename is blocked
+  and reverted; clearing a name is flagged by validation instead.
+- **Save** and **Calculate** both validate first: a blank or non-positive density, a blank or
+  non-positive component quantity, an unknown-chemical reference, or a data-bearing row with a
+  blank name produces a Proceed/Cancel prompt and tints the offending cells. Blank molar mass or
+  viscosity are legitimate and are not flagged.
+- Every chemical field round-trips, including viscosity and the particulate flag, as does each
+  component's calc mode.
 
 ---
 
-## 15. Autonomous Campaigns
+## 12. `softae-campaign`
 
-A campaign is a closed loop: **suggest → cast → measure → tell**. Run it interactively from
-[Tab 10](#tab-10-live-bo-campaign), or headless with `softae-campaign`.
-
-```bash
-softae-campaign check   my_campaign.toml                       # validate the spec, run no hardware
-softae-campaign run     my_campaign.toml --yes --head-up       # execute
-softae-campaign resume  my_campaign.toml --yes --head-up       # continue a saved checkpoint
-softae-campaign run     my_campaign.toml --yes --mock          # mock instruments, no rig
-softae-campaign run     my_campaign.toml --project ./runs/aug  # DataStore + checkpoint location
-```
-
-`--project` overrides `[data] project_dir`, and it also decides **where the resume checkpoint
-lives** — a `resume` pointed at a different project directory will not find the run you mean.
-`--mock` swaps in mock instruments for a full dry rehearsal of the loop.
-
-### The head-state gate: `--head-up` / `--head-down`
-
-This is the headless counterpart of the GUI's operator head-position verification, and it is
-the one flag on this command worth reading twice. **The campaign never assumes the dispenser
-head's state.** The loop drives the head with *conditional* commands — raise it if it is down,
-lower it if it is up — so a wrong belief does not merely mis-report, it costs one wrong flip:
-the head goes down when it should have come up, or drives into a board it should have cleared.
+A campaign is a closed loop: suggest → cast → measure → tell. Run it from Tab 10 or headlessly.
 
 ```bash
-softae-campaign run my_campaign.toml --head-up      # head is currently RAISED
-softae-campaign run my_campaign.toml --head-down    # head is currently LOWERED
+softae-campaign check   my_campaign.toml                       # validate; no hardware
+softae-campaign run     my_campaign.toml --yes --head-up
+softae-campaign resume  my_campaign.toml --yes --head-up       # alias for run --resume
+softae-campaign run     my_campaign.toml --yes --mock
+softae-campaign run     my_campaign.toml --project ./runs/aug
+softae-campaign control pause|resume|abort [--run-dir DIR] [--reason TEXT]
 ```
 
-The two are mutually exclusive. **Omit both and the CLI prompts on the terminal** — which is
-fine when you are sitting there, and a hang when you are not. A genuinely unattended launch
-(cron, `nohup`, a scheduler) must state the head position on the command line, alongside
-`--yes`; that pairing is what makes the run answerable without a human.
+| Flag | Applies to | Meaning |
+|---|---|---|
+| `--yes` / `-y` | run, resume | Skip the confirmation prompt |
+| `--resume` | run | Continue a saved checkpoint; off by default |
+| `--mock` | run, resume | Mock instruments for a full dry rehearsal |
+| `--project DIR` | all | Overrides `[data] project_dir`, and decides where the resume checkpoint lives |
+| `--head-up` / `--head-down` | run, resume | Mutually exclusive; prompted on the terminal if omitted |
 
-> Look at the rig, do not recall it. The flag records what is true right now, not what the
-> last run left behind — an aborted run, a manual jog or a power cycle all break that
-> inference. Every other headless gate defaults to the *safe* answer (board exchange cancels,
-> board freshness resumes past used wells, a stock shortfall stops the run); head position has
-> no safe default to fall back on, which is exactly why it is asked.
+`control` reaches a campaign already running; `--run-dir` defaults to reading the rig lock, and
+`--reason` is recorded verbatim in the transcript and, for `abort`, in the park alert.
 
-### Campaign spec (TOML)
+| Exit | Meaning |
+|---|---|
+| 0 | OK |
+| 1 | Campaign parked or failed |
+| 2 | Usage or spec error |
+| 3 | Declined — a gate answered no, a projected shortfall not accepted, head state not stated |
+| 4 | Rig busy — another process holds it; retrying later is correct |
+
+`check` prints name, parameters, budget, channels, the preflight projection, the EIS calibration
+advisory, and any checkpoint summary. It does **not** print the resolved run-plan phase order, and
+it does **not** emit the cure-temperature warning — that is raised during `run`, after hardware
+connect, when the deposition recipe is built.
+
+**Head state.** The loop drives the head with conditional commands (raise if down, lower if up), so
+a wrong belief costs one wrong flip. The flag records what is true *now*; an aborted run, a manual
+jog or a power cycle all break inference from the last run. Omitting both prompts on the terminal,
+which hangs an unattended launch, so cron and scheduler invocations must state it alongside
+`--yes`. Every other headless gate has a safe default; head position has none.
+
+### Spec file
 
 ```toml
 name      = "peo_licl_scan"
@@ -1314,46 +808,21 @@ low  = 5.0
 high = 30.0
 ```
 
-The loader **refuses what it cannot represent faithfully**. An unknown key is an error, not
-a silently-defaulted field, and fields carrying live Python objects (`prior_mean`,
-`formulation`, `piezo`, `seed_observations`) cannot be set from a file at all — a spec
-that silently ran a different experiment from the one the file describes is the failure this
-prevents. Those campaigns are built in Python or from Tab 10.
+An unknown key is an error. Fields carrying live Python objects (`prior_mean`, `formulation`,
+`piezo`, `seed_observations`) cannot be set from a file at all; those campaigns are built in Python
+or from Tab 10. `general_formulation` is loadable (only the `formulation` key is refused), and so
+is `run_plan` in the `[[run_plan.phases]]` form below.
 
-Two things that list does **not** refuse, because they are asked about often:
+**Casting one fixed recipe N times.** Pin a composition by writing it as a `[general_formulation]`
+axis with `low == high`; a pinned axis is left out of the optimizer's parameter space. Add one
+`int` axis to `[parameter_space]` (the shipped example calls it `replicate`) with `low = 1`,
+`high = N`, set `optimizer = "grid"` and `budget = N`. Write every axis out in full — all six keys
+(`kind`, `a`, `b`, `low`, `high`, `basis`), including `b = ""` on a `dried_fraction` axis — because
+an omitted key takes a default and casts a different composition. Any axis left searched
+(`low != high`) must also be named in `[parameter_space]`, or `check` refuses the spec.
+`examples/bench_instance.toml` is the worked example.
 
-- **`general_formulation` has always been loadable** — only the `formulation` *key* is
-  refused. A fully pinned composition is a first-class file form; see *Casting one fixed
-  recipe N times* below.
-- **`run_plan` is loadable as of this wave**, in the `[[run_plan.phases]]` form described
-  further down. It was on the refusal list until then.
-
-### Casting one fixed recipe N times
-
-A campaign does not have to search. A composition is **pinned** by writing it as a
-`[general_formulation]` axis with `low` equal to `high` — that is what pinning has always
-meant, and a pinned axis is left out of the optimizer's parameter space, so no suggestion can
-perturb the recipe. To cast that one recipe N times, add a single `int` axis to
-`[parameter_space]` (the shipped example calls it `replicate`) with `low = 1`, `high = N`,
-then set `optimizer = "grid"` and `budget = N`: grid walks the N points in order and every
-point solves to the same volumes, one well each.
-
-Write every axis out in full — all six keys (`kind`, `a`, `b`, `low`, `high`, `basis`),
-including `b = ""` on a `dried_fraction` axis — because an omitted key takes a default and
-casts a different composition. Any axis left *searched* (`low != high`) must also be named in
-`[parameter_space]`: `softae-campaign check` now **refuses** a spec that declares a searched
-axis it does not list. Before this, such a file loaded and cast every well at that axis's
-lower bound — a fixed recipe at the corner of the declared box, reported as a search.
-
-`examples/bench_instance.toml` is the worked example: two pinned axes, `replicate` 1–4,
-`grid`, `budget = 4`. The `[[run_plan.phases]]` block that turns it into a full bench
-instance — cast, cure, equilibrate, read — is described below, and is being added to that
-file in the same wave.
-
-### What to measure — the `[measurement]` block
-
-What a campaign measures is one block, named by **modality**, so a second kind of data needs
-no new spec fields:
+### `[measurement]`
 
 ```toml
 [measurement]
@@ -1365,35 +834,21 @@ enabled  = true       # false = formulate and cast, but do not measure
 n_points = 40         # modality settings layered over the preset
 ```
 
-The three EIS-shaped fields it replaces still work and still mean the same thing:
-
-| Legacy spelling *(deprecated)* | Block spelling |
+| Legacy spelling (deprecated) | Block spelling |
 |---|---|
-| `eis_preset = "Quick"` | `[measurement]` → `preset = "Quick"` |
-| `eis_overrides = { n_points = 40 }` | `[measurement.overrides]` → `n_points = 40` |
-| `measure_eis = false` | `[measurement]` → `enabled = false` |
+| `eis_preset = "Quick"` | `[measurement] preset` |
+| `eis_overrides = { n_points = 40 }` | `[measurement.overrides]` |
+| `measure_eis = false` | `[measurement] enabled = false` |
 
-A file written before the block still loads; the legacy fields raise a `DeprecationWarning`
-and are folded *into* the block, so there is exactly one authority at run time. Files the
-system writes carry the block only. The old fields are removed once one full campaign has
-run from a measurement-block spec.
+Legacy fields still load, raise a `DeprecationWarning` and fold into the block. Both spellings
+together are allowed **only when they agree**; a disagreement is refused rather than resolved by
+precedence, and `check` surfaces it before hardware moves. Naming an unbuilt modality refuses to
+start, listing the registered ones, before an instrument connects or a run row is written. Resume
+is unaffected: only `modality` is identity-bearing.
 
-- **Both spellings together are allowed only when they agree.** A disagreement is refused,
-  not resolved by precedence: whichever spelling lost was a written instruction to measure
-  something else, and neither the file nor the caller would show it had been overruled.
-  `softae-campaign check` surfaces this before any hardware moves.
-- **Naming a modality that is not built refuses to start** — before an instrument connects
-  or a run row is written, with the registered modalities listed in the error.
-- **Resume is unaffected.** Only `modality` is identity-bearing, and the default `"eis"`
-  contributes nothing to the checkpoint fingerprint, so a campaign checkpointed before the
-  block existed still resumes. `preset` / `overrides` / `enabled` are settings, re-tunable
-  between sessions, exactly as they were under the old names.
+### `[[run_plan.phases]]`
 
-### The run plan — `[[run_plan.phases]]`
-
-A spec can describe the **process** as well as the formulation: the ordered phases a board
-goes through between casting and reading. Each phase is one `[[run_plan.phases]]` table, and
-the array order is the execution order.
+Array order is execution order.
 
 ```toml
 [[run_plan.phases]]
@@ -1402,16 +857,16 @@ scope = "per_sample"
   [run_plan.phases.conditions]
   name            = "casting"
   temp_setpoint_C = 25.0
-  rh_setpoint_pct = 40.0
+  rh_setpoint_pct = 22.0
 
 [[run_plan.phases]]
 kind        = "anneal"
 scope       = "per_batch"
-anneal_task = "anneal_85C_8h"
+anneal_task = "anneal_85C_8h"    # the task owns the cure: its temperature AND its hold
   [run_plan.phases.conditions]
   name            = "anneal"
-  temp_setpoint_C = 85.0
-  rh_setpoint_pct = 20.0     # at 85 °C the attainable floor is ~20 %; check advises
+  temp_setpoint_C = 25.0         # the RESTORE target after the hold, not the cure temperature
+  rh_setpoint_pct = 22.0
 
 [[run_plan.phases]]
 kind  = "equilibrate"
@@ -1423,7 +878,7 @@ scope = "per_batch"
   [run_plan.phases.conditions]
   name            = "equilibrate"
   temp_setpoint_C = 25.0
-  rh_setpoint_pct = 50.0
+  rh_setpoint_pct = 22.0
 
 [[run_plan.phases]]
 kind  = "measure"
@@ -1434,1039 +889,456 @@ scope = "per_batch"
 
 | Key | Where | Required | Meaning |
 |---|---|---|---|
-| `kind` | every phase | **yes** | `formulate` · `anneal` · `equilibrate` · `measure` |
-| `scope` | every phase | **yes** | `per_sample` (once per well) or `per_batch` (once for the round) |
-| `anneal_task` | anneal | no | a task name from `data/tasks.toml` — **this is what sets the cure** |
-| `hold_s` | anneal | no | the cure's duration for this run, in seconds — overrides the task's own `hold_time_s`; refused if `anneal_params` spells `hold_time_s` too |
-| `[…conditions]` | any phase | no | chamber setpoints established at the phase boundary |
-| `[…settle]` | equilibrate | no | the settle loop's timing; the three keys are required **together** |
-| `[…measurement]` | **measure only** | no | a `[measurement]`-shaped block for a denser read |
+| `kind` | every phase | yes | `formulate` · `anneal` · `equilibrate` · `measure` |
+| `scope` | every phase | yes | `per_sample` (once per well) or `per_batch` (once for the round) |
+| `anneal_task` | anneal | no | Task name from `data/tasks.toml`; this sets the cure |
+| `hold_s` | anneal | no | Cure duration in seconds, overriding the task's `hold_time_s`. Refused if `anneal_params` also spells `hold_time_s` |
+| `[…conditions]` | any phase | no | Chamber setpoints established at the phase boundary |
+| `[…settle]` | equilibrate | no | Settle loop timing; the three keys are required together |
+| `[…measurement]` | measure only | no | A `[measurement]`-shaped block for a denser read |
 
-**`scope` is required on every phase and is never inferred.** It is not derived from `batch`,
-because guessing it silently changes which physical process runs — `per_sample` casts and
-anneals each well on its own, `per_batch` casts all of them and then cures once. A batch
-instance is `formulate ×N → anneal (all) → equilibrate (all) → measure (all)`, and
-`softae-campaign check` prints that resolved order before anything moves.
+- **`scope` is never inferred.** `per_sample` casts and anneals each well on its own; `per_batch`
+  casts all of them and cures once. A batch instance is
+  `formulate ×N → anneal (all) → equilibrate (all) → measure (all)`.
+- **`conditions` drives only the axes you name.** An omitted axis is not driven — leaving out
+  `rh_setpoint_pct` does not mean 0 %RH. Tolerances and approach timeouts default to the
+  *ascending* allowance (1 800 s); set them explicitly wherever the approach is passive, since this
+  stage has no active cooling. `check` reports that as an advisory, never a refusal.
+- **`conditions` on an ANNEAL phase is the rest state after the hold**, not the cure. The
+  conditions setpoint is written first, the anneal ramps to the task's target, and on the way out
+  it restores what conditions left. **Equal values are the trap**: `temp_setpoint_C = 85.0` beside
+  `anneal_85C_8h` leaves the chamber at 85 °C after the cure, and a MEASURE phase with no
+  conditions of its own then reads a hot board. Give the phase after an anneal its own
+  `conditions`.
+- **`settle` is all-or-nothing**; a partial block is refused rather than half-defaulted.
+- **`measurement` is legal only on a MEASURE phase**, and optional there. The production read after
+  settling is authoritative because of its role; this block only makes it denser.
 
-**`conditions` drives only the axes you name.** An omitted axis is **not driven** — leaving
-out `rh_setpoint_pct` does not mean "0 %RH", it means the humidifier is not commanded at this
-boundary and whatever the previous phase left stands. The block also carries tolerances and
-approach timeouts; they default to the *ascending* allowance (1 800 s). Set them explicitly
-wherever the approach is **passive**: this stage has no active cooling, so a descent — in
-temperature, and in the humidity that follows it — is limited by how fast the enclosure loses
-heat, and no cooling time constant has been measured yet. `check` surfaces that as an
-advisory, never a refusal.
+### Objective and engine
 
-> **`conditions` on an ANNEAL phase is the temperature the chamber RESTS AT after the hold —
-> not the cure temperature.** The cure is set by `anneal_task`, or by a `hold_s` /
-> `anneal_params` override on the phase — `conditions` never sets it. The conditions block
-> writes its setpoint first, the anneal ramps away to
-> the task's target, and on the way out it restores what conditions left — so `conditions`
-> is the *restore target*. **The case to watch is when the two agree.** Write
-> `temp_setpoint_C = 85.0` beside `anneal_85C_8h` and the chamber stays at 85 °C *after* the
-> cure, until some later phase moves it; a MEASURE phase with no conditions of its own then
-> reads a hot board, and nothing warns. Give the phase after an anneal its own `conditions`.
-> (`docs/SubAgent docs/anneal_phase_duration.md` §1–§2 measures this end to end.)
+`[eis] objective` and `[eis] engine` are different keys: the first chooses which metric, the second
+which physics computes it. With `objective = "auto"` (the default) the metric resolves from what
+the campaign can measure, and the direction follows the metric:
 
-**`settle` is all-or-nothing.** `round_period_s`, `min_hold_s` and `max_hold_s` are required
-together — a partial block is refused rather than half-defaulted, because a settle window with
-one bound taken from a default is a different experiment from the one the file describes.
-
-**`measurement` is legal only on a MEASURE phase**, and it is optional there. The production
-read after settling is authoritative **because of its role, not its parameters**: it always
-runs and is always what the batch result is recorded from. `[run_plan.phases.measurement]`
-only makes that read denser or broader than the campaign's own `[measurement]` block.
-
-`examples/bench_instance.toml` is where the worked four-phase version lands — see *Casting
-one fixed recipe N times* above for the rest of that file.
-
-### The objective is derived, not chosen
-
-`[eis] objective = "auto"` (the default) resolves the metric from what the campaign can
-actually measure, and the **direction follows the metric**:
-
-| Campaign mode | Twin can predict thickness? | Metric | Direction |
+| Campaign mode | Twin predicts thickness? | Metric | Direction |
 |---|---|---|---|
-| **composition** — carries a formulation | yes | σ | maximise |
-| **volume** — raw `vol_params` | no: no stock identity ⇒ no elution ⇒ no dry thickness | mean \|Z\| | minimise |
+| composition — carries a formulation | yes | σ | maximise |
+| volume — raw `vol_params` | no (no stock identity ⇒ no elution ⇒ no dry thickness) | mean \|Z\| | minimise |
 
-Neither is a fallback for the other. Volume mode is a legitimate exploration mode where σ is
-*impossible*, not merely missing. Setting `CampaignSpec.objective` to an explicit
-`maximize`/`minimize` is honoured only when it agrees with the resolved metric and
-**refused** when it does not — minimising \|Z\| and maximising σ are the same goal, so a
-contradiction would spend the whole budget finding the worst material on the board while
-every step reported progress.
+Neither is a fallback for the other. An explicit `maximize`/`minimize` on `CampaignSpec.objective`
+is honoured only when it agrees with the resolved metric and refused when it does not. The
+conductivity the GUI shows and the conductivity the objective optimises are the same number,
+produced by the engine named in `[eis] engine`; no surface names its own engine.
 
-### One σ everywhere
+### Rounds, boards, budget, resume
 
-The conductivity the GUI displays and the conductivity the autonomous objective optimises
-against are **the same number**, produced by the engine named in one place — `[eis] engine`
-in `softae_config.toml`. No surface names its own engine, so flipping that key moves the
-whole system at once.
+A round is sized before anything is suggested, to the smallest of the requested batch size, the
+electrodes still free on the plate, and the unspent budget.
 
-This closed a live divergence. Until 2026-08-09 the campaign objective forced the gated
-engine while every GUI surface followed the config key; on one synthetic spectrum
-(R_bulk = 2000 Ω, t = 150 µm) the objective reported σ = 3.34e-2 S/cm and the GUI
-7.36e-2 S/cm — **a factor of 2.2 for the same film**, with nothing on screen saying so. Both
-now read 7.36e-2 under the shipped `engine = "legacy"` and 3.34e-2 under `engine = "gated"`.
-Nothing about the casting or the measurement differs between the two surfaces, so nothing
-about the reported σ should either.
+- A full board is exchanged **before** the round, so no round is split across a plate swap.
+- The final round narrows to the budget: budget 5 with q=4 spends exactly 5 electrodes.
+- Board exchange prompts the operator and can be cancelled, stopping the run while keeping
+  everything already measured. With no handler (fully headless) an exchange request stops cleanly
+  rather than assuming a fresh plate.
+- Drop-cast wells are single-use, so occupancy is persisted per `(board_id, electrode)` and
+  survives a restart. Resuming into recorded occupancy asks fresh / resume / cancel.
+- `--resume` is off by default. The checkpoint is fingerprinted against the spec; a changed
+  parameter space, objective or optimizer setting is refused rather than continued into.
 
-`[eis] objective` and `[eis] engine` remain different keys: the first chooses **which
-metric** (σ or mean |Z|, per the table above), the second **which physics computes it**.
+### `SOFTAE_SEED_DATASET`
 
-### Rounds, boards and budget
-
-A round is sized *before* anything is suggested, to the smallest of the requested batch
-size, the electrodes still free on the current plate, and the budget still unspent.
-
-- **A full board is exchanged before the round**, so a round is never split across a plate
-  swap. Half a cast batch held through an operator prompt of unbounded duration is worse
-  than a narrower round that completes.
-- **The final round narrows to the budget** rather than rounding up to the next multiple of
-  q. A budget of 5 with q=4 spends exactly 5 electrodes.
-
-Board exchange prompts the operator and can be **cancelled** — which stops the run while
-keeping everything already measured. With **no handler** (a fully headless run), an exchange
-request stops cleanly rather than assuming a fresh plate: casting onto a board that is still
-full would destroy occupied single-use wells.
-
-### Occupancy, resume and checkpoints
-
-Drop-cast wells are single-use, so occupancy is persisted per `(board_id, electrode)` and
-survives a restart. Resuming a campaign that finds recorded occupancy asks whether the plate
-is **fresh**, a **resume**, or to **cancel**.
-
-`--resume` continues a saved checkpoint rather than restarting. It is **off by default**:
-silently resuming would make a re-run mean something different from what was typed. The
-checkpoint is fingerprinted against the spec — a changed parameter space, objective or
-optimizer setting is refused rather than continued into.
-
-### Seeding an offline BO run: `SOFTAE_SEED_DATASET`
-
-`SOFTAE_SEED_DATASET` points at a **historical aggregated-conductivity dataset** — a past
-campaign's results, used as a stand-in oracle so a BO run can be exercised without touching
-the rig. It is a path to a file, not a directory:
+Points at a historical aggregated-conductivity **file** (not a directory), used as a stand-in
+oracle so a BO run can be exercised off the rig.
 
 ```bash
-export SOFTAE_SEED_DATASET=/path/to/aggregated_conductivity.txt   # PowerShell: $env:SOFTAE_SEED_DATASET = "..."
-python examples/bo_campaign_demo.py                               # or pass the path as argv[1]
+export SOFTAE_SEED_DATASET=/path/to/aggregated_conductivity.txt
+python examples/bo_campaign_demo.py          # or pass the path as argv[1]
 ```
 
-Two consumers, and **neither invents data when it is unset**:
-
-| Consumer | Unset or missing |
-|---|---|
-| `examples/bo_campaign_demo.py` | prints what to set and exits **1**; an explicit path as the first argument wins over the variable |
-| the seeded tests (`tests/campaign_helpers.py`) | those tests **skip** |
-
-Skipping is deliberate. The dataset is a lab record, not a fixture — it is not in the
-repository, so a clone has no copy — and a test that quietly substituted synthetic numbers
-for it would report a convergence result about a curve nobody measured. Unset is a supported
-state: the rest of the campaign suite runs on synthetic frames and does not need it.
+`examples/bo_campaign_demo.py` prints what to set and exits 1 when it is unset or missing (an
+explicit `argv[1]` wins over the variable); the seeded tests in `tests/campaign_helpers.py` skip.
+Neither invents data — the dataset is a lab record and is not in the repository.
 
 ---
 
-## 16. EIS Commissioning & Calibration
+## 13. `softae-commission`
 
 Commissioning measures the **fixture** rather than a sample: what the leads and multiplexer
-contribute, and what the instrument can actually resolve. Because fixture electronics drift
-is minimal, a calibration is a **durable asset reused across campaigns**, not a per-run
-chore.
+contribute, and what the instrument can resolve. Fixture drift is minimal, so a calibration is a
+durable asset reused across campaigns.
 
 ```bash
-softae-commission status                                    # what is calibrated, what is next
+softae-commission status
 softae-commission run blank_short --channels 1-32 --fixture mux16 --electrode-mode two --yes
-softae-commission derive --fixture mux16                    # spectra → calibration → TOML
-softae-commission history --fixture mux16                   # successive sets = drift
+softae-commission derive --fixture mux16
+softae-commission history --fixture mux16
 ```
 
-`run` acquires and tags; `derive` reads the tagged spectra back from the database. They are
-separate because artifacts arrive over several sessions as parts turn up, and each `derive`
+`run` acquires and tags; `derive` reads the tagged spectra back from the database. Each `derive`
 produces the best calibration the artifacts so far support.
 
-Four flags are routine on every subcommand and need no ceremony: **`--fixture`** names the
-fixture (defaults to the configured one) and **`--project`** the project directory holding the
-DataStore — both accepted by `run`, `import`, `derive` and `history`, and both must match
-across the three or `derive` will look for spectra where none were written. On `run` only,
-**`--yes` / `-y`** skips the "is the hardware in place?" prompt and **`--mock`** measures a
-simulated fixture, which is how you rehearse the sequence away from the bench.
+| Subcommand | Flags |
+|---|---|
+| `status` | `--fixture`, `--project` |
+| `run` | role positional, `--channels`, `--fixture`, `--project`, `--nominal`, `--electrode-mode {two,three}`, `--yes`/`-y`, `--mock` |
+| `import` | role positional, `--file` (req), `--electrode-mode` (req), `--channel`, `--nominal`, `--re-connection {unverified,tied_to_ce,bridged_by_sample,open_by_geometry,connected}`, `--fixture`, `--project` |
+| `derive` | `--channels`, `--representative N`, `--declare-electrode-mode`, `--nominal-load`, `--nominal-cap`, `--nominal-r`, `--fixture`, `--project` |
+| `history` | `--fixture`, `--project` |
 
-### The artifacts, in order of value per hour of bench time
+`--fixture` and `--project` must match across `run`, `import` and `derive`, or `derive` looks for
+spectra where none were written. On `run`, `--yes` skips the hardware-in-place prompt and `--mock`
+measures a simulated fixture.
 
 | Artifact | Install | Gives you |
 |---|---|---|
-| **`blank_short`** | jumpered channel (CE–WE shorted) | `R_fixture`, `L_lead` → unlocks series correction |
-| **`blank_load`** | precision resistor, `--nominal <ohms>` | end-to-end correction error |
-| **`reference_cap`** | low-loss C0G/NP0, `--nominal <farads>` | **measured** phase floor → qualified upper bounds |
-| **`reference_r`** | reference resistor, ≥1 per decade | true \|Z\| window for *this* fixture |
-| **`blank_open`** | bare, uncast board | whether OSL correction is legitimate at all |
+| `blank_short` | Jumpered channel (CE–WE shorted) | `R_fixture`, `L_lead` → unlocks series correction |
+| `blank_load` | Precision resistor, `--nominal <ohms>` | End-to-end correction error |
+| `reference_cap` | Low-loss C0G/NP0, `--nominal <farads>` | Measured phase floor → qualified upper bounds |
+| `reference_r` | Reference resistor, ≥1 per decade | True \|Z\| window for this fixture |
+| `blank_open` | Bare, uncast board | Whether OSL correction is legitimate at all |
 
-`status` names **the next artifact** rather than listing every absence, and `derive` reports
-which single artifact would unblock each remaining capability.
+`status` names the next artifact; `derive` reports which single artifact would unblock each
+remaining capability.
 
-### Two-electrode mode is mandatory for every reference
+**Two-electrode mode is mandatory for every reference.** Tie RE to CE at the connector before
+measuring any two-terminal reference — short, load resistor, capacitor or bare board — because a
+two-terminal load gives the reference stripe no ionic path and RE then floats onto a capacitive
+divider whose ratio is not reproducible even at fixed load. A value taken any other way is refused
+at derive time. `derive --declare-electrode-mode` persists a mode and touches only rows recorded as
+`unknown`; a spectrum explicitly recorded as three-electrode stays refused.
 
-**Tie RE to CE at the connector before measuring any two-terminal reference** — short,
-load resistor, capacitor, or bare board. This is not a refinement; a value taken any
-other way is refused at derive time.
+**`--re-connection`** says what physically closed the potentiostat's control loop, which is a
+different question from how the cell was sensed.
 
-A two-terminal load gives the reference stripe no ionic path, so in three-electrode mode
-RE floats onto a **capacitive divider between WE and CE** and the instrument reports only
-a fraction of the true impedance. The fraction is not a constant. Measured on this rig:
-
-| configuration | apparent / true |
-|---|---|
-| ch25 blank | 2.24× |
-| ch25 + 100 pF | 9.58× |
-| ch17 blank (multichannel) | 23.8× |
-| **same 1 nF part, two trials** | **9.85× and 4.96×** |
-
-That last row is the decisive one: the ratio is not even reproducible at fixed load, so
-there is no correction factor to apply and none may be fitted. Three-electrode
-measurement of a two-terminal load is **uncalibratable in principle**, not merely
-uncalibrated.
-
-This also resolves a long run of "impossible" results — parts reading 8–9× their markings
-and blanks at 120–250 pF. Re-measured with RE tied to CE, a part marked "101" gave 96.4 pF
-and one marked "102" gave 974.6 pF, both within 4% of their EIA codes. **The components
-were correct all along.**
-
-> **A sample is different, and the distinction matters.** A conductive film in contact
-> with the reference stripe *does* establish an ionic path. That is exactly when
-> three-electrode sensing is valid and `K_config_factor = 2` is exact — which is why
-> verified RE *contact* is a precondition for applying the factor, not a footnote.
-
-Three ways to record the mode:
-
-```bash
-softae-commission run   reference_cap --electrode-mode two ...   # prompted at the bench
-softae-commission import reference_cap --file <path> --electrode-mode two ...
-softae-commission derive --fixture mux16 --declare-electrode-mode two
-```
-
-`import` registers an existing spectrum file without re-measuring — useful when the data
-already exists from an earlier session or a bench instrument. `--file` is required and
-`--electrode-mode` is too (*declaring it is the point of importing*); `--channel` names the
-channel when the file itself does not record one, and `--nominal` carries the marked value
-exactly as it does on `run`. `derive --declare-...` asserts a mode for spectra already stored,
-and **persists it**, so it is asked once. It only touches rows recorded as `unknown`: a
-spectrum explicitly recorded as three-electrode stays refused, because that is not missing
-information but information saying the value is unusable.
-
-### What closed the loop: `import --re-connection`
-
-Electrode mode says how the cell was *sensed*. `--re-connection` says what physically **closed
-the potentiostat's control loop** (overhaul R19) — a different question, and the one that
-decides whether a quadrant violation is an instrument artifact or a structural result. It
-defaults to `unverified`, which is honest but unlocks nothing, so declare it on import:
-
-| `--re-connection` | Means | Loop closed? |
+| Value | Means | Loop closed? |
 |---|---|---|
-| `unverified` | nobody recorded it *(default)* | unknown |
+| `unverified` | Nobody recorded it (default) | unknown |
 | `tied_to_ce` | RE jumpered to CE at the connector | yes |
-| `bridged_by_sample` | the cast film spans RE to the electrodes | yes |
-| `open_by_geometry` | nothing spans the gap to the RE stripe | no |
-| `connected` | the wire is on — says nothing about what spans the gap | yes |
+| `bridged_by_sample` | The cast film spans RE to the electrodes | yes |
+| `open_by_geometry` | Nothing spans the gap to the RE stripe | no |
+| `connected` | The wire is on; says nothing about what spans the gap | yes |
 
-> **Use `tied_to_ce` for any two-terminal reference and for open blanks.** It is the state you
-> created by hand when you followed the tie-RE-to-CE rule above, and it is the honest label for
-> a bare board where nothing bridges anything. It closes the loop *perfectly* while making RE
-> read the counter electrode — so the measurement is two-electrode by construction and its
-> configuration factor is 1, not 2. Recording it as `connected` or `bridged_by_sample` instead
-> would earn the spectrum a K = 2 it has not established, a clean 2× error on the absolute
-> number with the fit and residuals all looking perfect.
+Use `tied_to_ce` for any two-terminal reference and for open blanks: it closes the loop while
+making RE read the counter electrode, so the measurement is two-electrode by construction and its
+configuration factor is 1, not 2. Recording it as `connected` or `bridged_by_sample` earns the
+spectrum a K = 2 it has not established — a clean 2× error with a perfect-looking fit.
 
 ```bash
 softae-commission import blank_short --file ch1_short.csv \
     --electrode-mode two --re-connection tied_to_ce --channel 1 --fixture mux16
 ```
 
-> **Supply `--nominal` for any part with a marked value.** It is recorded with the
-> measurement, because it is not recoverable later — nobody remembers which resistor was in
-> the socket weeks ago — and the marking *disagreeing* with the measurement is exactly the
-> check that catches an unusable part.
+**`--nominal`** is always in **base SI units** with no suffix: `470e-12` for 470 pF, `1e-9` for
+1 nF, `1e6` for 1 MΩ. Supply it for any marked part; it is recorded with the measurement and is not
+recoverable later. `derive` reports the measured-to-marked ratio, so a mis-keyed exponent is
+visible where a bad part would be. Same rule for `--nominal-cap` / `--nominal-load` / `--nominal-r`.
 
-`--nominal` is always in **base SI units** — farads, not picofarads; ohms, not megohms — and
-takes scientific notation. There is no unit suffix:
-
-```bash
---nominal 470e-12    # 470 pF reference capacitor
---nominal 1e-9       # 1 nF
---nominal 1e6        # 1 MΩ load resistor
-```
-
-A mis-keyed exponent does not pass quietly: `derive` reports the measured-to-marked ratio, so
-a 1000× discrepancy is visible in the same place a genuinely bad part would be.
-
-### Deriving when most channels were never measured
-
-Measuring 32 channels of short blank is hours of jumpering. Measuring 7 is one sitting. The
-`derive` flag pair that bridges the gap is **`--representative` with `--channels`**, and it is
-the most consequential thing on this command:
+**Deriving from a partial channel set.**
 
 ```bash
 softae-commission derive --fixture mux16 \
-    --channels 1-32 \          # the FULL channel set the calibration must cover
-    --representative 3 \       # the MEASURED channel whose constants the rest inherit
-    --nominal-load 1e6         # the marked value of the load resistor
+    --channels 1-32 \        # the FULL channel set the calibration must cover
+    --representative 3 \     # the MEASURED channel whose constants the rest inherit
+    --nominal-load 1e6
 ```
 
-- **`--representative <N>`** names one measured channel whose fixture constants (`R_short`,
-  `L_lead`, `C_stray`) the **unmeasured channels inherit**. Pick a channel you actually
-  measured and that is unremarkable — a representative with an outlying `C_stray` exports its
-  own defect to every channel that inherits from it.
-- **`--channels`** is the *full* set the calibration must cover, not the set you measured. It
-  is what lets `derive` compute the difference — measured versus covered — and it is the only
-  way the assumed channels get named at all. Give `--representative` without it and there is no
-  set to inherit *into*.
-
-**The inheritance is recorded, not silently applied**, and that provenance travels. Every
-inheriting channel is marked `channels_assumed` in the `CalibrationSet`; every later correction
-built for one carries `inherited = True`; and each time such a channel is corrected the system
-logs `eis_calibration_channel_assumed` with the measured channel-to-channel spread attached. So
-a σ derived through an assumed channel is traceable as such months later, from the log line
-alone.
-
-> **Assumed is a real uncertainty, not a formality.** Measured on this fixture, `C_stray`
-> spanned **10.2–24.7 pF across 7 identical stripes — a 2.4× spread**. Stripes that are
-> identical by layout are not identical by measurement, and a channel inheriting from one of
-> them inherits a number that was never within a factor of two of correct for some of its
-> peers. Derive with as many measured channels as the bench time allows, treat the assumed ones
-> as the weaker evidence they are, and measure a channel outright before resting a headline
-> result on it.
-
-If you skip both flags, a channel with no constant of its own simply gets **no correction** —
-`derive` declines it and says so, naming this pair as the remedy. Declined is safe; assumed is
-useful; measured is best.
-
-The rest of `derive`'s surface declares the marked part values at derive time, for artifacts
-imported or measured without a `--nominal`:
-
-| `derive` flag | Purpose |
-|---|---|
-| `--channels` | full channel set the calibration covers, so assumed channels are known |
-| `--representative N` | measured channel whose constants unmeasured channels inherit |
-| `--nominal-load` | load resistor's marked value, **ohms** |
-| `--nominal-cap` | reference capacitor's marked value, **farads** |
-| `--nominal-r` | reference resistor's marked value, **ohms** |
-| `--declare-electrode-mode` | assert the mode for spectra stored as `unknown` (never overrides a recorded one) |
-| `--fixture` / `--project` | which fixture, which DataStore |
-
-Same base-SI rule as `--nominal`: `--nominal-cap 470e-12`, not `470`.
-
-### Two things worth knowing before the bench
-
-**An unusable open blank is a result, not a failure.** An open circuit's impedance can exceed
-the instrument ceiling across most of the band, in which case the record is noise — and that
-is itself the evidence that shunt admittance is negligible, which is precisely when
-short-only series correction is *exact*.
-
-**An open cell floats the reference electrode.** On a three-electrode fixture a bare-board
-open measures inter-stripe geometry, not the fixture. A genuine fixture open needs RE tied to
-CE at the connector, which the commissioning board should have designed in.
-
-### Where it lands
+`--representative N` names one measured channel whose `R_short`, `L_lead` and `C_stray` the
+unmeasured channels inherit; pick an unremarkable one, since an outlier exports its defect to every
+inheritor. `--channels` is the full covered set, not the measured set — without it there is no set
+to inherit into. Inheritance is recorded: inheriting channels are marked `channels_assumed`, later
+corrections carry `inherited = True`, and each logs `eis_calibration_channel_assumed` with the
+measured channel-to-channel spread. Skip both flags and a channel with no constant of its own gets
+**no correction**; `derive` declines it and names this pair as the remedy.
 
 | Destination | Contents |
 |---|---|
-| `measurements` table, `role != 'sample'` | raw spectra, queryable like any other |
-| `calibration/eis/<fixture_id>.toml` | derived constants — **commit this file** |
-| `eis_calibrations` table | append-only history; successive sets *are* a drift measurement |
+| `measurements` table, `role != 'sample'` | Raw spectra, queryable like any other |
+| `calibration/eis/<fixture_id>.toml` | Derived constants — **commit this file** |
+| `eis_calibrations` table | Append-only history; successive sets are a drift measurement |
 
-Staleness is by **hardware identity, not by clock**: a `hardware_hash` over the board,
-channel-routing and instrument-envelope config. A mismatch means the constants are
-**dropped, not applied** — a short blank from a different board silently correcting today's
-spectra is the failure this prevents. There is no expiry.
+Staleness is by **hardware identity, not clock**: a `hardware_hash` over the board, channel-routing
+and instrument-envelope config. A mismatch means the constants are dropped, not applied. There is
+no expiry.
 
 ---
 
-## 17. EIS Analysis Engine & Gates
+## 14. EIS engine, gates, cell constant, fixture correction
 
-Two analysis engines run side by side, selected by `[eis] engine`:
-
-| Engine | What it does |
+| `[eis] engine` | What it does |
 |---|---|
-| **`legacy`** (default) | fit `R0-CPE0-p(R1,C0)`, take `R1`, divide. What the rig has always done. |
-| **`gated`** | admission gates, covariance, per-sample cell constant, upper bounds where the measurement is resolution-limited |
+| `gated` (**shipped**) | Admission gates, covariance, per-sample cell constant, upper bounds where the measurement is resolution-limited |
+| `legacy` | Fit `R0-CPE0-p(R1,C0)`, take `R1`, divide |
 
-Both return the same report shape, so flipping the key is the whole cutover and it is
-reversible per run.
+Both return the same report shape, so flipping the key is the whole cutover and it is reversible
+per run.
 
-`engine` and `[eis.gates] enabled` are **deliberately separate**. `engine = "gated"` with
+`engine` and `[eis.gates] enabled` are deliberately separate. `engine = "gated"` with
 `enabled = false` runs every check and logs every verdict, and **failing points are still
-dropped**: what the flag withholds is the refusal, not the removal — a would-be REJECT is
-recorded as SUSPECT rather than refusing the spectrum. That is how you review a campaign's
-worth of would-reject decisions before giving thresholds authority over data.
+dropped**: the flag withholds the refusal, not the removal, so a would-be REJECT is recorded as
+SUSPECT. Shipped gate thresholds are engineering defaults from the specification, chosen without
+reference to this rig's spectra; `softae-shadow review` section 7 derives candidates from real
+spectra ([§15](#15-softae-shadow)).
 
-Every gate threshold currently shipped is an engineering default from the specification,
-chosen without reference to this rig's spectra — and values for these thresholds *can* be
-derived from the spectra a shadow run produces, which is what the review tool's section 7
-does ([§20](#20-shadow-campaign-review)).
+**What the gates catch.** Admission gates run before any fit, because the expensive failure is a
+fit that *succeeds* on a spectrum containing none of the physics being extracted. Every removed
+point is recorded with a named gate and a reason.
 
-### What the gates catch
+- *Valley feature* — `R_sol` must come from the interior local minimum of `−Z″`, never the `|Z|`
+  minimum (the high-frequency intercept ≈ `R_series`). The two can differ by more than 10× on one
+  spectrum, and taking the wrong one has no other symptom.
+- *Cross-spectrum duplicates* — bitwise-identical `|Z|` between independently measured spectra
+  proves an instrument rail. The remedy is a **higher current range, not a lower amplitude**.
+- *Kramers–Kronig* — tests whether the response could have come from any linear, causal, stable,
+  finite system, without assuming a circuit. It fits a K–K-compliant Voigt ladder (log-spaced
+  `R‖C` elements plus explicit `R`, `L` and, for a blocking cell, `C`) and reads the residuals, so
+  nothing outside the measured band is referenced. `add_cap` follows `[eis.cell] blocking`. K–K is
+  necessary, not sufficient, and cannot separate drift from nonlinearity.
 
-Admission gates run **before** any fit, because the expensive failure is not a fit that
-fails — it is a fit that *succeeds* on a spectrum containing none of the physics being
-extracted, and hands the number to a campaign. Every point removed is recorded with a named
-gate and a reason; nothing is masked silently.
-
-Two are worth knowing by name:
-
-- **Valley feature** — `R_sol` must come from the interior local minimum of `−Z″`, never the
-  `|Z|` minimum (which is the high-frequency intercept ≈ `R_series`). The two can differ by
-  more than 10× on the same spectrum, and taking the wrong one has *no other symptom*: the
-  fit and residuals both look fine.
-- **Cross-spectrum duplicates** — bitwise-identical `|Z|` between independently measured
-  spectra is impossible for distinct samples and therefore proves an instrument rail. The
-  remedy is a **higher current range, not a lower amplitude**: saturation scales with current
-  and bites hardest at the impedance minimum.
-
-### Kramers–Kronig: what the K–K gate actually tests
-
-The Kramers–Kronig relations hold for any response that is **linear, causal, stable and
-finite**. They are the one check available that assumes nothing about the circuit — so a
-K–K violation says the data could not have come from *any* such system, whatever model you
-were planning to fit.
-
-**The catch is that the K–K transform integrates over 0 → ∞.** You measured four decades.
-Applying it directly means extrapolating outside the band, and that extrapolation is an
-assumption about the very physics under test — you can make most spectra pass or fail
-depending on how you close the integral.
-
-So the test is inverted. Rather than transforming the data, fit a basis that is
-**K–K-compliant by construction** and read the residuals. Nothing outside the band is ever
-referenced. The basis is a **Voigt ladder** — a series of parallel `R‖C` elements with
-log-spaced time constants, plus explicit `R`, `L` and (for a blocking cell) `C` terms.
-
-Four properties make that the right basis:
-
-| Property | Why it matters |
-|---|---|
-| Each `R‖C` is analytically K–K compliant, and compliance is additive | Whatever the fit returns is guaranteed legal — the test can only fail on the *data* |
-| A log-spaced ladder discretises the distribution of relaxation times | It approaches *any* physically realisable relaxation response, so it is a basis, not a circuit — this is what makes the test model-free |
-| With the time constants fixed, it is **linear in the fitted resistances** | Convex least squares: no initial guess, no local minima, no convergence failure |
-| Residuals localise in frequency | A violation says not just *that* the spectrum is inadmissible but *where* |
-
-The linearity is the practical keystone. With a nonlinear fit, a large residual is
-ambiguous — non-K–K data, or a stalled optimiser? — and the test becomes uninterpretable
-exactly when it matters. You cannot build a falsification test on something that can itself
-fail to converge.
-
-**Order selection.** Too few ladder elements and real features read as violations; too many
-and the ladder fits the noise, everything passes, and the test is vacuous. The μ-criterion
-(`kk_c`, default 0.85) exploits a structural signature: past the optimum, the unconstrained
-solution starts producing large **negative** resistances that oscillate to chase noise. The
-fit deliberately leaves them unconstrained — physically meaningless, but keeping the problem
-linear, and their emergence is the overfitting detector.
-
-**Why `add_cap` follows `[eis.cell] blocking`.** A finite RC ladder cannot produce
-`Z → ∞` as `ω → 0`. A blocking electrode's low-frequency capacitive divergence is therefore
-*structurally* outside its span, and without the series capacitance term the residuals blow
-up at low frequency on every well-behaved blocking cell — which is precisely the region the
-gate is allowed to truncate. It would manufacture the evidence it then acts on.
-
-**Three limits worth knowing:**
-
-- **K–K is necessary, not sufficient.** A response that is causal but physically wrong
-  passes — a pure series RC and a dispersive dielectric both do. Those are failures of the
-  *model*, not of causality, and the topology triad owns them.
-- **It cannot separate drift from nonlinearity.** Both break the preconditions. Truncating
-  only the low-frequency end is a *physical* argument — that is where the sweep is slow
-  enough for the sample to change — bolted onto a mathematical test, not a conclusion the
-  mathematics reaches on its own.
-- **The residual is global.** Least squares over a shared basis redistributes a local
-  perturbation across every element: perturbing 5 of 41 points drove 40 past a 1% residual
-  in testing. That is inherent to the method, and it is why `kk_max_truncate_frac` exists —
-  past that fraction the spectrum is rejected rather than cut, since the licence to cut
-  rests on the cut staying clear of the arc.
-
-### Cell constant and `K_config_factor`
-
-`K = L_gap / ((t − h) · L_stripe)`, computed **per sample** from that sample's own thickness.
-A single nominal thickness applied across a series is a defect, not a simplification.
-
-`[eis.cell] electrode_configuration` records how the rig is wired — this one is
-**3-electrode**. Three-electrode sensing measures only part of the current path, so in
-principle σ = K_geom / (`k_config_factor` · R) with a factor of 2.
-
-> **The factor ships unarmed (`k_config_verified = false`, factor 1.0), which changes no
-> number.** The symmetry argument predicts exactly 2.00 and the source (overhaul §3.8) states
-> it without hedge — but it is contingent on stripe symmetry and RE centring, which §3.8 says
-> should be verified once and recorded, and nobody has done that on this board. So the factor
-> is unarmed because a check is outstanding, not because a measurement has come back against
-> it. Until it is armed, absolute σ reports as *scale unqualified*; **relative trends are
-> unaffected**, since a constant factor cannot reorder a series. Campaigns ranking
-> formulations are valid now.
-
-#### Arming it takes two checks, and one of them is per sample
-
-Setting `k_config_verified = true` is **necessary but not sufficient** (overhaul R26):
-
-| Check | Scope | How it is recorded |
+| K–K key | Shipped | Meaning |
 |---|---|---|
-| Stripe symmetry + RE centring | per board, once | `[eis.cell] k_config_verified = true` |
-| An ionic path from the film to the RE stripe | **per sample** | `re_contact_verified=True` passed to `cell_constant_for_sample` |
+| `kk_resid_pct` | `3.0` | Residual percentage above which a point is inadmissible; tuned on this rig, not an engineering default |
+| `kk_c` | `0.30` | μ-criterion for ladder order selection; tuned on this rig, not an engineering default |
+| `kk_max_M` | `50` | Ceiling on the Voigt ladder's order. Lower it to buy back fitter time, at the price of ladder flexibility |
+| `kk_max_truncate_frac` | `0.5` | Fraction of the band the low-f truncation may remove before the spectrum is rejected instead of cut |
 
-There is deliberately **no `re_contact_verified` config key**. The symmetry derivation assumes
-the reference electrode senses a real potential *in a conducting medium*; a dry, dewetted or
-non-wetting film does not provide one, and a board-level key would assert contact for exactly
-the samples where it fails. Unsupplied means unverified, which holds the factor at 1.0.
+**Cell constant.** `K = L_gap / ((t − h) · L_stripe)`, computed per sample from that sample's own
+thickness. A single nominal thickness applied across a series is a defect.
+`[eis.cell] electrode_configuration` records the wiring; this rig is 3-electrode, so in principle
+σ = K_geom / (`k_config_factor` · R) with a factor of 2. **The factor ships unarmed
+(`k_config_verified = false`, factor 1.0), which changes no number.** Arming needs two checks:
 
-What goes wrong without the path is worse than an unknown factor. §3.10 measures the RE
-floating onto a **load-dependent capacitive divider**, α = 2.2 to 23.8 — and not reproducible
-even at a fixed load (9.85 and 4.96 for the same 1 nF part). The ratio is not merely
-unmeasured; it is undefined, so there is nothing to apply.
+| Check | Scope | Recorded as |
+|---|---|---|
+| Stripe symmetry + RE centring | Per board, once | `[eis.cell] k_config_verified = true` |
+| An ionic path from film to RE stripe | **Per sample** | `re_contact_verified=True` passed to `cell_constant_for_sample` |
 
-> **`tied_to_ce` is the trap.** Jumpering RE to CE closes the control loop perfectly — the
-> quadrant gate will correctly call violations instrument-side — while making the RE read the
-> counter electrode. The measurement *is* two-electrode, so its factor is 1. This is why
-> `RE_IONIC_CONTACT` is a strictly smaller set than `RE_CLOSED_LOOP`: "the loop is closed" and
-> "ions reach the reference" are different questions, and confusing them costs a clean 2× with
-> a perfect-looking fit.
+There is deliberately no `re_contact_verified` config key: a board-level key would assert contact
+for exactly the samples where it fails. Unsupplied means unverified, holding the factor at 1.0.
+Until armed, absolute σ reports as *scale unqualified*; relative trends are unaffected, so
+campaigns ranking formulations are valid now. `RE_IONIC_CONTACT = {bridged_by_sample}` is strictly
+smaller than `RE_CLOSED_LOOP = {bridged_by_sample, tied_to_ce, connected}`. If contact is asserted
+alongside `open_by_geometry`, resolution fails closed and logs.
 
-If the two records contradict each other — contact asserted alongside `open_by_geometry` — the
-resolution **fails closed and logs**. One of them is wrong and guessing which is not safe.
-
-### Fixture correction
-
-A measurement made through a mux, a ribbon and a PCB trace records the cell *and the path to
-it*. `[eis.fixture]` subtracts the path. Gated engine only — correcting the legacy path would
-break the parity that makes the two engines comparable.
+**`[eis.fixture]`** subtracts the mux, ribbon and trace from the measurement. Gated engine only.
 
 | `mode` | Behaviour |
 |---|---|
-| **`auto`** (default) | `none` until this fixture has a short blank, `series` the moment it does |
-| `series` | subtract `R_short + jωL_lead`; refuses, with a reason, if no short blank exists |
-| `none` | subtract nothing |
+| `auto` (default) | `none` until this fixture has a short blank, `series` the moment it does |
+| `series` | Subtract `R_short + jωL_lead`; refuses with a reason if no short blank exists |
+| `none` | Subtract nothing |
 
-`auto` is the point of the design: correction switches on by itself after commissioning, and
-switches back off by itself after a board swap, because a `hardware_hash` mismatch has already
-dropped the constants. Nobody has to remember either direction.
+`auto` switches correction on after commissioning and off after a board swap, because a
+`hardware_hash` mismatch has already dropped the constants. **OSL is not implemented**, and `auto`
+declines it even when the artifacts would license it, saying so in the log. The open blank is still
+worth measuring: an *unusable* open is positive evidence that shunt admittance is negligible, which
+is exactly when short-only correction is exact.
 
-> **Series-only, on purpose — OSL is not implemented.** Open/short/load correction is the
-> obvious richer option and this rig has evidence against it: overhaul F6 records it corrupting
-> *every* spectrum on this fixture, mean error 32%, with one channel reading 1.26 MΩ against a
-> true ~840 Ω. The open blank is still worth measuring, because an **unusable** open is the
-> positive evidence that shunt admittance is negligible — which is exactly when short-only
-> correction is *exact*. The open selects the fallback; it is never applied. `auto` therefore
-> declines OSL even when the artifacts would license it, and says so in the log.
-
-**Where it runs in the pipeline** matters and is not obvious. Framework §6 places the
-correction at step 4, *between* the admission gates and the rest:
-
-| Runs on the raw instrument record | Runs on corrected data |
+| Gates on the raw instrument record | Gates on corrected data |
 |---|---|
-| finiteness, monotonic-f, quadrant, magnitude window, phase noise, stuck instrument | HF inductive truncation, min-points, **topology triad**, valley feature, and the fit |
+| Finiteness, monotonic-f, quadrant, magnitude window, phase noise, stuck instrument | HF inductive truncation, min-points, topology triad, valley feature, and the fit |
 
-Both directions are load-bearing. The admission gates ask *"did this measure anything
-real?"* — a railed point stays railed however much lead you subtract, so a correction must
-never be able to rescue a failed measurement. Everything downstream asks *"does this
-spectrum contain the physics being extracted?"*, which is only answerable once the
-fixture's own contribution is gone: a fixture `R_short` is a **series parasitic**, and a
-series parasitic is exactly what the loss-tangent slope test reads to decide a spectrum has
-no parallel conduction. Judging the triad on uncorrected data lets the fixture masquerade
-as the sample's own physics.
+A correction must never rescue a failed measurement, so admission runs first; a spectrum rejected
+at admission is never corrected at all.
 
-A spectrum rejected at admission is never corrected at all — every verdict downstream would
-otherwise describe a measurement already known to be inadmissible.
-
-**A wrong constant announces itself.** A subtraction can't be checked by looking at its output
-— a wrong `R_short` yields a merely shifted spectrum, and shifted spectra look fine. So two
-things happen instead. Any point the correction drives to `Re Z ≤ 0` that was physical
-beforehand marks the spectrum SUSPECT with a stated reason, since a small series impedance
-cannot do that. And `validate_load_blank` pushes a resistor of independently known value
-through the correction end to end — the only real check available, because re-measuring the
-short proves nothing about constants the short itself produced.
-
-Pick that load to be *comparable to the fixture*. A 6 Ω correction validated against a 1 MΩ
-reference passes no matter what: the error is below the noise. Against 100 Ω the same 6 Ω
-shows up as a 6% miss.
-
-Every analysed spectrum gets a `fixture_corrections` row — including a declined one, with its
-reason. **An absent row means uncorrected**, which is the honest reading of every measurement
-taken before this existed; a nullable column with a default would have had to claim something
-about the past.
-
-Set `fixture_id` to match what you commission. `softae-commission` takes its `--fixture`
-default from this same key, so the two cannot drift into commissioning one fixture while the
-engine looks for another.
+A wrong constant announces itself two ways: any point the correction drives to `Re Z ≤ 0` that was
+physical beforehand marks the spectrum SUSPECT, and `validate_load_blank` pushes a resistor of
+known value through the correction end to end — pick that load comparable to the fixture, since a
+6 Ω correction validated against 1 MΩ passes no matter what. Every analysed spectrum gets a
+`fixture_corrections` row, including a declined one with its reason; an absent row means
+uncorrected. Set `fixture_id` to match what you commission, since `softae-commission` takes its
+`--fixture` default from the same key.
 
 ---
 
-## 18. Unattended Operation & Safety
+## 15. `softae-shadow`
 
-### Hardware interlock
-
-Headless commands **cannot arm real motion hardware on their own**. With real stage, syringe
-or piezo instruments present, a workflow refuses to execute unless the operator has armed the
-rig deliberately:
+A shadow campaign runs the gated engine with every data-quality gate observing rather than
+enforcing: nothing is rejected, everything that would have been is recorded.
 
 ```bash
-export SOFTAE_ALLOW_HARDWARE=1        # bash
-$env:SOFTAE_ALLOW_HARDWARE = "1"      # PowerShell
+softae-shadow status
+softae-shadow rehearse --dry-run --run-id <film-run>
+softae-shadow rehearse --run-id <film-run>                  # → logs/rehearsal_<UTC>.log
+softae-shadow review shadow_run.log --project ./runs/aug --run-id run_20260810T1400Z
+softae-shadow review shadow_run.log --project ./runs/aug --emit-toml proposed.toml
 ```
 
-It is session-scoped and conscious by design. Launching the desktop GUI arms the process
-itself, since that is already a human-driven act. Mock managers never trip the interlock.
+Module form: `python -m softae.tools.shadow_review`.
 
-### Dispenser head state
+### `status`
 
-The head's up/down state cannot be read back from the hardware, so it is **asked at startup**
-and gates stage motion. The answer is authoritative — it is *not* overwritten by connecting
-or reconnecting instruments — and both `softae-campaign` and the GUI re-confirm it before a
-run that will move the stage.
-
-### Fault handling: retry, then park
-
-A failing trial is retried; a fault that looks systematic **parks** the run rather than
-continuing to consume electrodes. A parked run keeps its checkpoint — being able to resume
-after a park is exactly why the checkpoint exists.
-
-An unmeasured trial is *never* told to the optimizer as a number. `None` means "not
-measured", and a fabricated `0.0` would make the surrogate confident about a point nobody
-observed.
-
-### Consumables and preflight
-
-Stock levels are tracked in a ledger and projected before a run: a campaign that cannot
-finish on the declared stock says so up front, alongside its projected duration and waste
-accrual. **Undeclared is "unknown", never "empty"** — an undeclared reservoir will not be
-silently treated as full or as exhausted.
-
-### Anti-clog purge
-
-`[purge]` schedules purge windows against particulate lines. It ships with
-`actuate = false`: the harness plans and logs every window it *would* run without moving a
-pump, so the cadence can be observed against real runs before it is armed at the bench.
-
-### Alerts
-
-Long-running campaigns record alerts (parks, gate timeouts, board exchanges, stock warnings)
-to the DataStore so an unattended run leaves an audit trail rather than only a log file.
-
----
-
-## 19. Extending: a New Measurement Modality
-
-A **modality** is a kind of measurement — EIS today, a camera or any other stream tomorrow.
-The campaign path performs exactly one lookup (`get_modality(spec.measurement.modality)`), so
-a new stream registers in one place instead of being threaded through the step builder, the
-router, the objective table and the run-preparation block separately.
-
-```python
-from softae.core.modality_registry import Modality, ModalityDisplay, register_modality
-
-register_modality(Modality(
-    name="my_stream",
-    build_measure_step=...,  # (channel, spec) -> the per-channel step, or None
-    router_factory=...,      # () -> the router that persists what comes back
-    objectives={},           # what the optimizer may be told; may be empty
-    prepare_run=...,         # runs once before any measure step (EIS writes .mscr here)
-    display=ModalityDisplay(display_name="My Stream"),  # static, GUI-facing metadata
-))
-```
-
-Three points that are easy to get wrong:
-
-- **Registration is an explicit call, never an import side effect.** A modality that appeared
-  merely because a module happened to be imported would make the set of available modalities
-  depend on import order, and a half-written module would read as a *missing capability*
-  rather than an error.
-- **An analysis-only stream is a first-class modality.** `objectives = {}` is legitimate: a
-  stream that feeds the optimizer nothing still gets stored, tagged and joined to its sample.
-  Tagging its steps `measurement = "image"` (anything but `primary`) also keeps it out of the
-  loop-closure predicate, so it cannot accidentally be optimised against.
-- **The sample spine comes for free.** Any step carrying `tags["channel"]` inherits its
-  `sample_uuid`, so a new modality's payloads join to the formulation and occupancy rows
-  without any wiring of its own.
-
-A worked example ships in `src/softae/analysis/image/` — a camera-backed, analysis-only
-modality built with **no edit to `core/`, `workflows/`, `analysis/eis/` or `drivers/`**. One
-workflow can carry an image step and an EIS step and each result lands in its own router.
-
-*(coming soon)* Three edges of this seam are built but not yet reachable from a shipped
-campaign:
-
-| Not yet | Why |
-|---|---|
-| Running the `image` modality | `register_image_modality()` is deliberately not called at startup — one line of `core/` wiring is left open for whoever ships the first image campaign |
-| A `measurements` **row** for a non-EIS capture | the write path is still EIS-typed and the readers do not filter on `modality`, so an image row would surface to the Analysis browser as a spectrum with NULL fields. The payload self-links via its `attrs` in the meantime |
-| A modality-neutral router contract | `ResultRouter` / `RouterContext` still live inside `analysis/eis/`; a second modality duck-types rather than importing the EIS package |
-
----
-
-## 20. Shadow Campaign Review
-
-A **shadow campaign** runs the gated physics engine with every data-quality gate *observing
-rather than enforcing*: nothing is rejected, but everything that would have been is recorded.
-It is how the gated engine and the quality gates earn their cutover — on real spectra, at no
-risk to a run. `softae-shadow` sits on either side of that run — and, with `rehearse`, well
-before it.
-
-```bash
-softae-shadow status                                                 # is the rig armed?
-softae-shadow rehearse --dry-run --run-id <film-run>                 # what will a run cost?
-softae-shadow review shadow_run.log \
-    --project ./runs/aug --run-id run_20260810T1400Z                 # what did it see?
-softae-shadow review shadow_run.log --project ./runs/aug \
-    --emit-toml proposed_thresholds.toml                             # where would they sit?
-```
-
-> Equivalently `python -m softae.tools.shadow_review …` — note the module is **`shadow_review`**,
-> not `shadow`. The console script resolves in this venv (re-verified 2026-08-14, see
-> [§5](#5-cli-workflow-runner), which holds the one authoritative verification date); the module
-> form resolves regardless.
-
-**`status`** is read-only and answers one question — *is the config armed for a shadow run?* —
-which you ask **twice**: before the run ("did the flip take?") and after the revert ("is the rig
-back to shipped?"). It prints the three keys that matter and one verdict, and the exit code
-carries the same verdict for scripting:
+Read-only. Prints five keys — `[eis] engine`, `[eis] objective`, `[eis.gates] enabled`,
+`[quality] enabled`, `[eis.fixture] mode` (with its `fixture_id`) — plus one verdict.
 
 | Verdict | Config state | Exit |
 |---|---|---|
-| **ARMED FOR A SHADOW RUN** | `[eis] engine = "gated"`, `[eis.gates] enabled = false`, `[quality] enabled = false` | 0 |
-| **GATED AND ENFORCING** | engine gated but a gate is enforcing — this is a *cutover*, not a shadow run | 1 |
-| **NOT ARMED** | the shipped legacy engine | 2 |
+| ARMED FOR A SHADOW RUN | `engine = "gated"`, `gates.enabled = false`, `quality.enabled = false` | 0 |
+| GATED AND ENFORCING | Engine gated but a gate is enforcing — a cutover, not a shadow run | 1 |
+| NOT ARMED | The legacy engine | 2 |
 
-> **`status` also sizes the run.** When the config is armed, the screen ends with a wall-time
-> advisory, because observe-only is the **slowest** analysis setting the rig has and the one that
-> reads as the cheapest. A spectrum the gates would have rejected pre-fit still reaches the
-> fitter, and **a fit with no arc to find takes the long way to failing** — the cost is set by
-> **arc closure**, not by the gate verdict and not by the engine: an open arc has no in-band
-> feature for the fitter to converge onto. The screen quotes measurements, not estimates. Over
-> **192 real spectra (2026-08-14)**: open-arc median **~38 s**, max **~58 s**, against closed-arc
-> **~0.16 s**. **Size the run by the clock, not by the well count** — and run `rehearse` first,
-> because the open-arc *mix* is what sets the total and it is a property of the material.
+Ask it twice: before the run and after the revert. When armed it also prints a wall-time advisory,
+because observe-only is the slowest analysis setting the rig has — a spectrum the gates would have
+rejected pre-fit still reaches the fitter, and a fit with no arc to find takes the long way to
+failing. Cost is set by **arc closure**, not by the gate verdict, so size the run by the clock
+rather than the well count and run `rehearse` first.
 
-### `rehearse` — a dress rehearsal on spectra you already have
+### `rehearse`
 
-A bench shadow run is single-shot: it spends half a board, and the two things you most want to
-know beforehand — *what will this cost in wall time?* and *what will the review actually say?* —
-are only answerable afterwards. **`rehearse` answers both in advance**, by replaying stored
-spectra through the very same gated observe-only engine.
-
-```bash
-softae-shadow rehearse --dry-run --run-id <film-run>        # the plan and the projected duration
-softae-shadow rehearse --run-id <film-run>                  # → logs/rehearsal_<UTC>.log
-softae-shadow review logs/rehearsal_<UTC>.log --project ~/softae_data
-```
-
-> **Pass `--run-id`, or the pre-flight rehearses nothing.** The default is *the most recent
-> run with spectra*, which is whatever happened to land last — on **2026-09-11** that is
-> `20260903T224007Z_import_reference_r`: **one spectrum, projected 14.92 s.** A dry run that
-> returns in fifteen seconds has not told you the campaign is cheap, it has told you the
-> default picked a reference-resistor import. The plan line names the run it chose, so read
-> that line and the spectrum count before the duration beside them.
-
-It is a **replay, not a simulation**: the same `analyze_spectrum`, the same gates, the same
-structlog stream, so the log it writes is one `softae-shadow review` reads with no special case
-at all. Selection is **stratified and deterministic** — a cell is `(leg, setpoint, channel)`, and
-the default takes 2 rounds from each of them, spaced across the round axis. A convenience slice
-would sample one block and report the fast mode as the whole distribution; stratifying makes the
-open-arc mix a *measured* quantity.
-
-**Three read-only guarantees, structural rather than promised:**
-
-| Guarantee | How |
-|---|---|
-| No database write | The corpus is opened `sqlite3.connect("file:…?mode=ro", uri=True)`. `DataStore` is never constructed, so its `mkdir`/DDL/migrate/commit path never runs, and `record_fit` is never called |
-| No config edit | The gated engine is chosen by a `settings=` **argument**. `[eis] engine` is never read and never written — `softae-shadow status` says the same thing after a rehearsal as before |
-| No rig | Analysis modules only. No instrument is opened, no pose read, no stage moved |
+Replays stored spectra through the same gated observe-only engine, so its log is one `review` reads
+with no special case.
 
 | Flag | Default | Behaviour |
 |---|---|---|
-| `--project DIR` | `[data] project_dir` from the config loader | Where the corpus lives |
-| `--run-id ID` | most recent run with spectra | Which run to replay; the plan line names it, so a wrong default shows in the first line rather than in the totals |
-| `--rounds N` | `2` | Rounds per cell |
-| `--all` | — | Every spectrum in the run |
-| `--limit N` | *(none)* | Hard cap applied **after** stratification, so a cut is a prefix of a balanced plan; the summary reports the cells it dropped |
-| `--seed S` | *(deterministic)* | Randomise the round picks for a sensitivity check. Without it two rehearsals of one corpus compare line by line |
-| `--out PATH` | `logs/rehearsal_<UTC>.log` | The log. Refuses to overwrite, like `--emit-toml` |
-| `--tee` | off | Mirror to stdout for a watched run |
-| `--model NAME` | the fit row's `model_name` | Override |
-| `--enforced` | off | Replay with the gates **enforcing**, to measure what observing costs |
-| `--dry-run` | off | Print the plan and the projected duration; analyse nothing |
+| `--project DIR` | `[data] project_dir` | Where the corpus lives |
+| `--run-id ID` | Most recent run with spectra | Which run to replay; the plan line names it |
+| `--rounds N` | `2` | Rounds per `(leg, setpoint, channel)` cell |
+| `--all` | off | Every spectrum in the run |
+| `--limit N` | none | Hard cap applied **after** stratification; the summary reports dropped cells |
+| `--seed S` | deterministic | Randomise the round picks for a sensitivity check |
+| `--out PATH` | `logs/rehearsal_<UTC>.log` | The log; refuses to overwrite |
+| `--tee` | off | Mirror to stdout |
+| `--model NAME` | The fit row's `model_name` | Override |
+| `--enforced` | off | Replay with gates enforcing, to measure what observing costs |
+| `--dry-run` | off | Print the plan and projected duration; analyse nothing |
 
-One consequence of `--enforced` worth carrying into campaign design: under enforcing gates a
-rejected spectrum never reaches the fit that would annotate its arc, so an enforcing campaign
-**cannot report arc closure for the spectra it rejected** — their `arc_state` stays NULL — which
-matters to any analysis that selects on closed arcs.
+**Pass `--run-id`**, or the pre-flight rehearses whatever landed last — often a one-spectrum
+reference-resistor import, which returns in seconds and tells you nothing. Read the plan line and
+the spectrum count before the duration beside them. Selection is stratified and deterministic, so
+the open-arc mix is a measured quantity.
 
-**Two outputs.** The **log** carries the engine's own events (`eis_spectrum_metrics`,
-`eis_gate_would_reject`, `eis_gate_points_dropped`) interleaved with the rehearsal's own
-(`rehearsal_started`, `rehearsal_spectrum_done`, `rehearsal_summary`), so an hours-long run is
-observable while it runs. The tool **owns the file handle** rather than relying on shell
-redirection — opened `utf-8`/`errors="replace"`, because a gate detail containing `tan δ` will
-otherwise kill the run on a cp1252 console, on its first interesting spectrum. Beside it sits a
-**timing CSV** (`<out>.timing.csv`), one row per analysed spectrum with `seconds`, `verdict`,
-`arc_state`, `sigma_mode` and provenance. It is written **incrementally**, so a rehearsal
-interrupted at spectrum 140 still leaves 139 rows of evidence.
+| Guarantee | How |
+|---|---|
+| No database write | Corpus opened `sqlite3.connect("file:…?mode=ro", uri=True)`; `DataStore` is never constructed and `record_fit` never called |
+| No config edit | The gated engine is chosen by a `settings=` argument; `[eis] engine` is never read or written |
+| No rig | Analysis modules only; no instrument opened, no pose read, no stage moved |
 
-> **When to run it.** Before any bench shadow run, and again after a recalibration — a new
-> calibration set moves the envelope every gate is measured against. The 2026-08-14 rehearsal
-> measured **192 spectra in 36 m 42 s**, median **0.46 s** but P90 **39.45 s**: the cost is
-> **bimodal**, closed arcs at 0.16 s against open arcs at 38 s, and the *mix* sets the total. In
-> analysis alone that brackets a 16-well bench run at **2.5 s → 4 min → 10 min** and a 32-well
-> run at **5 s → 8 min → 20 min** (all-closed floor → measured mix → all-open ceiling). Read the
-> brackets: the mix is a property of the material, and the bench campaign casts something else.
-> Full figures and caveats in `docs/SHADOW_CAMPAIGN.md` §5.
->
-> **Those are 2026-08-14 rates, and they are now an upper bound.** They predate two changes
-> that both cut fitter cost — the circuit-template cache (measured **3.47×** faster, on
-> 300/300 bitwise-identical fits) and the raised **64 000** `nfev` ceiling. Until the rates are
-> re-measured on a film corpus, treat a projection as a ceiling rather than an estimate.
+Under `--enforced` a rejected spectrum never reaches the fit that would annotate its arc, so
+`arc_state` stays NULL for what it rejects.
 
-**The other pre-flight is the calibration state, and it is read, not assumed.**
-`softae-campaign check <spec>` prints an EIS calibration advisory; that line is the fact, and
-any document describing it — this one included — is only as fresh as the day it was written.
-Measured **2026-09-11**, `mux16` is **live**, not stale:
+Two outputs: the **log** (engine events interleaved with `rehearsal_started`,
+`rehearsal_spectrum_done`, `rehearsal_summary`; opened `utf-8`/`errors="replace"` by the tool
+itself, so a gate detail containing `tan δ` does not kill the run on a cp1252 console) and a
+**timing CSV** at `<out>.timing.csv` with `seconds`, `verdict`, `arc_state`, `sigma_mode` and
+provenance per spectrum, written incrementally.
 
-```
-calibration 'mux16' @e7e5c42572387732 [2026-09-10T13:58:43], 9 channel(s) (+30 assumed):
-fixture correction: osl; phase floor measured; |Z| window measured
-```
+Run it before any bench shadow run and again after a recalibration. A rehearsal's section 7 is
+evidence about the recommender, not thresholds for the rig — nothing from a rehearsal is pasted
+into `softae_config.toml`.
 
-Two lines of `check` mention fixture correction and **only one is the resolution**. The line
-above states what the calibration set is *capable of*. The separate line under *"EIS
-analysis:"* — `fixture correction: auto — series once fixture 'mux16' has a short blank, none
-until then` — is **static text describing what `auto` means**, not an evaluation against the
-set in front of it, so its *"none until then"* clause is a general statement rather than a
-report about today. The answer is `resolve_mode(configured, capabilities)`: on an `osl`-capable
-set with `mode = "auto"` it returns **`series`** (OSL is licensed by the artifacts and
-deliberately not applied — it corrupted every spectrum on this fixture). **So a shadow run
-today reviews verdicts on series-corrected spectra.** Record which calibration was live when
-you ran, because the review cannot recover it — `fit_results` has no `calibration_id` column.
-
-> **A rehearsal's section 7 is evidence about the recommender, not thresholds for the rig.**
-> Replaying an equilibration corpus tells you whether the rules behave on a real distribution —
-> the first such run found two that did not. It does not tell you where *this* campaign's gates
-> belong. Nothing from a rehearsal is pasted into `softae_config.toml`.
-
-**`review`** summarizes a run's would-reject verdicts: how many spectra would have been
-rejected, by which gate, and on which channel. `--project` adds the DataStore half —
-measurements per channel, the stored σ, and the two columns `fit_results` records honestly
-(§5b below) — and `--run-id` picks the run (default: the most recent in that project).
+### `review`
 
 | Flag | Default | What it adds |
 |---|---|---|
-| `--project DIR` | *(log only)* | The DataStore half: section 5 (per-channel σ) and section 5b (railed fits, arc closure) |
-| `--run-id ID` | most recent run | Which run in that project to read |
-| `--min-evidence N` | `20` | Spectra a metric must be observed on before section 7 may propose a value for it |
-| `--emit-toml PATH` | *(not written)* | Write the paste-ready `[eis.gates]` / `[quality]` block to a **new** file |
+| `log` (positional) | required | The redirected run log, or `-` for stdin |
+| `--project DIR` | log only | The DataStore half: section 5 (per-channel σ) and 5b |
+| `--run-id ID` | Most recent run | Which run in that project to read |
+| `--min-evidence N` | `20` | Spectra a metric must be observed on before section 7 may propose a value |
+| `--emit-toml PATH` | not written | Write the paste-ready `[eis.gates]` / `[quality]` block to a **new** file |
 
-> **The log file is the artifact, and it exists only if you made it.** Gate verdicts are
-> **not persisted**: a gated campaign still writes `gate_verdict = NULL` to `fit_results`, so
-> the only record of a would-reject is the **structlog stream on the console**. Redirect it or
-> lose it — `... | tee shadow_run.log` is a required step of the run, not a convenience. Pass
-> `-` as the log argument to read stdin instead of a file.
+**Gate verdicts are not persisted.** A gated campaign writes `gate_verdict = NULL` to
+`fit_results`, so the only record of a would-reject is the structlog stream on the console:
+`... | tee shadow_run.log` is a required step of the run.
 
-Two attribution limits the report states rather than smooths: per-*gate* counts are exact (the
-gate name heads every issue string), while per-*channel* counts are **positional** and are sound
-only for verdicts emitted during the workflow's auto-fit. Verdicts emitted during objective
-extraction land on whichever channel was routed last; the summary counts those separately as
-unattributed rather than misattributing them. That limit is the *verdict* event's, and section 4
-is where it lives: the `eis_spectrum_metrics` event behind section 7 carries `channel` and a
-content fingerprint outright, so its population is attributed and de-duplicated rather than
-inferred.
+Per-*gate* counts are exact (the gate name heads every issue string). Per-*channel* counts are
+positional and sound only for verdicts emitted during the workflow's auto-fit; verdicts from
+objective extraction land on whichever channel was routed last and are counted separately as
+unattributed. The `eis_spectrum_metrics` event behind section 7 carries `channel` and a content
+fingerprint outright, so its population is attributed and de-duplicated.
 
-### Section 5b — what `fit_results` records honestly
+**Section 5b** (with `--project`) prints railed fits per channel — rows since the railed-fit
+demotion carry `success = 0` and an `error_msg` naming the bound, earlier rows carry `success = 1`
+with `R1` exactly on it — and arc-closure state counts, read column first with a `gate_log_json`
+fallback. `sigma_is_bound` is labelled a stamped default (0 on every row, not an observation).
 
-Section 5 has to caveat almost every column it prints, because the router stamps defaults into
-most of them (`engine='legacy'`, `gate_verdict = NULL`). **Section 5b prints the two things the
-rows do record honestly**, and it appears whenever `--project` is given:
-
-- **Railed fits, per channel, across both eras.** A fit that came to rest on the model's own R₁
-  floor rather than on the data is detectable from the stored numbers whatever wrote them —
-  but by *two* detectors, because the eras differ. Rows written since the railed-fit demotion
-  landed carry `success = 0` and an `error_msg` naming the bound (**railed (new)**); rows
-  written before it carry `success = 1` with `R1` sitting exactly on the bound and nothing
-  marking them (**railed (historical)**) — a σ of roughly seawater from a dry film, wearing a
-  success flag. The bound is read from `CIRCUIT_MODELS`, never restated; a model declaring none
-  reports `unknown` rather than `0`.
-- **Arc-closure state counts.** Since T7.7 the verdict is a real column — `record_fit` writes
-  `arc_state` with `arc_f_peak_hz` / `arc_f_low_hz` / `arc_phase_low_deg` beside it, from the
-  fit itself. They are NULLable with **no default**, because NULL ("never annotated") and
-  `'unknown'` ("looked, and could not tell") are different facts. Older rows carried the same
-  verdict as a `gate_log_json` entry from the router's arc-provenance shim, so section 5b reads
-  **column first, JSON fallback**, counting each row exactly once. Rows predating the shim are
-  counted as **no record** rather than folded into an outcome they never reported.
-
-`sigma_is_bound` keeps section 5's posture and is labelled a **stamped default** — 0 on every
-row, not an observation — until P.18 passes the real report to `record_fit`.
-
-### Section 7 — recommended thresholds
-
-Whether to arm a gate is a scientific claim, and no arithmetic establishes it. But **where** a
-threshold would sit, given the decision to arm, is a percentile of a distribution — and doing
-that by eye across fourteen keys and hundreds of spectra is exactly the work that gets skipped.
-Section 7 computes the values and never decides — for what each key *means* before you move it,
-see [§17](#17-eis-analysis-engine--gates):
-
-```
-7. RECOMMENDED THRESHOLDS
-   Evidence: 61 spectra (122 events, deduplicated by content fingerprint).
-   ! = changing this key changes a stored NUMBER, not only a verdict.
-
-   section     key                default  recommended  rule         n   fired@def  rej@rec  status
-   ----------  -----------------  -------  -----------  -----------  --  ---------  -------  -----------------
-   eis.gates    tand_slope_max       -0.3            -  gap          61          0        0  hold (unimodal)
-   eis.gates    cap_flatness_max     0.15         0.41  upper-fence  61         22        3  recommended
-   eis.gates   !kk_resid_pct            1          2.6  upper-fence  58         31        2  recommended
-   eis.gates    min_fit_pts              8            -  count       61          0        0  hold (unexercised)
-   quality      min_r_squared        0.95        0.905  complement   47          9        2  recommended
-
-   REFUSED (evidence insufficient — the default stands):
-     eis.gates.max_rel_se
-       only 4 spectra carry rel_se_measurand (need 20); below 20 the P95 is a single observation
-   ...
-   ⚠ ARMING IS NOT RECOMMENDED HERE. These are values, not a decision.
-   Applying every 'recommended' value above (3 key(s)) would reject 7 of 61 spectra (11%).
-   Per-key counts do not add: one spectrum routinely fails several gates.
-```
-
-Four things to read off it:
+**Section 7** computes where each threshold would sit given the decision to arm, and never decides.
 
 | Column / marker | Means |
 |---|---|
-| **`!`** before a key | **Behavioural** — changing it moves a stored *number*, not only a verdict. Re-fit before trusting any σ produced under it |
-| `fired@def` / `rej@rec` | How many spectra the gate fired on at its shipped default, and how many the proposed value would reject |
-| `hold (unexercised)` | 0 spectra failed this gate at its default. *Untested is not validated* — the default stands |
-| `hold (unimodal)` | A gap rule found no two populations to separate, so the theory-anchored default stands |
-| `recommended (measures-the-rig)` | The gate fired on ≈every spectrum (≥ 90 %): at its default it is measuring the rig, not the sample |
+| `!` before a key | Behavioural: changing it moves a stored *number*, not only a verdict. Re-fit before trusting any σ produced under it |
+| `fired@def` / `rej@rec` | Spectra the gate fired on at its default, and how many the proposal would reject |
+| `hold (unexercised)` | 0 spectra failed at the default; untested is not validated, so the default stands |
+| `hold (unimodal)` | A gap rule found no two populations to separate |
+| `recommended (measures-the-rig)` | The gate fired on ≥90 % of spectra: at its default it is measuring the rig, not the sample |
 
-The final **joint** count is the number to act on. Per-key counts do not add — one bad spectrum
-routinely fails several gates, so summing the column overstates the cost, sometimes by more than
-the population size. Two further blocks follow the table and are stated rather than omitted:
-**not recommendable from a shadow run** (`kk_c`, `bound_tol`, the `blank_*` and `geom_*` keys,
-one reason each) and **observed but unconfigurable** — hardcoded constants such as
-`cross_check_pct` and `runs_z` that fire in practice but have no config line to move, reported
-with their P50/P95 and fire count as evidence *for* a future key.
+Act on the final **joint** count; per-key counts do not add, because one bad spectrum routinely
+fails several gates. Two further blocks follow: *not recommendable from a shadow run* (`kk_c`,
+`bound_tol`, the `blank_*` and `geom_*` keys) and *observed but unconfigurable* (hardcoded
+constants such as `cross_check_pct` and `runs_z`). A proposed value admitting many open-arc
+spectra deserves suspicion, since `R1` recovered past the apex is systematically biased high.
 
-> **A threshold that admits open-arc spectra admits a biased number.** Measured over **929
-> closed-arc spectra** truncated to force an extrapolation, R₁ recovered past the apex comes back
-> **systematically high — 60 % (two-point read) to 175 % (full CPE fit) median absolute error** —
-> and it is a *bias*, not scatter, so a wide threshold does not average it away. The surprise is
-> that the full fitter is **worse** than the cheap two-point read: with no in-band feature to
-> anchor on it wanders, and a sixth of its fits land ~30× *under* truth while still reporting
-> success. So when reading section 7, a proposed value that would admit many open-arc spectra
-> deserves suspicion rather than acceptance — check it against the arc-state split `rehearse`
-> already reports and section 5b's arc-closure counts, remembering that the alternative is not
-> free either: under enforcing gates those same spectra are rejected before the fit and their
-> `arc_state` stays NULL. `docs/SHADOW_CAMPAIGN.md` §8 carries the full table.
+### `--emit-toml`
 
-> **A pre-T7.1 log recommends nothing, and says so.** The pass-side distribution comes from the
-> `eis_spectrum_metrics` event, which the gated engine emits once per spectrum on **both**
-> verdict paths. Older logs recorded `metrics=` only where a spectrum *failed*, so every key
-> refuses with that one-sided-evidence reason. Sections 1–6 of such a log render exactly as they
-> always did.
+Four steps; the tool performs the first three.
 
-### The `--emit-toml` workflow
-
-Four steps, and the tool performs exactly the first three:
-
-1. `softae-shadow review shadow_run.log --project <dir>` — read sections 1–6 gate by gate, as
-   `docs/SHADOW_CAMPAIGN.md` §8 asks.
-2. Read **section 7** for where each threshold would sit, and what it would cost.
-3. `--emit-toml proposed_thresholds.toml` — writes the paste-ready block.
+1. `softae-shadow review shadow_run.log --project <dir>` — read sections 1–6 gate by gate.
+2. Read section 7 for where each threshold would sit and what it would cost.
+3. `--emit-toml proposed_thresholds.toml` writes the paste-ready block.
 4. **You** paste what you accept into `softae_config.toml`, and **you** decide arming.
 
-The emitted block is auditable rather than merely pasteable: every value carries its rule, `n`,
-and its fired → rejected counts as a trailing comment, and **refused and held keys are emitted
-commented out with their reason**, so pasting the block can never silently apply a
-non-recommendation. `enabled` is written `false` in both sections and is never written otherwise.
+Every emitted value carries its rule, `n`, and fired → rejected counts as a trailing comment;
+refused and held keys are emitted commented out with their reason. `enabled` is written `false` in
+both sections and is never written otherwise. Two absolute refusals: `--emit-toml` will not write
+to the live config, and will not overwrite an existing path. Either prints the reason and exits 1.
 
-> **Two refusals, both absolute.** `--emit-toml` will not write to the **live config** — arming
-> is a decision taken by reading the would-reject table, not by running a command that happens
-> to write a file — and it will not **overwrite** an existing path, because the one file an
-> operator would aim it at twice is the one holding the previous run's proposal. Either refusal
-> prints the reason and exits 1.
+**Evidence floor.** `--min-evidence` defaults to 20 spectra per metric: at n = 20 the empirical P95
+is the second-largest observation, so a fence rests on two points rather than the single worst
+spectrum. Below the floor a key is refused by name with a reason. The packaged shadow spec
+(`examples/shadow_campaign.toml`) ships `budget = 16`, deliberately below the floor, so a 16-well
+run recommends nothing. **Raise `budget` to 32** if you want thresholds. Lowering `--min-evidence`
+is possible and visible in the output, but buys a number the sample does not support.
 
-### The evidence floor: a 16-well run recommends nothing
-
-`--min-evidence` defaults to **20** spectra per metric, and that number is chosen rather than
-inherited: at *n* = 20 the empirical P95 is the second-largest observation, so a fence rests on
-two points instead of entirely on the single worst spectrum of the run. Below the floor, a key
-is **refused by name with a reason** rather than given a value.
-
-The packaged shadow spec (`examples/shadow_campaign.toml`) ships `budget = 16`, which sits
-**deliberately below** the floor. A 16-well run therefore recommends nothing — that is the
-design, not a failure. **Raise `budget` to 32** if you want the run to produce thresholds.
-Lowering `--min-evidence` instead is possible and visible in the output, but it buys a number
-the sample does not support.
-
-The full bench procedure — which keys to flip, in what order, and how to revert — is
-`docs/SHADOW_CAMPAIGN.md`. `status`, `rehearse` and `review` are the whole invocation surface.
+The full bench procedure — which keys to flip, in what order, how to revert — is
+`docs/SHADOW_CAMPAIGN.md`.
 
 ---
 
-## 21. Thickness Series
+## 16. `softae-thickness`
 
-Film thickness is a variable like any other, and like any other it can be **confounded**. If
-levels are assigned in channel order at cast time — CH27/28 at 200 µm, CH29/30 at 150, CH31/32
-at 100 — then a channel artifact and a thickness effect become mathematically indistinguishable,
-and no later analysis can separate them. `softae-thickness` exists to plan the assignment
-*before* casting, because a tool that only recorded measurements would have recorded that series
-faithfully and said nothing.
-
-**Plan before you cast. Confounding cannot be undone afterwards.**
+Film thickness can be confounded: assign levels in channel order at cast time and a channel
+artifact becomes mathematically indistinguishable from a thickness effect. **Plan before you cast;
+confounding cannot be undone afterwards.**
 
 ```bash
 softae-thickness plan --levels 100,150,200,250 --channels 1-32
 softae-thickness cast --plan geo-2026-08-06                 # DRY RUN
 softae-thickness cast --plan geo-2026-08-06 --execute       # drives hardware
 softae-thickness record --channel 7 --um 148.2 --uncertainty 3.0
-softae-thickness check --plan geo-2026-08-06                # still unconfounded?
-softae-thickness fit  --plan geo-2026-08-06                 # sigma from the slope
+softae-thickness check --plan geo-2026-08-06
+softae-thickness fit  --plan geo-2026-08-06
 softae-thickness list --plan geo-2026-08-06
 ```
 
-> Equivalently `python -m softae.tools.thickness …`. The console script exists here as of the
-> 2026-08-11 editable install; the module form resolves regardless
-> ([§5](#5-cli-workflow-runner)).
+Module form: `python -m softae.tools.thickness`. `--project` (default `[data] project_dir`) is
+accepted by every subcommand.
 
-Six subcommands, in the order they are used. `--project` (project directory, default
-`[data] project_dir`) is accepted by every one of them.
-
-| Subcommand | Flags | When you reach for it |
+| Subcommand | Flags | When |
 |---|---|---|
-| **`plan`** | `--levels` *(req)*, `--channels` *(req)*, `--id`, `--seed`, `--max-correlation`, `--notes` | Before casting. Assigns levels to channels so level and channel index are uncorrelated |
-| **`cast`** | `--plan` *(req)*, `--board`, `--execute`, `--no-drift-control` | At the rig. Resolves a plan into a cast order and checks the board |
-| **`record`** | `--channel` *(req)*, `--um` *(req)*, `--uncertainty`, `--plan`, `--run`, `--level`, `--instrument`, `--operator`, `--notes` | At the profilometer, one channel at a time |
-| **`check`** | `--plan`, `--run`, `--max-correlation` | After casting. Compares what was cast against what was planned |
-| **`fit`** | `--plan`, `--run`, `--fixture` | Geometry-series fit: σ from the slope, and *h* if `G_fixture` exists |
-| **`list`** | `--plan`, `--run`, `--plans` | Show measurements, or `--plans` to list the plans themselves |
+| `plan` | `--levels` (req), `--channels` (req), `--id`, `--seed`, `--max-correlation`, `--notes` | Before casting; assigns levels so level and channel index are uncorrelated |
+| `cast` | `--plan` (req), `--board`, `--execute`, `--no-drift-control` | At the rig; resolves a plan into a cast order and checks the board |
+| `record` | `--channel` (req), `--um` (req), `--uncertainty`, `--plan`, `--run`, `--level`, `--instrument`, `--operator`, `--notes` | At the profilometer, one channel at a time |
+| `check` | `--plan`, `--run`, `--max-correlation` | After casting; compares cast against planned |
+| `fit` | `--plan`, `--run`, `--fixture` | σ from the slope, and *h* if `G_fixture` exists |
+| `list` | `--plan`, `--run`, `--plans` | Show measurements, or list the plans |
 
-Three flags worth singling out:
-
-> **`cast --execute` drives real hardware.** Without it, `cast` is a **dry run** that resolves
-> the order and checks the board and touches nothing. Add `--execute` only when you mean to
-> actually cast — and see [§18](#18-unattended-operation--safety) for the interlock that any
-> real-motion command additionally requires.
-
-- **`--no-drift-control`** omits the end-of-session repeat cast. That repeat is what separates a
-  genuine thickness trend from session drift, so dropping it trades away the ability to tell
-  those apart. Reach for it only when bench time or board area genuinely will not stretch.
-- **`--seed`** (default 0) makes the assignment reproducible — the same seed and inputs give the
-  same plan, so a plan can be regenerated and audited rather than merely trusted.
+- **`cast --execute` drives real hardware.** Without it `cast` is a dry run that resolves the
+  order, checks the board and touches nothing. See
+  [§8](#8-stopping-safe-exit-interlock-head-state) for the interlock every real-motion command also
+  needs.
+- **`--no-drift-control`** omits the end-of-session repeat cast, which is what separates a genuine
+  thickness trend from session drift.
+- **`--seed`** (default 0) makes the assignment reproducible.
 - **`--max-correlation`** is the |r| ceiling between level and channel index that `plan` designs
-  under and `check` tests against. A confounded series exits **3**, distinct from a plain
-  failure (1), so a script can branch on it.
+  under and `check` tests against. A confounded series exits **3**, distinct from a plain failure
+  (1), so a script can branch on it.
 
-`check` is not optional ceremony: a sound plan followed inattentively produces exactly the
-dataset the plan existed to prevent. Run it after casting, while a re-cast is still cheap.
+Run `check` after casting, while a re-cast is still cheap.
 
 ---
 
-## 22. Equilibration Characterization
+## 17. `softae-equilibration`
 
-How long must a film be held at a setpoint before its conductivity is *the* conductivity, and
-not a number still relaxing toward one? `softae.tools.equilibration` answers that empirically:
-it records σ(t) while the chamber is brought to condition, fits the relaxation, and derives the
-conditioning hold time from the fit. This is an overnight bench run the operator starts and
-walks away from.
-
-### Invocation
+Records σ(t) while the chamber is brought to condition, fits the relaxation, and derives the
+conditioning hold time from the fit. This is an overnight bench run.
 
 ```bash
 softae-equilibration plan --save plan.toml
@@ -2475,225 +1347,136 @@ softae-equilibration fit    --run <run_id>
 softae-equilibration report --run <run_id> --tol-rel 0.02
 ```
 
-> **`python -m softae.tools.equilibration …` is the exact equivalent**, and is what the tool
-> itself prints in its suggested commands: a console script is generated only by an install,
-> so the module form resolves whether or not one was. `softae-equilibration` was module-only
-> until the **2026-08-11** editable install generated it; it resolves here now (verified), and
-> the arguments are identical either way.
->
-> The tool's `--help` **epilog is stale on this one point** — it still says the console script
-> "is not installed in this venv", a sentence written before that install. Its recommendation
-> (use the module form) is unaffected and remains correct.
+`python -m softae.tools.equilibration` is the exact equivalent and is what the tool prints in its
+own suggested commands. (Its `--help` epilog still says the console script is not installed in this
+venv; it is. The recommendation to use the module form is unaffected.)
 
-### `plan` and `run` share no state — this has already cost a run
+**`plan` and `run` share no state**, so **every design flag not repeated on `run` reverts to its
+default.** Two answers: `plan --save plan.toml` writes the fully resolved design, defaults
+included, and `run --from-plan plan.toml` executes it verbatim (a flag typed alongside
+`--from-plan` still wins, but as a printed diff against the file, repeated in the thermal
+confirmation); and `run --channels` is **mandatory** with no default, because a defaulted channel
+set would energise exactly the channels a subset was chosen to exclude. `--from-plan` supplies it.
 
-`plan` and `run` are separate process invocations. **Every design flag not repeated on `run`
-silently reverts to its default.** On 2026-08-10 that cost ~40 minutes of rig time and the whole
-scientific result: `--preset` fell back to `Standard` (40.7 s/channel measured, against
-`Quick`'s 10.47) and the electrode geometry was dropped whole, so `sigma_S_per_cm` came back
-NULL for all 41 fits — while every log line reported success.
+Design flags appear on both `plan` and `run`, which is what makes a plan file replayable.
+`--project` and `--mock` are available throughout.
 
-Two things answer that, and both are worth using:
-
-- **`plan --save plan.toml` writes the fully resolved design** — every value the run will use,
-  defaults included — which **`run --from-plan plan.toml`** then executes verbatim. A flag typed
-  alongside `--from-plan` still wins, but only as a **printed diff** against the file and
-  repeated in the thermal confirmation. Silent override was the original defect; a loud one is
-  fine.
-- **`run --channels` is MANDATORY.** It has no default, deliberately: a defaulted channel set
-  would energise exactly the channels a subset was chosen to exclude. `--from-plan` supplies it,
-  so the flag is only required when you are not using a plan file.
-
-### The flag surface, by purpose
-
-The surface is large; group it rather than memorise it. **Design** flags appear on both `plan`
-and `run` (that is what makes a plan file replayable); **execution** flags are `run`-only;
-**analysis** flags are `fit`/`report`-only. `--project` and `--mock` are available throughout.
-
-| Group | Flags | What it decides |
+| Group | Flags | Decides |
 |---|---|---|
-| **Design** *(`plan` + `run`)* | `--channels`, `--temperatures`, `--legs`, `--rh`, `--rounds`, `--preset`, `--round-period-s`, `--measured-per-channel-s`, `--circuit-model`, `--electrode-l-cm` / `-t-cm` / `-w-cm`, `--thickness-method`, `--fixture` *(plan only)* | Which channels, which setpoints, how the spectra are taken and turned into σ |
-| **Settling** *(`plan` + `run`)* | `--settle on\|off`, `--settle-tol-rel`, `--settle-n-rounds`, `--settle-min-channels`, `--min-hold-first-s`, `--min-hold-s` | When a setpoint has been held long enough to stop |
-| **Execution** *(`run`)* | `--from-plan`, `--execute`, `--yes` / `-y`, `--quiet`, `--telemetry-interval-s` | Whether hardware moves, and how loudly the run reports |
-| **Analysis** *(`fit`, `report`)* | `--run` *(req)*, `--relaxation-model`, `--tol-rel`, `--n-settle` | How σ(t) is fitted offline and which tolerance the verdict uses |
-
-Reading the groups:
+| Design (`plan` + `run`) | `--channels`, `--temperatures`, `--legs`, `--rh`, `--rounds`, `--preset`, `--round-period-s`, `--measured-per-channel-s`, `--circuit-model`, `--electrode-l-cm` / `-t-cm` / `-w-cm`, `--thickness-method`, `--fixture` (plan only) | Which channels, which setpoints, how spectra become σ |
+| Settling (`plan` + `run`) | `--settle on\|off`, `--settle-tol-rel`, `--settle-n-rounds`, `--settle-min-channels`, `--min-hold-first-s`, `--min-hold-s` | When a setpoint has been held long enough to stop |
+| Execution (`run`) | `--from-plan`, `--execute`, `--yes`/`-y`, `--quiet`, `--telemetry-interval-s` | Whether hardware moves, and how loudly |
+| Analysis (`fit`, `report`) | `--run` (req), `--relaxation-model`, `--tol-rel`, `--n-settle` | How σ(t) is fitted offline and which tolerance the verdict uses |
 
 - **`--rounds` is a ceiling, not a count.** A setpoint stops as soon as σ has settled, the hold
-  floor has elapsed, and the fitter's minimum number of rounds has run. It reaches `--rounds`
-  only when it has not settled.
-- **`--settle-tol-rel` must exceed the run's own noise floor**, or no hold length can satisfy it
-  and every setpoint runs to its ceiling. Measured here: 5.98 % median over 96 series, with 22
-  of them above 20 %. The run says so, per setpoint, when the criterion is unsatisfiable.
-- **`--settle on|off`** rather than `--no-settle`, because a `store_true` cannot be written into
-  a plan file and retyped from it. `off` restores fixed-count behaviour exactly.
-- **`--execute` is what makes anything real.** Without it `run` opens nothing — the default is a
-  dry run. `--yes` skips the thermal confirmation prompt, and `--quiet` drops only the live
-  status line (milestones, hold verdicts and telemetry still print, and everything still reaches
-  structlog).
-- **`--circuit-model` vs `--relaxation-model`.** Two different vocabularies that once shared the
-  spelling `--model`. The circuit model (e.g. `simpleSalt`) is fitted to each *spectrum* on
-  `plan`/`run`; the relaxation model (e.g. `exponential`, or `none` for t_tol only) is fitted to
-  *σ(t)* on `fit`/`report`. `--model` survives as a working alias on both, meaning whichever is
-  right for that subcommand.
-- **`-v` / `--verbose`** works on the top-level parser *and* on every subcommand, so
-  `... -v run ...` and `... run -v ...` both take. It is genuinely noisy — the RH controller logs
-  a duty cycle on every update.
+  floor has elapsed, and the fitter's minimum rounds have run.
+- **`--settle-tol-rel` must exceed the run's own noise floor**, or no hold length satisfies it and
+  every setpoint runs to its ceiling. The run says so, per setpoint, when the criterion is
+  unsatisfiable.
+- **`--settle on|off`** rather than `--no-settle`, because a `store_true` cannot be written into a
+  plan file and retyped from it. `off` restores fixed-count behaviour exactly.
+- **`--execute` is what makes anything real.** Without it `run` opens nothing. `--yes` skips the
+  thermal confirmation; `--quiet` drops only the live status line.
+- **`--circuit-model` vs `--relaxation-model`.** The circuit model (e.g. `simpleSalt`) is fitted to
+  each *spectrum* on `plan`/`run`; the relaxation model (e.g. `exponential`, or `none` for t_tol
+  only) is fitted to *σ(t)* on `fit`/`report`. `--model` is a working alias on both, meaning
+  whichever is right for that subcommand.
+- **`-v` / `--verbose`** works on the top-level parser and on every subcommand, so `... -v run …`
+  and `... run -v …` both take. It is genuinely noisy.
 
 ---
 
-## 23. Environment Hold — `softae-env`
+## 18. `softae-env`
 
-Every other shipped route to the humidifier bundles it into a measurement protocol: the only
-one is inside `softae-equilibration run`'s nine-to-fifteen-hour EIS characterization
-([§22](#22-equilibration-characterization)). An operator who simply wants a board conditioned
-at 45 %RH for four hours had no surface at all, and an ad-hoc script would take no rig claim,
-attach no watchdog, and restore nothing on the way out. `softae-env` is that surface — a hold
-that measures nothing.
-
-**One axis, deliberately.** There is no `--temp` and no heater is driven. `softae-equilibration
-run` already owns the temperature hold — approach timeout, tolerance band, watched hold,
-ambient restore — and a second copy here would be a second path to the same hardware. Chamber
-temperature is *reported* beside the humidity (one `get_TH` transaction returns both) because a
-humidity number without the air temperature is not actionable. Reporting is not driving.
-
-> **⚠ A hard-killed host leaves the humidifier running for about 25 seconds — then the device
-> shuts itself off.** The RH Trinket's own firmware carries a **deadman**: twenty consecutive
-> silent reads on a ≈1.25 s loop — **≈25 s** — force its control value to zero, and zero is an
-> explicit auto-shutoff branch that closes both Aalborg PSV valves. It self-recovers the instant
-> a valid value arrives, so it costs a healthy hold nothing. (Operator-written; verified by
-> reading the device volume **2026-08-19**. The piezo Trinket's equivalent timeout is **600 s**.)
-> The paths where no Python runs at all — a `SIGKILL` / *End Task*, a power cut to the host, a
-> blue screen — therefore latch the last duty for about half a minute, **not for hours**.
->
-> **What the software adds is immediacy and honesty, not the backstop.** *This* tool's exits —
-> Ctrl-C, the duration elapsing, a driver refusal — still write duty 0 *at once*, so a
-> `softae-env` hold never spends the deadman's 25 s window, and a hold that came off cleanly is
-> distinguishable from one that crashed because the verdict prints either way: a failed zero says
-> so out loud.
->
-> **The park sequence is the exception, since 2026-08-24, and it spends the window on purpose.**
-> The GUI's E-Stop and Safe Exit, a fault-class campaign park and the unclean-shutdown recovery
-> park no longer zero the duty — they leave the humidifier purging dry at `out_min`, precisely so
-> that the device's deadman, rather than `ctrl = 0`, is what closes the valves
-> ([§8](#8-emergency-stop--safe-exit)). So **a spent deadman window is no longer evidence that
-> something crashed**: on those paths it is the designed exit.
->
-> **The firmware is no longer un-versioned.** Both devices' code is checked in at
-> [`scripts/trinket_firmware/`](../scripts/trinket_firmware/) as of 2026-08-20, hashed and
-> annotated — so the 25 s above is now checkable against the loop that implements it, rather
-> than taken on trust. Its absence from the repository is what let this warning once claim there
-> was no deadman at all. The copies are a record, not a deployment path: see
-> [§10](#10-instruments-reference) before touching either device.
-
-### Invocation
+A chamber hold that measures nothing: conditions a board at one humidity for a stated duration,
+with a rig claim, a watchdog and a defined teardown. **One axis, deliberately** — there is no
+`--temp` and no heater is driven; `softae-equilibration run` owns the temperature hold. Chamber
+temperature is reported beside the humidity because one `get_TH` transaction returns both.
 
 ```bash
 softae-env plan --rh 45 --duration-h 4                        # prints; opens nothing
-softae-env hold --rh 45 --duration-h 4 --execute              # the hold itself
+softae-env hold --rh 45 --duration-h 4 --execute
 softae-env hold --rh 45 --execute --yes --quiet > hold.log    # unattended, until signalled
-softae-env hold --rh 45 --duration-s 600 --execute --mock     # no hardware, no rig claim
+softae-env hold --rh 45 --duration-s 600 --execute --mock
 ```
 
-> **`python -m softae.tools.env_hold …` is the exact equivalent**, and is the form the tool
-> prints in its own suggested commands: whether a console script resolves is a fact about when
-> the venv was last installed from, not about the tool. `softae-env` was added **2026-08-19**,
-> after the last editable install, so it is **module-only until `pip install -e .` is re-run**.
+`python -m softae.tools.env_hold` is the exact equivalent and is currently the form that resolves
+here — see the install-state note in [§5](#5-command-line-tools). `plan` and `hold` take the same
+flags, so a plan becomes a run by changing one word and adding `--execute`.
 
-`plan` and `hold` take the same flags, so a plan can be turned into a run by changing one word
-and adding `--execute`.
-
-| Flag | Default | What it decides |
+| Flag | Default | Decides |
 |---|---|---|
-| `--rh PCT` | **required** | The setpoint. Validated against the driver's own cap at `set_setpoint` time; the tool does not re-implement it |
-| `--duration-s S` / `--duration-h H` | mutually exclusive; **both omitted ⇒ hold until signalled** | Until-signal is the honest default for an operator conditioning a board who will decide when to stop; a bounded hold is what a scripted invocation wants |
-| `--execute` | off | **Without it nothing is opened.** See below |
+| `--rh PCT` | **required** | The setpoint; validated against the driver's own cap at `set_setpoint` time |
+| `--duration-s S` / `--duration-h H` | Mutually exclusive; **both omitted ⇒ hold until signalled** | How long |
+| `--execute` | off | **Without it nothing is opened** |
 | `--yes` / `-y` | off | Skips the typed confirmation, with a printed acknowledgement |
-| `--mock` | off | Simulated drivers, recording to an isolated `<project>/mock` store. Claims no rig |
+| `--mock` | off | Simulated drivers recording to an isolated `<project>/mock` store; claims no rig |
 | `--project PATH` | `[data] project_dir` | Where the run is recorded |
-| `--quiet` | off | Drops the per-interval heartbeat line only; the plan, milestones and the final verdict still print |
-| `--heartbeat-s S` | 300 | Seconds between heartbeat lines. Sampling is independent of this — the watchdog is polled at its own configured cadence regardless |
+| `--quiet` | off | Drops the heartbeat line only; plan, milestones and verdict still print |
+| `--heartbeat-s S` | 300 | Seconds between heartbeat lines; watchdog sampling is independent of this |
 
-### Nothing actuates without three separate acts
+**Three separate acts before anything actuates.** `hold` is a dry run unless `--execute` (without
+it the tool prints the plan, says so, opens no instrument and creates no run row); then a typed
+confirmation — the literal word `yes`, not `y` — stating the setpoint, the duration (or "until
+interrupted") and that the humidifier will actuate unattended; and `--yes` for scripts, since on a
+non-TTY the prompt reads end-of-input as a **decline** and exits 2.
 
-1. **`hold` is a dry run unless `--execute`.** Without it the tool prints the plan, says so, and
-   returns having opened no instrument and created no run row.
-2. **A typed confirmation.** The literal word `yes` — not `y`. It states the setpoint, the
-   duration (or "until interrupted"), and that the humidifier will actuate **unattended**.
-3. **`--yes` for scripts.** On a non-TTY there is nobody to type, so the prompt reads
-   end-of-input as a **decline** and exits 2. An unattended invocation that meant to run says so
-   with `--yes`.
+**Rig claim.** A real hold claims the rig as `tool:env-hold:<run_id>`. If someone else holds it,
+the tool refuses **before it opens anything** — the lock is checked before the store exists, so a
+refusal leaves no run row behind — prints who holds it, and exits **4**. The usual holder is the
+GUI, which claims the rig for its entire connected life, not only while a run executes: disconnect
+in the GUI (or close it), then run the tool. `--mock` claims nothing and can neither be refused nor
+lock out a real run.
 
-### The rig must be free
+**Watchdog.** The RH watchdog from `[safety]` is attached with the same thresholds every other
+RH-watched run uses and writes durable alert rows to the DataStore. A sustained excursion, or a
+sensor unreadable for the whole window, raises at CRITICAL on the console. **It does not stop the
+hold.** Unreadable values render as `--` on the heartbeat line, never as `0.0` and never as a stale
+number.
 
-A real hold claims the rig for itself as `tool:env-hold:<run_id>`, alongside every other
-claimant (the GUI, `softae-campaign`). If someone else holds it, the tool **refuses before it
-opens anything** — it checks the lock *before* the store exists, so a refusal over hardware this
-hold never touched leaves **no run row** behind to be mistaken for a hold that started and
-failed. It prints who holds the rig and exits **4**. Nothing was decided; the rig was occupied.
+### Stopping a hold
 
-**In practice the usual holder is the GUI**, which now claims the rig for its entire connected
-life — not merely while a run is executing. So `softae-env hold --execute`, and every other
-headless rig tool, will refuse for as long as a connected GUI is open. **The operator practice is
-simply: disconnect in the GUI (or close it), then run the tool.**
+Ctrl-C (and `SIGBREAK`) triggers the teardown:
 
-> **A refusal here is the single-occupancy rule working, not an error.** Two processes driving
-> the same valves, heater and stage is the failure this prevents; the tool declining to start is
-> the mechanism doing its job. Read the name it prints, free that claimant, and re-run.
+1. The PID loop is stopped and the humidifier is left **purging dry** — duty at `out_min`, the same
+   end state as the GUI park, so the chamber keeps its dry state over the ≈25 s until the Trinket's
+   deadman shuts both valves. If the driver exposes no `safe_dry()`, the fallback zeroes the duty
+   instead and says so.
+2. The verdict prints **to stderr**, so `--quiet > hold.log` still shows on the terminal whether
+   the humidifier came off:
+   - `Humidifier DRY-PURGED: PID stopped, setpoint 0, duty held at <d> = dry air.` — success; gas
+     is still flowing and that is deliberate.
+   - `!! NO DRY PURGE -- THE HUMIDIFIER WAS ZEROED INSTEAD:` — hardware safe (PID stopped, duty 0,
+     both valves shut), but the chamber collapses to room RH within tens of seconds.
+   - `!!!! NO DRY PURGE WAS CONFIRMED, AND THE HUMIDIFIER'S STATE IS UNKNOWN:` — it may still be
+     driving the setpoint. Check it at the rig.
+3. The run row is finalized, the rig claim released, the instruments disconnected — in that order,
+   because a disconnected driver can no longer be written to.
 
-`--mock` claims nothing and can neither be refused nor lock out a real run.
-
-### The watchdog alerts loudly and never stops the hold
-
-The RH watchdog from `[safety]` is attached with the same thresholds every other RH-watched run
-uses, and it writes durable alert rows to the DataStore. A sustained excursion — or a sensor
-that goes unreadable for the whole window — raises at **CRITICAL** and appears on the console.
-
-**It does not stop the hold, and that is the policy, not an omission.** A hold is a thing a
-human explicitly asked for and is watching the alerts on; a tool that switched a conditioning
-chamber off because the humidity was 6 % low for ten minutes would be worse than one that says
-so loudly and keeps going. Unreadable values render as `--` on the heartbeat line, never as
-`0.0` and never as a stale number, so a dropout is visible as a dropout.
-
-### Stopping: Ctrl-C is a clean zero
-
-**Ctrl-C** (and `SIGBREAK`) stops the hold the way it is meant to be stopped:
-
-1. the PID loop is stopped **and** duty 0 is written unconditionally — including the cases where
-   the loop was never started or is wedged past its join, where "stop" alone writes nothing;
-2. the verdict is printed **to stderr**, so `--quiet > hold.log` still shows on the terminal
-   whether the humidifier came off. A failed zero prints `!!!! HUMIDIFIER WAS NOT TURNED OFF`
-   and names the setpoint it may still be driving;
-3. the run row is finalized, the rig claim released, the instruments disconnected — in that
-   order, because a disconnected driver can no longer be zeroed.
-
-A **second** Ctrl-C during teardown is not a second park: the handler uninstalls itself, so the
-second one reaches the default handler and an operator watching a wedged teardown is not left
-with only Task Manager.
+A **second** Ctrl-C during teardown reaches the default handler, because the handler uninstalls
+itself.
 
 | Exit | Meaning |
 |---|---|
-| 0 | Bounded hold reached its duration — or an *until-signal* hold was signalled, which is exactly what it was asked to do |
+| 0 | A bounded hold reached its duration, or an until-signal hold was signalled |
 | 1 | A bounded hold was interrupted early; or the driver refused (setpoint cap, comms, instrument error) |
-| 2 | The confirmation was declined — including end-of-input on a non-TTY without `--yes` |
+| 2 | The confirmation was declined, including end-of-input on a non-TTY without `--yes` |
 | 4 | The rig is held by someone else; nothing was opened |
 
-Every path finalizes the run row: `done`, `interrupted`, `aborted` or `error`. An interrupted
-until-signal hold exits 0 and still records `interrupted` — the status says nothing but a person
-decided the end, and the exit code says the tool did its job.
+Every path finalizes the run row as `done`, `interrupted`, `aborted` or `error`. An interrupted
+until-signal hold exits 0 and still records `interrupted`. A hard-killed host (`SIGKILL`, End Task,
+power cut, blue screen) runs no teardown, so the humidifier latches its last duty for the ≈25 s
+deadman, not for hours.
 
 ---
 
-## 24. Adaptive-Acquisition Validation — `softae-eis-validate`
+## 19. `softae-eis-validate`
 
-Adaptive EIS acquisition ships inert behind `[eis.scout] actuate`. It works
-**scout-then-measure**: the configured baseline sweep runs first and *is* the measurement
-whenever the verdict is `ok`; only an inadequate spectrum earns a second, wider sweep. Whether
-that produces better science on real films is what this tool measures — by taking both arms on
-the same cell seconds apart, at one equilibrated and held condition. It is the only shipped
-route that can say GO or NO-GO on the adaptive path.
-
-### Invocation
+Adaptive EIS acquisition ships inert behind `[eis.scout] actuate`. It works scout-then-measure: the
+configured baseline sweep runs first and *is* the measurement whenever the verdict is `ok`; only an
+inadequate spectrum earns a second, wider sweep. This tool takes both arms on the same cell seconds
+apart at one held condition, and is the only shipped route that can say GO or NO-GO on the adaptive
+path.
 
 ```bash
 softae-eis-validate run \
@@ -2705,138 +1488,148 @@ softae-eis-validate run \
 softae-eis-validate report --validation-name adaptive-2026-09
 ```
 
-`--channels`, `--rh-setpoint-pct`, `--temp-setpoint-c` and `--validation-name` are **required
-and have no defaults**: an unstated condition is not a condition. `python -m
-softae.tools.eis_validate …` is the exact equivalent. `--dry-run` prints the plan and the
-projection and runs nothing; `--mock` uses a grid-aware synthetic backend that never prompts,
-never arms and never emits a GO.
+`--channels`, `--rh-setpoint-pct`, `--temp-setpoint-c` and `--validation-name` are **required with
+no defaults**. `python -m softae.tools.eis_validate` is the exact equivalent — see the install-state
+note in [§5](#5-command-line-tools). `--dry-run` prints the plan and projection and runs nothing;
+`--mock` uses a grid-aware synthetic backend that never prompts, never arms and never emits a GO.
 
-### The run only resolves anything in a 0.68-decade window
+**Resolving window.** `Extended` reaches 1.351 Hz, so its arc closes only for an apex above
+~13.5 Hz; below that its `R1` is an extrapolation. The baseline grid (6.475 Hz on the shipped
+`Quick` preset) returns `ok` for any apex above 64.75 Hz, and on `ok` the two arms are
+byte-identical. So the experiment resolves **only apexes in 13.5–65 Hz**: above it a cell is
+CONTROL, below it UNRESOLVED, and neither carries information about the decision. The **setpoint**
+is the lever that decides how many cells land in that window; the channel count is not. The run
+prints its own apex histogram before every refusal.
 
-`Extended` reaches 1.351 Hz, so its arc closes only for an apex above ~13.51 Hz; below that its
-`R1` is an extrapolation, measured on this rig at a **+60.9 % median** overestimate. The
-baseline grid (6.475 Hz on the shipped `Quick` preset) returns `ok` for any apex above
-64.75 Hz, and on `ok` the two arms are byte-identical. So the experiment resolves **only apexes
-in 13.5–65 Hz** — above it a cell is CONTROL, below it UNRESOLVED, and neither carries
-information about the decision. The **setpoint is the lever** that decides how many cells land
-inside that window; the channel count is not. The run prints its own apex histogram before
-every refusal.
+**End state and unheated running.** A park drives the heater to its safe setpoint and suspends
+anti-clog purging, so `--resume` **always** re-runs the full approach and settle gate before a
+single sweep; no flag skips it. `--end-state hold` holds temperature and **cannot** hold humidity
+(the Trinket wants a continuous heartbeat with a ≈25 s deadman), so the run prints the exact
+`softae-env` command that takes the axis over, and it must be started inside that window.
+**A `--temp-setpoint-c` at or below 10 °C is a condition, not a target**: this rig has a heater and
+no chiller, so 10 °C means *stop heating* — the temperature approach is skipped and the hold watch
+grades against where the board started. Do **not** widen `--tolerance-c` to get past an unreachable
+setpoint; that loosens the over-temperature gate for the whole run.
 
-### A park ends the condition; 10 C means *unheated*
-
-A park drives the heater to its safe setpoint and suspends anti-clog purging, so `--resume`
-**always** re-runs the full approach and settle gate before a single sweep. No flag skips it.
-`--end-state hold` holds temperature and **cannot** hold humidity: the Trinket wants a
-continuous heartbeat with a ~25 s deadman, so the run prints the exact `softae-env` command
-that takes the axis over, and it must be started inside that window or the chamber drifts to
-room RH ([§23](#23-environment-hold--softae-env)).
-
-**A `--temp-setpoint-c` at or below 10 C is a condition, not a target.** This rig has a heater
-and no chiller, so 10 C is the instruction *stop heating*, and whatever ambient gives is the
-condition: the temperature approach is skipped, and the hold watch grades against where the
-board started rather than against a setpoint nothing is driving toward. Do **not** widen
-`--tolerance-c` to get past an unreachable setpoint — that loosens the over-temperature gate
-for the whole run.
-
-### The flag surface, by purpose
-
-| Group | Flags | What it decides |
+| Group | Flags | Decides |
 |---|---|---|
-| **Condition** | `--rh-setpoint-pct`, `--temp-setpoint-c`, `--rh-tolerance-pct`, `--tolerance-c`, `--rh-approach-timeout-s`, `--temp-approach-timeout-s`, `--approach-dwell-s` | Where the chamber is taken, and when it counts as arrived |
-| **Settling** | `--settle`, `--settle-tol-rel`, `--settle-criterion`, `--settle-rate-tol-dec-per-h`, `--settle-max-rounds`, `--settle-max-hold-s`, `--rh-stability-pct`, `--soak-h` | When the board has stopped moving, and what to do if it has not |
-| **Survivors** | `--survivors`, `--min-treatment`, `--max-consecutive-failures` | Whether a partial board may proceed, and what it is then allowed to conclude |
-| **Measurement** | `--channels`, `--baseline`, `--reference-preset`, `--order`, `--max-follow-ups`, `--drift-check`, `--retries` | Which cells, which grids, and how the pairs are sequenced |
-| **End state** | `--end-state`, `--resume`, `--yes`, `--project`, `--out`, `--dry-run`, `--mock` | Whether hardware moves, and what is left behind |
-
-Defaults worth knowing before the first run:
+| Condition | `--rh-setpoint-pct`, `--temp-setpoint-c`, `--rh-tolerance-pct`, `--tolerance-c`, `--rh-approach-timeout-s`, `--temp-approach-timeout-s`, `--approach-dwell-s` | Where the chamber goes, and when it counts as arrived |
+| Settling | `--settle`, `--settle-tol-rel`, `--settle-criterion`, `--settle-rate-tol-dec-per-h`, `--settle-max-rounds`, `--settle-max-hold-s`, `--rh-stability-pct`, `--soak-h` | When the board has stopped moving, and what to do if it has not |
+| Survivors | `--survivors`, `--min-treatment`, `--max-consecutive-failures` | Whether a partial board may proceed, and what it may conclude |
+| Measurement | `--channels`, `--baseline`, `--reference-preset`, `--order`, `--max-follow-ups`, `--drift-check`, `--retries` | Which cells, which grids, how pairs are sequenced |
+| End state | `--end-state`, `--resume`, `--yes`, `--project`, `--out`, `--dry-run`, `--mock` | Whether hardware moves, and what is left behind |
 
 | Flag | Default | Note |
 |---|---|---|
-| `--settle-criterion` | `deviation` | `both` routes on deviation and reports the rate beside it — the shadow mode, and the only honest way to get the comparison a cutover needs |
-| `--settle-tol-rel` | `0.10` | A relative deviation of sigma from its own window mean — dimensionless, and **not** %RH. 0.20 means a cell swinging ±20 % still certifies. The run refuses above `0.50` |
-| `--settle-rate-tol-dec-per-h` | `0.05` | Decades of sigma per hour. Required by `--settle-criterion rate` and `both`; the run refuses above `0.5` |
-| `--settle-max-rounds` | `14` | The ceiling in **rounds** — the unit every criterion actually reads |
-| `--settle-max-hold-s` | *derived* | From `--settle-max-rounds` × the **achieved** round period (sweep block *plus* sleep). A typed value wins and is announced as an override in the projection |
-| `--rh-stability-pct` | `1.5` | How far the per-round RH **medians** may span across the judged window, compared against themselves. `0` or `off` disables the gate |
+| `--settle-criterion` | `deviation` | `both` routes on deviation and reports the rate beside it |
+| `--settle-tol-rel` | `0.10` | Relative deviation of σ from its own window mean; dimensionless, **not** %RH. The run refuses above `0.50` |
+| `--settle-rate-tol-dec-per-h` | `0.05` | Decades of σ per hour. Required by `--settle-criterion rate` and `both`; the run refuses above `0.5` |
+| `--settle-max-rounds` | `14` | The ceiling in **rounds**, the unit every criterion reads |
+| `--settle-max-hold-s` | derived | From `--settle-max-rounds` × the **achieved** round period (sweep block plus sleep). A typed value wins and is announced as an override |
+| `--rh-stability-pct` | `1.5` | How far per-round RH **medians** may span across the judged window. `0` or `off` disables the gate. Not `--rh-tolerance-pct`, which judges only the approach |
 | `--survivors` | `off` | Needs `--settle-criterion rate` or `both` |
-| `--max-consecutive-failures` | *derived* | `3` under `--survivors off`; the **board size** under `--survivors on`, where a dropped cell's failures no longer count at all |
-| `--approach-dwell-s` | `600` | Seconds each axis must stay in band before it counts as arrived; `0` restores the first-in-band-poll behaviour |
-| `--rh-approach-timeout-s` / `--temp-approach-timeout-s` | `5400` / `1800` | One RH descent measured on this chamber at 85 °C took ~5 000 s; treat these as ceilings, not as expected durations |
-| `--soak-h` | `0` | **Hours**, not seconds. The settle gate proves the *rig* stopped moving; the soak is the *sample's* own equilibration. Settle time counts against it |
-| `--reference-preset` | `Extended` | `longest` widens the resolving window 2.1x for 4.3x the reference cost — the documented escape hatch |
-| `--min-treatment` / `--drift-check` | `6` / `3` | How many cells must land in the resolving window, and how many cells are re-measured at the end of the block |
+| `--max-consecutive-failures` | derived | `3` under `--survivors off`; the board size under `--survivors on`, where a dropped cell's failures stop counting |
+| `--approach-dwell-s` | `600` | Seconds each axis must stay in band before it counts as arrived; `0` restores first-in-band-poll behaviour |
+| `--rh-approach-timeout-s` / `--temp-approach-timeout-s` | `5400` / `1800` | Ceilings, not expected durations |
+| `--soak-h` | `0` | **Hours**, not seconds. The settle gate proves the rig stopped moving; the soak is the sample's own equilibration. Settle time counts against it |
+| `--reference-preset` | `Extended` | Pass **`Longest`** (capital L) to widen the resolving window. Preset lookup is case-sensitive: `longest` logs `eis_preset_unknown` and silently falls back to built-in defaults |
+| `--baseline` | the modality's configured preset | Not a literal |
+| `--order` | `ref-first` | `alternate` is a diagnostic, not a design element |
+| `--max-follow-ups` | `1` | 1 validates what ships; >1 is exploratory |
+| `--min-treatment` / `--drift-check` | `6` / `3` | Cells that must land in the resolving window; cells re-measured at the end of the block |
 | `--end-state` | `park` | `hold` keeps temperature only |
 
 **`--survivors on` changes what the run may conclude**, not how long it waits. At the ceiling it
-partitions instead of refusing: cells the rate criterion certified quiet proceed, cells that
-could not be *judged* are dropped with their reason recorded, and cells **proven** to be moving
-still refuse. Every number a survivor run produces is conditional on settling — fine for "does
-the scout resolve the arc?", wrong for any hold-time or objective number. Read the survivor set
-as a subset, never as the board. Two details are easy to trip over: the RH preroll that holds
-the settle clock until the room is calm runs under `--settle-criterion rate` and under
-`both --survivors on`, but **not** under plain `both`, whose per-round record stays
-field-identical to `deviation`'s; and under `both --survivors on` the detection-floor refusal
-fires only when *no* cell certified quiet, so the window becomes the finding rather than the
-cells the partition exists to rescue.
+partitions instead of refusing: cells the rate criterion certified quiet proceed, cells that could
+not be *judged* are dropped with a recorded reason, and cells **proven** to be moving still refuse.
+Every number a survivor run produces is conditional on settling — fine for "does the scout resolve
+the arc?", wrong for any hold-time or objective number. Two details trip people up: the RH preroll
+runs under `--settle-criterion rate` and under `both --survivors on`, but **not** under plain
+`both`; and under `both --survivors on` the detection-floor refusal fires only when *no* cell
+certified quiet.
 
-### Watching one mid-run
-
-The run publishes `events.jsonl` and `conditions.json` beside itself in
+**Watching a run.** It publishes `events.jsonl` and `conditions.json` in
 `<project>/runs/<run_id>/`, and the rig claim's `log_path` names that directory. The per-round
-`settle_round` record is where the gate's own state lives — per-channel deviations, which cells
-participate, which left the window and why, the achieved RH spread, and under a rate criterion
-the per-channel standard error, relative residual and upper bound plus the window's own
-detection floor. **Sigma itself is deliberately absent from the stream**, so a round can be
-re-scored against a different band from its bounds but not recomputed from its conductivities;
-the raw settle sweeps are persisted under `eis/` tagged as the `settle` arm and excluded from
-every reader unless asked for.
+`settle_round` record carries per-channel deviations, participating cells, the achieved RH spread,
+and under a rate criterion the per-channel standard error, relative residual, upper bound and the
+window's detection floor. **σ itself is deliberately absent from the stream.** Raw settle sweeps
+are persisted under `eis/` tagged as the `settle` arm and excluded from every reader unless asked
+for.
 
-### Reading the report
+**Reading the report.** `report --validation-name <name>` re-evaluates the pre-registered rule over
+whatever has been persisted. Every measurement row carries a `hold_certified` stamp:
 
-`softae-eis-validate report --validation-name <name>` re-evaluates the pre-registered rule over
-whatever has been persisted. Every measurement row carries a `hold_certified` stamp, and the
-outcome turns on it:
-
-| `hold_certified` | Meaning |
+| Value | Meaning |
 |---|---|
 | `settled` | The whole board was certified quiet before the arms ran |
-| `survivors` | A partitioned settle phase certified *this* cell quiet; others were dropped |
-| `dropped_moving` | This cell was dropped: proven to be still moving |
-| `dropped_unevaluable` | This cell was dropped: it could not be judged either way |
+| `survivors` | A partitioned settle phase certified this cell quiet; others were dropped |
+| `dropped_moving` | Dropped: proven to be still moving |
+| `dropped_unevaluable` | Dropped: could not be judged either way |
 | `disabled` | `--settle off` — no gate ran |
-| `pre_settle` | A settle sweep, taken before the gate had spoken. Never an experiment arm |
+| `pre_settle` | A settle sweep taken before the gate spoke; never an experiment arm |
 
-Only a board-level `settled` licenses a verdict. A survivor run is *not* `settled` at board
-level, and under `--settle off` every row is stamped `disabled` and the outcome is **WITHHELD**
-— announced in the projection before the run starts, not discovered afterwards. A `--mock` run
-is WITHHELD for the same reason: a simulated verdict is not a verdict. Uncertified rows keep
-their numbers in every accuracy table, because that metrology is what production limits get
-calibrated from, but they lose their anonymity — marked `(uncertified)` wherever they print,
-counted beside every criterion computed over them, and partitionable offline off
-`payload["cells"][*]["stillness_certified"]`.
+Only a board-level `settled` licenses a verdict. A survivor run is not `settled` at board level.
+Under `--settle off` every row is stamped `disabled` and the outcome is **WITHHELD**, announced in
+the projection before the run starts; a `--mock` run is WITHHELD for the same reason. Uncertified
+rows keep their numbers in every accuracy table but lose their anonymity: marked `(uncertified)`
+wherever they print, counted beside every criterion computed over them, and partitionable offline
+off `payload["cells"][*]["stillness_certified"]`.
 
-### Failure modes seen on the bench
-
-Each row is dated because each is a claim about a specific run. The same table is in `--help`.
-
-| Date | What happened | The flag or default that answers it |
-|---|---|---|
-| 2026-08-20 | The settle band sat below the board's own noise floor, so no hold length could ever clear it | The run says so at the **first** judged window and names a workable `--settle-tol-rel` |
-| 2026-08-20 | One channel carried non-finite points in every sweep, starving the window below the minimum for 64 min | The round names the channel (`NO FIT`) and says the fits, not the film, are why the window is not evaluable |
-| 2026-09-13 | Two cells flipping between fits held eight cells that were quiet at 0.2–2.5 % for eight rounds — `settle_check` takes the **max** over participants | `--settle-criterion rate`, or `--survivors on`: the deviation criterion cannot tell "moving" from "too noisy to judge" |
-| 2026-09-13 | The tool restarts the RH loop at launch and starts the settle clock 30 s later; the room wandered ~70 min and five cells were reported MOVING because of it | `--approach-dwell-s`, and the RH preroll — rounds judged under a moving room are no longer regressed on |
-| 2026-09-13 | The rate band (0.025 dec/h) sat at the window's own detection floor, so every quiet cell came back `rate_undetectable` | `--settle-rate-tol-dec-per-h` now defaults to 0.05, and the run prints the smallest band the window can certify |
-| 2026-09-13 | A setpoint at or below the park temperature is unreachable on a heater-only rig; `--tolerance-c 20` was typed to get past it | State a setpoint at or below 10 C to run **unheated**; leave `--tolerance-c` where it is |
-| 2026-09-13 | Three adjacent dead wells would trip `--max-consecutive-failures` (3) before the first good cell was measured | It defaults to the board size under `--survivors on`, and a dropped cell's failure no longer counts toward it |
-| 2026-09-13 | The ceiling bought 10 rounds where the projection promised 17 | A round is the sweep block **plus** the sleep; the projection quotes the achieved period, and `--settle-max-rounds` states the ceiling in rounds |
-| 2026-09-13 | Four windows were blocked because the per-round RH medians spanned more than 1.5 %RH — and nothing on the console said so | `--rh-stability-pct` names that band (default 1.5, `0` = off). It is **not** `--rh-tolerance-pct`, which judges only the approach, against the setpoint |
-| 2026-09-13 | **Known limitation, not fixed.** The RH preroll is a **one-shot latch**: it releases the first time the trailing window is calm and is never re-armed. A room that starts calm and destabilizes later spends the preroll before the disturbance arrives, and on the 2026-09-13 board a widened band would not have caught the later excursion either | No flag covers this. Watch the achieved RH spread printed on every round, and treat a late excursion as a reason to re-run rather than to widen a band |
-| 2026-09-13 | **Operator note.** `--settle-rate-tol-dec-per-h 0.11` was chosen for one board — "walk further out on the drift/throughput envelope" | Admissible, and a per-board judgement rather than a new default. Over that board's ~50 min block at 12 channels it is ~0.09 dec (~23 % of sigma, ~2x H3's whole-block budget), but the paired reference/baseline sweeps are ~40 s apart (~0.003 dec), so the cost lands on the end-of-block **drift check**, not on the paired metric. Start an uncharacterised board at 0.05 |
-
-> **A run that ends in `ceiling` has measured nothing.** Read the per-round table and the apex
-> histogram before changing any flag: both are printed on every refusal, and both are built
-> from sweeps that were taken anyway.
+**A run that ends in `ceiling` has measured nothing.** Read the per-round table and the apex
+histogram before changing any flag; both print on every refusal and both are built from sweeps that
+were taken anyway.
 
 ---
 
-*Generated for SoftAE v0.1.0 — last revised August 2026*
+## 20. Adding a measurement modality
+
+The campaign path performs exactly one lookup (`get_modality(spec.measurement.modality)`), so a new
+stream registers in one place.
+
+```python
+from softae.core.modality_registry import Modality, ModalityDisplay, register_modality
+
+register_modality(Modality(
+    name="my_stream",
+    build_measure_step=...,  # (channel, spec) -> the per-channel step, or None
+    router_factory=...,      # () -> the router that persists what comes back
+    objectives={},           # what the optimizer may be told; may be empty
+    prepare_run=...,         # runs once before any measure step (EIS writes .mscr here)
+    display=ModalityDisplay(display_name="My Stream"),
+))
+```
+
+- **Registration is an explicit call, never an import side effect**, so the set of available
+  modalities does not depend on import order.
+- **An analysis-only stream is first-class.** `objectives = {}` is legitimate. Tagging its steps
+  `measurement = "image"` (anything but `primary`) keeps it out of the loop-closure predicate.
+- **The sample spine comes for free.** Any step carrying `tags["channel"]` inherits its
+  `sample_uuid`.
+
+A worked example ships in `src/softae/analysis/image/`, built with no edit to `core/`,
+`workflows/`, `analysis/eis/` or `drivers/`.
+
+*(coming soon)* Three edges are built but not reachable from a shipped campaign:
+
+| Not yet | Why |
+|---|---|
+| Running the `image` modality | `register_image_modality()` is deliberately not called at startup; one line of `core/` wiring is left open |
+| A `measurements` row for a non-EIS capture | The write path is still EIS-typed and readers do not filter on `modality`, so an image row would surface to the Analysis browser as a spectrum with NULL fields. The payload self-links via its `attrs` meanwhile |
+| A modality-neutral router contract | `ResultRouter` / `RouterContext` still live inside `analysis/eis/`; a second modality duck-types rather than importing the EIS package |
+
+---
+
+## 21. Documentation site
+
+```powershell
+pip install -e ".[docs]"    # mkdocs-material + mkdocstrings
+mkdocs serve                # live preview at http://127.0.0.1:8000
+mkdocs build                # static site in site/
+```
+
+API reference pages are auto-generated from docstrings by `mkdocstrings[python]`. Adding or
+renaming a public module requires a corresponding stub in `docs/api/`.
+
+---
+
+*Revised 2026-09-21 against the working tree at 7e445f5 (audit: docs/SubAgent docs/user_guide_rev1_audit.md).*
