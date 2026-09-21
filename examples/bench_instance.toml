@@ -136,12 +136,18 @@ preset = "Extended"
 #
 # The first phase carrying its own [conditions] OVERRIDES it (waits included)
 # and it never returns — so it can never fight the ANNEAL phase's rest state.
-# The values here are the FORMULATE phase's own casting environment below, and
-# the FORMULATE phase still re-establishes them AND WAITS: the suppression is
-# keyed on the whole PhaseSetpoints, `name` included, so "baseline" and
-# "casting" are two conditions that happen to agree. That is what is wanted —
-# the baseline drives the axes while the pumps run, and the cast is still gated
-# on the chamber having arrived.
+# THE HUMIDITY HERE IS THE REST STATE, NOT A CASTING HUMIDITY. 22 %RH is the
+# ruled baseline (operator ruling 2026-09-17: *baseline RH is 22 % across the
+# board*) and the settled state `examples/rung3a_fake_cast.toml` holds its
+# already-cast films at. The operator ruling of 2026-09-19/20 extends that value
+# to ALL FOUR commanded humidities in this file — the casting environment, the
+# anneal rest state and the equilibrate measurement condition are every one of
+# them 22 %RH now — so this baseline and every phase below agree on the NUMBER
+# and differ only in ROLE. That agreement suppresses nothing: `_condition_steps`
+# compares the whole PhaseSetpoints, `name` included, so "baseline" and "casting"
+# are still two establishes at the bench, and the cast is still GATED on the
+# chamber having arrived at the casting condition. What changes is that each
+# approach now arrives on the first poll instead of ramping.
 #
 # An omitted axis is an axis NOT DRIVEN, and `rh_setpoint_pct = 0.0` is NOT
 # "leave it alone" — it is a commanded dry purge (`ctrl == 0` shuts both Aalborg
@@ -151,7 +157,9 @@ preset = "Extended"
 [conditions]
 name            = "baseline"
 temp_setpoint_C = 25.0
-rh_setpoint_pct = 40.0
+# The ruled rest/settled baseline (operator ruling 2026-09-17), NOT the casting
+# humidity — the FORMULATE phase below states that one for itself.
+rh_setpoint_pct = 22.0
 
 # ── The run plan: cast all four, cure once, settle, then read ────────────────
 #
@@ -173,7 +181,14 @@ scope = "per_sample"
   [run_plan.phases.conditions]
   name            = "casting"
   temp_setpoint_C = 25.0
-  rh_setpoint_pct = 40.0
+  # 22, not the 40 this file shipped until 2026-09-19: the operator ruling of
+  # 2026-09-19/20 carries the 22 %RH baseline across ALL FOUR commanded
+  # humidities, casting included. Casting at the humidity the board is then
+  # annealed and measured at means the films never cross a humidity step
+  # mid-campaign. The phase keeps its own block, and its wait, because the ROLE
+  # is still distinct — the cast is gated on the chamber having ARRIVED, and
+  # that gate does not depend on the number differing from the one before it.
+  rh_setpoint_pct = 22.0
 
 [[run_plan.phases]]
 kind  = "anneal"
@@ -196,19 +211,27 @@ anneal_task = "anneal_85C_8h"
   # above: the anneal task drives temperature only and never rewrites the
   # humidity setpoint, so this value is HELD through the 85 °C hold, where the
   # warming flush basin humidifies the enclosure and a commanded 15 returned a
-  # PV of 19.5–23.2. Only the DESCENT to reach it now runs at 25 °C, where it is
-  # easy. See `analysis/rh_floor.py`, whose own warning forbids fitting an
-  # absolute threshold to this.
-  rh_setpoint_pct = 20.0
+  # PV of 19.5–23.2 (2026-08-11). 22 — the ruled value, 2026-09-19/20 — sits near
+  # the MIDDLE of that observed band, where the 20 this file shipped until then
+  # sat at its lower edge; and 20 → 22 asks the enclosure for MORE humidity,
+  # which is the direction the warming basin already pushes. So the ruled value
+  # is if anything the more attainable of the two. Stated honestly: no run has
+  # yet commanded 22 THROUGH an 85 °C hold, so this is a reading of the measured
+  # band and not a measurement at 22. See `analysis/rh_floor.py`, whose own
+  # warning forbids fitting an absolute threshold to either number.
+  rh_setpoint_pct = 22.0
   # 4 h, against the shipped 1 800 s default, and a CEILING rather than a
-  # budget: the wait ends when the chamber arrives. ONE 85 °C descent was
-  # measured at ~0.0015 %RH/s (2026-08-11), which put an 18 %RH descent near
-  # 12 000 s; 14 400 s is headroom over that single figure, not a rig property.
-  # Since this phase now rests at 25 °C the descent runs at 25 °C, where that
-  # figure does not apply at all — another reason it is a ceiling. At the
-  # default this phase would abort at the anneal boundary with four wet samples
-  # already cast: `rh_wait` carries `raise_on_timeout`, and that refusal is the
-  # point.
+  # budget: the wait ends when the chamber arrives. Casting and this rest state
+  # are BOTH 22 %RH since 2026-09-19, so this plan commands no humidity descent
+  # here at all and the approach should end on the first poll. The arithmetic
+  # this ceiling used to carry — ONE 85 °C descent measured at ~0.0015 %RH/s
+  # (2026-08-11), putting an 18 %RH descent near 12 000 s — therefore no longer
+  # describes any transition this file commands; it is kept as the provenance of
+  # the number, not as its justification. The ceiling STAYS, because it costs
+  # nothing when the approach is instant and because it is what stands between an
+  # enclosure that has drifted and cannot come back and an 8 h cure at an unknown
+  # RH with four wet samples already cast: `rh_wait` carries `raise_on_timeout`,
+  # and that refusal is the point.
   rh_approach_timeout_s = 14400.0
 
 [[run_plan.phases]]
@@ -224,7 +247,17 @@ scope = "per_batch"
   [run_plan.phases.conditions]
   name            = "equilibrate"
   temp_setpoint_C = 25.0
-  rh_setpoint_pct = 50.0
+  # THE MEASUREMENT CONDITION — σ is read at this humidity, both in the settle
+  # window above and in the MEASURE phase that follows. 22, not the 50 this file
+  # shipped until 2026-09-19 (operator ruling 2026-09-19/20: all four commanded
+  # humidities are 22 %RH). Conductivity in these films is strongly
+  # humidity-dependent, so this is a PROCESS boundary and not a tidy-up: σ read
+  # at 22 is not one series with σ read at 50. Nothing measured is orphaned by
+  # the move — the last row ever recorded at a commanded 50 %RH is 2026-07-23,
+  # seven weeks before `core/phase_setpoints.py` existed, so this phase has never
+  # run at 50 (DataStore census, T11.28b §7.1). Every measurement stores its own
+  # `rh_sp_pct` beside its PV, so comparing across the boundary is a query.
+  rh_setpoint_pct = 22.0
   # 3 h, against the 1 800 s default, because THIS approach is a DESCENT. The
   # stage is heater-only: cooling from the 85 °C cure to 25 °C is passive and no
   # time constant has been measured (rung 3 is the first measurement). 10 800 s

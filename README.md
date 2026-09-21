@@ -38,6 +38,13 @@ needs users to develop their own processes, recipes and workflows that best refl
 integrated hardware. A fresh checkout therefore names no tasks and is not green for the
 catalog-loading tests by construction — see the User Guide's *Before you start*.
 
+No command generates a catalog either: build `data/tasks.toml` and `data/recipes.toml` in the
+GUI's *Process Studio* (Tab 13) and the chemicals/solutions CSVs in *Catalogs* (Tab 11), or
+hand-author all four against the schemas in `src/softae/core/task_catalog.py`,
+`recipe_registry.py` and `formulation.py`. A missing catalog file loads as an *empty* catalog
+rather than raising, so the absence surfaces at the first task name a run asks for — the User
+Guide's *Before you start* names both routes and the test that demonstrates it.
+
 ## Project Structure
 
 ```

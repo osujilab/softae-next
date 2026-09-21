@@ -478,14 +478,20 @@ class TestBenchInstanceRunPlan:
 
         assert line.index("Formulate") < line.index("Anneal") \
             < line.index("Equilibrate") < line.index("Measure")
-        assert "casting (25 °C, 40 %RH) [per sample]" in line
-        assert "anneal (25 °C, 20 %RH) [per batch]" in line
+        assert "casting (25 °C, 22 %RH) [per sample]" in line
+        assert "anneal (25 °C, 22 %RH) [per batch]" in line
         assert "Measure EIS (Extended) [per batch]" in line
 
     def test_bench_instance_allows_four_hours_to_reach_the_anneal_humidity(
         self, plan
     ):
-        """1 800 s covers ~2.7 of the 18 %RH this descent needs; 14 400 s does not lie."""
+        """A CEILING, not a budget — and since the 2026-09-19/20 ruling put
+        casting and the anneal rest state both at 22 %RH, no descent is
+        commanded here at all. The old reading (1 800 s covers ~2.7 of an
+        18 %RH descent) described a 40 → 20 step this file no longer takes;
+        4 h stays because `rh_wait` raises on timeout and an enclosure that
+        has drifted and cannot come back must not enter an 8 h cure.
+        """
         assert plan.phases[1].conditions.rh_approach_timeout_s == 14400.0
         assert plan.phases[1].anneal_task == "anneal_85C_8h"
 

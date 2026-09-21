@@ -153,9 +153,15 @@ scope = "per_batch"
   [run_plan.phases.conditions]
   name            = "equilibrate"
   temp_setpoint_C = 25.0
-  # 22, not `bench_instance`'s 50. This is the state these films were settled at
-  # on 2026-09-13/14 (stage SP 10 C unheated, PV ~26.5 C, 22 %RH). Commanding 50
-  # would re-wet four films whose stability is the whole reason they were chosen.
+  # 22 %RH, which `bench_instance` now also commands at every phase -- the
+  # operator's 2026-09-19/20 ruling took all four of its `rh_setpoint_pct` values
+  # to 22.0, so the two examples rest and measure at the same humidity. This file
+  # reached that number first and for its OWN reason, which is the part worth
+  # keeping: it is the state these films were SETTLED at on 2026-09-13/14 (stage
+  # SP 10 C unheated, PV ~26.5 C, 22 %RH), and commanding anything wetter would
+  # re-wet four films whose stability is the whole reason they were chosen. The
+  # agreement with `bench_instance` is now a shared baseline, not a coincidence,
+  # but the argument here is the films -- it would hold even if the baseline moved.
   rh_setpoint_pct = 22.0
   # THE PASSIVE COOL-DOWN, and an UNMEASURED BUDGET. The stage is heater-only:
   # descent from the 85 C cure to 25 C has no measured time constant — this run
