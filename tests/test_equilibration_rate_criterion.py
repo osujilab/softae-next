@@ -31,11 +31,13 @@ import numpy as np
 import pytest
 
 from softae.analysis.equilibration import (
+    ChannelRate,
     DEFAULT_SETTLE_MIN_FIT_POINTS,
     EXCLUDED_ABSENT,
     EXCLUDED_RAILED,
     EXCLUDED_SIGMA_NULL,
     EXCLUDED_UNSETTLEABLE,
+    RATE_ARC_CLASS_CHANGED,
     RATE_MOVING,
     RATE_SPAN_TOO_SHORT,
     RATE_TOO_FEW_POINTS,
@@ -48,6 +50,8 @@ from softae.analysis.equilibration import (
     WELL_FIT_FAILED,
     RoundFit,
     SettleTracker,
+    _arc_classes_observed,
+    _resolving,
     channel_noise_floors,
     log_rate,
     rate_check,
@@ -1742,3 +1746,198 @@ class TestBoardMinimumPolicyReachesBothCriteria:
 
         assert run(noisy) == SETTLE_CEILING
         assert run(nothing) == SETTLE_NOT_EVALUABLE
+
+
+# ── T11.46 (c): a rate over a CHANGING arc class is withheld ──────────────────
+#
+# Operator ruling 2026-09-17. A rate is a slope in log space, so a *constant*
+# extrapolation bias cancels exactly and only a *changing* one corrupts it -- and
+# while a film hydrates the bias is not constant, it shrinks from ~2.75x toward
+# 1x as the arc closes. The dangerous direction is the QUIET one: a shrinking
+# bias working against a rising R1 cancels to flat, so the board would certify
+# `settled` on an artefact and every later sigma would inherit it silently.
+#
+# This is the complement of the consensus rule above, not a duplicate of it:
+# consensus forgives ONE round that was a different cell, this refuses a window
+# that was TWO. A transition is two or more divergent rounds by construction --
+# `open` for the first k rounds and `closed` for the remaining n-k -- so it falls
+# straight through a rule capped at one.
+
+
+def _straddling(open_rounds: int, n: int = ARMED_WINDOW) -> list[str]:
+    """A hydrating film: ``open`` for the first *k* rounds, ``closed`` after.
+
+    Two or more divergent rounds by construction, which is exactly why the
+    consensus rule cannot see this shape and why (c) exists.
+    """
+    return ["open"] * open_rounds + ["closed"] * (n - open_rounds)
+
+
+class TestArcClassStability:
+    """A window that straddles a regime change has no rate to admit."""
+
+    def _board(self, states: dict[int, list[str]] | None = None):
+        quiet = _quiet_r1(ARMED_WINDOW)
+        return _shaped({18: list(quiet), 19: list(quiet), 20: list(quiet)},
+                       states)
+
+    def _check(self, window, **kwargs):
+        return rate_check(window, _times(ARMED_WINDOW),
+                          tol_per_hour=RATE_TOL_LN_PER_H, min_channels=3,
+                          **kwargs)
+
+    # -- the negative controls, which are most of the corpus -----------------
+
+    @pytest.mark.parametrize("state", ["closed", "open", "unknown"])
+    def test_rate_check_one_class_on_every_round_is_judged_normally(self, state):
+        """**The reach of this refusal is the transition and nothing else.**
+
+        A window that read `open` on all seven rounds is a window whose bias was
+        CONSTANT, and a constant multiplicative bias cancels out of a slope
+        exactly -- which is the ruling's own argument and the reason the label is
+        not what decides admission. `unknown` is in here too: a board that could
+        never judge its arc must not be refused a rate for it.
+        """
+        check = self._check(self._board({18: [state] * ARMED_WINDOW}))
+
+        assert check.by_channel[18].refusal == ""
+        assert check.by_channel[18].settled is True
+        assert check.settled is True and check.quiet == [18, 19, 20]
+
+    def test_rate_check_never_asked_rounds_are_not_a_class(self):
+        """`SUBAGENT_RULES.md` §3.1(a), pointed at this criterion.
+
+        `""` is the absence of the QUESTION, not a fourth state, and a round
+        nobody asked cannot disagree with a round somebody did. Two unasked
+        rounds here rather than one, deliberately: one would be forgiven by the
+        consensus rule and the padding would never reach this check at all, so
+        the test would pass without exercising it.
+        """
+        window = self._board({18: ["", "closed", "", "closed", "closed",
+                                   "closed", "closed"]})
+        check = self._check(window)
+
+        assert _arc_classes_observed(
+            [row[0] for row in window]) == ("closed",)
+        assert check.excluded_rounds == []          # nothing was forgiven
+        assert check.by_channel[18].refusal == ""
+        assert check.by_channel[18].n_points == ARMED_WINDOW
+        assert check.settled is True
+
+    # -- the transition itself -----------------------------------------------
+
+    def test_rate_check_a_window_straddling_two_classes_withholds_the_rate(self):
+        """The deliverable. ch18's arc walked closed part-way through, so the
+        rounds before and after it are not measurements of the same cell.
+
+        The control is in the same test and is the whole point: the IDENTICAL
+        sigma series, differing only in what the fitter said about the arc,
+        certifies quiet. If that half ever goes red the fixture has stopped
+        being a quiet cell and this test would pass for the wrong reason.
+        """
+        straddled = self._check(self._board({18: _straddling(3)}))
+        same_series_one_class = self._check(self._board())
+
+        assert same_series_one_class.by_channel[18].settled is True
+
+        withheld = straddled.by_channel[18]
+        assert withheld.refusal == RATE_ARC_CLASS_CHANGED
+        assert withheld.evaluable is False and withheld.settled is False
+        assert straddled.by_well[18].word == RATE_ARC_CLASS_CHANGED
+        # Which classes disagreed, and in the order the film went through them.
+        assert "open then closed" in withheld.reason
+        # The board cannot certify while a well is mid-transition.
+        assert straddled.settled is False
+        assert straddled.quiet == [19, 20]
+
+    def test_rate_check_the_withheld_well_is_never_reported_as_moving(self):
+        """A slope across a regime change is not evidence of motion, so the
+        precondition runs BEFORE `_channel_rate` and not as one more ranked test
+        inside it. A decaying series under a changing class is withheld rather
+        than blamed on the sample -- `rate_moving` is the one word here that is a
+        claim ABOUT the cell, and this window cannot support one.
+        """
+        quiet = _quiet_r1(ARMED_WINDOW)
+        window = _shaped({18: _decaying_transient_r1(ARMED_WINDOW),
+                          19: list(quiet), 20: list(quiet)},
+                         {18: _straddling(3)})
+        check = self._check(window)
+
+        assert check.by_channel[18].refusal == RATE_ARC_CLASS_CHANGED
+        assert check.moving == []
+        # ...and the same decay under ONE class is still moving, which is what
+        # makes the assertion above a discrimination rather than a suppression.
+        assert self._check(
+            _shaped({18: _decaying_transient_r1(ARMED_WINDOW),
+                     19: list(quiet), 20: list(quiet)})).moving == [18]
+
+    # -- the seam with the consensus rule, which is the easy one to get wrong -
+
+    def test_rate_check_a_consensus_forgiven_round_is_not_a_class_change(self):
+        """**The seam, pinned in both directions.**
+
+        One `open` round among six `closed` ones is the shape the consensus rule
+        already forgives, and (c) reads the rounds that SURVIVE that forgiveness
+        -- so the well keeps its verdict and certifies. Disarm the forgiveness on
+        the identical window and the very same round becomes a second class in
+        the regression, which is the proof that this check reads the surviving
+        set and not the raw window.
+        """
+        window = self._board({18: _one_open_round(2)})
+
+        forgiven = self._check(window)
+        assert [(e.channel, e.round_index) for e in forgiven.excluded_rounds] \
+            == [(18, 2)]
+        assert forgiven.by_channel[18].refusal == ""
+        assert forgiven.by_channel[18].n_points == ARMED_WINDOW - 1
+        assert forgiven.settled is True and 18 in forgiven.quiet
+
+        unforgiven = self._check(window, consensus_exclude=False)
+        assert unforgiven.by_channel[18].refusal == RATE_ARC_CLASS_CHANGED
+        assert unforgiven.by_channel[18].n_points == ARMED_WINDOW
+        assert unforgiven.settled is False
+
+    # -- what "withheld" means: the well goes on holding the board -----------
+
+    def test_resolving_holds_the_board_unconditionally_for_a_class_change(self):
+        """Unconditional like `rate_span_too_short`, never conditional like
+        `rate_too_few_points`.
+
+        Implementing (c) by DROPPING the off-class rounds would land on the
+        latter, whose split then reads the well as short of ITS OWN rounds --
+        i.e. not resolving -- and a well in the middle of the transition would
+        stop holding the board. That is the quiet direction the ruling exists to
+        close, so the point count must not enter this decision at all.
+        """
+        def rate(refusal, n_points):
+            return ChannelRate(channel=18, refusal=refusal, n_points=n_points)
+
+        for n_points in (0, 3, ARMED_WINDOW - 1, ARMED_WINDOW):
+            assert _resolving(rate(RATE_ARC_CLASS_CHANGED, n_points),
+                              ARMED_WINDOW) is True
+            assert _resolving(rate(RATE_SPAN_TOO_SHORT, n_points),
+                              ARMED_WINDOW) is True
+        # The contrast that makes "unconditional" mean something.
+        assert _resolving(rate(RATE_TOO_FEW_POINTS, ARMED_WINDOW - 1),
+                          ARMED_WINDOW) is False
+
+    def test_rate_check_one_straddling_well_holds_a_board_of_quiet_ones(self):
+        """The early-stop rule, end to end on the campaign policy. Three wells
+        quiet, one mid-transition: the board does not settle, and the reason
+        names the well and the word so an operator is not left to infer why the
+        hold continued.
+        """
+        quiet = _quiet_r1(ARMED_WINDOW)
+        window = _shaped({1: list(quiet), 2: list(quiet), 3: list(quiet),
+                          4: list(quiet)}, {4: _straddling(3)})
+        check = rate_check(window, _times(ARMED_WINDOW),
+                           tol_per_hour=RATE_TOL_LN_PER_H, board_minimum=None)
+
+        assert check.settled is False
+        assert check.quiet == [1, 2, 3]
+        assert "still resolving" in check.reason
+        assert "ch4 " + RATE_ARC_CLASS_CHANGED in check.reason
+        assert check.by_well[4].word == RATE_ARC_CLASS_CHANGED
+        # Still EVALUABLE: three wells produced rate estimates. The board word is
+        # `ceiling` if the hold runs out, never `not_evaluable`.
+        assert check.evaluable is True

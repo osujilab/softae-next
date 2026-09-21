@@ -1113,6 +1113,20 @@ RATE_TOO_FEW_POINTS = "rate_too_few_points"
 #: span-vs-noise rather than span-vs-τ. A statement about the *observation* and
 #: not about the sample, so it is not evaluable.
 RATE_SPAN_TOO_SHORT = "rate_span_too_short"
+#: The arc-closure **class** was not the same on every round of this window, so
+#: the rounds before and after the change are not measurements of the same cell.
+#: Operator ruling 2026-09-17, T11.46 refusal (c): a rate is a slope in log
+#: space, so a **constant** extrapolation bias cancels exactly and only a
+#: **changing** one corrupts it — and the bias is not constant while a film
+#: hydrates and the arc walks closed, it shrinks from ~2.75× toward 1×. The
+#: dangerous direction is the quiet one: a shrinking bias working against a
+#: rising R₁ cancels to flat, so the board would certify ``settled`` on an
+#: artefact and every later σ would inherit it silently.
+#:
+#: A statement about the *observation* and not about the sample, like
+#: :data:`RATE_SPAN_TOO_SHORT` — and spelled apart from it rather than reusing
+#: it, because reusing a word spells one finding with another finding's token.
+RATE_ARC_CLASS_CHANGED = "rate_arc_class_changed"
 #: This channel's **own** noise floor exceeds the relative tolerance, so no hold
 #: length can ever certify it. :func:`window_noise_floor` takes the MEDIAN across
 #: participants — deliberately — while the criterion aggregates with MAX, so the
@@ -1481,6 +1495,7 @@ class WellVerdict:
     :data:`RATE_MOVING`                 evidence about the sample    **yes**
     :data:`RATE_UNDETECTABLE`           still resolving              **yes**
     :data:`RATE_SPAN_TOO_SHORT`         still resolving              **yes**
+    :data:`RATE_ARC_CLASS_CHANGED`      still resolving              **yes**
     :data:`RATE_TOO_FEW_POINTS`         still resolving              conditional
     :data:`EXCLUDED_UNSETTLEABLE`       no hold can certify it       no
     :data:`WELL_FIT_FAILED`             no information               no
@@ -1740,6 +1755,30 @@ def _shape_recorded(fit: RoundFit) -> bool:
     answered the question this predicate asks.
     """
     return bool(fit.arc_state or fit.sigma_mode or fit.quality_verdict)
+
+
+def _arc_classes_observed(fits: Sequence[RoundFit]) -> tuple[str, ...]:
+    """The distinct arc-closure classes these rounds recorded, first-seen first.
+
+    More than one is T11.46 refusal (c)'s trigger, and the **order is kept** so
+    the reason can say *open then closed* — which way a film went is the half an
+    operator reads. One class repeated any number of times is not a change.
+
+    ``""`` is *never asked* and is **not** a class: a window nobody asked must
+    not be readable as a window that agreed (``SUBAGENT_RULES.md`` §3.1(a)),
+    which is the line :func:`_shape_recorded` already draws. So padding rounds
+    neither contribute a class nor can produce a change between them.
+
+    The vocabulary is ``eis/arc.py``'s ``CLOSED`` / ``OPEN`` / ``UNKNOWN`` and it
+    is **compared, never imported**, on :func:`_fit_shape`'s precedent: the
+    feeders carry the word through verbatim, so a token this module has never
+    heard of counts as a class that disagrees with the others rather than as one
+    it silently forgives. ``unknown`` is a class like any other — *could not
+    judge* on some rounds and *judged* on the rest is exactly the window whose
+    rounds are not comparable.
+    """
+    return tuple(dict.fromkeys(
+        str(fit.arc_state) for fit in fits if fit.arc_state))
 
 
 def _has_absent_round(fits: Sequence[RoundFit]) -> bool:
@@ -2027,6 +2066,51 @@ def _reference_half_width(
                  / np.sqrt(sxx) * 3600.0)
 
 
+def _rate_fields(channel: int, times_s: Sequence[float],
+                 sigmas: Sequence[float]) -> dict[str, Any]:
+    """The four fields a :class:`ChannelRate` carries whether it refused or not.
+
+    One expression and not two, because a refusal built **beside**
+    :func:`_channel_rate` rather than inside it — T11.46's class-stability
+    precondition is the first of those — has to populate them identically or an
+    audit of a withheld well reads differently from an audit of a judged one for
+    no reason but which branch spoke.
+    """
+    return {
+        "channel": int(channel), "n_points": len(sigmas),
+        "span_s": float(max(times_s) - min(times_s)) if len(times_s) else 0.0,
+        "noise_floor_rel": noise_floor(sigmas, n_settle=len(sigmas)),
+    }
+
+
+def _arc_class_refusal(channel: int, times_s: Sequence[float],
+                       sigmas: Sequence[float],
+                       classes: Sequence[str]) -> ChannelRate:
+    """T11.46 refusal (c): this well's window straddles a regime change.
+
+    Built here rather than as one more ordered test inside :func:`_channel_rate`
+    because it is a **precondition** on admitting a rate at all: *"were these
+    rounds measurements of the same cell?"* is prior to *"was that cell
+    moving?"*, and a well whose arc walked closed mid-window has no rate for the
+    ordered tests to rank. The numbers that do not depend on the regression are
+    filled in anyway, on :func:`_channel_rate`'s own convention, so a withheld
+    well can be audited rather than merely named.
+
+    Deliberately **not** implemented by dropping the off-class rounds: that
+    lands on :data:`RATE_TOO_FEW_POINTS`, whose split in :func:`_resolving`
+    would then read the well as short of *its own* rounds and stop it holding
+    the board — the quiet direction the ruling exists to close.
+    """
+    return ChannelRate(
+        evaluable=False, settled=False, refusal=RATE_ARC_CLASS_CHANGED,
+        reason=(f"the arc-closure class changed inside this window "
+                f"({' then '.join(classes)}), so the rounds before and after "
+                f"the change are not measurements of the same cell; the "
+                f"regression straddles a regime change, the rate is withheld "
+                f"and the well goes on being watched rather than certified"),
+        **_rate_fields(channel, times_s, sigmas))
+
+
 def _channel_rate(
     channel: int,
     times_s: Sequence[float],
@@ -2059,12 +2143,17 @@ def _channel_rate(
        moving cell as unachievable. ``s_resid`` is the scatter *with the trend
        taken out*, which is what "this cell's own noise floor" has to mean once
        a slope estimate exists.
+
+    And one ordering fact that is **not** in this function, stated here because
+    this is where a reader looks for it: T11.46's arc-class-stability criterion
+    runs in :func:`rate_check` *before* this function is called, never as a test
+    among these. It asks whether the window's rounds measured one cell at all,
+    which is prior to every question below — and a well it withholds must not be
+    ranked behind :data:`RATE_MOVING`, because a slope across a regime change is
+    not evidence of motion. See :func:`_arc_class_refusal`.
     """
-    span_s = float(max(times_s) - min(times_s)) if len(times_s) else 0.0
-    fields: dict[str, Any] = {
-        "channel": int(channel), "n_points": len(sigmas), "span_s": span_s,
-        "noise_floor_rel": noise_floor(sigmas, n_settle=len(sigmas)),
-    }
+    fields = _rate_fields(channel, times_s, sigmas)
+    span_s = float(fields["span_s"])
     needed = max(SETTLE_MIN_FIT_POINTS, int(min_fit_points))
     if fit is None or len(sigmas) < needed:
         return ChannelRate(
@@ -2183,9 +2272,21 @@ def _resolving(rate: ChannelRate, window_len: int) -> bool:
     """Is this well still on its way to a verdict, as opposed to out of the race?
 
     The clause of the early-stop rule that is not a lookup, and the one the
-    operator refined by name (`[a289]`, ruling 2). :data:`RATE_UNDETECTABLE` and
-    :data:`RATE_SPAN_TOO_SHORT` are unconditionally still resolving — more
-    rounds is exactly what both of them ask for.
+    operator refined by name (`[a289]`, ruling 2). :data:`RATE_UNDETECTABLE`,
+    :data:`RATE_SPAN_TOO_SHORT` and :data:`RATE_ARC_CLASS_CHANGED` are
+    unconditionally still resolving — more rounds is exactly what all three of
+    them ask for.
+
+    The third is T11.46 refusal (c) and it is unconditional for the reason the
+    ruling gives: **the dangerous direction is the quiet one.** A well whose arc
+    closed part-way through the window is mid-transition, and the extrapolation
+    bias that moved under it can cancel a genuine rise to flat — so a board
+    allowed to stop on it certifies an artefact, and every σ taken afterwards
+    inherits that silently. The loud failure, a false *"still moving"*, costs a
+    ceiling and some hours. It must therefore hold the board the way
+    :data:`RATE_SPAN_TOO_SHORT` does and never the way
+    :data:`RATE_TOO_FEW_POINTS` conditionally does: a well in the middle of the
+    transition still has its rounds, it is the *window* that cannot speak.
 
     :data:`RATE_TOO_FEW_POINTS` splits, and the split is the refinement: a well
     short of points because the **window** has not filled yet is still
@@ -2204,7 +2305,8 @@ def _resolving(rate: ChannelRate, window_len: int) -> bool:
     channel upstream and never arrives here.) Equal means the window itself is
     short; fewer means this well is.
     """
-    if rate.refusal in (RATE_UNDETECTABLE, RATE_SPAN_TOO_SHORT):
+    if rate.refusal in (RATE_UNDETECTABLE, RATE_SPAN_TOO_SHORT,
+                        RATE_ARC_CLASS_CHANGED):
         return True
     return (rate.refusal == RATE_TOO_FEW_POINTS
             and rate.n_points >= int(window_len))
@@ -2326,6 +2428,20 @@ def rate_check(
     (:func:`_has_absent_round`) is routed straight to the participation gate on
     its full window, because nothing ran there to disagree with anything.
 
+    **The third precondition on admitting a rate, beside those two: the arc
+    class must hold still across the window** (T11.46 refusal (c), operator
+    ruling 2026-09-17). A rate is a slope in log space, so a *constant*
+    extrapolation bias cancels exactly and only a *changing* one corrupts it —
+    and while a film hydrates the bias is not constant. Where a channel's
+    surviving rounds carry more than one arc-closure class, that channel is
+    :data:`RATE_ARC_CLASS_CHANGED` and never reaches :func:`_channel_rate` at
+    all: the question is whether those rounds measured one cell, which is prior
+    to whether the cell was moving. It is the **complement** of the consensus
+    rule rather than a duplicate of it — consensus forgives **one** round that
+    was a different cell, this refuses a window that was **two** — and the two
+    compose in that order, so a single off-class round is forgiven and only what
+    survives is asked to agree.
+
     **Nothing calls this yet, by design.** It ships as a pure unit so that the
     criterion can be measured against real windows before it is given any
     routing power; the selector that would call it is a later stage.
@@ -2406,12 +2522,16 @@ def rate_check(
     # Per channel, not one shared axis: an excluded round must leave BOTH the σ
     # and its time point, or the surviving points are regressed against a pacing
     # they were not measured at.
-    paired = {
-        channel: tuple(zip(*[
-            (t, float(fit.sigma))  # type: ignore[arg-type]
-            for index, (t, fit) in enumerate(zip(axis, by_channel[channel]))
-            if index != dropped_index.get(channel)]))
+    kept = {
+        channel: [(t, fit)
+                  for index, (t, fit) in enumerate(zip(axis, by_channel[channel]))
+                  if index != dropped_index.get(channel)]
         for channel in participating
+    }
+    paired = {
+        channel: tuple(zip(*[(t, float(fit.sigma))  # type: ignore[arg-type]
+                             for t, fit in rows]))
+        for channel, rows in kept.items()
     }
     series = {channel: list(sigmas) for channel, (_t, sigmas) in paired.items()}
     fitted = {channel: log_rate(list(times), list(sigmas))
@@ -2420,18 +2540,29 @@ def rate_check(
     # cell over *this observation* could have certified, and a per-channel
     # exclusion is a fact about that channel rather than about the window.
     reference = _reference_half_width(axis, fitted.values())
-    by_rate = {
-        channel: _channel_rate(
-            channel, list(paired[channel][0]), sigmas, fitted[channel],
-            tol_per_hour=tol_per_hour, tol_rel=tol_rel,
-            min_fit_points=min_fit_points, reference_half_width=reference)
-        for channel, sigmas in series.items()
-    }
+    # THE CLASS-STABILITY PRECONDITION (T11.46 refusal (c)), asked per channel
+    # BEFORE `_channel_rate` and never after it: it decides whether this window
+    # has a rate to judge, not how a rate it has should be ranked. It reads the
+    # rounds that SURVIVED the forgiveness above -- the same set `paired`
+    # regresses, built from `kept` so the two cannot drift apart -- so a single
+    # off-class round the consensus rule already took out cannot refuse the well
+    # a second time on the strength of a round no longer in the regression.
+    by_rate: dict[int, ChannelRate] = {}
+    for channel, sigmas in series.items():
+        times = list(paired[channel][0])
+        classes = _arc_classes_observed([fit for _t, fit in kept[channel]])
+        by_rate[channel] = (
+            _arc_class_refusal(channel, times, sigmas, classes)
+            if len(classes) > 1 else
+            _channel_rate(
+                channel, times, sigmas, fitted[channel],
+                tol_per_hour=tol_per_hour, tol_rel=tol_rel,
+                min_fit_points=min_fit_points, reference_half_width=reference))
     grouped = {name: sorted(ch for ch, rate in by_rate.items()
                             if rate.refusal == name)
                for name in (RATE_MOVING, RATE_UNDETECTABLE,
                             EXCLUDED_UNSETTLEABLE, RATE_SPAN_TOO_SHORT,
-                            RATE_TOO_FEW_POINTS)}
+                            RATE_ARC_CLASS_CHANGED, RATE_TOO_FEW_POINTS)}
     quiet = sorted(ch for ch, rate in by_rate.items() if rate.settled)
     bounds = [rate.upper_bound_per_hour for rate in by_rate.values()
               if rate.upper_bound_per_hour is not None]
@@ -2492,7 +2623,7 @@ def rate_check(
     tally = ", ".join(
         f"{len(grouped[name])} {name}" for name in
         (RATE_UNDETECTABLE, EXCLUDED_UNSETTLEABLE, RATE_SPAN_TOO_SHORT,
-         RATE_TOO_FEW_POINTS) if grouped[name])
+         RATE_ARC_CLASS_CHANGED, RATE_TOO_FEW_POINTS) if grouped[name])
     if needed is None:
         # `evaluable` under this policy is "did ANY well produce a rate
         # estimate", certified or not — the input to the board word, where
