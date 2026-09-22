@@ -354,6 +354,48 @@ class TestAutonomousLoop:
         await manager.disconnect_all()
 
     @pytest.mark.asyncio
+    async def test_uncompilable_plan_parks_on_the_first_trial(self, store_with_run):
+        """A plan that cannot compile is a refusal — retrying rebuilds the same one.
+
+        Left as a soft failure it would burn wells and suggestions up to the
+        park limit for a workflow that could never have been built.
+        """
+        from softae.core.deposition_recipe import PlanCompileError
+
+        store, run_id = store_with_run
+        manager = _make_mock_manager()
+        await manager.connect_all()
+
+        builds = {"n": 0}
+
+        def refusing_builder(params):
+            builds["n"] += 1
+            raise PlanCompileError(
+                "the plan names task 'startup_flush_fll' for the campaign-start "
+                "flush, and the task catalog does not hold it"
+            )
+
+        loop = AutonomousLoop(
+            optimizer=GridSearchOptimizer(SIMPLE_SPACE, n_points=20),
+            workflow_template=None,
+            workflow_builder=refusing_builder,
+            manager=manager, data_store=store, run_id=run_id,
+            objective_extractor=lambda r: 1.0, auto_approve=True,
+            park_after_failed_trials=3,
+        )
+        await loop.run()
+
+        assert loop.state is LoopState.STOPPED
+        assert builds["n"] == 1                   # not retried
+        assert loop.consecutive_failures == 0     # retry budget untouched
+        assert loop.iteration == 0                # no well counted as consumed
+        assert "PlanCompileError" in (loop.park_reason or "")
+        # The operator reads the park reason in the terminal, so it has to name
+        # the task the catalog could not resolve.
+        assert "startup_flush_fll" in (loop.park_reason or "")
+        await manager.disconnect_all()
+
+    @pytest.mark.asyncio
     async def test_unanswered_approval_gate_parks_instead_of_hanging(self, store_with_run):
         """P1.4: the gate that could hang an overnight run must self-bound.
 

@@ -242,20 +242,6 @@ def test_piezo_all_elution_wraps_every_elution_event():
     assert names.index("piezo_off_deposit_ch21") < names.index("measure_eis_ch21")
 
 
-def test_piezo_skipped_when_tasks_absent():
-    # A catalog without piezo tasks + piezo enabled → no piezo steps, no crash.
-    from softae.core.task_catalog import TaskCatalog
-    cat = TaskCatalog()
-    for n in ("startup_flush_full", "precondition_flush", "single_drop_simul", "final_flush"):
-        cat.add(Task(name=n, instrument="lh", method=n, params={}))
-    wf = build_recipe_deposition_workflow(
-        get_deposition_recipe("two_phase"), [21], {21: [10.0, 30.0, 0.0]},
-        catalog=cat, pump_ids=[0, 1, 2], dispense_rate=100.0, flush_rate=500.0,
-        flush_factor=3.0, settle_factor=2.0, start_flush_uL=[80, 80, 80],
-        piezo=PiezoPlan(enabled=True), pcb=PCB, origin_xy=(43.5, 50.0))
-    assert not any("piezo" in s.name for s in wf.setup + wf.teardown)
-
-
 # ── Run-plan-driven phase ordering (anneal + pointwise/batch measurement) ─────
 
 from softae.core.run_plan import RunPlan  # noqa: E402
@@ -371,15 +357,6 @@ def test_batch_without_anneal_is_formulate_all_then_measure_all():
     names = [s.name for s in wf.setup]
     assert names == ["startup_flush", "deposit_ch21", "deposit_ch22",
                      "measure_eis_ch21", "measure_eis_ch22"]
-
-
-def test_missing_anneal_task_is_skipped_not_fatal():
-    # Catalog WITHOUT the anneal task → anneal phase emits nothing, no crash.
-    wf = _build_plan("single_drop", [21], {21: [1, 1, 1]},
-                     RunPlan.pointwise(anneal=True), catalog=_engine_catalog())
-    names = [s.name for s in wf.setup]
-    assert not any(n.startswith("anneal") for n in names)
-    assert "deposit_ch21" in names and "measure_eis_ch21" in names
 
 
 def test_anneal_params_override_task_defaults():
@@ -858,3 +835,141 @@ def test_conditions_disagreeing_leaves_task_temperature_on_the_wire():
 
     assert anneal.params["target_temp_C"] == 150       # the cure, from the task
     assert write_sp.params["T_SP"] == 65.0             # the restore, from the phase
+
+
+# ── Refusing a named task the catalog does not hold ──────────────────────────
+#
+# The engine used to test membership and drop the step. A plan naming a flush
+# task the catalog lacks therefore compiled without it, so the rig cast through
+# unflushed lines and nothing in the log said so. Declaring no task at all is a
+# different thing and stays a legal no-op.
+
+from dataclasses import replace  # noqa: E402
+
+from softae.core.deposition_recipe import PlanCompileError  # noqa: E402
+
+
+def _catalog_without(task_name: str) -> TaskCatalog:
+    """The full engine catalog minus one task."""
+    cat = _anneal_catalog()
+    cat.remove(task_name)
+    return cat
+
+
+def _build_recipe(recipe, catalog, **over):
+    """Compile *recipe* directly, for the cases that alter the recipe itself."""
+    kw = dict(
+        catalog=catalog, pump_ids=[0, 1, 2], dispense_rate=100.0, flush_rate=500.0,
+        flush_factor=3.0, settle_factor=2.0, start_flush_uL=[80, 80, 80],
+        pcb=PCB, origin_xy=(43.5, 50.0),
+    )
+    kw.update(over)
+    return build_recipe_deposition_workflow(
+        recipe, [21], {21: [10.0, 30.0, 0.0]}, **kw)
+
+
+def test_engine_missing_startup_flush_refuses():
+    """A named campaign-start flush the catalog lacks stops the compile.
+
+    Skipped silently, the rig casts onto a board through unflushed lines.
+    """
+    with pytest.raises(PlanCompileError, match="startup_flush_full"):
+        _build("single_drop", catalog=_catalog_without("startup_flush_full"))
+
+
+def test_engine_missing_final_flush_refuses():
+    """The teardown flush too: named and absent is a refusal, not a skip."""
+    with pytest.raises(PlanCompileError, match="final_flush"):
+        _build("single_drop", catalog=_catalog_without("final_flush"))
+
+
+def test_engine_missing_anneal_task_refuses():
+    """A cure phase whose task is absent would leave every sample uncured."""
+    with pytest.raises(PlanCompileError, match="anneal_150C_5min"):
+        _build_plan("single_drop", [21], {21: [1, 1, 1]},
+                    RunPlan.pointwise(anneal=True), catalog=_engine_catalog())
+
+
+def test_engine_enabled_piezo_missing_task_refuses():
+    """An enabled piezo that cannot resolve its task would actuate nothing."""
+    with pytest.raises(PlanCompileError, match="piezo_channel_a_on"):
+        _build("two_phase", catalog=_catalog_without("piezo_channel_a_on"),
+               piezo=PiezoPlan(enabled=True))
+
+
+def test_engine_disabled_piezo_missing_task_compiles():
+    """A disabled piezo asks for nothing, so its task names are never resolved."""
+    wf = _build("two_phase", catalog=_catalog_without("piezo_channel_a_on"),
+                piezo=PiezoPlan(enabled=False))
+    assert not any("piezo" in s.name for s in wf.setup + wf.teardown)
+
+
+def test_engine_undeclared_flush_methods_compiles():
+    """A recipe naming no flush asks for nothing, which stays legal.
+
+    Only a name the catalog cannot resolve is a refusal.
+    """
+    recipe = replace(get_deposition_recipe("single_drop"),
+                     startup_method="", final_method="")
+    wf = _build_recipe(recipe, _engine_catalog())
+    assert [s.name for s in wf.setup] == ["deposit_ch21"]
+    assert wf.teardown == []
+
+
+def test_engine_refusal_names_task_phase_and_near_miss():
+    """The message has to be actionable away from the code: what, where, and did-you-mean."""
+    recipe = replace(get_deposition_recipe("single_drop"),
+                     startup_method="startup_flush_fll")
+    with pytest.raises(PlanCompileError) as refusal:
+        _build_recipe(recipe, _engine_catalog())
+    message = str(refusal.value)
+    assert "startup_flush_fll" in message
+    assert "campaign-start flush" in message
+    assert "startup_flush_full" in message
+
+
+def test_engine_missing_deposit_method_override_refuses():
+    """An operator-selected deposit method the catalog lacks stops the compile.
+
+    The one lookup that still raised a bare KeyError: an unattended run would
+    die on a stack trace naming neither the method nor the channel.
+    """
+    with pytest.raises(PlanCompileError) as refusal:
+        _build("single_drop", deposit_method="single_drop_simool")
+    message = str(refusal.value)
+    assert "single_drop_simool" in message
+    assert "deposit-method override on channel 21" in message
+    assert "single_drop_simul" in message          # the near miss
+
+
+def test_engine_missing_recipe_phase_method_refuses():
+    """A recipe phase whose own method is absent refuses, naming the phase.
+
+    Dropped instead, the channel would be measured without ever being cast.
+    """
+    recipe = replace(get_deposition_recipe("single_drop"),
+                     phases=(replace(get_deposition_recipe("single_drop").phases[0],
+                                     method="single_drop_absent"),))
+    with pytest.raises(PlanCompileError) as refusal:
+        _build_recipe(recipe, _engine_catalog())
+    message = str(refusal.value)
+    assert "single_drop_absent" in message
+    assert "deposit phase on channel 21" in message
+
+
+def test_engine_anneal_phase_naming_no_task_refuses():
+    """An ANNEAL phase that names no task refuses rather than curing nothing.
+
+    Unlike every other role, "nothing was asked for" cannot be a legal no-op
+    here: an uncured sample is measured and told, not obviously missing.
+    """
+    plan = RunPlan((RunPhase(PhaseKind.FORMULATE),
+                    RunPhase(PhaseKind.ANNEAL, anneal_task="")))
+    with pytest.raises(PlanCompileError) as refusal:
+        _build_plan("single_drop", [21], {21: [1, 1, 1]}, plan, eis=False)
+    message = str(refusal.value)
+    assert "ANNEAL phase over channel 21" in message
+    assert "names no task" in message
+    # Not the near-miss message for the empty string, which would suggest
+    # catalog names for a name nobody wrote.
+    assert "nearest names" not in message

@@ -226,6 +226,7 @@ def _purge_is_attached(manager) -> bool:
 def _project(spec, manager, *, assume_yes: bool, store=None) -> bool:
     """Print the duration/stock projection; stop on a predicted shortfall."""
     from softae.config import loader
+    from softae.core.deposition_recipe import PlanCompileError
     from softae.core.preflight import project_campaign
     from softae.core.purge import load_purge_settings
     from softae.core.task_catalog import TaskCatalog
@@ -241,6 +242,10 @@ def _project(spec, manager, *, assume_yes: bool, store=None) -> bool:
         projection = project_campaign(
             spec, catalog=catalog, ledger=ledger,
             purge_uL_per_day=purge.uL_per_day() if billed else {})
+    except PlanCompileError:
+        # A named task the catalog lacks is a refusal, not a missing advisory:
+        # every trial this campaign would build names it (Wave 1, T11.59).
+        raise
     except Exception as exc:
         print(f"   (projection unavailable: {exc})")
         return True

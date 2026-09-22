@@ -1442,13 +1442,18 @@ class AutonomousLoop:
 
         Safety violations and an unarmed interlock are refusals, not glitches:
         the same command will be refused again, and for a reservoir hard-stop
-        (a mechanical dead-end) retrying is actively dangerous.  These park
+        (a mechanical dead-end) retrying is actively dangerous.  A plan that
+        names a task the catalog does not hold is the same shape — the trial
+        builder will refuse every identical rebuild, so retrying only spends
+        suggestions and wells on a workflow that can never compile.  These park
         immediately without consuming the retry budget.
         """
+        from softae.core.deposition_recipe import PlanCompileError
         from softae.core.hardware_safety import HardwareNotArmedError
         from softae.errors import SafetyError
 
-        return isinstance(exc, (SafetyError, HardwareNotArmedError))
+        return isinstance(exc, (SafetyError, HardwareNotArmedError,
+                                PlanCompileError))
 
     def _park(self, reason: str) -> None:
         """Enter the terminal parked state, recording *why*.

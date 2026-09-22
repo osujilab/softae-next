@@ -883,8 +883,13 @@ def project_campaign(
     ``mode=ro``). It is optional and defaulted so every existing caller is
     unchanged — but a run plan that commands humidity with no directory supplied
     says so in the warnings rather than reporting silence as a clean bill.
+
+    Every build failure degrades to an advisory projection carrying a warning —
+    a midpoint that cannot be built must not block a run — except
+    :class:`~softae.core.deposition_recipe.PlanCompileError`, which propagates.
     """
     from softae.core.autonomous_wiring import build_trial_workflow
+    from softae.core.deposition_recipe import PlanCompileError
     from softae.core.eis_scripts import EISParams
 
     warnings: list[str] = []
@@ -901,6 +906,10 @@ def project_campaign(
 
     try:
         wf = build_trial_workflow(spec, midpoint, catalog=catalog)
+    except PlanCompileError:
+        # Not advisory: a named task the catalog lacks is a property of the
+        # plan, true of every trial, not of this representative midpoint.
+        raise
     except Exception as exc:
         logger.warning("projection_build_failed", error=str(exc))
         return CampaignProjection(

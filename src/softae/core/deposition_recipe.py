@@ -21,6 +21,7 @@ hardware-validated and the HT tab cuts over.
 
 from __future__ import annotations
 
+import difflib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Sequence
 
@@ -44,6 +45,41 @@ if TYPE_CHECKING:  # annotation-only, mirroring `run_plan`'s own import of it
     from softae.core.phase_setpoints import PhaseSetpoints
 
 logger = structlog.get_logger(__name__)
+
+
+class PlanCompileError(ValueError):
+    """A recipe or run plan names a task the catalog does not hold.
+
+    A refusal rather than a skip, because every skip this replaced was silent
+    at the bench: a typo'd or un-catalogued flush task dropped the flush from
+    the compiled workflow and the rig cast through unflushed lines with nothing
+    in the log to say so.
+
+    A ``ValueError`` rather than the :mod:`softae.errors` family: this is a
+    compile-time refusal of a name, and ``ValidationError_`` descends from
+    ``WorkflowError``, which the executor catches to classify *step* failures —
+    a different stage of a run's life and a misleading association here.
+    """
+
+
+def _require_task(catalog: TaskCatalog, name: str, *, phase: str) -> Task:
+    """The catalogued task *name*, or refuse naming *phase* and the near misses.
+
+    Reached only once a name has been declared: a plan that names no task for a
+    role is asking for nothing, which stays a legitimate no-op. The distinction
+    is the whole point — "nothing was asked for" and "what was asked for does
+    not exist" had the same outcome before, and only one of them is correct.
+    """
+    if name in catalog:
+        return catalog.get(name)
+    near = difflib.get_close_matches(name, catalog.list_names(), n=3)
+    hint = (f"nearest names: {', '.join(near)}" if near
+            else f"the catalog holds {len(catalog)} task(s)")
+    raise PlanCompileError(
+        f"the plan names task '{name}' for the {phase}, and the task catalog "
+        f"does not hold it — refusing to compile a workflow that would run "
+        f"without that step ({hint})"
+    )
 
 
 #: Slack added on top of an anneal's hold time to cover the ramp to target, the
@@ -288,9 +324,12 @@ class PiezoPlan:
       individually bracketed with the piezo on/off (off before the non-elution
       EIS/measurement).  Step names ``piezo_on_{step}`` / ``piezo_off_{step}``.
 
-    The step methods come from the named catalog tasks; a missing task is silently
-    skipped.  A cross-cutting option (both ``single_drop`` and ``two_phase``
-    support it), driven by ``[piezo]`` config in the HT tab.
+    The step methods come from the named catalog tasks.  While :attr:`enabled`,
+    a name the catalog cannot resolve raises :class:`PlanCompileError` — an
+    enabled piezo that quietly actuates nothing is the failure this plan exists
+    to avoid.  Disabled, no name is resolved at all.  A cross-cutting option
+    (both ``single_drop`` and ``two_phase`` support it), driven by ``[piezo]``
+    config in the HT tab.
     """
 
     enabled: bool = False
@@ -545,6 +584,11 @@ def build_recipe_deposition_workflow(
     phase that speaks overrides it and it never returns. ``None`` leaves every
     existing caller's workflow byte-identical.
 
+    **Every task this names must be in the catalog.**  A name the catalog cannot
+    resolve raises :class:`PlanCompileError` rather than dropping the step (see
+    :func:`_require_task`); a role for which the recipe or plan names *no* task
+    stays a no-op.
+
     ``deposit_method`` overrides the deposit phase's method (the HT deposit-method
     selector).  ``eis_step_by_channel`` omitted (and no MEASURE phase) → no EIS
     (formulate-only).  ``time_scale`` (when given) is injected into every
@@ -585,26 +629,30 @@ def build_recipe_deposition_workflow(
         if ch is not None:
             tags["channel"] = str(ch)
         out: list[WorkflowStep] = []
-        if piezo.on_task in catalog:
-            out.append(catalog.get(piezo.on_task).to_step(
-                f"piezo_on_{step.name}").with_tags(**tags))
+        if piezo.on_task:
+            out.append(_require_task(
+                catalog, piezo.on_task, phase=f"piezo-on before '{step.name}'",
+            ).to_step(f"piezo_on_{step.name}").with_tags(**tags))
         out.append(step)
-        if piezo.off_task in catalog:
-            out.append(catalog.get(piezo.off_task).to_step(
-                f"piezo_off_{step.name}").with_tags(**tags))
+        if piezo.off_task:
+            out.append(_require_task(
+                catalog, piezo.off_task, phase=f"piezo-off after '{step.name}'",
+            ).to_step(f"piezo_off_{step.name}").with_tags(**tags))
         return out
 
     # Optional one-shot event-profile step FIRST, so the sweep profile is set
     # before any piezo actuation (including the startup flush in all-elution mode).
-    if (piezo is not None and piezo.enabled and piezo.event_task
-            and piezo.event_task in catalog):
-        ev = catalog.get(piezo.event_task).to_step("piezo_event")
+    if piezo is not None and piezo.enabled and piezo.event_task:
+        ev = _require_task(catalog, piezo.event_task,
+                           phase="piezo event profile").to_step("piezo_event")
         if piezo.event_params:
             ev = ev.with_params(**piezo.event_params)
         setup.append(ev)
 
     # Campaign-start general flush: per-pump start volumes at the (broadcast) line rate.
-    if recipe.startup_method in catalog:
+    if recipe.startup_method:
+        startup_task = _require_task(catalog, recipe.startup_method,
+                                     phase="campaign-start flush")
         start_vols = (
             list(start_flush_uL) if start_flush_uL is not None
             else [DEFAULT_FLUSH_VOL_UL] * len(ids)
@@ -613,11 +661,9 @@ def build_recipe_deposition_workflow(
         startup_params: dict = {
             "ids": list(ids), "disp_vols": start_vols, "disp_rate": float(flush_rate),
         }
-        if time_scale is not None and catalog.get(recipe.startup_method).instrument == "liquid_handler":
+        if time_scale is not None and startup_task.instrument == "liquid_handler":
             startup_params["time_scale"] = float(time_scale)
-        startup_step = catalog.get(recipe.startup_method).to_step("startup_flush").with_params(
-            **startup_params
-        )
+        startup_step = startup_task.to_step("startup_flush").with_params(**startup_params)
         setup.extend(_wrap_elution(startup_step, None))
 
     # Per-channel context (volumes, rate plan, electrode xy) computed once.
@@ -642,10 +688,14 @@ def build_recipe_deposition_workflow(
             # Deposit-scope piezo: enable just before the deposit phase.  All-elution
             # scope instead brackets every phase individually (via _wrap_elution below).
             if (phase.is_deposit and not piezo_all and piezo is not None
-                    and piezo.enabled and piezo.on_task in catalog):
-                steps.append(catalog.get(piezo.on_task).to_step(
-                    f"piezo_on_ch{ch}").with_tags(channel=str(ch), phase="piezo"))
-            method = deposit_method if (phase.is_deposit and deposit_method) else phase.method
+                    and piezo.enabled and piezo.on_task):
+                steps.append(_require_task(
+                    catalog, piezo.on_task,
+                    phase=f"piezo-on before the deposit on channel {ch}",
+                ).to_step(f"piezo_on_ch{ch}").with_tags(
+                    channel=str(ch), phase="piezo"))
+            override = deposit_method if phase.is_deposit else None
+            method = override or phase.method
             params: dict = {}
             if phase.inject_electrode:
                 params[slots.electrode_x] = ex
@@ -665,7 +715,9 @@ def build_recipe_deposition_workflow(
                 params["elution_wait_s"] = float(plan.settle_wait_s)
             if phase.zero_deadvols:
                 params["deadvols"] = [0.0] * len(ids)
-            task = catalog.get(method)
+            role = (f"deposit-method override on channel {ch}" if override
+                    else f"{phase.key} phase on channel {ch}")
+            task = _require_task(catalog, method, phase=role)
             if time_scale is not None and task.instrument == "liquid_handler":
                 params["time_scale"] = float(time_scale)
             phase_step = task.to_step(f"{phase.name_prefix}_ch{ch}").with_params(
@@ -707,12 +759,20 @@ def build_recipe_deposition_workflow(
         The trailing retract is not optional: the head guard refuses stage motion
         while lowered, so leaving it down would block the next phase.
         """
-        if rp.anneal_task not in catalog:
-            logger.warning("anneal_task_missing", task=rp.anneal_task,
-                           channel=ch if ch is not None else "all")
-            return []
-        step = catalog.get(rp.anneal_task).to_step(
-            f"anneal_ch{ch}" if ch is not None else "anneal_all")
+        where = f"channel {ch}" if ch is not None else "the whole plate"
+        # Every other `_require_task` site lets an undeclared name mean "nothing
+        # was asked for" and emits no step. This one does not, on purpose: a cure
+        # nobody performed leaves samples *wrongly* annealed rather than
+        # obviously missing, which is the failure that reads as a healthy run.
+        if not rp.anneal_task:
+            raise PlanCompileError(
+                f"the ANNEAL phase over {where} names no task, so nothing would "
+                f"hold the plate at temperature — refusing to compile a cure "
+                f"that would silently not happen"
+            )
+        step = _require_task(
+            catalog, rp.anneal_task, phase=f"anneal phase over {where}",
+        ).to_step(f"anneal_ch{ch}" if ch is not None else "anneal_all")
         if rp.anneal_params:
             step = step.with_params(**dict(rp.anneal_params))
         if rp.hold_s is not None:
@@ -832,9 +892,12 @@ def build_recipe_deposition_workflow(
                 # phases (deposit + any adjacent per-sample EIS), mirroring the
                 # legacy order.  All-elution scope disables per event instead.
                 if (seg_has_formulate and not piezo_all and piezo is not None
-                        and piezo.enabled and piezo.off_task in catalog):
-                    setup.append(catalog.get(piezo.off_task).to_step(
-                        f"piezo_off_ch{ch}").with_tags(channel=str(ch), phase="piezo"))
+                        and piezo.enabled and piezo.off_task):
+                    setup.append(_require_task(
+                        catalog, piezo.off_task,
+                        phase=f"piezo-off after the deposit on channel {ch}",
+                    ).to_step(f"piezo_off_ch{ch}").with_tags(
+                        channel=str(ch), phase="piezo"))
         else:  # PER_BATCH — whole-plate boundary
             for rp in seg_phases:
                 setup.extend(_condition_steps(rp, "all"))
@@ -850,12 +913,15 @@ def build_recipe_deposition_workflow(
                                    channel="all")
 
     teardown: list[WorkflowStep] = []
-    if recipe.final_method in catalog:
-        final_step = catalog.get(recipe.final_method).to_step("final_flush")
+    if recipe.final_method:
+        final_step = _require_task(catalog, recipe.final_method,
+                                   phase="teardown flush").to_step("final_flush")
         teardown.extend(_wrap_elution(final_step, None))
     # Return the piezo to standby last.
-    if piezo is not None and piezo.enabled and piezo.standby_task in catalog:
-        teardown.append(catalog.get(piezo.standby_task).to_step("piezo_standby"))
+    if piezo is not None and piezo.enabled and piezo.standby_task:
+        teardown.append(_require_task(
+            catalog, piezo.standby_task,
+            phase="piezo standby").to_step("piezo_standby"))
 
     logger.info("recipe_deposition_built", recipe=recipe.name, channels=channels,
                 piezo=piezo_on)

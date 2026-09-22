@@ -12,6 +12,7 @@ import pytest
 from softae.analysis.rh_floor import TemperatureBin
 from softae.config import loader
 from softae.core.autonomous_wiring import CampaignSpec
+from softae.core.deposition_recipe import PlanCompileError
 from softae.core.eis_scripts import EISParams
 from softae.core.measurement_spec import MeasurementSpec
 from softae.core.phase_setpoints import CONDITIONS_PHASE_TAG, PhaseSetpoints
@@ -730,6 +731,32 @@ class TestAdvisoriesNeverRefuse:
                              catalog=catalog, project_dir=tmp_path / "nothing-here")
         assert p.per_iteration_s > 0
         assert any("no RH-floor history was consulted" in w for w in p.warnings)
+
+
+def _catalog_without(task_name: str) -> TaskCatalog:
+    """A freshly loaded catalog minus one task.
+
+    Loaded here rather than taken from the module-scoped ``catalog`` fixture,
+    which every other test in this file shares and must not see mutated.
+    """
+    cat = TaskCatalog.load_toml(loader.tasks_toml_path())
+    cat.remove(task_name)
+    return cat
+
+
+class TestOneRefusalIsNotAnAdvisory:
+    """A named task the catalog lacks is a property of the plan, not of the
+    representative midpoint, so it is the one build failure that propagates.
+    Everything else still degrades to the advisory projection above."""
+
+    def test_project_campaign_catalog_missing_a_named_task_raises(self):
+        """Swallowed, this printed the refusal and reported success anyway."""
+        with pytest.raises(PlanCompileError, match="final_flush"):
+            project_campaign(_spec(), catalog=_catalog_without("final_flush"))
+
+    def test_project_campaign_full_catalog_still_projects(self, catalog):
+        """The companion: the refusal is conditional, not unconditional."""
+        assert project_campaign(_spec(), catalog=catalog).per_iteration_s > 0
 
 
 class TestMeasurementBlockOnTheMeasurePhase:
