@@ -38,9 +38,12 @@ The process catalog under `data/` is excluded for a different reason than the wo
 documents above: it is not in-flight, it is **per-instance**. Each installation develops its
 own processes, recipes and workflows against its own integrated hardware, so no catalog
 shipped here would be correct anywhere else — and a fresh checkout is not green for the
-catalog-loading tests by construction. No command generates one — it is built in the GUI
-(*Process Studio*, Tab 13; *Catalogs*, Tab 11) or hand-authored against the schemas under
-`src/softae/core/`; see the User Guide's *Before you start*.
+catalog-loading tests by construction. `softae-catalog init` writes a **placeholder** catalog
+into `data/` — a demonstration with generic chemistry and illustrative numbers, carrying no
+rig's ports, volumes or cure recipe, and not guaranteed to work on any hardware as shipped;
+copy it and edit your own copy. A real catalog is built in the GUI (*Process Studio*, Tab 13;
+*Catalogs*, Tab 11) or hand-authored against the schemas under `src/softae/core/`; see the
+User Guide's *Before you start*.
 
 Runnable examples ship as files rather than pages: workflow YAML under `workflows/`
 (including `workflows/examples/piezo_assisted_dispense.yaml` for piezo-assisted

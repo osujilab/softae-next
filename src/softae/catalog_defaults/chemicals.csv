@@ -1,0 +1,6 @@
+name,formula,density_g_per_mL,molar_mass_g_per_mol,viscosity_mPa_s,is_particulate,provides,notes
+Ethylene oxide,[H]OCCO,1.1,44.05,,0,,PLACEHOLDER - edit your own copy under data/
+Fumed silica,O=[Si]=O,2.65,60.08,,1,,PLACEHOLDER - edit your own copy under data/; particulate
+Isopropanol,CC(O)C,0.786,60.096,2.0,0,,PLACEHOLDER - edit your own copy under data/
+Lithium chloride,[Li]Cl,2.068,42.394,,0,,PLACEHOLDER - edit your own copy under data/
+Water,O,1.001,18.015,1.0021,0,,PLACEHOLDER - edit your own copy under data/

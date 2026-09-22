@@ -1,0 +1,26 @@
+# PLACEHOLDER recipe registry — copy it, then edit your own copy.
+#
+# This file is a DEMONSTRATION, not a configuration for any particular rig.
+# It is NOT guaranteed to work on your hardware out of the box.
+#
+#   softae-catalog init     copies this file to `data/recipes.toml`
+#
+# `data/` is untracked by design. Edit the COPY under `data/`, never this file.
+#
+# A recipe is a named single-sample procedure composed from catalogued methods,
+# and the Process Studio tab reads and writes this file. The campaign examples
+# under `examples/` do NOT need it: their deposition recipe (`single_drop`) is a
+# built-in in `softae.core.deposition_recipe`, resolved by name and never looked
+# up here. The one entry below exists to show the file's shape and to give a
+# fresh clone something for the Process Studio to open.
+
+[recipes.single_drop_demo]
+maturity = "draft"
+kind = "builder"
+builder = "softae.core.deposition_recipe:build_recipe_deposition_workflow"
+methods = [
+    "startup_flush_full",
+    "single_drop_simul",
+    "final_flush",
+]
+description = "Placeholder: one simultaneous drop-cast per channel, bracketed by the startup and teardown flushes. Replace with your own recipes."

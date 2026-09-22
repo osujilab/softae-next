@@ -1,0 +1,8 @@
+solution_name,component_name,role,quantity,unit,calc_mode,counts_as_deposit
+10 wt% silica solution,Fumed silica,dep,1.0,g,Mass-based,1
+10 wt% silica solution,Isopropanol,carrier,9.0,mL,Volume-based,0
+5wt% 20k PEO stock,Ethylene oxide,dep,0.702,g,Mass-based,
+5wt% 20k PEO stock,Water,carrier,13.0,g,Mass-based,
+5wt% 20k PEO stock,Isopropanol,carrier,0.16,g,Mass-based,
+LiCl 10M,Lithium chloride,dep,423.9,g,Mass-based,
+LiCl 10M,Water,carrier,1000.0,g,Mass-based,

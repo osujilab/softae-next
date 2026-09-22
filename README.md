@@ -38,12 +38,18 @@ needs users to develop their own processes, recipes and workflows that best refl
 integrated hardware. A fresh checkout therefore names no tasks and is not green for the
 catalog-loading tests by construction — see the User Guide's *Before you start*.
 
-No command generates a catalog either: build `data/tasks.toml` and `data/recipes.toml` in the
-GUI's *Process Studio* (Tab 13) and the chemicals/solutions CSVs in *Catalogs* (Tab 11), or
-hand-author all four against the schemas in `src/softae/core/task_catalog.py`,
+`softae-catalog init` writes a **placeholder** catalog into `data/` so a clone has something to
+compile the specs under `examples/` against, and so each file's shape is visible. It is a
+demonstration, not a configuration: generic chemistry and illustrative numbers, no ports, no
+calibrated volumes, no cure recipe belonging to any rig, and **no guarantee it works on your
+hardware as shipped**. It refuses to overwrite an existing catalog. Copy it, then edit your own
+copy under `data/`.
+
+Build or edit a catalog in the GUI's *Process Studio* (Tab 13, the TOMLs) and *Catalogs*
+(Tab 11, the CSVs), or by hand against the schemas in `src/softae/core/task_catalog.py`,
 `recipe_registry.py` and `formulation.py`. A missing catalog file loads as an *empty* catalog
 rather than raising, so the absence surfaces at the first task name a run asks for — the User
-Guide's *Before you start* names both routes and the test that demonstrates it.
+Guide's *Before you start* names the routes and the test that demonstrates it.
 
 ## Project Structure
 

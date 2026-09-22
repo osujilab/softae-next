@@ -58,10 +58,9 @@
 # not in the solution catalog"* — when they are absent); and `data/tasks.toml` to
 # carry `anneal_85C_8h`. Build your own catalog in the Process Studio tab
 # (Tab 13), or copy one from another instance and edit it against your hardware;
-# the catalog-loading tests are not green on a fresh clone by construction. The
-# plan-pin harness compiles this example against COMMITTED fixture catalogs
-# instead (`tests/data/plan_pins/`), which is why its pin reproduces with no
-# `data/` directory at all.
+# the catalog-loading tests are not green on a fresh clone by construction.
+# `softae-catalog init` seeds `data/` with the shipped PLACEHOLDER catalogs — a
+# starting point to edit against your own hardware, never a calibrated one.
 # ─────────────────────────────────────────────────────────────────────────────
 
 name     = "bo_init_bench"

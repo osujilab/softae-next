@@ -9,6 +9,14 @@ Studio (Tab 13, writes the TOMLs) and Catalogs (Tab 11, writes the CSVs), or by 
 file loads as an empty catalog rather than raising, so catalog-loading tests are red on a fresh
 clone by construction.
 
+`softae-catalog init` seeds `data/` with a **placeholder** catalog — the four files, generic
+chemistry, illustrative numbers — so the specs under `examples/` compile and each file's shape
+is visible. It is a demonstration, **not a configuration for any rig**: no ports, no calibrated
+volumes, no cure recipe of anyone's, and no guarantee it runs on your hardware as shipped. It
+refuses to overwrite an existing catalog, naming the file and writing nothing. Copy it, then
+edit your own copy under `data/`. `--dest DIR` seeds somewhere other than the configured data
+root.
+
 ## Contents
 
 1 [Installation](#1-installation) · 2 [Configuration](#2-configuration) · 3 [Launching the GUI](#3-launching-the-gui) ·
@@ -305,6 +313,7 @@ expected maturity emits `method_below_maturity` and continues.
 | `softae-commission` | Acquire and derive the EIS fixture calibration | [§13](#13-softae-commission) |
 | `softae-deposition` | Standalone deposition-twin GUI | [§11](#11-deposition-twin-and-catalogs) |
 | `softae-method` | Method maturity (`status`, `test`, `promote`, `sign-off`, `versions`) | `docs/METHOD_MATURITY_PIPELINE.md` |
+| `softae-catalog` | `init` — seed `data/` with the placeholder catalog, never overwriting | *Before you start*, above |
 | `softae-web` | EIS web visualizer over the DataStore; needs `[web]` | `python -m softae.web --help` |
 | `softae-shadow` | Arm, rehearse and review a shadow campaign | [§15](#15-softae-shadow) |
 | `softae-thickness` | Plan and record an unconfounded thickness series | [§16](#16-softae-thickness) |
@@ -315,15 +324,16 @@ expected maturity emits `method_below_maturity` and continues.
 
 `softae` is an additional `gui_scripts` launcher for the GUI.
 
-**Install state in this venv (2026-09-21).** `softae-env`, `softae-eis-timing` and
-`softae-eis-validate` are registered in `pyproject.toml` but have **no generated `.exe` here**;
-they were added after the last editable install. Re-run `pip install -e .`, or use the module
-form, which resolves either way:
+**Install state in this venv (2026-09-21).** `softae-env`, `softae-eis-timing`,
+`softae-eis-validate` and `softae-catalog` are registered in `pyproject.toml` but have **no
+generated `.exe` here**; they were added after the last editable install. Re-run
+`pip install -e .`, or use the module form, which resolves either way:
 
 ```bash
 python -m softae.tools.env_hold --help        # softae-env
 python -m softae.tools.eis_timing --help      # softae-eis-timing
 python -m softae.tools.eis_validate --help    # softae-eis-validate
+python -m softae.tools.catalog_init --help    # softae-catalog
 python -m softae.tools.shadow_review --help   # softae-shadow — module is shadow_review, not shadow
 ```
 

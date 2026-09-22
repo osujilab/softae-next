@@ -1,0 +1,102 @@
+# PLACEHOLDER task catalog — copy it, then edit your own copy.
+#
+# This file is a DEMONSTRATION, not a configuration for any particular rig. It
+# exists so that a fresh clone can compile the campaign examples under
+# `examples/` and run the test suite without first hand-building a catalog. It
+# is NOT guaranteed to work on your hardware out of the box: the coordinates,
+# flow rates, volumes and durations below are illustrative values, and every
+# instance is expected to replace them with its own.
+#
+#   softae-catalog init     copies this file to `data/tasks.toml`
+#
+# `data/` is untracked by design. Edit the COPY under `data/`, never this file:
+# an edit here changes what every test compiles, and changes nothing on a rig.
+#
+# These four tasks are exactly the ones the committed examples resolve — the
+# `single_drop` deposition recipe's startup / deposit / teardown methods, plus
+# the cure task the ANNEAL phases name. A name an example uses and this file
+# does not hold is refused at compile time (`PlanCompileError`), so the set can
+# be re-derived by deleting an entry and reading the refusal.
+
+[tasks.anneal_85C_8h]
+instrument = "temp_controller"
+method = "anneal"
+timeout_s = 29400.0
+category = "thermal"
+description = "Placeholder cure: ramp, hold, then restore the prior setpoint. timeout_s MUST exceed hold_time_s (hold + ramp + margin)."
+
+[tasks.anneal_85C_8h.params]
+target_temp_C = 85
+hold_time_s = 28800
+ramp_rate = 5
+tolerance = 1.0
+
+[tasks.final_flush]
+instrument = "syringe"
+method = "single_pump"
+category = "liquid_handling"
+description = "Placeholder teardown flush: clear the lines after a run."
+
+[tasks.final_flush.params]
+res_vol = 1000
+ID = 0
+rate = 200
+dispense_vol = 80
+
+[tasks.single_drop_simul]
+instrument = "liquid_handler"
+method = "single_drop_simul"
+timeout_s = 600.0
+category = "liquid_handling"
+description = "Placeholder composite drop-cast at an electrode (all components simultaneous, then an elution wait). x/y are overwritten with the per-channel electrode position at run time."
+
+[tasks.single_drop_simul.params]
+x = 0.0
+y = 0.0
+wick_x = -50.0
+wick_y = -25.0
+ids = [
+    0,
+    1,
+    2,
+]
+disp_rate = 75
+vols = [
+    21,
+    21,
+    21,
+]
+deadvols = [
+    20,
+    20,
+    20,
+]
+res_vol = 10000
+elution_wait_s = 240.0
+wick_dwell_s = 5.0
+time_scale = 1.0
+
+[tasks.startup_flush_full]
+instrument = "liquid_handler"
+method = "startup_flush"
+timeout_s = 900.0
+category = "liquid_handling"
+description = "Placeholder startup prime: move to the flush position, dispense every pump, wick."
+
+[tasks.startup_flush_full.params]
+flush_x = -50.0
+flush_y = 50.0
+wick_x = -50.0
+wick_y = -25.0
+disp_rate = 1500
+disp_vol = 150
+ids = [
+    0,
+    1,
+    2,
+]
+res_vol = 1000
+settle_factor = 1.5
+post_flush_dwell_s = 60.0
+wick_dwell_s = 5.0
+time_scale = 1.0
