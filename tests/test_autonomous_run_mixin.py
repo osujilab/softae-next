@@ -73,11 +73,18 @@ def host(qapp):
 
 @pytest.fixture
 def panel_host(qapp, tmp_path):
-    """A panel-carrying host whose files land in ``tmp_path``, never the data root."""
-    h = _PanelHost(create_mock_manager(config={}),
-                   data_store=SimpleNamespace(project_dir=tmp_path))
+    """A panel-carrying host whose files land in ``tmp_path``, never the data root.
+
+    A real store rather than a stub: the launch digest reads occupancy and the
+    pump loadout from it, so a stub would only prove the digest was skipped.
+    """
+    from softae.core.data_store import DataStore
+
+    store = DataStore(tmp_path / "proj")
+    h = _PanelHost(create_mock_manager(config={}), data_store=store)
     yield h
     h.deleteLater()
+    store.close()
 
 
 def test_a_non_bo_surface_can_host_the_whole_harness(host):
@@ -299,12 +306,24 @@ class TestHandover:
             vol_params=("vol_p0",), pump_ids=(0,), budget=2)
 
     @staticmethod
-    def _arm(host, monkeypatch, *, released=None, spawned=None, lock=None):
+    def _answer_digest(monkeypatch, answer: bool = True) -> list:
+        """Answer the Final-Check modal without entering it; returns what it showed."""
+        shown: list = []
+        monkeypatch.setattr(
+            "softae.gui.widgets.final_check_dialog.show_final_check_dialog",
+            lambda parent, fc: shown.append(fc) or answer)
+        return shown
+
+    @staticmethod
+    def _arm(host, monkeypatch, *, released=None, spawned=None, lock=None,
+             digest=True):
         """Drive the handover synchronously and let nothing reach the rig.
 
         The scheduler is replaced because the real one needs the qasync loop the
-        GUI runs on; the lock reader and the spawn are replaced because this test
-        must not read the operator's live rig lock or start a process.
+        GUI runs on; the lock reader, the spawn and the digest modal are replaced
+        because this test must not read the operator's live rig lock, start a
+        process, or block on a dialog nobody can answer. ``digest=None`` leaves
+        the real modal in place for a test that drives it.
         """
         import asyncio
 
@@ -312,6 +331,8 @@ class TestHandover:
 
         released = [] if released is None else released
         spawned = [] if spawned is None else spawned
+        if digest is not None:
+            TestHandover._answer_digest(monkeypatch, digest)
         monkeypatch.setattr(
             host, "_schedule",
             lambda coro, done: done(asyncio.run(coro) is None))
@@ -366,6 +387,7 @@ class TestHandover:
         async def _disconnect():
             order.append("disconnect")
 
+        self._answer_digest(monkeypatch)
         monkeypatch.setattr(panel_host._manager, "disconnect_all", _disconnect)
         monkeypatch.setattr(
             panel_host, "_schedule",
@@ -499,6 +521,77 @@ class TestHandover:
 
         assert panel_host._hand_over_to_a_detached_campaign(self._spec()) is False
         assert spawned == []
+
+    def test_handover_accepted_digest_spawns_and_was_built_from_this_store(
+        self, panel_host, monkeypatch
+    ):
+        """The digest the operator answers is the one built from this host's store."""
+        spawned: list = []
+        self._arm(panel_host, monkeypatch, spawned=spawned, digest=None)
+        shown = self._answer_digest(monkeypatch)
+
+        assert panel_host._hand_over_to_a_detached_campaign(self._spec()) is True
+
+        assert len(shown) == 1 and shown[0].title == "handover"
+        assert spawned
+
+    def test_handover_declined_digest_does_not_spawn(self, panel_host, monkeypatch):
+        """Declining must cost nothing: no spec written, no head asked, no child."""
+        spawned: list = []
+        self._arm(panel_host, monkeypatch, spawned=spawned, digest=False)
+        head: list = []
+        monkeypatch.setattr(panel_host, "_head_state_after_gate",
+                            lambda: head.append(True) or True)
+
+        assert panel_host._hand_over_to_a_detached_campaign(self._spec()) is False
+
+        assert spawned == [] and head == []
+        assert list((panel_host._project_dir() / "launched").glob("*")) == []
+        assert any("final check" in line for line in panel_host.logs)
+
+    def test_handover_blocking_digest_does_not_spawn_even_when_accepted(
+        self, panel_host, monkeypatch
+    ):
+        """A block is the file and the bench disagreeing; a click does not settle it.
+
+        Driven through the real digest and the real modal loop: the store records
+        a cast on the well this spec targets, and the spec declares no
+        ``electrode_capacity``, so nothing would skip it.
+        """
+        from PySide6.QtWidgets import QDialog
+
+        spawned: list = []
+        self._arm(panel_host, monkeypatch, spawned=spawned, digest=None)
+        panel_host._data_store.record_electrode_cast(
+            panel_host._data_store.current_board_id(), 1)
+        entered: list = []
+        monkeypatch.setattr(
+            QDialog, "exec",
+            lambda self: (entered.append(self), 1)[1], raising=False)
+
+        assert panel_host._hand_over_to_a_detached_campaign(self._spec()) is False
+
+        assert spawned == []
+        assert entered and entered[-1]._btn_proceed.isEnabled() is False
+
+    def test_handover_unbuildable_digest_refuses_rather_than_launching(
+        self, panel_host, monkeypatch
+    ):
+        """A check that could not run must not be spelled like a check that passed."""
+        spawned: list = []
+        self._arm(panel_host, monkeypatch, spawned=spawned)
+        monkeypatch.setattr(
+            "softae.core.final_check.build_final_check",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("catalog gone")))
+        shown: list[str] = []
+        monkeypatch.setattr(
+            QMessageBox, "critical",
+            staticmethod(lambda p, t, text, *a, **k: shown.append(text)))
+
+        assert panel_host._hand_over_to_a_detached_campaign(self._spec()) is False
+
+        assert spawned == []
+        assert shown and "catalog gone" in shown[0]
 
     def test_a_failed_spawn_says_the_instruments_were_released(
         self, panel_host, monkeypatch

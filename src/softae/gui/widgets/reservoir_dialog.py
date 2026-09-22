@@ -33,6 +33,14 @@ from softae.drivers.contracts import N_PUMPS
 #: Shown for a pump whose stock has not been declared.
 _UNDECLARED = "— not declared —"
 
+#: Why the stock combos are dead when the dialog was opened without a store.
+_NO_STORE_NOTE = (
+    "Stock declaration needs a project store, and this window was opened without "
+    "one — the selectors above are disabled. A stock picked here could not be "
+    "saved, so it would be discarded without saying so. Open the dialog from a "
+    "surface that has a project to declare what is loaded."
+)
+
 
 class ReservoirDialog(QDialog):
     """Show remaining stock per pump and let the operator declare a refill."""
@@ -94,6 +102,11 @@ class ReservoirDialog(QDialog):
             stock.currentIndexChanged.connect(
                 lambda _idx, pid=pump_id: self._assign_stock(pid)
             )
+            # Without a store the pick cannot be persisted, and a writable-looking
+            # combo whose selection is dropped is worse than no combo at all.
+            stock.setEnabled(data_store is not None)
+            if data_store is None:
+                stock.setToolTip(_NO_STORE_NOTE)
             self._stock_boxes[pump_id] = stock
 
             row = QWidget()
@@ -109,6 +122,12 @@ class ReservoirDialog(QDialog):
             row_layout.addWidget(declare)
             form.addRow(f"Pump {pump_id}", row)
         layout.addLayout(form)
+
+        self._stock_note = QLabel(_NO_STORE_NOTE)
+        self._stock_note.setWordWrap(True)
+        self._stock_note.setStyleSheet("color: #c0392b;")
+        self._stock_note.setVisible(data_store is None)
+        layout.addWidget(self._stock_note)
 
         self._particulate_note = QLabel()
         self._particulate_note.setWordWrap(True)
@@ -205,8 +224,14 @@ def _pump_list(pumps) -> str:
 
 
 def _solution_names(sol_catalog) -> list:
+    """Names for the stock combos; falls back to the data root like :func:`_catalogs`.
+
+    A caller with no catalog is the ordinary case, and an empty dropdown there
+    reads as "nothing is catalogued" rather than "nobody was asked".
+    """
+    catalog = _catalogs(sol_catalog)[1] if sol_catalog is None else sol_catalog
     try:
-        return list(sol_catalog.list_names()) if sol_catalog is not None else []
+        return list(catalog.list_names())
     except Exception:
         return []
 

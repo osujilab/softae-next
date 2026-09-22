@@ -33,14 +33,17 @@ def _arm_handover(tab, monkeypatch, *, spawned=None, lock=None):
     """Let the handover run end-to-end without touching the rig or the OS.
 
     The scheduler needs the GUI's qasync loop in production, the lock read is the
-    machine's real one, and the spawn starts a process — all three are replaced,
-    and nothing else about the path is.
+    machine's real one, the spawn starts a process, and the Final-Check digest
+    opens a modal nothing here could answer — those four are replaced, and
+    nothing else about the path is. The digest's own refusals are driven in
+    ``tests/test_autonomous_run_mixin.py``.
     """
     import asyncio
 
     import softae.gui.campaign_launch as launch
 
     spawned = [] if spawned is None else spawned
+    monkeypatch.setattr(tab, "_refuse_if_final_check_declined", lambda spec: False)
     monkeypatch.setattr(tab, "_schedule",
                         lambda coro, done: done(asyncio.run(coro) is None))
     monkeypatch.setattr("softae.core.rig_session.release_rig_session",

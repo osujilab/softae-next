@@ -14,13 +14,15 @@ which is the shipped precedent for this handover:
 ======  =====================================================================
 1       prove a spec file can carry this campaign faithfully — a file that
         reloads as a *different* experiment must never start a child
-2       write the spec beside the project
-3       disconnect the instrument sessions, then release the rig claim
-4       refuse to spawn if anything is still connected **or** still claimed
-5       spawn detached, and let go
+2       show the Final-Check digest and take the operator's answer, because
+        the child's copy of that prompt is pre-approved by ``--yes``
+3       write the spec beside the project
+4       disconnect the instrument sessions, then release the rig claim
+5       refuse to spawn if anything is still connected **or** still claimed
+6       spawn detached, and let go
 ======  =====================================================================
 
-Step 4 is the one that earns the split. A launcher that skipped it would start a
+Step 5 is the one that earns the split. A launcher that skipped it would start a
 child that either collides on the ports or is refused the rig lock and dies into
 a log file nobody is watching — and both failures look, from the GUI, exactly
 like a campaign that started.
@@ -57,9 +59,12 @@ class CampaignHandoverMixin:
         1. **Prove the file is the whole spec.** A composition campaign written
            to TOML reloads as a raw-volume one and raises nothing, so an
            unprovable spec is refused *before* anything is written or released.
-        2. **Write it.** The child reads a file, exactly as a terminal run does.
-        3. **Release**: disconnect the sessions, then give the rig claim back.
-        4. **Refuse to spawn if anything is still held.** Two processes on one
+        2. **Show the digest and take the answer.** The child is spawned with
+           ``--yes``, so its own Final-Check prompt approves itself; this is the
+           only place the operator is actually asked.
+        3. **Write it.** The child reads a file, exactly as a terminal run does.
+        4. **Release**: disconnect the sessions, then give the rig claim back.
+        5. **Refuse to spawn if anything is still held.** Two processes on one
            set of ports is the collision the whole lock exists to prevent, and a
            disconnect that failed is precisely when it would happen.
         """
@@ -76,6 +81,12 @@ class CampaignHandoverMixin:
         # file that is not the campaign on screen, including a caller that
         # reached this method by another route.
         if self._refuse_if_spec_is_unwritable(spec):
+            return False
+
+        # Before the head gate, for `_refuse_if_spec_is_unwritable`'s reason: a
+        # launch that is going to be refused must ask for nothing and move
+        # nothing, and the head gate can issue a safety retract.
+        if self._refuse_if_final_check_declined(spec):
             return False
 
         head_up = self._head_state_after_gate()
@@ -315,3 +326,54 @@ class CampaignHandoverMixin:
             + saved,
         )
         return True
+
+    def _refuse_if_final_check_declined(self, spec) -> bool:
+        """``True`` when the digest was declined, blocked, or could not be built.
+
+        The GUI's only chance to ask: ``campaign_run_argv`` appends ``--yes``
+        unconditionally, so the child approves its own copy of this page.
+        """
+        from softae.core.final_check import build_final_check
+        from softae.gui.widgets.final_check_dialog import show_final_check_dialog
+
+        try:
+            digest = build_final_check(
+                spec,
+                data_store=getattr(self, "_data_store", None),
+                task_catalog=_task_catalog_or_none(),
+                source="GUI (written to a spec file on Proceed)",
+            )
+        except Exception as exc:
+            # Not swallowed into a silent launch. The digest is the only thing
+            # comparing this file against the bench, and a launch that skipped it
+            # without saying so is exactly the state it exists to prevent.
+            logger.warning("final_check_build_failed", exc_info=True)
+            self._sig_log.emit(f"✗ Not started — the final check failed: {exc}")
+            QMessageBox.critical(
+                self, "The final check could not be run",
+                f"{exc}\n\nThe check that compares this campaign against the "
+                f"bench did not complete, so nothing was started and the rig "
+                f"was not released.",
+            )
+            return True
+
+        if show_final_check_dialog(self, digest):
+            return False
+
+        self._sig_log.emit(
+            "✗ Not started — the final check was "
+            + ("blocked." if digest.has_block else "declined.")
+            + " Nothing was written and the rig was not released.")
+        return True
+
+
+def _task_catalog_or_none():
+    """The shipped task catalog, or ``None`` — the digest reports its own absence."""
+    try:
+        from softae.config import loader
+        from softae.core.task_catalog import TaskCatalog
+
+        return TaskCatalog.load_toml(loader.tasks_toml_path())
+    except Exception:
+        logger.warning("task_catalog_unavailable_for_final_check", exc_info=True)
+        return None
