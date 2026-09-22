@@ -35,6 +35,9 @@ softae-next.code-workspace
 /data/
 # real experimental results DB at repo root
 softae_results.db
+# a DataStore opened on a mis-resolved project path lands its db in the tree;
+# no softae.db is ever source, wherever it appears
+**/softae.db
 # workflow run logs (*.jsonl)
 logs/
 # ms_plot_*.txt and other run dumps
