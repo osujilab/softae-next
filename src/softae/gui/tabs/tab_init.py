@@ -430,6 +430,18 @@ class InitCalibrationTab(QWidget):
             data_store=self._data_store,
         )
         pos_layout.addWidget(self._pos_map)
+
+        occ_row = QHBoxLayout()
+        self._btn_edit_occupancy = QPushButton("Edit Well Occupancy…")
+        self._btn_edit_occupancy.setToolTip(
+            "Mark wells cast or free by hand — for manual casts and mis-records.")
+        self._btn_edit_occupancy.clicked.connect(self._on_edit_occupancy)
+        occ_row.addWidget(self._btn_edit_occupancy)
+        self._lbl_occupancy_status = QLabel("")
+        occ_row.addWidget(self._lbl_occupancy_status)
+        occ_row.addStretch()
+        pos_layout.addLayout(occ_row)
+
         bottom_splitter.addWidget(pos_grp)
 
         # PCB Configuration
@@ -1061,6 +1073,25 @@ class InitCalibrationTab(QWidget):
         pos_map = getattr(self, "_pos_map", None)
         if pos_map is not None:
             pos_map.refresh_occupancy(board_id)
+
+    def _on_edit_occupancy(self) -> None:
+        """Pop out the manual occupancy editor, then re-read the map from the store."""
+        from softae.gui.widgets.occupancy_editor import OccupancyEditorDialog
+
+        if self._data_store is None:
+            QMessageBox.information(
+                self, "Edit Well Occupancy",
+                "Board occupancy needs a project data store; none is open.")
+            return
+
+        dlg = OccupancyEditorDialog(self, self._data_store)
+        dlg.exec()
+        if dlg.changed_board_id is None:
+            return
+        # No argument: the dialog's own swap button may have moved the board.
+        self.refresh_occupancy()
+        self._lbl_occupancy_status.setText(
+            f"Occupancy updated — board {dlg.changed_board_id}.")
 
     # --- Cleanup ----------------------------------------------------------------
 

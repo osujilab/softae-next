@@ -223,6 +223,48 @@ class TestInitTabCleanup:
         assert not tab._poll_worker.isRunning()
 
 
+class TestEditWellOccupancyHook:
+    """_on_edit_occupancy — null-store guard, dialog wiring, refresh on change.
+
+    OccupancyEditorDialog is patched at its defining module because the slot
+    imports it locally, so the live module attribute is what gets read.
+    """
+
+    _DLG = "softae.gui.widgets.occupancy_editor.OccupancyEditorDialog"
+
+    def test_edit_occupancy_without_store_informs_and_skips_dialog(self, tab):
+        assert tab._data_store is None, "fixture tab is built without a data store"
+        with patch(self._DLG) as dlg_cls, \
+                patch("softae.gui.tabs.tab_init.QMessageBox.information") as info:
+            tab._btn_edit_occupancy.click()  # also covers the clicked->slot wiring
+        info.assert_called_once()
+        dlg_cls.assert_not_called()
+
+    def test_edit_occupancy_changed_board_refreshes_map_and_status(self, tab):
+        tab._data_store = MagicMock()
+        tab.refresh_occupancy = MagicMock()
+        dlg = MagicMock()
+        dlg.changed_board_id = 7
+        with patch(self._DLG, return_value=dlg) as dlg_cls:
+            tab._on_edit_occupancy()
+        dlg_cls.assert_called_once_with(tab, tab._data_store)
+        dlg.exec.assert_called_once()
+        tab.refresh_occupancy.assert_called_once_with()
+        assert "7" in tab._lbl_occupancy_status.text()
+
+    def test_edit_occupancy_cancelled_leaves_map_and_status_untouched(self, tab):
+        tab._data_store = MagicMock()
+        tab.refresh_occupancy = MagicMock()
+        dlg = MagicMock()
+        dlg.changed_board_id = None
+        before = tab._lbl_occupancy_status.text()
+        with patch(self._DLG, return_value=dlg):
+            tab._on_edit_occupancy()
+        dlg.exec.assert_called_once()
+        tab.refresh_occupancy.assert_not_called()
+        assert tab._lbl_occupancy_status.text() == before
+
+
 class TestTablePollWorkerStopWorker:
     def test_table_poll_worker_stop_worker_joins(self, qapp, manager):
         from softae.gui.tabs.tab_init import _TablePollWorker
