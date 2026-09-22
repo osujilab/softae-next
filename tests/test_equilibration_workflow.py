@@ -868,11 +868,39 @@ class TestAgainstTheRealExecutor:
     series. Mock drivers only; nothing here is armed and nothing moves.
     """
 
+    #: The operating point the synthetic cell is measured at, declared here
+    #: rather than drawn by the mock's own lottery.
+    #:
+    #: The shipped mock draws ``R1`` log-uniform in [1e6, 1e9] against its 110 pF
+    #: parallel capacitance, which leaves the cell capacitive right across the
+    #: sweep: its loss tangent sits ~8x BELOW the measured phase floor, so
+    #: ``report.py`` reports sigma as an upper bound (``mode="bound"``, value NaN)
+    #: and ``sigma_S_per_cm`` is stored NULL. That is the engine being correct
+    #: about a spectrum no film produces -- and it is true of EVERY channel
+    #: (1..16 checked), so no choice of ``channels`` avoids it. It is *not* the
+    #: failure this test names: the ``fit_results`` row the run writes under the
+    #: mock's own draw already carries ``model_name = "simpleSalt"`` and all
+    #: three ``electrode_*_cm`` terms, so ``circuit_model`` and the geometry do
+    #: reach the router either way. ``tools/eis_validate_mock.py`` records the
+    #: same finding about the same double -- "the shipped mock cannot exercise
+    #: this tool" -- and answers it the same way, by supplying the spectrum.
+    MOCK_R0_OHM = 5.0e4
+    MOCK_R1_OHM = 2.0e5          # ~2.9e-4 S/cm at this test's electrode geometry
+
     @pytest.mark.asyncio
-    async def test_a_mock_round_lands_a_sigma_that_the_join_reads_back(self, tmp_path):
+    async def test_a_mock_round_lands_a_sigma_that_the_join_reads_back(
+            self, tmp_path, monkeypatch):
         from softae.analysis.equilibration import load_sigma_series
         from softae.core.data_store import DataStore
         from softae.drivers.factory import create_manager
+        from softae.drivers.mock_espico import MockESPico, _synthetic_eis
+
+        def _measurable_spectrum(_self, mscrpath, outdir, chan):
+            """The shipped mock's own generator, at a resolvable operating point."""
+            return [_synthetic_eis(R0=self.MOCK_R0_OHM, R1=self.MOCK_R1_OHM,
+                                   seed=int(chan))]
+
+        monkeypatch.setattr(MockESPico, "sendscript_getdata", _measurable_spectrum)
 
         manager = create_manager(mock=True)
         await manager.connect_all()
