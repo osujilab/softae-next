@@ -133,6 +133,41 @@ class TestElectrodeOccupancy:
             assert ds2.occupied_electrodes(0) == {4}
             assert ds2.current_board_id() == 0
 
+    def test_release_electrode_deletes_and_returns_the_row(self, store: DataStore) -> None:
+        store.record_electrode_cast(0, 3, run_id="r1", iteration=2, sample_uuid="u1")
+        released = store.release_electrode(0, 3)
+        assert released is not None
+        assert released["board_id"] == 0
+        assert released["electrode"] == 3
+        assert released["run_id"] == "r1"
+        assert released["iteration"] == 2
+        assert released["sample_uuid"] == "u1"
+        assert 3 not in store.occupied_electrodes(0)
+
+    def test_release_electrode_absent_well_returns_none_and_leaves_others(
+        self, store: DataStore
+    ) -> None:
+        store.record_electrode_cast(0, 5)
+        assert store.release_electrode(0, 9) is None
+        assert store.occupied_electrodes(0) == {5}
+
+    def test_electrode_occupancy_rows_ordered_with_correct_values(
+        self, store: DataStore
+    ) -> None:
+        store.record_electrode_cast(0, 7, run_id="r2", iteration=1, sample_uuid="u2")
+        store.record_electrode_cast(0, 3, run_id="r1", iteration=2, sample_uuid="u1")
+        rows = store.electrode_occupancy_rows(0)
+        assert [r["electrode"] for r in rows] == [3, 7]
+        assert rows[0]["run_id"] == "r1"
+        assert rows[0]["sample_uuid"] == "u1"
+        assert rows[1]["run_id"] == "r2"
+        assert rows[1]["sample_uuid"] == "u2"
+
+    def test_electrode_occupancy_rows_empty_board_returns_empty_list(
+        self, store: DataStore
+    ) -> None:
+        assert store.electrode_occupancy_rows(1) == []
+
 
 class TestActiveBoardPointer:
     """The board pointer is durable, independent of any cast landing on it."""

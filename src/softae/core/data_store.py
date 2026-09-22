@@ -2257,6 +2257,31 @@ class DataStore:
         )
         self._conn.commit()
 
+    def release_electrode(self, board_id: int, electrode: int) -> dict | None:
+        """Forget one well's cast on ``board_id``; return the row it held, or ``None``."""
+        row = self._conn.execute(
+            "SELECT board_id, electrode, run_id, iteration, cast_at, sample_uuid "
+            "FROM electrode_occupancy WHERE board_id = ? AND electrode = ?",
+            (int(board_id), int(electrode)),
+        ).fetchone()
+        if row is None:
+            return None
+        self._conn.execute(
+            "DELETE FROM electrode_occupancy WHERE board_id = ? AND electrode = ?",
+            (int(board_id), int(electrode)),
+        )
+        self._conn.commit()
+        return dict(row)
+
+    def electrode_occupancy_rows(self, board_id: int) -> list[dict]:
+        """Every recorded cast on ``board_id``, one dict per well, ordered by electrode."""
+        rows = self._conn.execute(
+            "SELECT board_id, electrode, run_id, iteration, cast_at, sample_uuid "
+            "FROM electrode_occupancy WHERE board_id = ? ORDER BY electrode",
+            (int(board_id),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     # ── Queries ─────────────────────────────────────────────────────────
 
     def query_measurements(
