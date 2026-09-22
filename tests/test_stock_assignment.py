@@ -165,6 +165,53 @@ class TestPersistence:
         assert load_loadout(store).by_pump == {0: "Clean IPA"}
 
 
+class TestDeclarationAudit:
+    """The KV row is one mutable cell; the alerts are what give it a history."""
+
+    @staticmethod
+    def _declared(store):
+        return [a for a in store.query_alerts() if a["kind"] == "stock_declared"]
+
+    def test_save_loadout_changed_pump_raises_info_alert(self, tmp_path):
+        from softae.core.data_store import DataStore
+
+        store = DataStore(tmp_path / "t.db")
+        save_loadout(store, PumpLoadout({0: "Clean IPA", 1: "Water rinse"}))
+        save_loadout(store, PumpLoadout({0: "Silica dispersion",
+                                         1: "Water rinse"}))
+
+        swap = [a for a in self._declared(store)
+                if a["details"]["new"] == "Silica dispersion"]
+        assert len(swap) == 1
+        assert swap[0]["severity"] == "info"
+        assert swap[0]["details"] == {"pump": 0, "previous": "Clean IPA",
+                                      "new": "Silica dispersion"}
+
+    def test_save_loadout_unchanged_pump_raises_no_alert(self, tmp_path):
+        from softae.core.data_store import DataStore
+
+        store = DataStore(tmp_path / "t.db")
+        loadout = PumpLoadout({0: "Clean IPA", 1: "Water rinse"})
+        save_loadout(store, loadout)
+        before = len(self._declared(store))
+        save_loadout(store, loadout)
+        assert len(self._declared(store)) == before == 2
+
+    def test_save_loadout_cleared_pump_is_announced(self, tmp_path):
+        """Clearing a line changes what the syringe holds as much as swapping."""
+        from softae.core.data_store import DataStore
+
+        store = DataStore(tmp_path / "t.db")
+        save_loadout(store, PumpLoadout({0: "Clean IPA"}))
+        save_loadout(store, PumpLoadout())
+        cleared = [a for a in self._declared(store) if a["details"]["new"] is None]
+        assert [a["details"]["previous"] for a in cleared] == ["Clean IPA"]
+
+    def test_save_loadout_with_no_store_raises_nothing(self):
+        """The no-store contract is unchanged: it returns before any alert."""
+        save_loadout(None, PumpLoadout({0: "Clean IPA"}))
+
+
 class TestSchedulerIntegration:
     def test_the_scheduler_uses_the_declared_loadout(self, tmp_path, catalogs):
         """End-to-end: declaring stock changes what actually gets purged."""

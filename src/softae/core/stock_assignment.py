@@ -152,10 +152,44 @@ def derive_particulate_pumps(
 
 # ── Persistence ──────────────────────────────────────────────────────────────
 
+def _announce_changes(previous: dict[int, str], current: dict[int, str],
+                      data_store: Any) -> None:
+    """One INFO alert per *changed* pump — the declaration's audit trail.
+
+    The KV row is a single mutable cell, so a declaration overwritten at the
+    bench leaves nothing behind saying what used to be there. The alerts give it
+    a **history**, which is what makes the loadout usable as the fallback when a
+    run's recorded stock names are later disputed.
+
+    Unchanged pumps say nothing: an alert per save would be a log of writes, not
+    a record of declarations, and a reader could no longer tell a re-save from a
+    swap. Never raises — an audit record must not become the failure.
+    """
+    from softae.core.alerts import INFO, Alert, raise_alert
+
+    for pump in sorted(set(previous) | set(current)):
+        before, after = previous.get(pump), current.get(pump)
+        if before == after:
+            continue
+        raise_alert(
+            Alert(
+                kind="stock_declared",
+                severity=INFO,
+                message=(
+                    f"Pump {pump} stock declared: "
+                    f"{before or 'undeclared'} → {after or 'undeclared'}."
+                ),
+                details={"pump": pump, "previous": before, "new": after},
+            ),
+            data_store=data_store,
+        )
+
+
 def save_loadout(data_store: Any, loadout: PumpLoadout) -> None:
     """Persist the pump→solution map. Durable, not per-session."""
     if data_store is None:
         return
+    previous = load_loadout(data_store).by_pump
     try:
         payload = json.dumps({str(k): v for k, v in loadout.by_pump.items()})
         data_store._kv_set_text(_LOADOUT_KEY, payload)
@@ -163,6 +197,10 @@ def save_loadout(data_store: Any, loadout: PumpLoadout) -> None:
         logger.warning("pump_loadout_persist_failed", exc_info=True)
         return
     logger.info("pump_loadout_saved", loadout=loadout.describe())
+    try:
+        _announce_changes(previous, dict(loadout.by_pump), data_store)
+    except Exception:
+        logger.warning("pump_loadout_alert_failed", exc_info=True)
 
 
 def load_loadout(data_store: Any = None) -> PumpLoadout:

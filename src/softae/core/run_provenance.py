@@ -8,6 +8,10 @@ happening not to have moved.
 ``provenance.json`` closes that: schema version, the canonical spec dict, one
 representative compiled workflow, the catalog digests, the config hash and the
 code revision — written once per run, atomically, next to ``events.jsonl``.
+A campaign that names stocks also records **which stock sat on which pump**, in
+both directions and with the record that said so, so the chemistry a run cast is
+answerable from the run directory rather than by joining a spec to a bench
+declaration that has since been overwritten.
 
 Writing it must never cost a run: an I/O failure is logged and reported by a
 ``None`` return, while a bad argument still raises so a wiring mistake is not
@@ -36,7 +40,9 @@ from softae.core.catalog_digest import (
 logger = structlog.get_logger(__name__)
 
 #: Bumped whenever the document's key set or meaning changes.
-SCHEMA_VERSION = 1
+#: 2 — an optional ``stocks`` block: which stock the run resolved onto which
+#: pump, in both directions, and which record said so.
+SCHEMA_VERSION = 2
 
 #: Written into the run directory, beside ``events.jsonl``.
 PROVENANCE_FILENAME = "provenance.json"
@@ -132,12 +138,19 @@ def build_run_provenance(
     tasks: Any,
     chemicals: Any = None,
     solutions: Any = None,
+    stocks: Any = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The provenance document, as a plain dict, without touching the disk.
 
     Separate from the write so a caller can inspect or log the document, and so
     the tests can prove the content and the I/O contract independently.
+
+    *stocks* is a
+    :class:`~softae.core.stock_resolution.ResolvedStocks`, and **its absence is
+    written as absence**: a campaign that names no stocks gets no ``stocks``
+    key, never an empty map. An empty map would read as "resolved, and nothing
+    was on any pump", which is a claim about the bench that nothing here made.
     """
     config_hash, config_hash_reason = _config_hash()
     document: dict[str, Any] = {
@@ -155,6 +168,8 @@ def build_run_provenance(
             "package_version": softae.__version__,
         },
     }
+    if stocks is not None and not getattr(stocks, "is_empty", True):
+        document["stocks"] = canonical(stocks.to_record())
     if extra:
         document["extra"] = canonical(extra)
     return document
@@ -191,6 +206,7 @@ def write_run_provenance(
     tasks: Any,
     chemicals: Any = None,
     solutions: Any = None,
+    stocks: Any = None,
     run_id: str | None = None,
     extra: dict[str, Any] | None = None,
 ) -> Path | None:
@@ -205,7 +221,7 @@ def write_run_provenance(
         run_id=run_id if run_id is not None else directory.name,
         spec=spec, workflow=workflow,
         tasks=tasks, chemicals=chemicals, solutions=solutions,
-        extra=extra,
+        stocks=stocks, extra=extra,
     )
     text = dumps(document)
     path = directory / PROVENANCE_FILENAME

@@ -34,6 +34,9 @@ PROMISED_KEYS = {
     "code_revision", "notes",
 }
 
+#: Three stocks the shipped solution catalog knows, on three pumps.
+STOCKS = ["5wt% 20k PEO stock", "10 wt% silica solution", "LiCl 10M"]
+
 
 # ── In-memory inputs ─────────────────────────────────────────────────────────
 
@@ -66,6 +69,29 @@ def _workflow() -> Workflow:
                     loop_steps=[loop], teardown=[teardown], iterations=2,
                     iterate_over="channels",
                     metadata={"derived": object()})
+
+
+def _formulation_spec(monkeypatch):
+    """A three-stock campaign decoded against the shipped placeholder catalogs."""
+    from softae.core.campaign_spec_io import spec_from_dict
+    from tests.support.fixture_catalog import use_default_chemistry
+
+    use_default_chemistry(monkeypatch)
+    return spec_from_dict({
+        "name": "provenance_probe",
+        "channels": [1, 2],
+        "budget": 2,
+        "optimizer": "grid",
+        "parameter_space": {"replicate": {"type": "int", "low": 1, "high": 2}},
+        "general_formulation": {
+            "stocks": STOCKS,
+            "pump_assignment": {name: i for i, name in enumerate(STOCKS)},
+            "target_deposition_uL": 4.5,
+            "axes": [{"kind": "molar_ratio", "a": "Ethylene oxide",
+                      "b": "Lithium chloride", "low": 20.0, "high": 20.0,
+                      "basis": "volume"}],
+        },
+    }, source="<test>")
 
 
 def _write(run_dir: Path, **overrides) -> Path | None:
@@ -140,6 +166,41 @@ def test_write_run_provenance_code_revision_is_null_with_a_reason(tmp_path) -> N
 def test_write_run_provenance_file_ends_with_a_newline(tmp_path) -> None:
     """A trailing newline keeps the file well-formed for line-oriented tools."""
     assert _write(tmp_path / "run").read_text(encoding="utf-8").endswith("}\n")
+
+
+# ── Stocks ───────────────────────────────────────────────────────────────────
+
+def test_provenance_records_stocks_by_pump_and_by_name(monkeypatch, tmp_path) -> None:
+    """Both directions plus the record that said so, so a name stays checkable."""
+    from softae.core.stock_assignment import PumpLoadout
+    from softae.core.stock_resolution import resolve_stocks
+
+    spec = _formulation_spec(monkeypatch)
+    resolved = resolve_stocks(spec, PumpLoadout({0: STOCKS[0]}), None)
+    loaded = json.loads(
+        _write(tmp_path / "run", spec=spec, stocks=resolved)
+        .read_text(encoding="utf-8"))
+    assert loaded["stocks"]["source"] == "spec"
+    assert loaded["stocks"]["by_pump"] == {str(i): n for i, n in enumerate(STOCKS)}
+    assert loaded["stocks"]["by_name"][STOCKS[2]] == 2
+    assert loaded["stocks"]["undeclared"] == [1, 2]
+
+
+def test_provenance_without_formulation_omits_stocks(monkeypatch, tmp_path) -> None:
+    """Absence is absence: an empty map would claim the pumps were read as bare."""
+    from softae.core.stock_resolution import resolve_stocks
+
+    resolved = resolve_stocks(_spec(), None, None)
+    loaded = json.loads(
+        _write(tmp_path / "run", stocks=resolved).read_text(encoding="utf-8"))
+    assert "stocks" not in loaded
+    assert set(loaded) == PROMISED_KEYS
+
+
+def test_provenance_stocks_absent_by_default(tmp_path) -> None:
+    """The control for the arm above: not passing stocks is the same absence."""
+    assert "stocks" not in json.loads(
+        _write(tmp_path / "run").read_text(encoding="utf-8"))
 
 
 # ── Workflow serialisation ───────────────────────────────────────────────────
