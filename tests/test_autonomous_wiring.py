@@ -19,10 +19,13 @@ from softae.core.autonomous_wiring import (
     build_batch_trial_workflow,
     build_optimizer,
     build_trial_workflow,
+    campaign_spec_fingerprint,
     composition_target_objective,
     deposit_step_name,
     eis_impedance_objective_for_channel,
     measure_step_name,
+    optimizer_tuning_identity,
+    resolve_optimizer_tuning,
     run_autonomous_campaign,
 )
 from softae.core.data_store import DataStore
@@ -467,6 +470,129 @@ def test_prior_mean_ignored_warned_for_non_bayesian():
         opt = build_optimizer(_spec(optimizer="grid", prior_mean=lambda p: 0.0))
     assert isinstance(opt, GridSearchOptimizer)
     assert any(e.get("event") == "prior_mean_ignored" for e in logs)
+
+
+# ── T11.58 — n_initial as the eighth tuning knob ─────────────────────────────
+#
+# The warm-up length used to be the SOLE literal in `build_optimizer`'s bayesian
+# call, `min(5, budget)`. These pin the three things that made that a problem:
+# it is now stated rather than derived, it reaches the resume fingerprint, and a
+# stated value is no longer clamped into silence by the same `min()` that spells
+# an init-phase dry run and a mis-set campaign identically.
+
+@pytest.fixture
+def no_site_defaults(monkeypatch):
+    """Silence the TOML layer so a test measures the spec field alone.
+
+    The shipped ``[optimizer]`` section carries no ``n_initial`` key today, so
+    these tests would pass without this — which is exactly why it is here: a site
+    default landing later must not quietly retune what these assert.
+    """
+    monkeypatch.setattr(loader, "optimizer_tuning", lambda: {})
+    monkeypatch.setattr(loader, "feasibility_config", lambda: {})
+
+
+WARMUP_EVENT = "optimizer_warmup_spans_entire_budget"
+
+
+def _warmup_events(spec) -> list[dict]:
+    """Build *spec*'s optimizer, returning only the warm-up-span log records."""
+    import structlog
+    with structlog.testing.capture_logs() as logs:
+        build_optimizer(spec)
+    return [e for e in logs if e.get("event") == WARMUP_EVENT]
+
+
+@pytest.mark.parametrize("budget,expected", [(6, 5), (5, 5), (3, 3), (1, 1)])
+def test_resolve_optimizer_tuning_n_initial_unset_is_todays_min_of_five_and_budget(
+        budget, expected, no_site_defaults):
+    """Unset keeps the pre-T11.58 literal exactly — no new magic number."""
+    assert resolve_optimizer_tuning(_spec(budget=budget))["n_initial"] == expected
+
+
+@pytest.mark.parametrize("budget,expected", [(6, 5), (3, 3)])
+def test_build_optimizer_n_initial_unset_matches_the_pre_t11_58_literal(
+        budget, expected, no_site_defaults):
+    opt = build_optimizer(_spec(optimizer="bayesian", budget=budget))
+    assert opt._n_initial == expected == min(5, budget)
+
+
+def test_build_optimizer_threads_an_explicit_n_initial_verbatim(no_site_defaults):
+    opt = build_optimizer(_spec(optimizer="bayesian", budget=6, n_initial=2))
+    assert opt._n_initial == 2
+
+
+def test_an_explicit_n_initial_above_budget_reaches_the_optimizer_unclamped(
+        no_site_defaults):
+    """The ruling's substance: `min()` must not repair a stated value.
+
+    Clamping to 6 here would make a deliberate all-warm-up run indistinguishable
+    from a campaign that set the warm-up too long.
+    """
+    opt = build_optimizer(_spec(optimizer="bayesian", budget=6, n_initial=9))
+    assert opt._n_initial == 9
+
+
+def test_a_site_default_supplies_n_initial_when_the_spec_is_silent(monkeypatch):
+    monkeypatch.setattr(loader, "optimizer_tuning", lambda: {"n_initial": 3})
+    monkeypatch.setattr(loader, "feasibility_config", lambda: {})
+    assert build_optimizer(_spec(optimizer="bayesian", budget=6))._n_initial == 3
+
+
+def test_the_spec_field_beats_the_site_default(monkeypatch):
+    monkeypatch.setattr(loader, "optimizer_tuning", lambda: {"n_initial": 3})
+    monkeypatch.setattr(loader, "feasibility_config", lambda: {})
+    opt = build_optimizer(_spec(optimizer="bayesian", budget=6, n_initial=4))
+    assert opt._n_initial == 4
+
+
+def test_a_warmup_spanning_the_whole_budget_is_announced(no_site_defaults):
+    events = _warmup_events(_spec(optimizer="bayesian", budget=6, n_initial=9))
+    assert len(events) == 1
+    assert events[0]["n_initial"] == 9
+    assert events[0]["budget"] == 6
+    assert events[0]["campaign"] == "test_campaign"
+    assert "no surrogate model" in events[0]["detail"]
+
+
+def test_a_warmup_exactly_equal_to_budget_is_announced(no_site_defaults):
+    """`>=`, not `>`: at equality the last ask is still index budget-1 < budget."""
+    assert len(_warmup_events(_spec(optimizer="bayesian", budget=6, n_initial=6))) == 1
+
+
+def test_an_all_warmup_dry_run_is_announced_even_with_n_initial_unset(
+        no_site_defaults):
+    """`examples/bo_init_bench.toml`'s shape: budget 4, nothing stated.
+
+    The default resolves to `min(5, 4) = 4`, so the whole run is warm-up and the
+    file's premise holds — and is now said out loud rather than inferred from
+    arithmetic in a comment.
+    """
+    assert len(_warmup_events(_spec(optimizer="bayesian", budget=4))) == 1
+
+
+def test_a_warmup_shorter_than_budget_is_not_announced(no_site_defaults):
+    """The check can fail in both directions — a real campaign stays quiet."""
+    assert _warmup_events(_spec(optimizer="bayesian", budget=6)) == []
+    assert _warmup_events(_spec(optimizer="bayesian", budget=20, n_initial=5)) == []
+
+
+def test_n_initial_contributes_to_the_resume_fingerprint_when_set():
+    """A run that warms up for 8 trials is not the run that warmed up for 5."""
+    assert optimizer_tuning_identity(_spec(n_initial=8)) == {"n_initial": 8}
+    assert campaign_spec_fingerprint(_spec(n_initial=8)) != \
+        campaign_spec_fingerprint(_spec())
+
+
+def test_n_initial_left_unset_contributes_no_key_at_all():
+    """Omission is the mechanism: an eighth defaulted key would rehash every
+    in-flight checkpoint and blame a warm-up nobody changed."""
+    assert optimizer_tuning_identity(_spec()) is None
+    # And it is genuinely OMITTED rather than defaulted in: a spec that sets a
+    # *different* knob contributes that one alone. (A `min(5, budget)` resolved
+    # into the payload would show up here as a second key.)
+    assert optimizer_tuning_identity(_spec(decision_rtol=0.25)) == \
+        {"decision_rtol": 0.25}
 
 
 # ── End-to-end campaign ──────────────────────────────────────────────────────

@@ -530,7 +530,7 @@ class CampaignSpec:
 
     #: ── Optimizer tuning (T1.3 knobs, reachable since T3.1; + T3.1's own) ──
     #:
-    #: All seven are **sentinel-defaulted**, not value-defaulted, so "unset" and
+    #: All eight are **sentinel-defaulted**, not value-defaulted, so "unset" and
     #: "explicitly set to the shipped default" stay distinct — the T2.4 shim
     #: mechanism. That distinction is what lets `build_optimizer` honour a TOML
     #: site default only when the campaign did not speak, and what keeps a spec
@@ -550,6 +550,27 @@ class CampaignSpec:
     feasibility_min_filter: bool = SPEC_UNSET     # type: ignore[assignment]
     feasibility_min_infeasible: int = SPEC_UNSET  # type: ignore[assignment]
     feasibility_min_feasible: int = SPEC_UNSET    # type: ignore[assignment]
+    #: T11.58. The Bayesian optimizer's WARM-UP length: the number of asks served
+    #: by `_random_point()` before the GP is fit at all (`BayesianOptimizer._propose`
+    #: takes the warm-up branch while `len(history) < n_initial`). Per the
+    #: 2026-09-04 standing MO the warm-up is **history-independent** — it runs
+    #: batch-shaped regardless of campaign mode — so its length is a property of
+    #: the campaign, not of the round structure, and belongs here beside the other
+    #: search knobs rather than being derived at the call site.
+    #:
+    #: Before T11.58 there was no field and `build_optimizer` passed the literal
+    #: `min(5, budget)` — the sole literal in that call. That tied the warm-up to
+    #: `budget` with no lever and no record: changing `budget` silently changed the
+    #: warm-up, and since nothing entered the resume fingerprint, a resumed run
+    #: could warm up for a different number of trials than the run it resumed.
+    #:
+    #: `SPEC_UNSET` preserves that behaviour EXACTLY — `resolve_optimizer_tuning`
+    #: defaults this to `min(5, spec.budget)`, today's literal moved intact into
+    #: the resolver, so no new magic number is introduced here. A value that IS
+    #: stated (spec field or `[optimizer] n_initial`) reaches the optimizer
+    #: **uncapped**: see `build_optimizer` for why `min()` must not clamp a stated
+    #: value, and what is emitted instead.
+    n_initial: int = SPEC_UNSET                   # type: ignore[assignment]
 
     def resolved_vol_params(self) -> tuple[str, ...]:
         """Volume-driving param names, defaulting to the whole space in order."""
@@ -767,12 +788,13 @@ def campaign_spec_fingerprint(spec: "CampaignSpec") -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
-#: The seven optimizer-tuning fields T1.3 and T3.1 added. Order is irrelevant
-#: (the payload is hashed sorted); membership is what matters.
+#: The eight optimizer-tuning fields T1.3, T3.1 and T11.58 added. Order is
+#: irrelevant (the payload is hashed sorted); membership is what matters.
 _OPTIMIZER_TUNING_FIELDS = (
     "decision_rtol", "exclusion_radius",
     "learned_feasibility", "feasibility_strategy", "feasibility_min_filter",
     "feasibility_min_infeasible", "feasibility_min_feasible",
+    "n_initial",
 )
 
 
@@ -781,7 +803,7 @@ def optimizer_tuning_identity(spec: "CampaignSpec") -> dict[str, Any] | None:
 
     **Returns ``None`` — contributing no key at all — for any spec that does not
     mention them**, which is every spec expressible before T3.1. That omission is
-    the mechanism, not an oversight: seven defaulted keys in the hashed payload
+    the mechanism, not an oversight: eight defaulted keys in the hashed payload
     would have rehashed every campaign in existence and made every in-flight
     checkpoint unresumable, blaming a parameter space nobody touched. Same rule
     :func:`~softae.core.measurement_spec.measurement_identity` follows for a
@@ -914,13 +936,21 @@ def _site_default(section: str) -> dict[str, Any]:
 
 
 def resolve_optimizer_tuning(spec: CampaignSpec) -> dict[str, Any]:
-    """Settle the seven tuning knobs. **The sole resolution point** (§8).
+    """Settle the eight tuning knobs. **The sole resolution point** (§8).
 
     Precedence: an explicitly-set ``CampaignSpec`` field beats the TOML site
     default, which beats the constructor default. "Explicitly set" is identity
     against :data:`SPEC_UNSET`, not equality against a value, so a campaign that
     deliberately pins ``decision_rtol = 0.0`` keeps it even under a site default
     that turned it on.
+
+    ``n_initial`` (T11.58) is the one knob whose *constructor* default depends on
+    the spec: it is ``min(5, spec.budget)``, which is the literal
+    :func:`build_optimizer` used to pass directly. Keeping the budget-awareness
+    **here**, in the fallback, rather than at the call site is what lets a stated
+    value through uncapped while leaving an unstated one bit-for-bit as before —
+    the clamp only ever applied to the case where nobody said anything, and that
+    is the only case in which there is no intent for it to override.
 
     The coherence condition the restructuring spec asks for is **not** "one
     source" but "one resolution point" — two sources are fine, and are what
@@ -938,6 +968,8 @@ def resolve_optimizer_tuning(spec: CampaignSpec) -> dict[str, Any]:
     return {
         "decision_rtol": float(
             pick("decision_rtol", "decision_rtol", toml_opt, 0.0) or 0.0),
+        "n_initial": int(
+            pick("n_initial", "n_initial", toml_opt, min(5, spec.budget))),
         "exclusion_radius": pick(
             "exclusion_radius", "exclusion_radius", toml_opt, None),
         "feasibility": FeasibilityConfig(
@@ -978,9 +1010,22 @@ def build_optimizer(spec: CampaignSpec) -> BaseOptimizer:
         )
     if kind == "bayesian":
         tuning = resolve_optimizer_tuning(spec)
+        # T11.58. Passed UNCAPPED, deliberately. `min(5, budget)` used to sit
+        # here and clamp every value, stated or not — and a clamp spells an
+        # init-phase dry run (whose whole point is that the budget is spent
+        # before the GP is ever fit; see `examples/bo_init_bench.toml`) exactly
+        # the way it spells a real campaign that set the warm-up too long. The
+        # condition is named instead of repaired, so the log distinguishes them.
+        n_initial = tuning["n_initial"]
+        if n_initial >= spec.budget:
+            logger.warning("optimizer_warmup_spans_entire_budget",
+                           campaign=spec.name, n_initial=n_initial,
+                           budget=spec.budget,
+                           detail="every trial is a random warm-up draw; "
+                                  "no surrogate model will ever be fit")
         return BayesianOptimizer(
             spec.parameter_space, spec.objective, spec.seed,
-            n_initial=min(5, spec.budget),
+            n_initial=n_initial,
             acquisition=spec.acquisition,
             kappa=spec.kappa,
             prior_mean=spec.prior_mean,
@@ -3671,6 +3716,29 @@ async def run_autonomous_campaign(
                 emit("maturity_warning", **w)
         except Exception:
             logger.warning("maturity_check_skipped", exc_info=True)
+
+        # What this run compiled: the spec, one representative trial workflow
+        # (the parameter-space midpoint, as the projection builds) and the
+        # catalogs it resolved against. Best-effort, like the guard above.
+        try:
+            from softae.core.campaign_spec_fields import catalogs as _chem_catalogs
+            from softae.core.run_provenance import write_run_provenance
+
+            _mid = {
+                p: ((float(d["low"]) + float(d["high"])) / 2.0
+                    if d.get("type") in ("float", "int")
+                    else (d.get("choices") or [None])[0])
+                for p, d in (spec.parameter_space or {}).items()
+            }
+            _chems, _sols = _chem_catalogs()
+            write_run_provenance(
+                data_store.run_dir(run_id),
+                spec=spec,
+                workflow=build_trial_workflow(spec, _mid, catalog=catalog),
+                tasks=catalog, chemicals=_chems, solutions=_sols,
+            )
+        except Exception:
+            logger.warning("run_provenance_skipped", exc_info=True)
 
         # Adapt this module's (results, params) extractors to the loop's
         # single-arg signature by capturing the latest suggestion. The metric was
