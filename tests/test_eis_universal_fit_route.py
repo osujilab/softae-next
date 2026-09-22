@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import math
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -736,23 +737,68 @@ def test_cell_constant_sigma_does_not_call_z_to_sigma_so_the_parity_oracle_stays
                     <= math.ulp(legacy)
 
 
+#: The three spellings the guide must never *teach*. Prose may still name them — §7
+#: documents them as deprecated, which is the opposite of teaching them — so every
+#: check below reads fenced ``python`` blocks only, never the surrounding text.
+DEPRECATED_SIGMA_SPELLINGS = ("z_to_sigma", "fit.sigma(", "fit_circuit(")
+
+
+def _python_blocks(markdown: str) -> str:
+    """Every ```python fence in *markdown*, joined into one scannable string.
+
+    Joining matters: §7 holds **two** blocks and the first is the ``EISResult`` loader,
+    not the conductivity example. Reading only the first block — what this test used to
+    do — would scan the wrong half and pass without ever seeing the example.
+    """
+    return "\n".join(re.findall(r"```python\n(.*?)```", markdown, re.S))
+
+
+def _guide_section(markdown: str, heading_text: str) -> str:
+    """The body under the first *heading* containing ``heading_text``, to the next ``##``.
+
+    Anchored on the heading's **text** and on the leading ``#``, not on its number:
+    "## 7." renumbers whenever a section is inserted above it, and a bare
+    ``split(heading_text)`` matches the Contents line first — the table of contents
+    links every section by name, so the naive split silently returns the tail of the
+    TOC, which holds no code at all.
+    """
+    heading = re.search(rf"^#+ .*{re.escape(heading_text)}", markdown, re.M)
+    assert heading is not None, f"USER_GUIDE.md has no heading naming {heading_text!r}"
+    body = markdown[heading.end():]
+    following = re.search(r"^## ", body, re.M)
+    return body[: following.start()] if following else body
+
+
 def test_the_user_guide_conductivity_example_does_not_teach_the_deprecated_route():
     """A worked example teaches faster than a deprecation retires.
 
     ``USER_GUIDE.md`` presented ``fit_circuit`` + ``z_to_sigma`` (and ``fit.sigma(...)``)
     as *the* way to obtain conductivity. Left alone it would re-seed the pattern into
     every reader who follows it.
+
+    Two halves. The **section** half pins that the conductivity example teaches the
+    engine route positively; the **guide-wide** half pins that no other worked example
+    anywhere quietly re-seeds a deprecated spelling, which is the hole a section-scoped
+    check leaves open — the example can move to another section and take the pattern
+    with it. Each half asserts it found code to scan first: an anchor that silently
+    matched nothing would report "no deprecated call here" about an empty string.
     """
     guide = (REPO / "docs" / "USER_GUIDE.md").read_text(encoding="utf-8")
-    block = guide.split("### Circuit Fitting", 1)[1].split("### Available Models", 1)[0]
-    code = block.split("```python", 1)[1].split("```", 1)[0]
 
-    assert "z_to_sigma" not in code
-    assert "fit.sigma(" not in code
-    assert "fit_circuit(" not in code
+    code = _python_blocks(_guide_section(guide, "EIS analysis API"))
+    assert code.strip(), "the EIS analysis API section holds no python code to check"
+
+    for spelling in DEPRECATED_SIGMA_SPELLINGS:
+        assert spelling not in code
     assert "analyze_spectrum(" in code
     assert "report.sigma.mode" in code                # the unavailable case is taught
     assert "engine" in code                           # …and so is who chooses it
+
+    guide_wide = _python_blocks(guide)
+    assert guide_wide.strip(), "USER_GUIDE.md holds no python code blocks at all"
+    for spelling in DEPRECATED_SIGMA_SPELLINGS:
+        assert spelling not in guide_wide, (
+            f"a python example somewhere in USER_GUIDE.md teaches {spelling!r}")
 
 
 # ── Stage B: the two files afl-session held ──────────────────────────────────
