@@ -25,8 +25,13 @@ so they now cross the boundary through :mod:`softae.core.campaign_spec_fields`.
 load-bearing in a way nothing said out loud: a file could not describe an
 anneal or an equilibrate phase, so **every TOML campaign ran pointwise
 formulate→measure**. It crosses through
-:mod:`softae.core.campaign_spec_run_plan`. Everything genuinely unrepresentable
-still raises.
+:mod:`softae.core.campaign_spec_run_plan`.
+
+``piezo`` was the fifth and the last, in the same shape: the plan is wired
+end-to-end in Python and built from config by the HT tab, so a file was the only
+surface that could not ask for it — and **no file-driven campaign ever actuated
+the piezo**. It crosses through :mod:`softae.core.campaign_spec_fields` beside
+``general_formulation``. Everything genuinely unrepresentable still raises.
 
 Example::
 
@@ -91,10 +96,13 @@ class SpecLoadError(Exception):
 #: structural rather than cosmetic: **no file-driven campaign could carry a run
 #: plan, so every TOML campaign ran pointwise formulate→measure with no anneal
 #: phase at all.** It is an ``OBJECT_FIELDS`` entry now
-#: (:mod:`softae.core.campaign_spec_run_plan`).
+#: (:mod:`softae.core.campaign_spec_run_plan`). ``piezo`` left for the same
+#: reason and with the same shape of consequence — a plan wired end-to-end in
+#: Python that no file could ask for, so **no file-driven campaign ever actuated
+#: the piezo** — and is an ``OBJECT_FIELDS`` entry now too
+#: (:mod:`softae.core.campaign_spec_fields`).
 _UNSUPPORTED = {
     "formulation": "a FormulationContext object",
-    "piezo": "a PiezoPlan object",
 }
 
 #: Top-level array naming fields the file sets to **nothing**.

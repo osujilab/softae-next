@@ -202,3 +202,252 @@ class TestTheConditionsFieldIsRegistered:
         with pytest.raises(SpecLoadError) as exc:
             spec_from_dict({**MINIMAL, "conditions": {"name": "baseline"}})
         assert "unknown field(s) ['conditions']" in str(exc.value)
+
+
+# ────────────────────────────── the [piezo] codec ────────────────────────────
+#
+# ``piezo`` was the last field ``_UNSUPPORTED`` refused outright, in the shape
+# ``run_plan`` was in before it got a codec: ``PiezoPlan`` is wired end-to-end in
+# Python and built from config by the HT tab, so a *file* was the only surface
+# that could not ask for it — and no file-driven campaign ever actuated the piezo.
+# The codec lives in ``campaign_spec_fields`` (six flat primitives, no module of
+# its own), so its tests live beside the other ``OBJECT_FIELDS`` round trips here.
+
+PIEZO_PCB = {"grid": [8, 4], "spacing_mm": [10, 10]}
+
+
+def _piezo_codec():
+    from softae.core.campaign_spec_fields import OBJECT_FIELDS
+
+    return OBJECT_FIELDS["piezo"]
+
+
+def _piezo_catalog():
+    """Enough catalog to compile a single-drop cast with the piezo enabled."""
+    from softae.core.task_catalog import Task, TaskCatalog
+
+    cat = TaskCatalog()
+    for name in ("startup_flush_full", "single_drop_simul", "final_flush"):
+        cat.add(Task(name=name, instrument="liquid_handler", method=name,
+                     params={"x": 0, "y": 0, "vols": [1, 1, 1],
+                             "disp_rate": 75}))
+    cat.add(Task(name="piezo_channel_a_on", instrument="piezo",
+                 method="set_channel", params={"channel": "A", "enabled": True}))
+    cat.add(Task(name="piezo_channel_a_off", instrument="piezo",
+                 method="set_channel", params={"channel": "A", "enabled": False}))
+    cat.add(Task(name="piezo_standby", instrument="piezo", method="standby",
+                 params={}))
+    return cat
+
+
+class TestThePiezoFieldIsRegistered:
+
+    def test_spec_io_piezo_is_no_longer_refused_outright(self):
+        """The whole defect, in one assertion: a file may now name it."""
+        from softae.core.campaign_spec_fields import OBJECT_FIELDS
+        from softae.core.campaign_spec_io import _UNSUPPORTED
+
+        assert "piezo" not in _UNSUPPORTED
+        assert "piezo" in OBJECT_FIELDS
+
+    def test_spec_io_piezo_keys_cover_every_field_but_event_params(self):
+        """The seam that makes a future ``PiezoPlan`` field go red, not silent.
+
+        ``_PIEZO_KEYS`` is written out rather than derived, so a field added to
+        the dataclass would be refused as an unknown key until the codec learns
+        it. That is the intended direction — but only if somebody is told. This
+        test is the telling.
+        """
+        from dataclasses import fields as dataclass_fields
+
+        from softae.core.campaign_spec_fields import _PIEZO_KEYS
+        from softae.core.deposition_recipe import PiezoPlan
+
+        declared = {f.name for f in dataclass_fields(PiezoPlan)}
+        assert declared == set(_PIEZO_KEYS) | {"event_params"}
+
+
+class TestThePiezoRoundTrip:
+
+    def test_spec_io_piezo_default_plan_writes_only_what_was_chosen(self):
+        """An enabled plan at every other default is one key, not six."""
+        from softae.core.deposition_recipe import PiezoPlan
+
+        codec, plan = _piezo_codec(), PiezoPlan(enabled=True)
+
+        assert codec.encode(plan) == {"enabled": True}
+        assert codec.decode(codec.encode(plan)) == plan
+
+    def test_spec_io_piezo_every_field_non_default_round_trips(self):
+        from softae.core.deposition_recipe import PiezoPlan
+
+        codec = _piezo_codec()
+        plan = PiezoPlan(
+            enabled=True, on_task="ch_b_on", off_task="ch_b_off",
+            standby_task="ch_b_standby", event_task="piezo_liquid_event",
+            elution_scope="all_elution")
+
+        table = codec.encode(plan)
+
+        assert table == {
+            "enabled": True, "on_task": "ch_b_on", "off_task": "ch_b_off",
+            "standby_task": "ch_b_standby", "event_task": "piezo_liquid_event",
+            "elution_scope": "all_elution"}
+        assert codec.decode(table) == plan
+
+    def test_spec_io_piezo_a_spec_carrying_a_plan_is_reported_complete(self):
+        """The write half: a file may now stand in for a piezo campaign."""
+        from softae.core.campaign_spec_io import (
+            spec_to_dict,
+            spec_toml_completeness,
+        )
+
+        spec = spec_from_dict({**MINIMAL, "piezo": {
+            "enabled": True, "event_task": "piezo_liquid_event"}})
+
+        assert spec_to_dict(spec)["piezo"] == {
+            "enabled": True, "event_task": "piezo_liquid_event"}
+        assert spec_toml_completeness(spec).complete
+
+
+class TestThePiezoRefusals:
+
+    def test_spec_io_piezo_event_params_encodes_as_unrepresentable(self):
+        """The `anneal_params` refusal, on the encode side."""
+        from softae.core.campaign_spec_fields import UNREPRESENTABLE
+        from softae.core.deposition_recipe import PiezoPlan
+
+        plan = PiezoPlan(enabled=True, event_params={"frequency_hz": 525.0})
+
+        assert _piezo_codec().encode(plan) is UNREPRESENTABLE
+
+    def test_spec_io_piezo_event_params_in_the_file_is_refused(self):
+        """And on the decode side, naming what to do instead."""
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict({**MINIMAL, "piezo": {
+                "enabled": True, "event_params": {"frequency_hz": 525.0}}})
+
+        assert "event_params" in str(exc.value)
+        assert "event_task" in str(exc.value)
+
+    def test_spec_io_piezo_an_unknown_key_is_refused_with_the_legal_set(self):
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict({**MINIMAL, "piezo": {"enabled": True,
+                                                 "elution_scopes": "deposit"}})
+
+        message = str(exc.value)
+        assert "unknown key(s) ['elution_scopes']" in message
+        assert "'elution_scope'" in message and "'standby_task'" in message
+
+    def test_spec_io_piezo_an_illegal_elution_scope_is_refused(self):
+        """``PiezoPlan`` accepts any string, and the engine then runs the
+        narrower scope in silence — so the codec owns this refusal."""
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict({**MINIMAL, "piezo": {"enabled": True,
+                                                 "elution_scope": "all"}})
+
+        message = str(exc.value)
+        assert "unknown elution_scope 'all'" in message
+        assert "'deposit'" in message and "'all_elution'" in message
+
+    def test_spec_io_piezo_a_non_boolean_enabled_is_refused(self):
+        """``enabled = "false"`` is truthy in Python: a plan that would actuate."""
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict({**MINIMAL, "piezo": {"enabled": "false"}})
+
+        assert "'enabled' must be true or false" in str(exc.value)
+
+    def test_spec_io_piezo_an_empty_task_name_is_refused(self):
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict({**MINIMAL, "piezo": {"enabled": True,
+                                                 "on_task": "  "}})
+
+        assert "'on_task' must be the name of a catalog task" in str(exc.value)
+
+
+class TestThePiezoAbsentAndEmptyTable:
+    """What each of the two silences actually produces, pinned rather than assumed.
+
+    They are **not** the same object — ``CampaignSpec.piezo`` defaults to ``None``
+    and ``OBJECT_FIELDS`` decode runs only when the key is present at all, so an
+    empty table decodes to a default ``PiezoPlan`` instead. What matters is that
+    they are the same *experiment*: the engine asks ``piezo is not None and
+    piezo.enabled``, so both actuate nothing, and the second test is the one that
+    says so rather than trusting the first.
+    """
+
+    def test_spec_io_piezo_absent_table_leaves_the_field_unset(self):
+        assert spec_from_dict(MINIMAL).piezo is None
+
+    def test_spec_io_piezo_empty_table_decodes_to_an_inert_default_plan(self):
+        from softae.core.deposition_recipe import PiezoPlan
+
+        assert spec_from_dict({**MINIMAL, "piezo": {}}).piezo == PiezoPlan()
+
+    @pytest.mark.parametrize("payload", [
+        {}, {"piezo": {}}, {"piezo": {"enabled": False}}])
+    def test_spec_io_piezo_three_inert_spellings_compile_no_piezo_steps(
+        self, payload
+    ):
+        """Absent, empty and explicitly-off must be one experiment, not three."""
+        from softae.core.deposition_recipe import (
+            build_deposition_workflow,
+            get_deposition_recipe,
+        )
+
+        spec = spec_from_dict({**MINIMAL, "channels": [21], **payload})
+        workflow = build_deposition_workflow(
+            get_deposition_recipe("single_drop"), [21], {21: [10.0, 30.0, 0.0]},
+            settings=spec.deposition_settings(pcb=PIEZO_PCB),
+            catalog=_piezo_catalog())
+
+        assert not any(s.instrument == "piezo"
+                       for s in workflow.resolve_steps())
+
+
+class TestThePiezoPlanReachesTheCompiler:
+
+    def test_spec_io_piezo_a_file_loaded_plan_compiles_actuation_steps(self):
+        """THE POINT. A round trip through the codec proves nothing on its own:
+        this proves the decoded plan is consumable by ``deposition_recipe``."""
+        from softae.core.deposition_recipe import (
+            build_deposition_workflow,
+            get_deposition_recipe,
+        )
+
+        spec = spec_from_dict({**MINIMAL, "channels": [21],
+                               "piezo": {"enabled": True}})
+        workflow = build_deposition_workflow(
+            get_deposition_recipe("single_drop"), [21], {21: [10.0, 30.0, 0.0]},
+            settings=spec.deposition_settings(pcb=PIEZO_PCB),
+            catalog=_piezo_catalog())
+
+        names = [s.name for s in workflow.resolve_steps()]
+
+        assert "piezo_on_ch21" in names
+        assert names.index("piezo_on_ch21") < names.index("deposit_ch21")
+        assert names.index("deposit_ch21") < names.index("piezo_off_ch21")
+        assert names[-1] == "piezo_standby"
+        assert workflow.metadata["piezo"] == "applied"
+
+    def test_spec_io_piezo_a_file_loaded_all_elution_scope_reaches_the_branch(
+        self
+    ):
+        """``elution_scope`` is the one field whose two values compile
+        *differently*, so a codec that dropped it would look identical here."""
+        from softae.core.deposition_recipe import (
+            build_deposition_workflow,
+            get_deposition_recipe,
+        )
+
+        spec = spec_from_dict({**MINIMAL, "channels": [21], "piezo": {
+            "enabled": True, "elution_scope": "all_elution"}})
+        workflow = build_deposition_workflow(
+            get_deposition_recipe("single_drop"), [21], {21: [10.0, 30.0, 0.0]},
+            settings=spec.deposition_settings(pcb=PIEZO_PCB),
+            catalog=_piezo_catalog())
+
+        names = [s.name for s in workflow.resolve_steps()]
+
+        assert "piezo_on_startup_flush" in names      # the all-elution branch
+        assert "piezo_on_ch21" not in names           # not the deposit-only one

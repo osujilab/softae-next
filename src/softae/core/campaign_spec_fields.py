@@ -366,6 +366,144 @@ def decode_general_formulation(value: Any) -> Any:
     return GeneralFormulation(**kwargs)
 
 
+# ── piezo ────────────────────────────────────────────────────────────────────
+#
+# ``PiezoPlan`` was the last object-valued field ``campaign_spec_io._UNSUPPORTED``
+# refused outright, and the refusal had the same shape ``run_plan``'s did: the
+# plan is wired end-to-end in Python (``CampaignSpec.piezo`` →
+# ``DepositionSettings.piezo`` → ``build_recipe_deposition_workflow``, since
+# P2.1) and the HT tab builds one from config, so a *file* was the only surface
+# that could not ask for it — ``autonomous_wiring.py``'s own field comment names
+# the consequence, *"campaigns never actuated the piezo even with [piezo]
+# configured"*. It is six flat primitives; the refusal was a missing codec.
+#
+# It lives here rather than in a module of its own, unlike ``run_plan``: a piezo
+# plan is one flat table with no nested phase array, so there is nothing for a
+# second module to hold.
+
+#: Why an encode can answer :data:`UNREPRESENTABLE`, in an operator's words. Read
+#: back by ``spec_toml_completeness`` as "piezo is {this}".
+PIEZO_WHY_NOT = (
+    "a piezo plan carrying event_params, a per-run override of a catalog task's "
+    "parameters that the file shape has no key for"
+)
+
+#: Every key a ``[piezo]`` table may carry, each the name of a
+#: :class:`~softae.core.deposition_recipe.PiezoPlan` field. Written out rather
+#: than derived from the dataclass **on purpose**: a field added to ``PiezoPlan``
+#: must be *refused* here until this codec learns to carry it, where a derived set
+#: would accept the key and then drop it on the floor — "accepted" and "carried"
+#: spelled with one token. ``test_campaign_spec_io`` pins the pair so the
+#: addition goes red rather than silent.
+_PIEZO_KEYS = ("enabled", "on_task", "off_task", "standby_task", "event_task",
+               "elution_scope")
+
+#: The keys naming a catalog task. An unresolvable name already raises
+#: ``PlanCompileError`` at compile while the plan is enabled (``_require_task``),
+#: so this codec checks only that a name was written at all and leaves *which*
+#: names exist to the catalog that owns them.
+_PIEZO_TASK_KEYS = ("on_task", "off_task", "standby_task", "event_task")
+
+#: The two scopes the engine actually branches on (``deposition_recipe.py``:
+#: ``elution_scope == "all_elution"``, else deposit-only).
+#: ``PiezoPlan.elution_scope`` is a plain ``str`` with no ``__post_init__``, so a
+#: typo is accepted there, misses the ``all_elution`` branch and silently runs the
+#: *narrower* scope — actuating less than the file asked for, in the direction
+#: nothing goes red. This codec owns the refusal the dataclass does not make.
+_ELUTION_SCOPES = ("deposit", "all_elution")
+
+
+def encode_piezo(value: Any) -> Any:
+    """The plan as a ``[piezo]`` table, or :data:`UNREPRESENTABLE`.
+
+    Only what was *chosen*: a field equal to ``PiezoPlan``'s own declared default
+    is omitted, so an otherwise-default enabled plan writes ``{"enabled": True}``
+    and nothing else. The defaults are read from the dataclass — a
+    default-constructed instance — rather than restated, so a task name retuned in
+    ``deposition_recipe`` cannot leave a stale copy here deciding what is worth
+    writing.
+    """
+    from softae.core.deposition_recipe import PiezoPlan
+
+    if not isinstance(value, PiezoPlan):
+        return UNREPRESENTABLE
+    if value.event_params:
+        # The identical refusal `campaign_spec_run_plan` makes for
+        # `anneal_params`, for the identical reason: a dict-shaped per-run
+        # override of an arbitrary named task's parameters gives the decoder no
+        # way to tell a typo from a future key, so the file shape has no slot for
+        # it. Truthiness rather than `is not None` because the engine itself reads
+        # it that way (`if piezo.event_params`) — an empty dict overrides nothing
+        # and is therefore written as the absence it already is.
+        logger.warning("piezo_not_encodable", reason="event_params")
+        return UNREPRESENTABLE
+    default = PiezoPlan()
+    table: dict[str, Any] = {}
+    for key in _PIEZO_KEYS:
+        current = getattr(value, key)
+        if current != getattr(default, key):
+            table[key] = bool(current) if key == "enabled" else str(current)
+    return table
+
+
+def decode_piezo(value: Any) -> Any:
+    """A :class:`~softae.core.deposition_recipe.PiezoPlan` from the ``[piezo]``
+    table, or ``ValueError``.
+
+    An omitted key is **not given a value here** — the keyword is simply not
+    passed, so ``PiezoPlan``'s own dataclass default applies and each default is
+    written in exactly one place. An empty ``[piezo]`` table is therefore legal
+    and inert, describing the same plan a file omitting the table entirely leaves
+    unset.
+    """
+    from softae.core.deposition_recipe import PiezoPlan
+
+    if not isinstance(value, dict):
+        raise ValueError(
+            "expected a [piezo] table, e.g. a [piezo] block setting "
+            "enabled = true")
+    if "event_params" in value:
+        raise ValueError(
+            "'event_params' cannot be set from a file: it is a per-run override "
+            "of the parameters of an arbitrary named catalog task, and a "
+            "dict-shaped override gives this decoder no way to tell a typo from "
+            "a future key. Name a catalog task carrying the parameters you want "
+            "as 'event_task' instead — the same way a custom anneal duration "
+            "gets its own task rather than a per-run override.")
+    unknown = sorted(set(value) - set(_PIEZO_KEYS))
+    if unknown:
+        raise ValueError(
+            f"unknown key(s) {unknown}; valid keys: {sorted(_PIEZO_KEYS)}")
+
+    kwargs: dict[str, Any] = {}
+    if "enabled" in value:
+        if not isinstance(value["enabled"], bool):
+            raise ValueError(
+                f"'enabled' must be true or false (got {value['enabled']!r})")
+        kwargs["enabled"] = value["enabled"]
+    for key in _PIEZO_TASK_KEYS:
+        if key not in value:
+            continue
+        name = value[key]
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(
+                f"'{key}' must be the name of a catalog task (got {name!r})")
+        kwargs[key] = name
+    if "elution_scope" in value:
+        scope = value["elution_scope"]
+        if scope not in _ELUTION_SCOPES:
+            legal = ", ".join(repr(s) for s in _ELUTION_SCOPES)
+            raise ValueError(
+                f"unknown elution_scope {scope!r}; legal values are {legal} — "
+                f"'deposit' brackets each channel's own deposit phase, "
+                f"'all_elution' brackets every elution event including the "
+                f"flushes. A scope this codec does not recognise would reach the "
+                f"engine, miss the 'all_elution' branch and quietly actuate the "
+                f"narrower one.")
+        kwargs["elution_scope"] = scope
+    return PiezoPlan(**kwargs)
+
+
 #: The fields this module owns, by spec field name. :mod:`campaign_spec_io`
 #: consults it in both directions, so adding a field here is the whole change.
 OBJECT_FIELDS: dict[str, FieldCodec] = {
@@ -404,4 +542,7 @@ OBJECT_FIELDS: dict[str, FieldCodec] = {
         encode_seed_observations, decode_seed_observations,
         "a list of (params, value) pairs this file cannot encode",
     ),
+    # The last field `campaign_spec_io._UNSUPPORTED` refused outright. Six flat
+    # primitives, so its codec is above rather than in a module of its own.
+    "piezo": FieldCodec(encode_piezo, decode_piezo, PIEZO_WHY_NOT),
 }
