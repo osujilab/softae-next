@@ -21,7 +21,16 @@ from __future__ import annotations
 import pytest
 import structlog
 
-from softae.core.campaign_spec_io import SpecLoadError, spec_from_dict
+from softae.core.campaign_spec_io import (
+    SpecLoadError,
+    load_campaign_spec,
+    spec_from_dict,
+)
+from tests.support.fixture_catalog import (
+    EXAMPLES,
+    example_path,
+    use_default_chemistry,
+)
 
 #: A legacy volume-mode spec — no composition context, nothing to pin.
 MINIMAL = {
@@ -451,3 +460,130 @@ class TestThePiezoPlanReachesTheCompiler:
 
         assert "piezo_on_startup_flush" in names      # the all-elution branch
         assert "piezo_on_ch21" not in names           # not the deposit-only one
+
+
+# ──────────────────────── an axis's sampling `scale` ─────────────────────────
+#
+# ``CompositionAxis.scale`` ("linear" | "log") landed in ``composition_axes`` as a
+# live Python field, so the GUI could ask for a log search and a *file* could not
+# — the same one-surface gap the ``piezo`` codec above closed. The key is
+# **permitted but not required** on read: every spec on disk predates it and each
+# describes the linear search its absence already means, so requiring it would
+# refuse a file for omitting a key it could not have known about. The encoder
+# writes it regardless, because an omitted key silently taking a default is what
+# the axis-key doctrine exists to prevent.
+
+LOG_RATIO_AXIS = {**RATIO_AXIS, "scale": "log"}
+
+#: The committed examples whose ``general_formulation`` declares axes at all —
+#: named rather than counted, so the back-compatibility test below cannot pass by
+#: finding no axes to check.
+EXAMPLES_WITH_AXES = ("bench_instance", "bo_init_bench", "rung3a_fake_cast")
+
+
+@pytest.fixture
+def default_chemistry(monkeypatch):
+    """Chemistry seam pointed at the shipped catalogs for the whole test."""
+    use_default_chemistry(monkeypatch)
+
+
+def _example_axes(example):
+    gf = getattr(load_campaign_spec(example_path(example)),
+                 "general_formulation", None)
+    return tuple(getattr(gf, "axes", ()) or ())
+
+
+class TestTheAxisScaleKey:
+
+    def test_spec_io_axis_a_log_scale_axis_round_trips_through_the_file(
+        self, stub_catalogs
+    ):
+        """THE ASK: written out, read back, and the same axis object."""
+        from softae.core.campaign_spec_io import spec_to_dict
+
+        spec = spec_from_dict(
+            _payload([LOG_RATIO_AXIS], {"ratio_EO_Li": RATIO_PARAM}))
+        axis = spec.general_formulation.axes[0]
+
+        written = spec_to_dict(spec)["general_formulation"]["axes"][0]
+
+        assert axis.scale == "log" and axis.is_log
+        assert written["scale"] == "log"
+        assert spec_from_dict(
+            _payload([written], {"ratio_EO_Li": RATIO_PARAM})
+        ).general_formulation.axes[0] == axis
+
+    def test_spec_io_axis_without_a_scale_key_still_loads_as_linear(
+        self, stub_catalogs
+    ):
+        """The regression this shape exists for: ``scale`` is optional on read,
+        so every spec written before the key still describes its own search."""
+        spec = spec_from_dict(
+            _payload([RATIO_AXIS], {"ratio_EO_Li": RATIO_PARAM}))
+
+        assert "scale" not in RATIO_AXIS
+        assert spec.general_formulation.axes[0].scale == "linear"
+
+    def test_spec_io_axis_a_linear_axis_is_written_with_its_scale_key(
+        self, stub_catalogs
+    ):
+        """Optional on read, always written — the asymmetry, pinned. A file
+        round-tripped through the GUI states the scale it searches."""
+        from softae.core.campaign_spec_io import spec_to_dict
+
+        spec = spec_from_dict(
+            _payload([RATIO_AXIS], {"ratio_EO_Li": RATIO_PARAM}))
+
+        written = spec_to_dict(spec)["general_formulation"]["axes"][0]
+
+        assert written["scale"] == "linear"
+        assert set(written) == {"kind", "a", "b", "low", "high", "basis", "scale"}
+
+    def test_spec_io_axis_an_unknown_scale_is_refused_at_load(self, stub_catalogs):
+        """Permitting the key must not mean accepting any value in it: an
+        unrecognised scale would reach the sampler and quietly search linearly."""
+        payload = _payload([{**RATIO_AXIS, "scale": "ln"}],
+                           {"ratio_EO_Li": RATIO_PARAM})
+
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict(payload, source="<bad-scale>")
+
+        assert "scale" in str(exc.value)
+
+    def test_spec_io_axis_an_unknown_axis_key_is_still_refused(self, stub_catalogs):
+        """The control on widening the permitted set: only ``scale`` was added."""
+        payload = _payload([{**RATIO_AXIS, "sclae": "log"}],
+                           {"ratio_EO_Li": RATIO_PARAM})
+
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict(payload, source="<typo>")
+
+        assert "sclae" in str(exc.value)
+
+    def test_spec_io_axis_a_log_axis_at_or_below_zero_is_refused_at_load(
+        self, stub_catalogs
+    ):
+        """``CompositionAxis`` refuses ``low <= 0`` on a searched log axis; the
+        file path must reach that refusal rather than construct around it."""
+        payload = _payload([{**LOG_RATIO_AXIS, "low": 0.0}],
+                           {"ratio_EO_Li": RATIO_PARAM})
+
+        with pytest.raises(SpecLoadError) as exc:
+            spec_from_dict(payload, source="<log-zero>")
+
+        assert "log" in str(exc.value)
+
+
+@pytest.mark.parametrize("example", EXAMPLES)
+def test_spec_io_axis_every_committed_example_still_loads_as_a_linear_search(
+        example, default_chemistry):
+    """No committed spec declares ``scale``, so each must load as the linear
+    search it describes — the on-disk half of the optional-key regression."""
+    assert all(a.scale == "linear" for a in _example_axes(example))
+
+
+def test_spec_io_axis_the_examples_checked_above_do_carry_axes(default_chemistry):
+    """The counter that stops the parametrized test passing on zero axes."""
+    with_axes = {e for e in EXAMPLES if _example_axes(e)}
+
+    assert with_axes == set(EXAMPLES_WITH_AXES)

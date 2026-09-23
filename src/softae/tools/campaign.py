@@ -67,7 +67,7 @@ from typing import Any
 
 from softae.core.campaign_events import EVENTS_FILENAME
 from softae.core.campaign_spec_io import SpecLoadError, load_campaign_spec
-from softae.tools import use_utf8_console
+from softae.tools import add_verbosity_flag, configure_logging, use_utf8_console
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -713,6 +713,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="softae-campaign",
         description="Run an autonomous deposition campaign without a GUI.",
     )
+    add_verbosity_flag(p)
     sub = p.add_subparsers(dest="command", required=True)
 
     def _common(sp, *, project_required: bool):
@@ -726,8 +727,8 @@ def build_parser() -> argparse.ArgumentParser:
                              + ("" if project_required else " (optional)"))
         return sp
 
-    _common(sub.add_parser("check", help="parse and project; run nothing"),
-            project_required=False)
+    chk = _common(sub.add_parser("check", help="parse and project; run nothing"),
+                  project_required=False)
 
     run = _common(sub.add_parser("run", help="run the campaign"),
                   project_required=True)
@@ -764,12 +765,24 @@ def build_parser() -> argparse.ArgumentParser:
     ctl.add_argument("--reason", default=None,
                      help="recorded verbatim in the campaign's transcript and, "
                           "for abort, in its park alert")
+
+    # Also on every subcommand, not only the top level: `-v` after the verb is
+    # the spelling an operator reaches for, and a subparser would otherwise
+    # reject it. `add_verbosity_flag`'s `default=argparse.SUPPRESS` is what
+    # keeps the outer `-v` from being overwritten by the inner default.
+    for parser in (chk, run, res, ctl):
+        add_verbosity_flag(parser)
     return p
 
 
 def main(argv: "list[str] | None" = None) -> int:
     use_utf8_console()
     args = build_parser().parse_args(argv)
+    # Before dispatch, so every subcommand is covered and there is exactly one
+    # place the level is decided. Without it this entry point inherits
+    # structlog's default PrintLogger and prints every level — the RH
+    # controller's `rh_duty_sent` on each control update, for the whole run.
+    configure_logging(getattr(args, "verbose", False))
     if args.command == "resume":
         args.resume = True
         args.command = "run"

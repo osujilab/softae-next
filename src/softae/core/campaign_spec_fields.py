@@ -133,10 +133,19 @@ def decode_seed_observations(value: Any) -> Any:
 
 # ── general_formulation ──────────────────────────────────────────────────────
 
-#: Every field of a :class:`~softae.core.composition_axes.CompositionAxis`. All
-#: six are always written: an axis with an omitted key would silently take a
-#: default (``basis``, ``low``) and search a different composition.
-_AXIS_KEYS = ("kind", "a", "b", "low", "high", "basis")
+#: The axis keys a *file* must carry. Each is always written too: an axis with an
+#: omitted key would silently take a default (``basis``, ``low``) and search a
+#: different composition.
+_AXIS_REQUIRED_KEYS = ("kind", "a", "b", "low", "high", "basis")
+
+#: Every field of a :class:`~softae.core.composition_axes.CompositionAxis`, which
+#: is what an axis table may *carry* — the same "permitted" role ``_GF_KEYS`` and
+#: ``_PIEZO_KEYS`` play. ``scale`` is permitted but **not** required: it postdates
+#: every spec on disk, and each of those describes the linear search its absence
+#: already means, so requiring it would refuse a file for omitting a key it could
+#: not have known about. The encoder writes it regardless, for the reason above —
+#: the asymmetry is deliberate and narrow, and applies to no other axis key.
+_AXIS_KEYS = _AXIS_REQUIRED_KEYS + ("scale",)
 
 _GF_KEYS = frozenset(
     {"stocks", "pump_assignment", "target_deposition_uL", "axes",
@@ -206,7 +215,7 @@ def encode_general_formulation(value: Any) -> Any:
             "axes": [
                 {"kind": str(ax.kind), "a": str(ax.a), "b": str(ax.b),
                  "low": float(ax.low), "high": float(ax.high),
-                 "basis": str(ax.basis)}
+                 "basis": str(ax.basis), "scale": str(ax.scale)}
                 for ax in value.axes
             ],
         }
@@ -229,17 +238,23 @@ def _axis_from_dict(row: Any, index: int) -> Any:
     unknown = sorted(set(row) - set(_AXIS_KEYS))
     if unknown:
         raise ValueError(f"axis #{index} has unknown key(s) {unknown}")
-    missing = [k for k in _AXIS_KEYS if k not in row]
+    missing = [k for k in _AXIS_REQUIRED_KEYS if k not in row]
     if missing:
         raise ValueError(
             f"axis #{index} is missing {missing} — every key is written so that "
             f"an omitted one cannot silently take a default and search a "
             f"different composition")
+    # ``scale`` is passed only when the file declares it, so ``"linear"`` stays
+    # written in exactly one place — ``CompositionAxis``'s own default — for the
+    # reason ``decode_piezo`` omits a keyword rather than restating one. An
+    # illegal value is refused by the dataclass and wrapped below, so this codec
+    # adds no second opinion about which scales exist.
+    optional = {"scale": str(row["scale"])} if "scale" in row else {}
     try:
         return CompositionAxis(
             kind=str(row["kind"]), a=str(row["a"]), b=str(row["b"]),
             low=float(row["low"]), high=float(row["high"]),
-            basis=str(row["basis"]))
+            basis=str(row["basis"]), **optional)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"axis #{index}: {exc}") from exc
 

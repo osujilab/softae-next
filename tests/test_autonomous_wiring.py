@@ -25,6 +25,7 @@ from softae.core.autonomous_wiring import (
     eis_impedance_objective_for_channel,
     measure_step_name,
     optimizer_tuning_identity,
+    replication_identity,
     resolve_optimizer_tuning,
     run_autonomous_campaign,
 )
@@ -595,6 +596,138 @@ def test_n_initial_left_unset_contributes_no_key_at_all():
         {"decision_rtol": 0.25}
 
 
+# ── Rung 3b — replicated sampling ────────────────────────────────────────────
+#
+# `budget` counts DISTINCT COMPOSITIONS and the loop counts WELLS; they are 1:1
+# until `replicates > 1`, at which point one composition is cast k times inside a
+# single batched round. These pin the four places the wiring has to know that.
+
+def test_build_optimizer_replicates_one_returns_the_bare_optimizer():
+    """The wrap is the *campaign's* decision, not ``build_optimizer``'s.
+
+    Stated as an assertion rather than left implicit, because it is the seam that
+    makes the resume branch safe: a resumed checkpoint is rebuilt as the wrapper
+    by ``BaseOptimizer.from_dict``, so ``run_autonomous_campaign`` wraps only on
+    the fresh branch. A ``build_optimizer`` that wrapped would nest two wrappers
+    on every resume and square the replicate count.
+    """
+    from softae.optimizers import ReplicatingOptimizer
+
+    assert not isinstance(
+        build_optimizer(_spec(optimizer="random")), ReplicatingOptimizer)
+    # And it stays bare even when the spec asks for replication — this function
+    # is not where that happens.
+    assert not isinstance(
+        build_optimizer(_spec(optimizer="random", batch=True, replicates=2)),
+        ReplicatingOptimizer)
+
+
+def test_campaign_spec_fingerprint_replicates_default_contributes_no_key():
+    """Omission is the mechanism, as for ``measurement`` and the tuning knobs: a
+    defaulted ``"replicates": 1`` in the payload would rehash every checkpoint in
+    existence and blame a replicate count nobody set.
+
+    Asserted on ``replication_identity`` and not only on the hash: comparing two
+    *defaulted* specs' fingerprints cannot see this failure, because a key
+    contributed unconditionally is contributed to both sides and cancels. (That
+    vacuity was caught by a positive control, not by review.)
+    """
+    assert replication_identity(_spec()) is None
+    assert replication_identity(_spec(replicates=1)) is None
+    assert campaign_spec_fingerprint(_spec(replicates=1)) == \
+        campaign_spec_fingerprint(_spec())
+
+
+def test_campaign_spec_fingerprint_replicates_two_changes_the_hash():
+    """A replicated run is a different experiment — the optimizer is told k
+    observations per proposal — so a resume must not graft one onto the other."""
+    assert replication_identity(_spec(batch=True, replicates=2)) == {"replicates": 2}
+    assert campaign_spec_fingerprint(_spec(batch=True, replicates=2)) != \
+        campaign_spec_fingerprint(_spec(batch=True))
+
+
+def test_campaign_spec_fingerprint_replicate_layout_default_contributes_no_key():
+    """``"adjacent"`` is the shipped order, so it contributes nothing — and a spec
+    that sets only the *other* field contributes that one alone, which is what
+    distinguishes omitted from defaulted-in."""
+    assert replication_identity(_spec(replicate_layout="adjacent")) is None
+    assert replication_identity(_spec(batch=True, replicates=2)) == {"replicates": 2}
+    assert campaign_spec_fingerprint(_spec(replicate_layout="adjacent")) == \
+        campaign_spec_fingerprint(_spec())
+
+
+def test_campaign_spec_fingerprint_interleaved_layout_changes_the_hash():
+    """The layout decides which physical well receives which composition, so a
+    resume under the other one would re-cast the wrong wells."""
+    assert replication_identity(
+        _spec(batch=True, replicates=2, replicate_layout="interleaved")) == \
+        {"replicates": 2, "replicate_layout": "interleaved"}
+    assert campaign_spec_fingerprint(
+        _spec(batch=True, replicates=2, replicate_layout="interleaved")) != \
+        campaign_spec_fingerprint(_spec(batch=True, replicates=2))
+
+
+def test_spec_load_replicates_without_batch_is_refused():
+    """``suggest_batch`` is where replication happens, and the single-point path
+    never calls it — it already casts one suggestion onto every channel. So
+    ``replicates = 2, batch = false`` asks for duplicates and would silently get
+    today's behaviour, which is refused at load rather than warned about."""
+    from softae.core.campaign_spec_io import SpecLoadError, spec_from_dict
+
+    with pytest.raises(ValueError, match="requires batch = true"):
+        _spec(replicates=2, batch=False)
+
+    with pytest.raises(SpecLoadError, match="requires batch = true"):
+        spec_from_dict({
+            "name": "r3b", "channels": [21, 22, 23, 24],
+            "parameter_space": SPACE, "vol_params": ["vol_p0", "vol_p1"],
+            "optimizer": "random", "budget": 2, "replicates": 2,
+        }, source="<test>")
+
+
+def test_spec_load_accepts_replicates_through_the_plain_scalar_path():
+    """No codec was added for either field: ``spec_from_dict`` loads any plain
+    dataclass scalar by name and ``spec_to_dict`` writes non-default scalars
+    generically. Asserted here rather than in ``test_campaign_spec_io.py`` only to
+    keep this change inside two files; the surface under test is that loader's."""
+    from softae.core.campaign_spec_io import spec_from_dict, spec_to_dict
+
+    spec = spec_from_dict({
+        "name": "r3b", "channels": [21, 22, 23, 24],
+        "parameter_space": SPACE, "vol_params": ["vol_p0", "vol_p1"],
+        "optimizer": "random", "budget": 2, "batch": True,
+        "replicates": 2, "replicate_layout": "interleaved",
+    }, source="<test>")
+    assert (spec.replicates, spec.replicate_layout) == (2, "interleaved")
+
+    encoded = spec_to_dict(spec)
+    assert (encoded["replicates"], encoded["replicate_layout"]) == (2, "interleaved")
+    # And a spec that says nothing writes nothing: an unreplicated campaign's TOML
+    # must not grow two keys it never asked for.
+    plain = spec_to_dict(_spec())
+    assert "replicates" not in plain and "replicate_layout" not in plain
+
+
+def test_an_unknown_replicate_layout_is_refused_at_construction():
+    """Refused where the spec is built, not where the optimizer is: a typo'd
+    layout otherwise passes ``softae-campaign check`` (which loads the spec and
+    never constructs an optimizer) and fails at run start with the board loaded.
+    The permitted set is the wrapper's own ``LAYOUTS``, not a second copy."""
+    with pytest.raises(ValueError, match="replicate_layout"):
+        _spec(batch=True, replicates=2, replicate_layout="interleved")
+    # Inert-but-wrong is still refused: a layout typo on a k=1 spec replicates
+    # nothing, so nothing downstream would ever look at it.
+    with pytest.raises(ValueError, match="replicate_layout"):
+        _spec(replicate_layout="nope")
+
+
+def test_replicates_below_one_is_refused_rather_than_read_as_one():
+    """``max(1, k)`` guards the arithmetic downstream, which is exactly what would
+    turn ``replicates = 0`` into a silent 1."""
+    with pytest.raises(ValueError, match="replicates"):
+        _spec(replicates=0)
+
+
 # ── End-to-end campaign ──────────────────────────────────────────────────────
 
 @pytest.fixture
@@ -694,6 +827,104 @@ async def test_batch_campaign_tells_per_channel(connected, tmp_path: Path):
     assert {r["channel"] for r in rows} == {21, 22, 23, 24}
     assert all(r["objective_value"] is not None for r in rows)
     assert sum(e["type"] == "result" for e in events) == 8
+    store.close()
+
+
+def _cast_by_channel(store, run_id: str) -> dict[int, dict]:
+    """``{channel: the composition actually cast there}`` from the DOE rows."""
+    import json
+    return {r["channel"]: json.loads(r["parameters_json"])
+            for r in store.query_doe_parameters(run_id=run_id)}
+
+
+@pytest.mark.asyncio
+async def test_campaign_loop_ceiling_is_budget_times_replicates(
+    connected, tmp_path: Path
+):
+    """Rung 3b's shape in miniature: 2 compositions, each cast twice, 4 wells.
+
+    This is the test that can tell the wrapper *applied* from the wrapper *built
+    and dropped* — the failure the brief's shape invites, since a missing wrap
+    leaves a perfectly healthy 4-well campaign behind, just one that searched four
+    points instead of duplicating two. So it asserts on the CASTS, not on the
+    optimizer object: the ceiling is ``budget x replicates`` wells, the board holds
+    two distinct compositions, and ``adjacent`` puts each pair side by side.
+    """
+    store = DataStore(tmp_path / "proj")
+    events: list[dict] = []
+    # 4 channels → one round of q=4; the inner random search draws ceil(4/2) = 2.
+    spec = _spec(optimizer="random", batch=True, budget=2, replicates=2)
+
+    result = await run_autonomous_campaign(
+        spec, manager=connected, data_store=store, on_event=events.append)
+
+    assert result.n_trials == 4                      # wells, not compositions
+    cast = _cast_by_channel(store, result.run_id)
+    assert sorted(cast) == [21, 22, 23, 24]
+    assert cast[21] == cast[22] and cast[23] == cast[24]   # adjacent pairs
+    assert cast[21] != cast[23]                            # two distinct draws
+    # Announced, so an operator can see replication is on without reading the spec.
+    assert [e for e in events if e["type"] == "replicated_mode"] == [{
+        "type": "replicated_mode", "replicates": 2, "layout": "adjacent",
+        "compositions": 2, "wells": 4, "channels": 4,
+    }]
+    # The pair is greppable from the formulation row alone (P7.6 notes).
+    notes = {r["channel"]: r["notes"]
+             for r in store.query_formulations(run_id=result.run_id)}
+    assert notes[21] == notes[22] == "campaign:test_campaign suggestion:0"
+    assert notes[23] == notes[24] == "campaign:test_campaign suggestion:1"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_an_interleaved_campaign_puts_a_pair_half_a_round_apart(
+    connected, tmp_path: Path
+):
+    """The operator's ask in `[a371]`: neighbouring wells share systematics (a
+    thermal gradient across the board, a dispenser drift down the row), so the two
+    casts of one composition must not be neighbours. Same run as above with one
+    kwarg changed — pairs move to 21&23 and 22&24."""
+    store = DataStore(tmp_path / "proj")
+    spec = _spec(optimizer="random", batch=True, budget=2, replicates=2,
+                 replicate_layout="interleaved")
+
+    result = await run_autonomous_campaign(
+        spec, manager=connected, data_store=store)
+
+    assert result.n_trials == 4
+    cast = _cast_by_channel(store, result.run_id)
+    assert cast[21] == cast[23] and cast[22] == cast[24]
+    assert cast[21] != cast[22]
+    # The notes ordinal names the composition, not the position, so it is the same
+    # number under either layout.
+    notes = {r["channel"]: r["notes"]
+             for r in store.query_formulations(run_id=result.run_id)}
+    assert notes[21] == notes[23] == "campaign:test_campaign suggestion:0"
+    assert notes[22] == notes[24] == "campaign:test_campaign suggestion:1"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_board_that_is_not_budget_times_replicates_warns_and_still_runs(
+    connected, tmp_path: Path
+):
+    """A warning, not a refusal: the run is correct (the final round narrows), but
+    the operator's arithmetic and the plate's disagree, and eight wells is a poor
+    place to discover that."""
+    import structlog
+    store = DataStore(tmp_path / "proj")
+    # 4 channels, but 3 compositions x 2 = 6 wells wanted.
+    spec = _spec(optimizer="random", batch=True, budget=3, replicates=2)
+
+    with structlog.testing.capture_logs() as logs:
+        result = await run_autonomous_campaign(
+            spec, manager=connected, data_store=store)
+
+    mismatch = [e for e in logs
+                if e.get("event") == "replicate_channel_count_mismatch"]
+    assert len(mismatch) == 1
+    assert (mismatch[0]["channels"], mismatch[0]["wells"]) == (4, 6)
+    assert result.n_trials == 6          # two rounds: 4 wells then 2
     store.close()
 
 

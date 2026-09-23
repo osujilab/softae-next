@@ -112,6 +112,7 @@ from softae.optimizers import (
     BayesianOptimizer,
     GridSearchOptimizer,
     RandomSearchOptimizer,
+    ReplicatingOptimizer,
 )
 from softae.optimizers.bayesian import PriorMean
 from softae.optimizers.failure_labels import (
@@ -468,6 +469,23 @@ class CampaignSpec:
     #: (afl-session), not here.
     condition_sets: dict[str, "PhaseSetpoints"] = field(default_factory=dict)
     budget: int = 12
+    #: Wells cast per distinct composition. ``budget`` counts *compositions*, so a
+    #: campaign of ``budget = 4, replicates = 2`` searches four points and consumes
+    #: eight wells — the loop ceiling is ``budget x replicates``. Replication is a
+    #: batch-shape transform performed by
+    #: :class:`~softae.optimizers.replicated.ReplicatingOptimizer` inside
+    #: ``suggest_batch``, so it requires ``batch = true``; ``__post_init__`` refuses
+    #: the combination rather than silently replicating nothing (the single-point
+    #: path already casts one suggestion onto every channel).
+    replicates: int = 1
+    #: Where a composition's replicates land within a round. ``"adjacent"``
+    #: (default) puts a pair on neighbouring channels (p0 p0 p1 p1 …);
+    #: ``"interleaved"`` emits the whole block k times (p0 p1 p2 p3 p0 p1 p2 p3),
+    #: so a pair sits half a round apart — which is what the operator wants when
+    #: neighbouring wells share a systematic (a thermal gradient across the board,
+    #: a dispenser drift down the row). Values are
+    #: :attr:`ReplicatingOptimizer.LAYOUTS`, the wrapper's own authority.
+    replicate_layout: str = "adjacent"
     #: What this campaign measures, and how (T2.4). One block naming a
     #: **modality** alongside its preset/overrides, so a second modality needs no
     #: new spec fields. Defaults to exactly today's behaviour: EIS, ``Quick``, no
@@ -698,6 +716,36 @@ class CampaignSpec:
         if not self.channels:
             raise ValueError("CampaignSpec.channels must name at least one channel")
 
+        # ── Replication (rung 3b) ────────────────────────────────────────────
+        # Refused here rather than at build time so `softae-campaign check` — which
+        # loads the spec and never constructs an optimizer — catches it at the desk
+        # instead of at run start with the board already loaded.
+        if not isinstance(self.replicates, int) or self.replicates < 1:
+            raise ValueError(
+                "CampaignSpec.replicates must be an int >= 1, got "
+                f"{self.replicates!r}"
+            )
+        if self.replicate_layout not in ReplicatingOptimizer.LAYOUTS:
+            raise ValueError(
+                "CampaignSpec.replicate_layout must be one of "
+                f"{', '.join(ReplicatingOptimizer.LAYOUTS)}; got "
+                f"{self.replicate_layout!r}"
+            )
+        # Replication happens inside `suggest_batch`; the single-point path never
+        # calls it, and already casts ONE suggestion onto every channel as
+        # replicates. So `replicates = 2, batch = false` would multiply what is
+        # replicated already — meaning, in practice, exactly nothing. Refused
+        # rather than warned: a spec asking for duplicates and silently getting
+        # today's behaviour is the failure that reads as a success.
+        if self.replicates > 1 and not self.batch:
+            raise ValueError(
+                f"CampaignSpec.replicates = {self.replicates} requires batch = true. "
+                "Replication is a batch-shape transform (one suggestion repeated "
+                "across k channels of one round); with batch = false the run "
+                "already casts a single suggestion onto every channel, so the "
+                "replicate count would be silently ignored."
+            )
+
         # One authority for what gets measured (T2.4). Runs on every
         # construction, including `dataclasses.replace`, so a spec is never
         # observed in the half-canonical state.
@@ -784,6 +832,9 @@ def campaign_spec_fingerprint(spec: "CampaignSpec") -> str:
     tuning = optimizer_tuning_identity(spec)
     if tuning is not None:
         payload["optimizer_tuning"] = _jsonable(tuning)
+    replication = replication_identity(spec)
+    if replication is not None:
+        payload.update(replication)
     blob = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -818,6 +869,34 @@ def optimizer_tuning_identity(spec: "CampaignSpec") -> dict[str, Any] | None:
         for f in _OPTIMIZER_TUNING_FIELDS
         if getattr(spec, f, SPEC_UNSET) is not SPEC_UNSET
     }
+    return supplied or None
+
+
+def replication_identity(spec: "CampaignSpec") -> dict[str, Any] | None:
+    """The replicate fields' contribution to the resume fingerprint, or ``None``.
+
+    Third instance of the rule :func:`~softae.core.measurement_spec.measurement_identity`
+    and :func:`optimizer_tuning_identity` follow, and a helper rather than two
+    inline ``if``\\ s for the same reason they are: *contributes nothing* is the
+    load-bearing half, and only a function returning ``None`` makes that
+    directly assertable — a test comparing two defaulted specs' hashes passes
+    just as happily when the key is contributed to both.
+
+    A replicated run genuinely is a different experiment: the optimizer is told
+    ``k`` observations per proposal, so its posterior after n wells is not the
+    posterior of an n-well unreplicated search. And the **layout** decides which
+    physical well receives which composition, so resuming an ``interleaved`` run
+    as ``adjacent`` would re-cast wells the first run had already filled.
+
+    Read through ``getattr``: a checkpoint's spec may predate both fields.
+    """
+    supplied: dict[str, Any] = {}
+    replicates = int(getattr(spec, "replicates", 1) or 1)
+    if replicates != 1:
+        supplied["replicates"] = replicates
+    layout = getattr(spec, "replicate_layout", "adjacent") or "adjacent"
+    if layout != "adjacent":
+        supplied["replicate_layout"] = layout
     return supplied or None
 
 
@@ -1376,8 +1455,29 @@ def _record_trial_formulations(
         logger.warning("trial_deposit_area_unresolved", exc_info=True)
         area_mm2 = None
 
+    # Replicate grouping, so a pair is greppable without joining on
+    # `parameters_json`. The group is this round's ORDINAL of the composition —
+    # derived from the batch itself, NOT from `index // k`, which holds only for
+    # the `adjacent` layout: under `interleaved` a pair sits `ceil(q/k)` apart, so
+    # `index // k` would group the wrong wells and then name them a replicate pair.
+    # Deriving it instead makes the marker layout-independent, and the same number
+    # names the same composition either way.
+    #
+    # Contributed only under replication, so every campaign that has ever run keeps
+    # a byte-identical notes string. The ordinal is round-local: within one round it
+    # identifies a group exactly, and rung 3b's whole run is a single round.
+    replicates = max(1, int(getattr(spec, "replicates", 1) or 1))
+    distinct: list[dict[str, Any]] = []
+    if replicates > 1:
+        for _p in batch:
+            if _p not in distinct:
+                distinct.append(_p)
+
     for params, channel in zip(batch, channels):
         try:
+            note = f"campaign:{spec.name}"
+            if replicates > 1:
+                note += f" suggestion:{distinct.index(params)}"
             volumes = list(_trial_volumes(spec, params))
             twin = simulate_trial(spec, params)
             data_store.record_formulation(
@@ -1394,7 +1494,7 @@ def _record_trial_formulations(
                 # ever asked on behalf of.
                 thickness_method="predicted" if twin is not None else "unavailable",
                 sample_uuid=(sample_uuid_by_channel or {}).get(int(channel)),
-                notes=f"campaign:{spec.name}",
+                notes=note,
             )
         except Exception:
             logger.warning("trial_formulation_record_failed",
@@ -3447,6 +3547,14 @@ async def run_autonomous_campaign(
                 logger.warning("resume_warning", campaign=spec.name, detail=_w)
         else:
             optimizer = build_optimizer(spec)
+            # Replicate wrapper (rung 3b). Only on this branch: a resumed
+            # checkpoint was WRITTEN by the wrapper, so `BaseOptimizer.from_dict`
+            # has already rebuilt it as the wrapper (with its inner's own
+            # checkpoint inside) — wrapping again here would nest two of them and
+            # square the replicate count.
+            if spec.replicates > 1:
+                optimizer = ReplicatingOptimizer(
+                    optimizer, spec.replicates, layout=spec.replicate_layout)
 
             # Warm-start: feed prior observations to the optimizer before the loop
             # so the surrogate opens with existing knowledge (physically/prior-
@@ -3505,6 +3613,28 @@ async def run_autonomous_campaign(
         # one per electrode, scored against that electrode's own EIS.
         channels = list(spec.channels)
         batch_size = len(channels) if spec.batch else 1
+
+        # Replication is announced on BOTH paths (fresh and resumed), from the spec
+        # rather than from the optimizer object, so a resumed run says what it is
+        # doing too. The mismatch is a warning, not a refusal: the run is still
+        # correct — the loop narrows its final round — but a board sized other than
+        # `budget x replicates` means the operator's arithmetic and the plate's
+        # disagree, which is worth saying before eight wells are spent rather than
+        # discovering it from a half-filled board.
+        if spec.replicates > 1:
+            wells_wanted = int(spec.budget) * int(spec.replicates)
+            emit("replicated_mode", replicates=spec.replicates,
+                 layout=spec.replicate_layout, compositions=spec.budget,
+                 wells=wells_wanted, channels=len(channels))
+            if len(channels) != wells_wanted:
+                logger.warning(
+                    "replicate_channel_count_mismatch", campaign=spec.name,
+                    channels=len(channels), compositions=spec.budget,
+                    replicates=spec.replicates, wells=wells_wanted,
+                    detail="channel count is not budget x replicates; rounds will "
+                           "not align one-to-one with the board")
+                emit("replicate_channel_count_mismatch",
+                     channels=len(channels), wells=wells_wanted)
 
         # Tag-index bridge (T1.5): the extractors receive only {step_name: result},
         # but tag-based closure needs each step's tags. The builders are the one
@@ -4192,7 +4322,11 @@ async def run_autonomous_campaign(
             objective_extractor=loop_extractor,
             workflow_builder=workflow_builder,
             auto_approve=spec.auto_approve and approval_fn is None,
-            max_iterations=spec.budget,
+            # The loop counts WELLS (one iteration per told batch member), while
+            # `budget` counts distinct compositions — 1:1 until replication, which
+            # casts each composition k times. `max(1, ...)` is belt-and-braces:
+            # `__post_init__` already refuses k < 1.
+            max_iterations=spec.budget * max(1, spec.replicates),
             batch_size=batch_size,
             batch_workflow_builder=batch_builder if batch_size > 1 else None,
             batch_objective_extractor=batch_extractor if batch_size > 1 else None,
@@ -4208,7 +4342,8 @@ async def run_autonomous_campaign(
 
         if resume_plan is not None:
             # Continue the iteration count rather than restarting it. With
-            # max_iterations kept absolute (spec.budget), the loop's own budget
+            # max_iterations kept absolute (the whole run's well ceiling,
+            # `budget x replicates`), the loop's own budget
             # check then stops at the right total, and checkpoint iteration
             # numbers stay monotonic across restarts instead of rewinding.
             loop._iteration = resume_plan.iteration

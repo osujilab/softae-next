@@ -652,6 +652,32 @@ class TestCLI:
         args = cli.build_parser().parse_args(["check", "s.toml"])
         assert args.project is None
 
+    @pytest.mark.parametrize("argv_prefix", [[], ["-v"]])
+    def test_campaign_main_configures_logging_at_config_level(
+        self, tmp_path, monkeypatch, argv_prefix
+    ):
+        """This entry point used to configure nothing, so it printed every level.
+
+        Without `configure_logging` a headless campaign inherits structlog's
+        default `PrintLogger`, and the RH controller's `rh_duty_sent` DEBUG line
+        — one per control update — buries the run's own reporting for hours. The
+        two parametrized cases are each other's control: an unpatched or
+        never-called `configure_logging` records nothing at all, so neither
+        `[False]` nor `[True]` can pass by accident.
+        """
+        calls: list[bool] = []
+        monkeypatch.setattr(cli, "configure_logging", calls.append)
+
+        rc = cli.main(argv_prefix + ["check", str(_write(tmp_path, DEMO))])
+
+        assert rc == cli.EXIT_OK
+        assert calls == [bool(argv_prefix)]
+
+    def test_verbose_is_accepted_after_the_subcommand_too(self, tmp_path):
+        """`softae-campaign check -v spec` is the spelling operators type."""
+        args = cli.build_parser().parse_args(["check", "s.toml", "-v"])
+        assert getattr(args, "verbose", False) is True
+
 
 class TestHeadlessPurgeAttachment:
     """The headless path must purge, or must not bill for purging (T5.4).
