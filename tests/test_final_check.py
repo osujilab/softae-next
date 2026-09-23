@@ -328,7 +328,7 @@ BLOCKED = FinalCheck("blocked", (Section("Campaign", (), (
     (CLEAN, False, "n", False),
     (CLEAN, False, "", False),
     (BLOCKED, False, "y", False),
-    (BLOCKED, True, None, True),
+    (BLOCKED, True, None, False),
 ])
 def test_confirm_answer_and_blocks_decide_the_launch(
         digest, assume_yes, answer, expected):
@@ -340,7 +340,15 @@ def test_confirm_answer_and_blocks_decide_the_launch(
 
     assert confirm_final_check(
         digest, assume_yes=assume_yes, ask=ask) is expected
-    assert asked == ([] if assume_yes else [asked[0]])
+    assert bool(asked) is not (assume_yes or digest.has_block)
+
+
+def test_confirm_block_with_assume_yes_is_refused_without_asking():
+    """A block is never overridable: --yes answers warnings, not blocks."""
+    def ask(prompt):  # pragma: no cover - must never be reached
+        raise AssertionError("a block must not be put to the operator")
+
+    assert confirm_final_check(BLOCKED, assume_yes=True, ask=ask) is False
 
 
 def test_confirm_unanswerable_prompt_is_a_no():

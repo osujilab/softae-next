@@ -524,14 +524,13 @@ def confirm_final_check(fc: FinalCheck, *, assume_yes: bool,
                         ask: Callable[[str], str] = input) -> bool:
     """Whether to launch. Prints nothing; the caller has already shown the page.
 
-    **A ``block`` is not overridable at the prompt, and ``assume_yes`` is.** A
-    block means the file and the bench contradict each other, and a ``y`` typed
-    in the moment is not evidence the contradiction was resolved — only that
-    someone wanted to continue. The fix is to change the spec or the bench and
-    run the check again. ``--yes`` is different because it is a decision recorded
-    in the launch command, the same standing ``softae-campaign run --yes``
-    already has over a projected stock shortfall.
+    **A ``block`` is never overridable** — not by a typed ``y``, not by
+    ``--yes`` — and it is not even put to the operator, since there is nothing
+    to ask. The fix is to change the spec or the bench and run the check again.
+    ``--yes`` still answers warnings.
     """
+    if fc.has_block:
+        return False
     if assume_yes:
         return True
     try:
@@ -540,7 +539,7 @@ def confirm_final_check(fc: FinalCheck, *, assume_yes: bool,
         # The same reading `softae-campaign`'s own `_confirm` takes: a prompt
         # nobody could answer is a no, never a yes.
         return False
-    return answer in ("y", "yes") and not fc.has_block
+    return answer in ("y", "yes")
 
 
 def main(argv: "Sequence[str] | None" = None) -> int:
@@ -593,7 +592,7 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         proceed = confirm_final_check(
             digest, assume_yes=args.yes,
             ask=(lambda _p: "") if unanswerable else _ask)
-        if unanswerable and not args.yes:
+        if unanswerable and not (args.yes or digest.has_block):
             print("(no terminal — pass --yes at launch)")
         return 0 if proceed else 3
     finally:
