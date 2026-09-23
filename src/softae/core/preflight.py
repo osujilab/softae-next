@@ -516,6 +516,9 @@ class CampaignProjection:
 
     per_iteration_s: float
     per_iteration_draw_uL: dict[int, float]
+    #: **Rounds**, not wells and not ``spec.budget``. The projected trial casts
+    #: every channel, so this is the count that multiplies the two fields above
+    #: (see :func:`_projected_rounds`). The field name predates the distinction.
     budget: int
     duration_complete: bool = True
     #: Declared stock per pump at projection time (``None`` = unmanaged).
@@ -570,6 +573,8 @@ class CampaignProjection:
         """Operator-facing summary: a rate with bounds, never a single ETA."""
         lines: list[str] = []
         per_it = _fmt_duration(self.per_iteration_s)
+        # "per iteration" is pinned by a foreign test (tests/test_campaign_cli.py);
+        # for a batched campaign it means per ROUND — one full-channel cast.
         lines.append(f"About {per_it} per iteration.")
         if not self.duration_complete:
             lines.append(
@@ -589,8 +594,8 @@ class CampaignProjection:
             )
 
         lines.append(
-            f"At most {_fmt_duration(self.time_to_budget_s)} to reach the "
-            f"{self.budget}-iteration budget — convergence may stop it sooner."
+            f"At most {_fmt_duration(self.time_to_budget_s)} to reach the budget "
+            f"in {self.budget} round(s) — convergence may stop it sooner."
         )
 
         draw_total = sum(self.per_iteration_draw_uL.values())
@@ -599,6 +604,7 @@ class CampaignProjection:
                 f"pump {p} {v:.0f} µL"
                 for p, v in sorted(self.per_iteration_draw_uL.items())
             )
+            # Same pinned label as above: per ROUND for a batched campaign.
             lines.append(f"Stock per iteration: {draw_total:.0f} µL ({per_pump}).")
 
         supported = self.iterations_supported()
@@ -610,7 +616,7 @@ class CampaignProjection:
             runway_s = supported * self.per_iteration_s
             verdict = "enough" if supported >= self.budget else "NOT enough"
             lines.append(
-                f"Declared stock supports about {supported} iteration(s) "
+                f"Declared stock supports about {supported} round(s) "
                 f"(~{_fmt_duration(runway_s)}) — {verdict} for the full budget."
             )
 
@@ -864,6 +870,20 @@ def unconditioned_start_warnings(spec: Any) -> list[str]:
     return [] if first_phase_axes(run_plan) else [UNCONDITIONED_START_WARNING]
 
 
+def _projected_rounds(spec: Any) -> int:
+    """Rounds the campaign will run — the unit a projected trial actually prices.
+
+    Both spellings of the count are read defensively: a spec written before
+    ``replicates`` existed has no such field, and a spec may declare no channels.
+    """
+    replicates = max(1, int(getattr(spec, "replicates", 1) or 1))
+    wells = int(getattr(spec, "budget", 0) or 0) * replicates
+    channels = list(getattr(spec, "channels", ()) or ())
+    if getattr(spec, "batch", False) and channels:
+        return -(-wells // len(channels))       # ceil
+    return wells
+
+
 def project_campaign(
     spec: Any,
     *,
@@ -904,6 +924,16 @@ def project_campaign(
         except Exception:
             midpoint[name] = 0.0
 
+    # `build_trial_workflow` casts one suggestion onto EVERY channel, so both
+    # `per_iteration_s` and `per_iteration_draw` price a whole ROUND. The count
+    # they are multiplied by must therefore be rounds too. `budget` counts
+    # distinct compositions and `replicates` how many wells each one fills, so
+    # the wells are `budget x k` and a batched round consumes `len(channels)` of
+    # them. The un-batched path already casts one suggestion across all channels
+    # per iteration, so an iteration is a round there and the count is unchanged
+    # — which is also what the loop's own `max_iterations` counts.
+    rounds = _projected_rounds(spec)
+
     try:
         wf = build_trial_workflow(spec, midpoint, catalog=catalog)
     except PlanCompileError:
@@ -914,7 +944,7 @@ def project_campaign(
         logger.warning("projection_build_failed", error=str(exc))
         return CampaignProjection(
             per_iteration_s=0.0, per_iteration_draw_uL={},
-            budget=int(getattr(spec, "budget", 0)), duration_complete=False,
+            budget=rounds, duration_complete=False,
             warnings=[f"Could not build a representative trial: {exc}"],
         )
 
@@ -985,7 +1015,7 @@ def project_campaign(
     projection = CampaignProjection(
         per_iteration_s=per_iteration_s,
         per_iteration_draw_uL=draw,
-        budget=int(getattr(spec, "budget", 0)),
+        budget=rounds,
         duration_complete=est.is_complete,
         stock_uL=stock,
         purge_uL_per_day=purge,
@@ -1001,7 +1031,7 @@ def project_campaign(
         projection.warnings.insert(
             0,
             f"Declared stock supports only ~{supported} of {projection.budget} "
-            f"iterations. The campaign will hard-stop before the budget.",
+            f"round(s). The campaign will hard-stop before the budget.",
         )
 
     logger.info(

@@ -163,11 +163,17 @@ def load_resume_plan(
         )
 
     iteration = int(cp.get("iteration") or 0)
-    remaining = max(0, int(spec.budget) - iteration)
+    # `iteration` counts WELLS — the loop advances once per *told* batch member,
+    # and a replicated round casts one composition onto k of them. So the ceiling
+    # is `budget x replicates`, which is what the loop's own `max_iterations`
+    # uses. Read defensively: a spec predating the field has no `replicates`.
+    replicates = max(1, int(getattr(spec, "replicates", 1) or 1))
+    wells = int(spec.budget) * replicates
+    remaining = max(0, wells - iteration)
     if remaining == 0:
         warnings.append(
-            f"The checkpoint is already at the budget ({iteration}/{spec.budget}); "
-            f"raise the budget to continue."
+            f"The checkpoint is already at the budget ({iteration}/{wells} "
+            f"wells; budget counts compositions); raise the budget to continue."
         )
 
     board_id = cp.get("board_id")

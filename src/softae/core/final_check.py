@@ -410,23 +410,26 @@ def _projection_section(spec: Any, task_catalog: Any, ledger: Any,
 
     supported = projection.iterations_supported()
     draw = sum(projection.per_iteration_draw_uL.values())
+    # Every count here is a ROUND: the projected trial casts every channel, so
+    # `budget` and `iterations_supported()` both count full-board rounds, not
+    # wells and not `spec.budget` (see preflight._projected_rounds).
     rows = [
-        ("per iteration", _dur(projection.per_iteration_s)
+        ("per round", _dur(projection.per_iteration_s)
          + ("" if projection.duration_complete else "  (lower bound)")),
         ("to budget", f"at most {_dur(projection.time_to_budget_s)} for "
-                      f"{projection.budget} iteration(s)"),
-        ("stock draw", f"{draw:,.0f} µL per iteration"),
+                      f"{projection.budget} round(s)"),
+        ("stock draw", f"{draw:,.0f} µL per round"),
         ("runway", "unknown — no reservoir levels declared" if supported is None
-         else f"about {supported} iteration(s) on declared stock"),
+         else f"about {supported} round(s) on declared stock"),
     ]
     findings = [Finding(WARN, w) for w in projection.warnings]
     if projection.stock_sufficient is False:
         findings.insert(0, Finding(
             WARN, f"Declared stock covers only ~{supported} of "
-                  f"{projection.budget} iterations; the run hard-stops early."))
+                  f"{projection.budget} round(s); the run hard-stops early."))
     elif projection.stock_sufficient:
         findings.append(Finding(
-            OK, f"Declared stock covers the full {projection.budget}-iteration "
+            OK, f"Declared stock covers the full {projection.budget}-round "
                 f"budget."))
     return Section("Projection", tuple(rows), tuple(findings))
 

@@ -262,8 +262,23 @@ def test_projection_with_a_catalog_reports_duration_and_draw(
                                task_catalog=task_catalog)
     rows = dict(next(s for s in digest.sections
                      if s.title == "Projection").rows)
-    assert "per iteration" in rows and rows["per iteration"]
-    assert "µL per iteration" in rows["stock draw"]
+    assert "per round" in rows and rows["per round"]
+    assert "µL per round" in rows["stock draw"]
+
+
+def test_runway_section_renders_rounds_not_iterations(monkeypatch, task_catalog):
+    """The projected count is rounds, so the digest must not call it iterations."""
+    spec = make_spec(monkeypatch, channels=[1, 2, 3, 4], budget=4, batch=True)
+    digest = build_final_check(spec, data_store=FakeStore(),
+                               task_catalog=task_catalog)
+    section = next(s for s in digest.sections if s.title == "Projection")
+
+    assert "1 round(s)" in dict(section.rows)["to budget"]
+    rendered = "\n".join(
+        [f"{k}: {v}" for k, v in section.rows]
+        + [f.text for f in section.findings]
+    )
+    assert "iteration" not in rendered
 
 
 # ── Rendering ───────────────────────────────────────────────────────────────

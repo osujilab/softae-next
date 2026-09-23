@@ -320,6 +320,34 @@ class TestProjection:
         assert not p.duration_complete
 
 
+class TestTheProjectedBudgetCountsRounds:
+    """``per_iteration_s`` and ``per_iteration_draw`` price ONE full-channel
+    workflow, so the count they are multiplied by is rounds, not wells."""
+
+    def test_project_campaign_batched_budget_counts_rounds_not_wells(self, catalog):
+        """Four compositions onto four channels is one round, not four."""
+        p = project_campaign(
+            _spec(budget=4, channels=(1, 2, 3, 4), batch=True), catalog=catalog)
+
+        assert p.budget == 1
+
+    def test_project_campaign_replicates_multiply_wells_before_rounding(self, catalog):
+        """Wells = budget x replicates; rounds divide that by the channel count."""
+        wide = _spec(budget=4, channels=(1, 2, 3, 4, 5, 6, 7, 8), batch=True)
+        wide.replicates = 2
+        narrow = _spec(budget=4, channels=(1, 2, 3, 4), batch=True)
+        narrow.replicates = 2
+
+        assert project_campaign(wide, catalog=catalog).budget == 1
+        assert project_campaign(narrow, catalog=catalog).budget == 2
+
+    def test_project_campaign_unbatched_budget_is_unchanged(self, catalog):
+        """An un-batched iteration already casts every channel, so it is a round."""
+        p = project_campaign(_spec(budget=7, channels=(1, 2, 3, 4)), catalog=catalog)
+
+        assert p.budget == 7
+
+
 class TestSummary:
     def test_describe_uses_human_units(self):
         p = CampaignProjection(

@@ -107,6 +107,18 @@ class TestLoad:
         assert plan.is_exhausted
         assert any("budget" in w for w in plan.warnings)
 
+    def test_resume_remaining_counts_wells_as_budget_times_replicates(self, store):
+        """`iteration` counts wells, so the ceiling is budget x replicates."""
+        spec = _spec(budget=4)
+        spec.replicates = 2        # the field parallel-session is adding
+        _checkpoint(store, spec, iteration=4)
+
+        plan = load_resume_plan(store, spec)
+
+        assert plan.remaining_budget == 4
+        assert not plan.is_exhausted
+        assert not any("already at the budget" in w for w in plan.warnings)
+
 
 # ── Refusing to resume the wrong thing ───────────────────────────────────────
 
