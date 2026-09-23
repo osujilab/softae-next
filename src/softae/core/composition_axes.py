@@ -21,6 +21,7 @@ than mean |Z|. Same rig, same solver, different question asked of it.
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -40,6 +41,9 @@ logger = structlog.get_logger(__name__)
 
 #: Target kinds an axis can carry, in the vocabulary the twin's editor already uses.
 AXIS_KINDS = ("molar_ratio", "dried_fraction", "concentration")
+
+#: Sampling scales. ``"linear"`` is what every spec predating the option means.
+AXIS_SCALES = ("linear", "log")
 
 #: Human labels, shared by the GUI so the two cannot drift apart.
 AXIS_LABELS = {
@@ -61,6 +65,12 @@ class CompositionAxis:
     ``low == high`` pins the target instead of searching it — the optimizer is never
     handed a degenerate dimension, because :func:`axes_parameter_space` omits it and
     :func:`build_targets_from_axes` substitutes the constant.
+
+    ``scale`` chooses how the *searched* span is sampled: ``"linear"`` (the default)
+    passes the bounds through untouched, ``"log"`` searches ``log10`` of them so a
+    flat draw spreads evenly per decade rather than piling into the top one. **A
+    pinned axis is unaffected** — its fixed value is used directly, never
+    exponentiated — so a pinned log axis may sit at zero while a searched one may not.
     """
 
     kind: str
@@ -69,6 +79,7 @@ class CompositionAxis:
     low: float = 0.0
     high: float = 1.0
     basis: str = Basis.VOLUME.value
+    scale: str = "linear"
 
     def __post_init__(self) -> None:
         if self.kind not in AXIS_KINDS:
@@ -81,6 +92,16 @@ class CompositionAxis:
             raise ValueError(
                 f"axis '{self.name}' has high ({self.high}) below low ({self.low})"
             )
+        if self.scale not in AXIS_SCALES:
+            raise ValueError(
+                f"unknown axis scale {self.scale!r} on '{self.name}'; expected "
+                f"'linear' or 'log'")
+        # Refused here, not in axes_parameter_space, so the invariant holds wherever
+        # the axis travels — log10(0) has no answer on any of those paths.
+        if self.is_log and self.low <= 0.0:
+            raise ValueError(
+                f"axis '{self.name}' is searched on a log scale, so it needs "
+                f"low > 0; got low={self.low:g}")
 
     @property
     def name(self) -> str:
@@ -96,13 +117,19 @@ class CompositionAxis:
         """A pinned target — held constant, not searched."""
         return self.high <= self.low
 
+    @property
+    def is_log(self) -> bool:
+        """Searched on a log scale. A pinned axis is never log, whatever it declares."""
+        return self.scale == "log" and not self.is_fixed
+
     def describe(self) -> str:
         label = AXIS_LABELS[self.kind]
         subject = f"{self.a}/{self.b}" if self.kind == "molar_ratio" else self.a
         if self.kind == "dried_fraction":
             subject = f"{subject} ({self.basis})"
         span = (f"= {self.low:g}" if self.is_fixed
-                else f"∈ [{self.low:g}, {self.high:g}]")
+                else f"∈ [{self.low:g}, {self.high:g}]"
+                     + (" (log)" if self.is_log else ""))
         return f"{label} {subject} {span}"
 
     def target(self, value: float) -> FormulationTarget:
@@ -120,13 +147,20 @@ def axes_parameter_space(axes: Sequence[CompositionAxis]) -> dict[str, dict[str,
     Handing the optimizer a dimension whose bounds are equal costs a GP dimension
     and a scaling division by zero to learn nothing, so a pinned target stays a
     constant of the campaign rather than becoming a degenerate axis.
+
+    A ``scale="log"`` axis is published in ``log10`` units, and that is the whole
+    change: every optimizer draws flat between the bounds it is handed, so decade
+    spacing is bought by the bounds rather than by a new dimension type.
+    :func:`build_targets_from_axes` undoes it on the way back.
     """
     space: dict[str, dict[str, Any]] = {}
     for axis in axes:
         if axis.is_fixed:
             continue
-        space[axis.name] = {"type": "float", "low": float(axis.low),
-                            "high": float(axis.high)}
+        low, high = float(axis.low), float(axis.high)
+        if axis.is_log:
+            low, high = math.log10(low), math.log10(high)
+        space[axis.name] = {"type": "float", "low": low, "high": high}
     return space
 
 
@@ -139,6 +173,10 @@ def build_targets_from_axes(
     A searched axis missing from *params* falls back to its ``low`` rather than
     raising — a solver that runs on a stale bound is recoverable, a campaign that
     dies mid-round on a ``KeyError`` is not.
+
+    Only a *drawn* value on a log axis is exponentiated: both fallbacks read ``low``,
+    already in the natural units the solver wants, so exponentiating either would
+    silently change the composition the operator wrote down.
     """
     frozen = tuple(axes)
 
@@ -149,6 +187,8 @@ def build_targets_from_axes(
                 value = axis.low
             elif axis.name in params:
                 value = params[axis.name]
+                if axis.is_log:
+                    value = 10.0 ** float(value)
             else:
                 logger.warning("composition_axis_missing", axis=axis.name,
                                msg="suggestion lacks this axis; using its lower bound")

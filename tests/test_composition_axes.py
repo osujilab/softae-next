@@ -14,6 +14,8 @@ and a scaling division by zero to learn nothing.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from softae.core.composition_axes import (
@@ -104,6 +106,56 @@ class TestBuildTargets:
         # casting; one that solves on a stale bound is recoverable and logged.
         targets = build_targets_from_axes([RATIO])({})
         assert targets == [MolarRatioTarget("PEO", "LiCl", 5.0)]
+
+
+class TestLogScale:
+    """``scale = "log"`` searches decades instead of the raw span.
+
+    A flat draw over EO:Li ∈ [5, 50] lands two thirds of its mass above 20:1;
+    a flat draw over log10 of the same span spreads it evenly per decade.
+    """
+
+    def test_axes_parameter_space_log_axis_writes_log10_bounds(self):
+        axis = CompositionAxis("molar_ratio", "PEO", "LiCl",
+                               low=5.0, high=50.0, scale="log")
+        assert axes_parameter_space([axis]) == {
+            axis.name: {"type": "float", "low": math.log10(5.0),
+                        "high": math.log10(50.0)}}
+
+    def test_build_targets_log_axis_exponentiates_the_draw(self):
+        axis = CompositionAxis("molar_ratio", "PEO", "LiCl",
+                               low=5.0, high=50.0, scale="log")
+        targets = build_targets_from_axes([axis])({axis.name: math.log10(20.0)})
+        assert targets[0].value == pytest.approx(20.0, abs=1e-9)
+
+    def test_axis_default_scale_is_linear_and_unchanged(self):
+        # Every spec written before `scale` existed must be bit-for-bit unmoved.
+        omitted = CompositionAxis("molar_ratio", "PEO", "LiCl", low=5.0, high=50.0)
+        explicit = CompositionAxis("molar_ratio", "PEO", "LiCl",
+                                   low=5.0, high=50.0, scale="linear")
+        assert omitted.scale == "linear"
+        assert axes_parameter_space([omitted]) == axes_parameter_space([explicit])
+        params = {omitted.name: 20.0}
+        assert (build_targets_from_axes([omitted])(params)
+                == build_targets_from_axes([explicit])(params)
+                == [MolarRatioTarget("PEO", "LiCl", 20.0)])
+
+    def test_axis_log_scale_with_nonpositive_low_is_refused(self):
+        with pytest.raises(ValueError, match="low > 0"):
+            CompositionAxis("dried_fraction", "SiO2",
+                            low=0.0, high=0.15, scale="log")
+
+    def test_axis_unknown_scale_is_refused(self):
+        with pytest.raises(ValueError, match="'linear'.*'log'"):
+            CompositionAxis("molar_ratio", "PEO", "LiCl",
+                            low=5.0, high=50.0, scale="ln")
+
+    def test_pinned_log_axis_uses_its_fixed_value(self):
+        # A pinned axis never reaches the log math, so 0.1 stays 0.1, not 10**0.1.
+        axis = CompositionAxis("dried_fraction", "SiO2",
+                               low=0.1, high=0.1, scale="log")
+        assert axes_parameter_space([axis]) == {}
+        assert build_targets_from_axes([axis])({})[0].value == pytest.approx(0.1)
 
 
 class TestDeterminacy:
