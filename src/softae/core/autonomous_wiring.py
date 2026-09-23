@@ -3723,6 +3723,27 @@ async def run_autonomous_campaign(
         try:
             from softae.core.campaign_spec_fields import catalogs as _chem_catalogs
             from softae.core.run_provenance import write_run_provenance
+            from softae.core.stock_assignment import load_loadout
+            from softae.core.stock_resolution import (
+                resolve_stocks, stocks_resolved_event)
+
+            _chems, _sols = _chem_catalogs()
+            # Both records, compared once: the file's intent and the bench's
+            # declaration. Emitted unconditionally — a `source: "none"` event
+            # says the launch looked and found nothing, which no *absent* event
+            # could distinguish from the resolution never having run.
+            #
+            # Sited FIRST — before the midpoint and before the write — so that
+            # claim is true of the code and not only of this comment. `_mid`
+            # raises on a malformed parameter space and `build_trial_workflow`
+            # on a spec the catalog cannot compile, and an emit sited below them
+            # would be lost in exactly the launches whose chemistry a reader most
+            # needs named. Nothing above it can cost the write in return:
+            # `resolve_stocks` is pure and `load_loadout` never raises, and a
+            # caller whose `on_event` raises has already lost the run at the next
+            # unguarded `emit` a few lines down.
+            _stocks = resolve_stocks(spec, load_loadout(data_store), _sols)
+            emit("stocks_resolved", **stocks_resolved_event(_stocks))
 
             _mid = {
                 p: ((float(d["low"]) + float(d["high"])) / 2.0
@@ -3730,12 +3751,12 @@ async def run_autonomous_campaign(
                     else (d.get("choices") or [None])[0])
                 for p, d in (spec.parameter_space or {}).items()
             }
-            _chems, _sols = _chem_catalogs()
             write_run_provenance(
                 data_store.run_dir(run_id),
                 spec=spec,
                 workflow=build_trial_workflow(spec, _mid, catalog=catalog),
                 tasks=catalog, chemicals=_chems, solutions=_sols,
+                stocks=_stocks,
             )
         except Exception:
             logger.warning("run_provenance_skipped", exc_info=True)

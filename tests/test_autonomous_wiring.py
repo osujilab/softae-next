@@ -2685,3 +2685,141 @@ async def test_campaign_start_does_not_emit_settle_min_channels_ignored_when_uns
     assert [e for e in events if e["type"] == "settle_mode"]
     assert not [e for e in events if e["type"] == "settle_min_channels_ignored"]
     store.close()
+
+
+# ── Stock resolution reaches the run record ──────────────────────────────────
+
+import json  # noqa: E402
+
+#: The three shipped stocks `examples/bench_instance.toml` casts, on its pumps.
+STOCK_PUMPS = {"5wt% 20k PEO stock": 0, "10 wt% silica solution": 1,
+               "LiCl 10M": 2}
+
+
+def _pinned_stock_spec(monkeypatch, **over):
+    """A pinned three-stock recipe, decoded against the shipped catalogs.
+
+    Every ``_spec()`` above is volume mode, which names no stocks at all: its
+    resolution is ``source: "none"``, and ``build_run_provenance`` writes that as
+    *absence* rather than as an empty map. A spec carrying a
+    ``[general_formulation]`` is therefore the only shape that can show the
+    resolved record landing in ``provenance.json`` with names in it.
+
+    Pinned rather than searched — every axis ``low == high``, as
+    ``examples/bench_instance.toml`` ships them — so the campaign still has one
+    honest int dimension to walk and casts one fixed, feasible recipe.
+    """
+    from softae.core.campaign_spec_io import spec_from_dict
+    from tests.support.fixture_catalog import use_default_chemistry
+
+    use_default_chemistry(monkeypatch)
+    data = {
+        "name": "stocks_probe",
+        "pcb_name": "SoftAE_EIS_4Stripe",
+        "channels": [21, 22],
+        "optimizer": "grid",
+        "budget": 2,
+        "time_scale": 0.0,
+        "pump_ids": [0, 1, 2],
+        "parameter_space": {"replicate": {"type": "int", "low": 1, "high": 2}},
+        "general_formulation": {
+            "stocks": sorted(STOCK_PUMPS, key=STOCK_PUMPS.get),
+            "target_deposition_uL": 4.5,
+            "budget_uL": 118.0,
+            "pump_assignment": dict(STOCK_PUMPS),
+            "axes": [
+                {"kind": "molar_ratio", "a": "Ethylene oxide",
+                 "b": "Lithium chloride", "low": 20.0, "high": 20.0,
+                 "basis": "volume"},
+                {"kind": "dried_fraction", "a": "Fumed silica", "b": "",
+                 "low": 0.10, "high": 0.10, "basis": "volume"},
+            ],
+        },
+    }
+    data.update(over)
+    return spec_from_dict(data, source="<test>")
+
+
+@pytest.mark.asyncio
+async def test_campaign_writes_the_resolved_stocks_into_provenance_and_emits_once(
+    connected, tmp_path: Path, monkeypatch
+):
+    """Which stock sat on which pump is answerable from the run directory.
+
+    The resolution rides inside the campaign's best-effort provenance block, so
+    a wiring fault there is invisible: the whole thing degrades to one
+    ``run_provenance_skipped`` warning and every other assertion in this module
+    stays green. This is the test that can tell *ran* from *silently skipped* —
+    it reads the file back and requires the names, not merely that nothing
+    raised.
+    """
+    store = DataStore(tmp_path / "proj")
+    events: list[dict] = []
+
+    result = await run_autonomous_campaign(
+        _pinned_stock_spec(monkeypatch), manager=connected, data_store=store,
+        on_event=events.append)
+
+    document = json.loads((store.run_dir(result.run_id) / "provenance.json")
+                          .read_text(encoding="utf-8"))
+    stocks = document["stocks"]
+    # The spec named the pumps, so the spec is the record that won.
+    assert stocks["source"] == "spec"
+    # Both directions, per the module rule: the pump index is the physical fact
+    # and the name is its interpretation.
+    assert stocks["by_pump"] == {str(p): n for n, p in STOCK_PUMPS.items()}
+    assert stocks["by_name"] == STOCK_PUMPS
+    # Rows snapshotted, and resolved — an unreadable catalog would leave the
+    # tagged marker here instead, which is a different answer from a name.
+    assert set(stocks["catalog_rows"]) == set(STOCK_PUMPS)
+    assert not any("__unresolved__" in row for row in stocks["catalog_rows"].values())
+    # Nothing was loaded at the bench, so all three pumps are undeclared rather
+    # than in agreement.
+    assert stocks["disagreements"] == {}
+    assert stocks["undeclared"] == [0, 1, 2]
+
+    resolved = [e for e in events if e["type"] == "stocks_resolved"]
+    assert len(resolved) == 1, "one resolution per run, not zero and not per trial"
+    assert resolved[0]["by_name"] == STOCK_PUMPS
+    # The bulky rows stay in the file; `events.jsonl` carries the answer only.
+    assert "catalog_rows" not in resolved[0]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_stock_resolution_that_raises_skips_provenance_and_says_nothing(
+    connected, tmp_path: Path, monkeypatch
+):
+    """The positive control for the test above, and the guard's own contract.
+
+    Without this, a green ``provenance.json`` assertion cannot distinguish "the
+    block ran" from "the block cannot fail". Here the resolution raises, and the
+    two consequences are exactly the ones the ``except`` branch promises: the
+    run survives to its full budget, and the record is *absent* rather than
+    half-written — no event either, since the emit sits downstream of the call
+    that raised.
+
+    The injected raise is not a shape production cannot make
+    (``SUBAGENT_RULES`` §3.1(e)): ``spec_stock_by_pump`` coerces pump indices
+    with ``int()`` and the catalog snapshot runs ``canonical()`` over a solution
+    row, so a malformed assignment or an uncanonicalisable row reaches this same
+    handler.
+    """
+    from softae.core import stock_resolution
+
+    spec = _pinned_stock_spec(monkeypatch)
+
+    def _raise(*_a, **_k):
+        raise RuntimeError("stock resolution exploded")
+
+    monkeypatch.setattr(stock_resolution, "resolve_stocks", _raise)
+
+    store = DataStore(tmp_path / "proj")
+    events: list[dict] = []
+    result = await run_autonomous_campaign(
+        spec, manager=connected, data_store=store, on_event=events.append)
+
+    assert result.n_trials == 2, "provenance is best-effort; the run is not"
+    assert not (store.run_dir(result.run_id) / "provenance.json").exists()
+    assert not [e for e in events if e["type"] == "stocks_resolved"]
+    store.close()

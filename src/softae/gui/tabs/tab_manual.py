@@ -7,7 +7,6 @@ quick-run.
 
 from __future__ import annotations
 
-import math
 import os
 import tempfile
 from typing import TYPE_CHECKING, Iterable
@@ -694,7 +693,7 @@ class ManualControlTab(QWidget):
             syr_layout.addLayout(rate_row)
 
             vol_row = QHBoxLayout()
-            vol_row.addWidget(QLabel(f"       Vol:"))
+            vol_row.addWidget(QLabel("       Vol:"))
             spin_vol = QDoubleSpinBox()
             spin_vol.setRange(0.01, 5000.0)
             spin_vol.setValue(10.0)
@@ -1686,7 +1685,13 @@ class ManualControlTab(QWidget):
             return
         from softae.gui.widgets.reservoir_dialog import ReservoirDialog
 
-        ReservoirDialog(ledger, parent=self).exec()
+        # The store is what makes the stock dropdown writable: without it the
+        # dialog disables the combo and `save_loadout(None, ...)` would drop the
+        # operator's pick silently. No `sol_catalog=` to pass — this tab is never
+        # handed one — and the dialog falls back to `catalogs_from_data_root()`,
+        # which reads the same two CSVs off the same data root that
+        # `MainWindow._load_catalogs_from_root` does for its own call site.
+        ReservoirDialog(ledger, parent=self, data_store=self._data_store).exec()
         self.refresh_stock_labels()
 
     def refresh_stock_labels(self) -> None:

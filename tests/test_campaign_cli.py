@@ -605,6 +605,11 @@ class TestCLI:
         assert rc == cli.EXIT_OK
         assert "head registered as raised" in out
         assert "STOPPED: 2 trial(s)" in out
+        # The digest is on the live run path, and `--yes` carries it. This is
+        # also the positive control for the declined case below: the gate lets a
+        # run through, so an EXIT_DECLINED there is the refusal and not the
+        # branch always returning 3.
+        assert "FINAL CHECK" in out
 
     def test_head_position_must_be_stated_not_assumed(self, tmp_path, capsys,
                                                       monkeypatch):
@@ -778,6 +783,113 @@ class TestCalibrationAdvisory:
         cli._calibration_advisory(spec_from_dict(MINIMAL))
 
         assert "calibration state unavailable" in capsys.readouterr().out
+
+
+class TestFinalCheckDigest:
+    """The launch page: what the spec intends beside what the bench holds (D7).
+
+    `run` shows it and gates on the answer; `check` shows it and asks nothing,
+    because `check` connects to nothing and so has no launch to decline.
+    """
+
+    @staticmethod
+    def _isolated_rig(monkeypatch, tmp_path):
+        """A real-rig branch whose lock is a tmp file, never the operator's.
+
+        Two patches, and both are load-bearing. `rig_is_simulated -> False` is
+        what makes `_cmd_run` actually take a claim, so the release below is a
+        fact rather than a vacuous truth about a claim never taken. Moving
+        `DEFAULT_SCOPE` is what keeps that off ``~/.softae/rig.lock`` — asking
+        the real one would read, and could clear, a live experiment's claim.
+        The import first binds the genuine `rig_is_simulated` into
+        `autonomous_wiring` before the patch, per `test_campaign_liveness_guard`.
+        """
+        import softae.core.autonomous_wiring  # noqa: F401 — bind the real one
+        from softae.core import run_lock as rl
+
+        monkeypatch.setattr(rl, "DEFAULT_SCOPE", tmp_path / "rig_scope")
+        monkeypatch.setattr(rl, "rig_is_simulated", lambda _m: False)
+        return rl
+
+    def test_campaign_run_declined_digest_returns_exit_declined(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """A declined digest starts nothing and hands the rig claim back."""
+        rl = self._isolated_rig(monkeypatch, tmp_path)
+        started = []
+        monkeypatch.setattr("softae.core.autonomous_wiring."
+                            "run_autonomous_campaign",
+                            lambda *a, **k: started.append(1))
+
+        asked = {}
+
+        def _decline(digest, **_kw):
+            # Read inside the prompt, which is the only moment the claim is both
+            # taken and still held; afterwards either answer looks identical.
+            asked["held"] = rl.lock_path().exists()
+            asked["digest"] = digest
+            return False
+
+        monkeypatch.setattr("softae.core.final_check.confirm_final_check",
+                            _decline)
+
+        rc = cli.main(["run", str(_write(tmp_path, DEMO)), "--mock", "--head-up",
+                       "--project", str(tmp_path / "proj")])
+        out = capsys.readouterr().out
+
+        # Reached the digest at all — without this, an earlier gate returning
+        # EXIT_DECLINED would pass this test for the wrong reason.
+        assert asked, "the digest gate was never reached"
+        assert rc == cli.EXIT_DECLINED
+        assert "FINAL CHECK" in out
+        assert not started, "a declined launch must not start the campaign"
+        assert asked["held"] is True, "the claim was never taken"
+        assert not rl.lock_path().exists(), "the claim outlived the refusal"
+
+    def test_campaign_check_prints_digest_without_prompting(self, tmp_path,
+                                                            capsys, monkeypatch):
+        """`check` renders the page and asks nothing; absence reads as unchecked."""
+        def _never_ask(*_a, **_k):
+            raise AssertionError("`check` runs nothing, so it asks nothing")
+
+        monkeypatch.setattr("softae.core.final_check.confirm_final_check",
+                            _never_ask)
+        monkeypatch.setattr("builtins.input", _never_ask)
+
+        rc = cli.main(["check", str(_write(tmp_path, DEMO))])
+        out = capsys.readouterr().out
+
+        assert rc == cli.EXIT_OK
+        assert "FINAL CHECK" in out
+        # No `--project`, so no store — and the board must say so rather than
+        # report the wells it could not read as free.
+        assert "NOT CHECKED" in out
+
+    def test_check_digest_reads_the_store_when_a_project_is_given(
+        self, tmp_path, capsys
+    ):
+        """The negative control for the line above: with a store it is checked.
+
+        Without this, `NOT CHECKED` could be the only thing `check` ever prints
+        and the test above would still pass.
+        """
+        rc = cli.main(["check", str(_write(tmp_path, DEMO)),
+                       "--project", str(tmp_path / "proj")])
+        out = capsys.readouterr().out
+
+        assert rc == cli.EXIT_OK
+        assert "NOT CHECKED" not in out
+        assert "board id" in out
+
+    def test_a_missing_task_catalog_costs_the_projection_not_the_launch(
+        self, monkeypatch
+    ):
+        """`_task_catalog_or_none` is the soft half; `_project` keeps the hard one."""
+        monkeypatch.setattr("softae.core.task_catalog.TaskCatalog.load_toml",
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                RuntimeError("catalog is unreadable")))
+
+        assert cli._task_catalog_or_none() is None
 
 
 class TestSafeDefaults:

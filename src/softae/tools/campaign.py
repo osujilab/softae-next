@@ -223,6 +223,23 @@ def _purge_is_attached(manager) -> bool:
 
 # ── Projection ───────────────────────────────────────────────────────────────
 
+def _task_catalog_or_none():
+    """The bench task catalog for the digest's projection, or None when absent.
+
+    Deliberately softer than :func:`_project`'s load, which lets a
+    ``PlanCompileError`` refuse the launch. That refusal has already happened by
+    the time the digest is built, so a failure here can only mean the catalog
+    became unreadable in between — and costs the projection *row*, not the run.
+    """
+    from softae.config import loader
+    from softae.core.task_catalog import TaskCatalog
+
+    try:
+        return TaskCatalog.load_toml(loader.tasks_toml_path())
+    except Exception:
+        return None
+
+
 def _project(spec, manager, *, assume_yes: bool, store=None) -> bool:
     """Print the duration/stock projection; stop on a predicted shortfall."""
     from softae.config import loader
@@ -351,15 +368,31 @@ def _cmd_check(args) -> int:
     from softae.core.data_store import DataStore
 
     store = DataStore(args.project) if args.project else None
-    if store is not None:
-        try:
+    try:
+        # The same page `run` shows, and **no prompt**: `check` connects nothing
+        # and moves nothing, so there is no launch here to decline. Whether a
+        # disagreement should also move `check`'s exit code is open with the
+        # operator (spec §7.2); until it is ruled, `check` reports and returns 0,
+        # because a wrapper reading non-zero as "spec broken" would start
+        # reporting a bench state instead.
+        #
+        # With no `--project` there is no store, and the digest says the board is
+        # *unchecked* rather than clean — the absence is reported, not defaulted.
+        from softae.core.final_check import build_final_check, render_final_check
+
+        print(render_final_check(build_final_check(
+            spec, data_store=store, source=str(args.spec),
+            task_catalog=_task_catalog_or_none())))
+
+        if store is not None:
             from softae.core.campaign_resume import describe_resume, load_resume_plan
 
             plan = load_resume_plan(store, spec, strict=False)
             if plan is not None:
                 print("A checkpoint exists for this campaign:")
                 print(describe_resume(plan))
-        finally:
+    finally:
+        if store is not None:
             store.close()
     return EXIT_OK
 
@@ -485,6 +518,25 @@ def _cmd_run(args) -> int:
         if not _project(spec, manager, assume_yes=args.yes, store=store):
             return EXIT_DECLINED
         _calibration_advisory(spec)
+
+        # The last thing before anything connects: what the file intends, beside
+        # what the bench holds. Sited here because the digest needs the store,
+        # which is opened above — and the rig claim is already held, which is
+        # safe rather than awkward: `finally: rig_claim.close()` hands it back on
+        # this return, so a declined launch occupies the rig for the length of
+        # one prompt and nothing else.
+        from softae.core.final_check import (
+            build_final_check,
+            confirm_final_check,
+            render_final_check,
+        )
+
+        _digest = build_final_check(
+            spec, data_store=store, source=str(args.spec),
+            task_catalog=_task_catalog_or_none())
+        print(render_final_check(_digest))
+        if not confirm_final_check(_digest, assume_yes=args.yes):
+            return EXIT_DECLINED
 
         # Queried before anything connects so the operator is told early, but
         # acted on after (see `_go`): a park needs live sessions.

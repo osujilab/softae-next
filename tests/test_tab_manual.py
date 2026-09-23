@@ -42,11 +42,8 @@ def manager():
     return create_mock_manager(config={})
 
 
-@pytest.fixture
-def tab(qapp, manager):
-    widget = ManualControlTab(manager)
-    yield widget
-    # belt-and-suspenders: stop embedded workers that might still be running
+def _shutdown_tab(widget) -> None:
+    """Belt-and-suspenders: stop embedded workers that might still be running."""
     pos_map = getattr(widget, "_pos_map", None)
     if pos_map is not None:
         worker = getattr(pos_map, "_pos_worker", None)
@@ -57,6 +54,13 @@ def tab(qapp, manager):
     if pv_worker is not None and pv_worker.isRunning():
         pv_worker.stop_worker()
     widget.close()
+
+
+@pytest.fixture
+def tab(qapp, manager):
+    widget = ManualControlTab(manager)
+    yield widget
+    _shutdown_tab(widget)
 
 
 @pytest.fixture
@@ -197,7 +201,6 @@ class TestCommandWorkerSignals:
 
     def test_goto_updates_position_label_via_signal(self, tab):
         """After _on_goto worker completes, _lbl_pos shows the new position."""
-        stage = tab._manager.get("stage")
         # Move to known position then call _on_goto to a different coord
         tab._spin_x.setValue(5.0)
         tab._spin_y.setValue(3.0)
@@ -893,3 +896,74 @@ class TestAWindowlessTabIsFullyUsable:
         tab._on_lamp_on()
 
         assert calls == ["on"]
+
+
+class _FakeLedger:
+    """Enough ledger to be *attached*; the dialog itself is recorded, not built."""
+
+    hard_stop_uL = 100.0
+    soft_warn_uL = 500.0
+
+    def remaining_uL(self, pump_id):    # drives `refresh_stock_labels`
+        return None
+
+
+class TestTheStockDialogIsOpenedWithItsStore:
+    """`_on_report_stock` opened ``ReservoirDialog(ledger, parent=self)`` with no
+    store at all, which disables the stock dropdown and turns
+    ``save_loadout(None, ...)`` into a silent no-op — the operator's declaration
+    discarded without a word. The store is what makes that combo writable."""
+
+    @staticmethod
+    def _open(widget, monkeypatch) -> list:
+        """Press Report Stock with a ledger attached, recording the dialog."""
+        calls: list[dict] = []
+
+        class _Recorder:
+            def __init__(self, ledger, parent=None, **kwargs):
+                calls.append({"ledger": ledger, "parent": parent, **kwargs})
+
+            def exec(self):
+                return 0
+
+        # The handler imports the dialog at call time, so the module attribute
+        # is the binding it will resolve.
+        monkeypatch.setattr(
+            "softae.gui.widgets.reservoir_dialog.ReservoirDialog", _Recorder)
+        monkeypatch.setattr(widget._manager.get("syringe"), "reservoir_ledger",
+                            _FakeLedger(), raising=False)
+
+        widget._on_report_stock()
+        return calls
+
+    def test_report_stock_hands_the_dialog_the_tabs_data_store(
+            self, qapp, manager, monkeypatch):
+        store = object()
+        widget = ManualControlTab(manager, data_store=store)
+        try:
+            calls = self._open(widget, monkeypatch)
+        finally:
+            _shutdown_tab(widget)
+
+        assert len(calls) == 1, "the stock dialog was not opened"
+        assert calls[0]["data_store"] is store
+
+    def test_report_stock_passes_no_store_when_the_tab_has_none(
+            self, tab, monkeypatch):
+        """The store is *threaded from the tab*, not conjured at the call site —
+        so a tab built without one still says so, and the dialog's own note
+        about an unsaveable pick is what the operator sees."""
+        calls = self._open(tab, monkeypatch)
+
+        assert len(calls) == 1
+        assert calls[0]["data_store"] is None
+
+    def test_report_stock_passes_no_catalog_and_relies_on_the_fallback(
+            self, tab, monkeypatch):
+        """This tab is never handed a solution catalog; the dialog falls back to
+        ``catalogs_from_data_root()``, which reads the same two CSVs off the same
+        data root that ``MainWindow._load_catalogs_from_root`` does."""
+        calls = self._open(tab, monkeypatch)
+
+        assert "sol_catalog" not in calls[0]
+        assert not hasattr(tab, "_sol_catalog")
