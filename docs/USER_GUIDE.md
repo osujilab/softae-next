@@ -204,6 +204,15 @@ live position, "Go Home"/"Go Dep-1" move on a background thread. Syringe config:
 `parallel_syringes` (1 or 2), **Apply + Save** persists to `softae_config.toml`. PCB selector.
 Position map: click an electrode to move there.
 
+**Edit Well Occupancy…** (under the position map) pops out a per-well editor for the current board:
+mark a well cast or free by hand, or swap to a fresh board from the same place. Nothing is written
+until **OK** — Cancel means nothing happened — and every override records an `occupancy_override`
+alert carrying the well, the direction, whatever row it displaced and your free-text reason. The
+editor **refuses to open while a campaign holds the rig**, because a running campaign froze its copy
+of occupancy at launch and would not see the edit. If the store cannot delete a well, recorded wells
+are read-only rather than silently unchanged; if it cannot read row detail, the free-confirmation
+says the sample identities could not be read rather than reporting none.
+
 **Tab 2 — Liquid Model.** System parameters (`beta`, `eta_ref_mpas`, `alpha_growth_per_run`) and
 three line panels (0/1/2) with per-line physics and a live prime-volume estimate. **Apply + Save**
 writes `[liquid_handling]`, `[liquid_handling.line.<id>]` and `[piezo.liquid_events]`. Piezo event
@@ -284,11 +293,12 @@ derived-objective map, convergence trace, suggested-point scatter; JSON export.
 
 Raw volumes has no stock identity, hence no dry thickness and no σ; composition targets give every
 trial a predicted thickness. Stocks and pump assignment come from the persisted pump loadout, so
-declare it in the Formulation Manager first. A target row with `Low == High` is pinned: held
-constant, kept out of the optimizer. **Direction** defaults to `auto` and should stay there
-([§12](#12-softae-campaign)). Also here: board-exchange controls and electrode capacity, seed
-observations, an optional prior mean, a pre-run overflow scan, and a projected duration plus
-stock-runway preflight.
+declare it in **Instruments → Syringe Stock…** first ([§12](#12-softae-campaign)). A target row with
+`Low == High` is pinned: held constant, kept out of the optimizer. **Direction** defaults to `auto`
+and should stay there ([§12](#12-softae-campaign)). Also here: board-exchange controls and electrode
+capacity, seed observations, an optional prior mean, a pre-run overflow scan, and a projected
+duration plus stock-runway preflight. **Starting a campaign shows the Final-Check digest as a dialog
+before anything is spawned**; on a block, **Proceed** is disabled ([§12](#12-softae-campaign)).
 
 **Tab 11 — Catalogs.** Read-only browser over the chemical and solution catalogs with an **Edit**
 button opening the Catalog Manager ([§11](#11-deposition-twin-and-catalogs)).
@@ -774,7 +784,7 @@ softae-campaign control pause|resume|abort [--run-dir DIR] [--reason TEXT]
 
 | Flag | Applies to | Meaning |
 |---|---|---|
-| `--yes` / `-y` | run, resume | Skip the confirmation prompt |
+| `--yes` / `-y` | run, resume | Answers the launch prompts, Final Check included. **Never overrides a block** |
 | `--resume` | run | Continue a saved checkpoint; off by default |
 | `--mock` | run, resume | Mock instruments for a full dry rehearsal |
 | `--project DIR` | all | Overrides `[data] project_dir`, and decides where the resume checkpoint lives |
@@ -792,15 +802,52 @@ softae-campaign control pause|resume|abort [--run-dir DIR] [--reason TEXT]
 | 4 | Rig busy — another process holds it; retrying later is correct |
 
 `check` prints name, parameters, budget, channels, the preflight projection, the EIS calibration
-advisory, and any checkpoint summary. It does **not** print the resolved run-plan phase order, and
-it does **not** emit the cure-temperature warning — that is raised during `run`, after hardware
-connect, when the deposition recipe is built.
+advisory, any checkpoint summary, and the Final-Check digest below — the same page `run` shows, with
+no prompt, since `check` connects nothing and moves nothing. It does **not** print the resolved
+run-plan phase order, and it does **not** emit the cure-temperature warning — that is raised during
+`run`, after hardware connect, when the deposition recipe is built.
 
 **Head state.** The loop drives the head with conditional commands (raise if down, lower if up), so
 a wrong belief costs one wrong flip. The flag records what is true *now*; an aborted run, a manual
 jog or a power cycle all break inference from the last run. Omitting both prompts on the terminal,
 which hangs an unattended launch, so cron and scheduler invocations must state it alongside
 `--yes`. Every other headless gate has a safe default; head position has none.
+
+### Final Check
+
+Every launch is preceded by a digest that puts what the file intends beside what the bench holds:
+the stocks on each pump, the measurement block, the run-plan sequence, board occupancy, EIS
+calibration coverage, purge state, and the duration and stock projection. Each finding is `ok`, a
+`warn` or a **`BLOCK`**.
+
+| Surface | Behaviour |
+|---|---|
+| `softae-campaign run` / `resume` | Prints the digest, then asks `Proceed? [y/N]`. Declining exits **3** |
+| Tab 10 | Shows the digest as a dialog before the campaign is spawned; on a block, **Proceed** is disabled |
+| `softae-campaign check` | Prints the digest and stops — no prompt, and today still exit 0 |
+| `py -m softae.core.final_check <spec.toml> [--project DIR] [--yes]` | The same digest, standalone, against any spec |
+
+**A block is not overridable.** `--yes` answers warnings; it cannot answer a block, and neither can a
+typed `y`. A block means the spec and the bench declaration contradict each other — a pump loaded
+with one solution and assigned another in the file — which is precisely the case that used to load
+clean and cast the wrong chemistry. Fix the spec or re-declare the loadout.
+
+Without `--project` there is no store, so the digest reports board occupancy as **unchecked** rather
+than clean. *Unknown* is never printed as *fine*.
+
+### Declaring stock, and what a run records
+
+Declare what is physically loaded in **Instruments → Syringe Stock…**. Each pump's solution is picked
+from the project's solution catalog. Opened without a project store, the stock combos are **disabled**
+with a visible notice — a pick that could not be persisted is worse than no pick — so open a project
+first. Every re-declaration writes an INFO `stock_declared` alert, giving the loadout a history
+instead of a silent overwrite.
+
+Each run's `provenance.json` then records `stocks` **both ways**: `by_pump` (the physical fact) and
+`by_name` (its interpretation), with `source` saying which record won — `spec` when the file's
+`pump_assignment` was authoritative, `declared` when the bench loadout was — plus the catalog rows
+and any disagreement. A wrong name is therefore checkable afterwards against the pump the volume
+actually left, from the run directory alone.
 
 ### Spec file
 
@@ -951,7 +998,8 @@ electrodes still free on the plate, and the unspent budget.
   everything already measured. With no handler (fully headless) an exchange request stops cleanly
   rather than assuming a fresh plate.
 - Drop-cast wells are single-use, so occupancy is persisted per `(board_id, electrode)` and
-  survives a restart. Resuming into recorded occupancy asks fresh / resume / cancel.
+  survives a restart. Resuming into recorded occupancy asks fresh / resume / cancel. Wells can also
+  be set by hand between runs, from Tab 1 ([§4](#4-tab-reference)).
 - `--resume` is off by default. The checkpoint is fingerprinted against the spec; a changed
   parameter space, objective or optimizer setting is refused rather than continued into.
 

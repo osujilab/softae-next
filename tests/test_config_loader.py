@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -54,6 +55,31 @@ class TestDefaultPCB:
         toml.write_text("[paths]\ndata_root = './data'\n", encoding="utf-8")
         loader.load(path=toml, reload=True)
         assert loader.default_pcb_name() is None
+
+    def test_shipped_config_default_pcb_is_top_level_and_names_a_known_board(self):
+        """The shipped file must carry ``default_pcb`` at the TOP level.
+
+        A bare key written after a table header belongs to that table, so a
+        ``default_pcb`` sitting under ``[piezo.liquid_events]`` parses as
+        ``piezo.liquid_events.default_pcb`` and :func:`loader.default_pcb_name`
+        never sees it — the alphabetical fallback answers instead, silently and
+        with no symptom while the two happen to agree.  The synthetic cases above
+        cannot catch that: only the shipped file's own layout can.
+        """
+        shipped = Path(loader.__file__).resolve().parents[3] / "softae_config.toml"
+        assert shipped.is_file(), f"shipped config not found at {shipped}"
+        doc = tomllib.loads(shipped.read_text(encoding="utf-8"))
+
+        assert "default_pcb" in doc, (
+            "default_pcb is not a top-level key — a table header precedes it, so it "
+            "parses as a member of that table and default_pcb_name() cannot read it"
+        )
+        assert doc["default_pcb"] in doc.get("pcb", {}), (
+            f"default_pcb={doc['default_pcb']!r} names no board in [pcb.*]"
+        )
+
+        loader.load(path=shipped, reload=True)
+        assert loader.default_pcb_name() == doc["default_pcb"]
 
     def test_electrode_count_from_channels_then_grid(self):
         from softae.core.geometry import electrode_count
