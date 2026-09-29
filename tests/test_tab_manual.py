@@ -1208,3 +1208,64 @@ class TestAbortRampContract:
 
     def test_ramp_worker_is_a_command_worker_joined_by_settle_qt(self):
         assert issubclass(_RampWorker, _CommandWorker)
+
+
+# ── Manual EIS: the saved header and the conditions row share one snapshot ───
+#
+# eis-acq [e147]: `_measure_one` saved each spectrum BEFORE reading the
+# environment, so every manual `.txt` header read T_SP/T_PV/RH_SP/RH_PV = nan
+# while the DB `conditions` row held the real values. The header is asserted by
+# reading the file back, because the file is what an operator actually opens.
+
+_ENV_STAGE_SP, _ENV_STAGE_PV = 60.0, 58.4
+_ENV_RH_SP, _ENV_RH_PV, _ENV_AIR = 22.0, 23.7, 26.1
+
+
+def _env_manager(pico):
+    """A manager whose temp/RH controllers answer known, distinct values."""
+    from types import SimpleNamespace
+
+    temp = SimpleNamespace(get_sp=lambda: _ENV_STAGE_SP, get_pv=lambda: _ENV_STAGE_PV)
+    rh = SimpleNamespace(get_T=lambda: _ENV_AIR, get_H=lambda: _ENV_RH_PV,
+                         status=lambda: {"setpoint": _ENV_RH_SP})
+    instruments = {"pico1": pico, "temp_controller": temp, "rh_controller": rh}
+    return SimpleNamespace(names=list(instruments), get=instruments.__getitem__)
+
+
+def test_manual_eis_measure_one_saved_header_carries_environment(
+        tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import softae.core.conditions_capture as conditions_capture
+    from softae.analysis.eis_data import EISResult
+    from softae.core.data_store import DataStore
+    from softae.gui.tabs.tab_manual import _ManualEisWorker
+
+    spectrum = _eis_result(3)
+    monkeypatch.setattr("softae.drivers.mscr_library.eis_run_mscrbuild",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(EISResult, "from_raw",
+                        classmethod(lambda cls, raw, **kw: spectrum))
+    reads = []
+    real_read = conditions_capture.read_environment
+    monkeypatch.setattr(conditions_capture, "read_environment",
+                        lambda m: reads.append(m) or real_read(m))
+
+    pico = SimpleNamespace(sendscript_getdata=lambda *a: object(), _output_dir=".")
+    with DataStore(tmp_path / "ds") as store:
+        run_id = store.start_run("manual_eis", mode="manual",
+                                 campaign="manual", quality="explore")
+        worker = _ManualEisWorker(
+            _env_manager(pico), store, channels=[3], eis_params={},
+            auto_fit=False, fit_model="simpleSalt", auto_save=True)
+        payload = worker._measure_one(3, "pico1", run_id)
+        rows = store.query_conditions(measurement_id=payload["measurement_id"])
+
+    saved = EISResult.load(spectrum.raw_file_path)
+    header = (saved.T_sp, saved.T_pv, saved.rh_sp, saved.rh_pv)
+    assert header == (_ENV_STAGE_SP, _ENV_STAGE_PV, _ENV_RH_SP, _ENV_RH_PV)
+    assert len(reads) == 1, "one snapshot per measurement feeds header and row"
+    (row,) = rows
+    assert (row["stage_temp_sp_C"], row["stage_temp_pv_C"],
+            row["rh_sp_pct"], row["rh_pv_pct"]) == header
+    assert row["chamber_air_C"] == _ENV_AIR

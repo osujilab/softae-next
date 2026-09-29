@@ -337,16 +337,19 @@ class _ManualEisWorker(QObject):
 
         measurement_id: int | None = None
         if run_id is not None and self._data_store is not None:
+            from softae.core.conditions_capture import read_environment, stamp_environment
+
             eis_dir = self._data_store.eis_dir(run_id)
             save_path = eis_dir / f"ch{channel:02d}_manual.txt"
+            # One snapshot, read before the save, feeds both the file header and
+            # the conditions row below, so the two cannot disagree.
+            env = read_environment(self._manager)
+            stamp_environment(eis_result, env)
             eis_result.raw_file_path = str(save_path)
             eis_result.save(save_path)
             measurement_id = self._data_store.record_measurement(run_id, eis_result)
             if fit_result is not None:
                 self._data_store.record_fit(measurement_id, fit_result)
-            from softae.core.conditions_capture import read_environment
-
-            env = read_environment(self._manager)
             if any(v is not None for v in env.values()):
                 self._data_store.record_conditions(
                     measurement_id, "measurement", **env
