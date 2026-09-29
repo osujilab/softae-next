@@ -522,6 +522,51 @@ class TestACampaignWithNoRunPlanIsUnchanged:
         assert not any("humidity" in w for w in p.warnings)
 
 
+class TestTheResolvedRecipeIsNamed:
+    """Rung 3b nearly cast unpreconditioned and ``check`` said nothing.
+
+    A spec that sets neither ``recipe_name`` nor ``two_phase`` resolves to
+    ``single_drop`` — deposit only, no line preload — and the only place that
+    was visible was the bench. R2's ruling: keep the default, but make ``check``
+    print what it resolved to.
+    """
+
+    def test_project_campaign_names_the_resolved_recipe(self, catalog):
+        two = project_campaign(_spec(two_phase=True), catalog=catalog)
+        one = project_campaign(_spec(two_phase=False), catalog=catalog)
+
+        assert "two_phase" in two.describe()
+        assert "single_drop" in one.describe()
+
+    def test_the_single_drop_line_says_there_is_no_preconditioning(self, catalog):
+        """The finding is the *absence*, so the absence is what must be spelled."""
+        text = project_campaign(_spec(two_phase=False), catalog=catalog).describe()
+        assert "no preconditioning" in text
+        assert 'recipe_name = "two_phase"' in text     # and how to change it
+
+    def test_the_two_phase_line_names_its_phases_and_flush_settings(self, catalog):
+        text = project_campaign(
+            _spec(two_phase=True, flush_factor=2.0, line_flush_rate=1500.0),
+            catalog=catalog,
+        ).describe()
+        assert "precondition" in text and "deposit" in text
+        assert "2.0" in text and "1500" in text
+
+    def test_recipe_name_beats_the_legacy_two_phase_flag(self, catalog):
+        """``resolved_recipe_name`` is the authority; the line must not re-derive."""
+        text = project_campaign(
+            _spec(two_phase=False, recipe_name="two_phase"), catalog=catalog
+        ).describe()
+        assert "two_phase" in text
+        assert "no preconditioning" not in text
+
+    def test_the_recipe_line_is_not_a_warning(self, catalog):
+        """``final_check`` turns every warning into a WARN finding; an advisory
+        that a campaign is correctly configured must not arrive as one."""
+        p = project_campaign(_spec(two_phase=False), catalog=catalog)
+        assert not any("recipe" in w.lower() for w in p.warnings)
+
+
 class TestASettleSpelledInTheFlatFieldsIsBilledToo:
     """**Operator-visible, and deliberate.** A campaign can ask to settle in two
     ways — an EQUILIBRATE phase in a ``run_plan``, or the flat

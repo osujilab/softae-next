@@ -539,6 +539,15 @@ class CampaignProjection:
     settle_ceiling_s: float = 0.0
     #: That phase's ``min_hold_s`` — the floor it cannot stop before.
     settle_floor_s: float = 0.0
+    #: One line naming the resolved cast recipe and its per-channel phases.
+    #:
+    #: **Not a warning, on purpose.** ``final_check`` renders every warning as a
+    #: ``WARN`` finding, and a campaign that is correctly configured must not
+    #: produce one. It is rendered by :meth:`describe`, which is what
+    #: ``softae-campaign check`` prints. Empty for a projection that could not
+    #: resolve a recipe, and defaulted so every existing construction is
+    #: unchanged. See :func:`_cast_recipe_line`.
+    cast_recipe: str = ""
 
     @property
     def time_to_budget_s(self) -> float:
@@ -570,8 +579,14 @@ class CampaignProjection:
         return None if supported is None else supported >= self.budget
 
     def describe(self) -> str:
-        """Operator-facing summary: a rate with bounds, never a single ETA."""
+        """Operator-facing summary: a rate with bounds, never a single ETA.
+
+        :attr:`cast_recipe` leads, because it is the only line that says what the
+        rig will physically *do* to each channel; the rest is cost.
+        """
         lines: list[str] = []
+        if self.cast_recipe:
+            lines.append(self.cast_recipe)
         per_it = _fmt_duration(self.per_iteration_s)
         # "per iteration" is pinned by a foreign test (tests/test_campaign_cli.py);
         # for a batched campaign it means per ROUND — one full-channel cast.
@@ -622,6 +637,45 @@ class CampaignProjection:
 
         lines.extend(f"Note: {w}" for w in self.warnings)
         return "\n".join(lines)
+
+
+def _cast_recipe_line(spec: Any) -> str:
+    """One line naming *spec*'s resolved cast recipe and its per-channel phases.
+
+    **Why this exists.** ``recipe_name`` defaults to ``None`` and ``two_phase``
+    to ``False``, so a spec that mentions neither compiles ``single_drop`` — a
+    bare drop-cast with no line preload. That is a reasonable default and R2
+    kept it; what it was missing is *visibility*. On rung 3b the resolution was
+    discoverable only from the compiled workflow, and the run came within a step
+    of casting eight unpreconditioned wells with ``check`` reporting nothing.
+
+    :meth:`CampaignSpec.resolved_recipe_name` is the sole authority — the legacy
+    ``two_phase`` bool is deliberately **not** re-derived here, or a spec setting
+    ``recipe_name`` alone would be described as the thing it overrode.
+
+    Returns ``""`` when nothing can be resolved: a projection that cannot name
+    the recipe must say nothing rather than name a default it did not check.
+    """
+    from softae.core.deposition_recipe import get_deposition_recipe
+
+    try:
+        name = spec.resolved_recipe_name()
+        recipe = get_deposition_recipe(name)
+    except Exception as exc:
+        logger.warning("cast_recipe_unresolved", error=str(exc))
+        return ""
+
+    phases = " → ".join(p.key for p in recipe.phases)
+    if name == "single_drop":
+        return (f"Cast recipe: {name} — {phases} only (no preconditioning); "
+                f'set recipe_name = "two_phase" to precondition.')
+
+    detail = ""
+    if any(p.key == "precondition" for p in recipe.phases):
+        detail = (f" (flush_factor {float(getattr(spec, 'flush_factor', 0.0)):.1f}, "
+                  f"line_flush_rate {float(getattr(spec, 'line_flush_rate', 0.0)):g}"
+                  f" µL/min)")
+    return f"Cast recipe: {name} — {phases}{detail}."
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -913,6 +967,10 @@ def project_campaign(
     from softae.core.eis_scripts import EISParams
 
     warnings: list[str] = []
+    # Resolved before the workflow is built, so it is reported even when the
+    # midpoint trial cannot be: an unpreconditioned cast is exactly the thing an
+    # operator needs to see on a projection that otherwise failed.
+    cast_recipe = _cast_recipe_line(spec)
 
     midpoint: dict[str, Any] = {}
     for name, p in (getattr(spec, "parameter_space", {}) or {}).items():
@@ -946,6 +1004,7 @@ def project_campaign(
             per_iteration_s=0.0, per_iteration_draw_uL={},
             budget=rounds, duration_complete=False,
             warnings=[f"Could not build a representative trial: {exc}"],
+            cast_recipe=cast_recipe,
         )
 
     preset = getattr(spec, "eis_preset", None)
@@ -1024,6 +1083,7 @@ def project_campaign(
         approach_ceiling_s=approach_s,
         settle_ceiling_s=settle_ceiling,
         settle_floor_s=settle_floor,
+        cast_recipe=cast_recipe,
     )
 
     if projection.stock_sufficient is False:
