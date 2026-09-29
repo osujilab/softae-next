@@ -229,15 +229,36 @@ class _RawTrace:
 
 
 def validate_raw_eis(raw: Any, **kw: Any) -> QualityReport:
-    """Validate the raw array an EIS step returns, without building an EISResult.
+    """Validate the raw result an EIS step returns, without building an EISResult.
 
-    The autonomous path never materialises an ``EISResult`` — it reads the
-    instrument's array directly — so the gate has to meet the data where it is
-    rather than forcing a conversion that could itself fail. Column convention
-    matches the objective extractor: the last two columns are Z' and -Z''.
+    **The driver's shape is the real input, and it is not an array.** The EIS
+    step is ``sendscript_getdata``, so the step result *is* the driver's return
+    value — on the rig that is ``palmsens.mscript.parse_result_lines`` output,
+    ``list[curve][row][col]`` of ``MScriptVar``, and ``np.asarray(…, dtype=float)``
+    raises on it. That is not hypothetical: it is what happened to all eight
+    channels of rung 3b, where the gate reported *unreadable measurement* for a
+    board of perfectly good spectra and was inert only because
+    ``[quality] enabled = false``. The hand-rolled conversion here was the third
+    private copy of an idiom that :meth:`EISResult.from_raw` already owns and
+    that the settle path was migrated to (T11.29); this is the second.
+
+    So conversion is attempted through ``from_raw`` first, and the array reader
+    below is kept as the fallback for shapes ``from_raw`` declines — a bare 1-D
+    result, an empty one, a 2-column one — because each of those has a *specific*
+    verdict here that "unreadable" would erase. Column convention for that
+    fallback is unchanged and matches the objective extractor: the last two
+    columns are Z' and -Z''.
     """
     if raw is None:
         return QualityReport(Verdict.REJECT, ["no measurement returned"])
+
+    try:
+        from softae.analysis.eis_data import EISResult
+
+        return validate_eis_trace(EISResult.from_raw(raw, channel=0), **kw)
+    except Exception:
+        pass    # not a shape from_raw knows; the array reader below may still.
+
     try:
         arr = np.asarray(
             raw[0] if isinstance(raw, (list, tuple)) else raw, dtype=float)

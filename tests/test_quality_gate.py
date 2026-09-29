@@ -121,6 +121,136 @@ class TestRawAdapter:
         assert validate_raw_eis(object()).verdict is Verdict.REJECT
 
 
+# ── The real driver's shape (rung 3b) ────────────────────────────────────────
+#
+# On the bench the EIS step is ``sendscript_getdata``, so the step result *is*
+# the driver's return value: ``palmsens.mscript.parse_result_lines`` output,
+# ``list[curve][row][col]`` of ``MScriptVar``. Against that,
+# ``np.asarray(raw[0], dtype=float)`` raises
+# ``float() argument must be a string or a real number, not 'MScriptVar'`` and
+# the gate reported *unreadable measurement* for all eight channels of run
+# 20260923T183923Z_rung3b_bench. Inert only because ``[quality] enabled=false``.
+
+
+@pytest.fixture()
+def palmsens_on_path():
+    """Put the vendored SDK on ``sys.path``, as ``AsyncESPico.connect()`` does.
+
+    ``EISResult.from_raw``'s MScriptVar branch does ``import palmsens.mscript``,
+    which resolves **only** after ``_ensure_sdk_on_path()`` has inserted
+    ``src/softae/drivers`` — a side effect of connecting the real potentiostat.
+    Reproducing that here is what makes this test exercise the branch the rig
+    takes rather than the ImportError fallback beneath it.
+    """
+    import pathlib
+    import sys
+
+    from softae.drivers.palmsens import mscript as vendored
+
+    drivers_dir = str(pathlib.Path(vendored.__file__).resolve().parent.parent)
+    added = drivers_dir not in sys.path
+    if added:
+        sys.path.insert(0, drivers_dir)
+    try:
+        import palmsens.mscript as rig_mscript
+
+        yield rig_mscript
+    finally:
+        if added and drivers_dir in sys.path:
+            sys.path.remove(drivers_dir)
+
+
+def _mscript_rows(mscript, freq, z_real, z_imag):
+    """Build ``list[curve][row][col]`` of real ``MScriptVar``, as the driver returns.
+
+    Encodes through ``parse_mscript_data_package`` — the driver's own parser —
+    rather than hand-building objects, so the payload is one the instrument
+    could actually have produced. Columns are the driver's own EIS convention
+    (``async_espico.eis_extractdata``): 0 = f, 1 = Z', 2 = Z''.
+    """
+    def encode(var_id: str, value: float, prefix: str = " ") -> str:
+        raw = int(round(value / mscript.SI_PREFIX_FACTOR[prefix]))
+        return f"{var_id}{raw + 2 ** 27:07X}{prefix}"
+
+    rows = []
+    for f, zr, zi in zip(freq, z_real, z_imag):
+        line = "P" + ";".join(
+            [encode("dc", f), encode("cc", zr), encode("cd", zi)]) + "\n"
+        rows.append(mscript.parse_mscript_data_package(line))
+    return [rows]
+
+
+class TestTheDriverShape:
+    def test_validate_raw_eis_accepts_driver_mscriptvar_rows(self, palmsens_on_path):
+        freq = np.logspace(5, 1, 20)
+        z_real = np.linspace(100, 200, 20)
+        z_imag = -np.linspace(10, 50, 20)      # Im Z < 0, the physics convention
+        raw = _mscript_rows(palmsens_on_path, freq, z_real, z_imag)
+
+        assert isinstance(raw[0][0][0], palmsens_on_path.MScriptVar)
+        assert validate_raw_eis(raw).verdict is Verdict.ACCEPT
+
+    def test_mscriptvar_rows_give_the_same_report_as_their_numeric_equivalent(
+        self, palmsens_on_path
+    ):
+        """Same spectrum, two encodings, one report — metrics included.
+
+        The numeric comparand is built from the *decoded* variable values, not
+        from the floats fed in: an MScriptVar carries a 7-hex-digit mantissa and
+        an SI prefix, so the round trip quantises. Comparing against the
+        pre-encoding floats would compare two different spectra.
+        """
+        freq = np.logspace(5, 1, 20)
+        z_real = np.linspace(100, 200, 20)
+        z_imag = -np.linspace(10, 50, 20)
+        raw = _mscript_rows(palmsens_on_path, freq, z_real, z_imag)
+
+        decoded = np.array([[v.value for v in row] for row in raw[0]], dtype=float)
+        # The gate's own column convention: [f, Z', -Z''].
+        numeric = np.column_stack([decoded[:, 0], decoded[:, 1], -decoded[:, 2]])
+
+        assert validate_raw_eis(raw) == validate_raw_eis(numeric)
+
+    def test_a_dead_channel_is_still_rejected_through_the_driver_shape(
+        self, palmsens_on_path
+    ):
+        """The check must be able to fail: reading the shape is not passing it.
+
+        The reason is asserted because *unreadable* is also a REJECT — before the
+        fix this test passed for exactly the wrong reason.
+        """
+        freq = np.logspace(5, 1, 20)
+        raw = _mscript_rows(
+            palmsens_on_path, freq, np.full(20, 1e-9), np.full(20, -1e-9))
+        report = validate_raw_eis(raw)
+        assert report.verdict is Verdict.REJECT
+        assert "unreadable" not in report.summary().lower()
+        assert "short" in report.summary().lower() or "dead" in report.summary().lower()
+
+    def test_the_numeric_verdicts_are_byte_identical_to_the_old_adapter(self):
+        """Routing through the converter must not move any existing verdict.
+
+        The expected values are the ones the hand-rolled ``np.asarray`` adapter
+        produced, recorded here so a regression in either direction is visible.
+        """
+        assert validate_raw_eis(_raw()) == validate_raw_eis(_raw())
+        assert validate_raw_eis(_raw()).verdict is Verdict.ACCEPT
+        assert validate_raw_eis([_raw()]) == validate_raw_eis(_raw())
+
+        one_d = validate_raw_eis(np.arange(20, dtype=float))
+        assert one_d.verdict is Verdict.SUSPECT
+        assert one_d.issues == ["measurement has no Z' / Z'' columns"]
+
+        # An empty *3-column* array is now read by the converter and rejected by
+        # the shared trace validator ("empty trace") rather than by the array
+        # reader ("empty measurement"). Same verdict, different sentence — the
+        # one behaviour the reroute moves, recorded rather than asserted away.
+        assert validate_raw_eis(np.zeros((0, 3))).verdict is Verdict.REJECT
+        assert validate_raw_eis(np.zeros(0)).issues == ["empty measurement"]
+        assert validate_raw_eis(None).issues == ["no measurement returned"]
+        assert validate_raw_eis(object()).issues[0].startswith("unreadable measurement:")
+
+
 # ── Fit grading ──────────────────────────────────────────────────────────────
 
 class TestFitGrading:
