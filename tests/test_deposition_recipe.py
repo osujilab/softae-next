@@ -251,7 +251,7 @@ def _anneal_catalog() -> TaskCatalog:
     cat = _engine_catalog()
     cat.add(Task(name="anneal_150C_5min", instrument="temp_controller", method="anneal",
                  params={"target_temp_C": 150, "hold_time_s": 300,
-                         "ramp_rate": 5, "tolerance": 1.0}))
+                         "ramp_rate_C_per_min": 300, "tolerance": 1.0}))
     return cat
 
 

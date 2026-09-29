@@ -33,7 +33,7 @@ def _catalog(temp_C: float | None = 85.0) -> TaskCatalog:
     catalog would assert on a machine-local file and could not be green in a
     fresh checkout. ``temp_C=None`` is the task that states no cure temperature.
     """
-    params: dict = {"hold_time_s": 28800, "ramp_rate": 5, "tolerance": 1.0}
+    params: dict = {"hold_time_s": 28800, "ramp_rate_C_per_min": 300, "tolerance": 1.0}
     if temp_C is not None:
         params["target_temp_C"] = temp_C
     catalog = TaskCatalog()

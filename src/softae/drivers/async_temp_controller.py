@@ -27,12 +27,18 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
-import numpy as np
 import structlog
 
 from softae.drivers.contracts import validate_temp_setpoint
+from softae.drivers.temp_ramp import (
+    RampReport,
+    RampStep,
+    ramp_span_s,
+    refuse_unknown_anneal_kwargs,
+    run_ramp,
+)
 from softae.errors import CommunicationError, ConnectionError_
 from softae.server.base_instrument import BaseInstrument, InstrumentState
 
@@ -57,6 +63,12 @@ class AsyncTempController(BaseInstrument):
         self._daq_channel: str | None = self.config.get("daq_channel")
         self._instrument = None  # minimalmodbus.Instrument
         self._serial_lock = threading.Lock()  # serialise access from multiple polling threads
+        # Held across write_sp's read+write pair, and by a ramp across its
+        # cancel re-check and its write, so a park's setpoint always lands after
+        # any ramp step it races. Re-entrant because a ramp step takes it and
+        # then calls write_sp. Distinct from _serial_lock, which is per
+        # transaction and must stay a plain Lock.
+        self._sp_write_lock = threading.RLock()
         # Set by ArrheniusSweep.abort() to interrupt an in-progress wait() /
         # _with_retry() immediately without waiting for retries to exhaust.
         self._stop_wait: threading.Event = threading.Event()
@@ -178,11 +190,14 @@ class AsyncTempController(BaseInstrument):
     def write_sp(self, T_SP: float, print_flag: int = 1) -> None:
         """Write a new temperature setpoint (°C).
 
-        Enforces min/max safety limits from config.
+        Enforces min/max safety limits from config. The SP read and the SP
+        write happen under ``_sp_write_lock`` together, so no other setpoint
+        writer — a park in particular — can land between them.
         """
         validate_temp_setpoint(T_SP, self.config, self.name)
-        cur_sp = self.get_sp()
-        self._with_retry(self._instrument.write_register, self._reg_sp, int(T_SP * 10))
+        with self._sp_write_lock:
+            cur_sp = self.get_sp()
+            self._with_retry(self._instrument.write_register, self._reg_sp, int(T_SP * 10))
         if print_flag:
             logger.info("temp_setpoint_changed", old=cur_sp, new=T_SP)
 
@@ -226,46 +241,50 @@ class AsyncTempController(BaseInstrument):
         T_start: float,
         T_end: float,
         t_span: float,
-        up_int: float,
+        up_int: float | None = None,
         print_flag: int = 1,
-    ) -> None:
-        """Execute a blocking linear temperature ramp.
+        *,
+        on_step: Callable[[RampStep], None] | None = None,
+        cancel: threading.Event | None = None,
+    ) -> RampReport:
+        """Execute a blocking linear temperature ramp; see :func:`~softae.drivers.temp_ramp.run_ramp`.
 
         Parameters
         ----------
-        T_start : float
-            Starting temperature (°C).
-        T_end : float
-            Final temperature (°C).
+        T_start, T_end : float
+            Start and final setpoints (°C).
         t_span : float
             Total ramp duration (seconds).
-        up_int : float
-            Setpoint update interval (seconds).
+        up_int : float or None
+            Setpoint update interval (seconds). ``None`` derives it from the
+            rate (:func:`~softae.drivers.temp_ramp.update_interval_s`); an
+            explicit value is honoured but capped at 60 s.
+        print_flag : int
+            Non-zero reads PV and logs an INFO ``ramp_step`` line per write.
+        on_step : callable, optional
+            Called with a :class:`RampStep` after every write, on this thread.
+        cancel : threading.Event, optional
+            A dedicated abort — deliberately **not** ``_stop_wait``, which makes
+            every later serial call raise. Once set, nothing further is written
+            and the last-written setpoint holds. It is re-checked under
+            ``_sp_write_lock``, so a writer that sets it and then calls
+            :meth:`write_sp` is never overwritten by a step.
         """
-        n_steps = max(int(t_span / up_int), 1)
-        t_vals = np.linspace(0, t_span, n_steps)
-        T_vals = np.round(np.linspace(T_start, T_end, n_steps), 1)
-
-        t0 = time.time()
-        for i, t_pt in enumerate(t_vals):
-            while (time.time() - t0) < t_pt:
-                time.sleep(0.5)
-            self.write_sp(T_vals[i], print_flag=0)
-            if print_flag:
-                logger.info(
-                    "ramp_step",
-                    pv=self.get_pv(),
-                    sp=T_vals[i],
-                    step=i + 1,
-                    total=n_steps,
-                )
+        return run_ramp(
+            lambda sp: self.write_sp(sp, print_flag=0),
+            T_start, T_end, t_span, up_int,
+            on_step=on_step, cancel=cancel,
+            read_pv=self.get_pv if print_flag else None,
+            write_lock=self._sp_write_lock,
+        )
 
     def anneal(
         self,
         target_temp_C: float,
         hold_time_s: float,
-        ramp_rate: float | None = None,
+        ramp_rate_C_per_min: float | None = None,
         tolerance: float = 1.0,
+        **legacy: Any,
     ) -> None:
         """Ramp to *target_temp_C*, hold for *hold_time_s*, then restore the original setpoint.
 
@@ -275,27 +294,31 @@ class AsyncTempController(BaseInstrument):
             Target anneal temperature (°C).
         hold_time_s:
             Duration to hold at the target temperature (seconds).
-        ramp_rate:
-            Rate of temperature change (°C/s).  If *None* the setpoint is
-            written directly without a controlled ramp.
+        ramp_rate_C_per_min:
+            Rate of temperature change (**°C/min**).  If *None* the setpoint is
+            written directly without a controlled ramp.  The retired
+            ``ramp_rate`` key (°C/s) is refused before anything is read or
+            written; see :func:`~softae.drivers.temp_ramp.legacy_ramp_rate_problem`.
         tolerance:
             Acceptable deviation from target before the hold begins (°C).
 
         Raises
         ------
+        ValidationError_
+            If the retired ``ramp_rate`` key is passed.
         SafetyError
             If the process value stays outside the fault band — or cannot be
             read at all — for longer than the configured grace period. The hold
             is *watched*, not slept through; see
             :func:`softae.drivers.contracts.monitored_hold`.
         """
+        refuse_unknown_anneal_kwargs(legacy)
         original_sp = self.get_sp()
         logger.info("anneal_start", target=target_temp_C, hold_time=hold_time_s, original_sp=original_sp)
         try:
-            if ramp_rate is not None and ramp_rate > 0:
-                t_span = abs(target_temp_C - original_sp) / ramp_rate
-                up_int = max(t_span / 100, 1.0)
-                self.ramp_linear(original_sp, target_temp_C, t_span, up_int, print_flag=0)
+            if ramp_rate_C_per_min is not None and ramp_rate_C_per_min > 0:
+                t_span = ramp_span_s(original_sp, target_temp_C, ramp_rate_C_per_min)
+                self.ramp_linear(original_sp, target_temp_C, t_span, None, print_flag=0)
             else:
                 self.write_sp(target_temp_C, print_flag=0)
             self.wait(within=tolerance)

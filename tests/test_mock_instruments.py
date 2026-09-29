@@ -156,16 +156,16 @@ async def test_acquire_multiple_releases_on_exception(manager: InstrumentManager
 # --- anneal tests -------------------------------------------------------------
 
 
-@pytest.mark.parametrize("ramp_rate", [None, 10.0])
+@pytest.mark.parametrize("ramp_rate_C_per_min", [None, 600.0])
 @pytest.mark.asyncio
-async def test_anneal(manager: InstrumentManager, ramp_rate):
-    """Anneal restores original SP whether or not a ramp_rate is given."""
+async def test_anneal(manager: InstrumentManager, ramp_rate_C_per_min):
+    """Anneal restores original SP whether or not a ramp rate (°C/min) is given."""
     await manager.connect_all()
     tc = manager.get("temp_controller")
     tc.write_sp(25.0, print_flag=0)
     kwargs = {"target_temp_C": 50.0, "hold_time_s": 0, "tolerance": 2.0}
-    if ramp_rate is not None:
-        kwargs["ramp_rate"] = ramp_rate
+    if ramp_rate_C_per_min is not None:
+        kwargs["ramp_rate_C_per_min"] = ramp_rate_C_per_min
     tc.anneal(**kwargs)
     assert tc.get_sp() == pytest.approx(25.0)
 

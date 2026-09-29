@@ -9,9 +9,18 @@ import asyncio
 import random
 import threading
 import time as _time
-from typing import Any
+from typing import Any, Callable
 
 from softae.drivers.contracts import validate_temp_setpoint
+from softae.drivers.temp_ramp import (
+    ProgressNotifier,
+    RampReport,
+    RampStep,
+    ramp_schedule,
+    ramp_span_s,
+    refuse_unknown_anneal_kwargs,
+    zero_span_report,
+)
 from softae.server.base_instrument import BaseInstrument, InstrumentState
 
 import structlog
@@ -33,6 +42,9 @@ class MockTempController(BaseInstrument):
         self._pv_surf: float = 21.5
         self._last_update: float = _time.time()
         self._stop_wait: threading.Event = threading.Event()
+        # Mirrors AsyncTempController._sp_write_lock: a ramp re-checks cancel
+        # and writes under it, so a park that cancels then writes lands last.
+        self._sp_write_lock = threading.RLock()
 
     async def connect(self) -> None:
         logger.info("mock_temp_connect", port=self.config.get("port", "SIM"))
@@ -63,8 +75,9 @@ class MockTempController(BaseInstrument):
 
     def write_sp(self, T_SP: float, print_flag: int = 1) -> None:
         validate_temp_setpoint(T_SP, self.config, self.name)
-        old = self._sp
-        self._sp = T_SP
+        with self._sp_write_lock:
+            old = self._sp
+            self._sp = T_SP
         if print_flag:
             logger.info("mock_temp_setpoint", old=old, new=T_SP)
 
@@ -83,30 +96,45 @@ class MockTempController(BaseInstrument):
         T_start: float,
         T_end: float,
         t_span: float,
-        up_int: float,
+        up_int: float | None = None,
         print_flag: int = 1,
-    ) -> None:
+        *,
+        on_step: Callable[[RampStep], None] | None = None,
+        cancel: threading.Event | None = None,
+    ) -> RampReport:
         """Simulate a linear temperature ramp (instant in mock).
 
-        Mirrors :meth:`AsyncTempController.ramp_linear`:
-
-        Parameters
-        ----------
-        T_start : float
-            Starting temperature (°C).
-        T_end : float
-            Final temperature (°C).
-        t_span : float
-            Total ramp duration (seconds) — ignored by the simulation.
-        up_int : float
-            Setpoint update interval (seconds) — ignored by the simulation.
-
-        Both endpoints are validated against the safety limits via
-        :meth:`write_sp`, matching the real driver (which raises on the
-        first out-of-range setpoint step).
+        Mirrors :meth:`AsyncTempController.ramp_linear`'s signature and report:
+        the step count comes from :func:`~softae.drivers.temp_ramp.ramp_schedule`,
+        but only the first and last setpoints are written, with no waiting.
+        *on_step* is called after each of the two writes (indices ``1`` and
+        ``total``) and *cancel* is checked under ``_sp_write_lock`` before each
+        write, as the real driver does, so a test aborts
+        "mid-ramp" deterministically by setting the event inside the first
+        callback. Both endpoints are validated against the safety limits via
+        :meth:`write_sp`, as the real driver's first out-of-range step is.
         """
-        self.write_sp(round(float(T_start), 1), print_flag=0)
-        self.write_sp(round(float(T_end), 1), print_flag=0)
+        times, temps = ramp_schedule(T_start, T_end, t_span, up_int)
+        total = len(times)
+        if total == 0:
+            return zero_span_report(T_start, T_end)
+        notify = ProgressNotifier(on_step)
+        last_sp = None
+        for index, sp in ((1, float(temps[0])), (total, float(temps[-1]))):
+            # Check-and-write under the SP lock, as the real driver's run_ramp does.
+            with self._sp_write_lock:
+                cancelled = cancel is not None and cancel.is_set()
+                if not cancelled:
+                    self.write_sp(sp, print_flag=0)
+            if cancelled:
+                steps_done = 0 if last_sp is None else 1
+                logger.info("ramp_cancelled", steps_done=steps_done, total=total,
+                            last_sp=last_sp)
+                return RampReport(total, steps_done, last_sp, cancelled=True,
+                                  zero_span=False, elapsed_s=0.0)
+            last_sp = sp
+            notify(RampStep(index=index, total=total, sp_C=sp, T_start=T_start,
+                            T_end=T_end, elapsed_s=0.0, t_span=t_span, next_in_s=0.0))
         self._pv = self._sp + random.gauss(0, 0.2)
         self._pv_surf = self._pv - 0.5
         if print_flag:
@@ -114,13 +142,16 @@ class MockTempController(BaseInstrument):
                 "mock_ramp_done",
                 start=T_start, end=T_end, t_span=t_span, up_int=up_int,
             )
+        return RampReport(total, total, last_sp, cancelled=False, zero_span=False,
+                          elapsed_s=0.0)
 
     def anneal(
         self,
         target_temp_C: float,
         hold_time_s: float,
-        ramp_rate: float | None = None,
+        ramp_rate_C_per_min: float | None = None,
         tolerance: float = 1.0,
+        **legacy: Any,
     ) -> None:
         """Ramp to *target_temp_C*, hold for *hold_time_s*, then restore the original setpoint.
 
@@ -130,19 +161,20 @@ class MockTempController(BaseInstrument):
             Target anneal temperature (°C).
         hold_time_s:
             Duration to hold at the target temperature (seconds).
-        ramp_rate:
-            Rate of temperature change (°C/s).  If *None* the setpoint is
-            written directly without a controlled ramp.
+        ramp_rate_C_per_min:
+            Rate of temperature change (**°C/min**).  If *None* the setpoint is
+            written directly without a controlled ramp.  The retired
+            ``ramp_rate`` key (°C/s) is refused, as on the real driver.
         tolerance:
             Acceptable deviation from target before the hold begins (°C).
         """
+        refuse_unknown_anneal_kwargs(legacy)
         original_sp = self.get_sp()
         logger.info("anneal_start", target=target_temp_C, hold_time=hold_time_s, original_sp=original_sp)
         try:
-            if ramp_rate is not None and ramp_rate > 0:
-                t_span = abs(target_temp_C - original_sp) / ramp_rate
-                up_int = max(t_span / 100, 1.0)
-                self.ramp_linear(original_sp, target_temp_C, t_span, up_int, print_flag=0)
+            if ramp_rate_C_per_min is not None and ramp_rate_C_per_min > 0:
+                t_span = ramp_span_s(original_sp, target_temp_C, ramp_rate_C_per_min)
+                self.ramp_linear(original_sp, target_temp_C, t_span, None, print_flag=0)
             else:
                 self.write_sp(target_temp_C, print_flag=0)
             self.wait(within=tolerance)

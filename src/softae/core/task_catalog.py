@@ -17,8 +17,9 @@ The public surface (``add``/``remove``/``get``/``list_names``/``__len__`` +
 "missing file → empty catalog, never raise" load contract.
 
 Loading also *validates* (:func:`validate_task`): a task whose declared ceiling
-cannot outlast the hold it asks for is rejected rather than catalogued, since
-that inconsistency only shows up hours into an unattended run.
+cannot outlast the hold it asks for, or an anneal still spelling its rate in
+the retired °C/s ``ramp_rate`` key, is rejected rather than catalogued, since
+either mistake only shows up hours into an unattended run.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from typing import Any
 import structlog
 import tomli_w
 
+from softae.drivers.temp_ramp import legacy_ramp_rate_problem
 from softae.errors import ValidationError_
 from softae.workflows.workflow_model import WorkflowStep
 
@@ -56,38 +58,46 @@ def _positive_float(value: Any) -> float | None:
 def validate_task(task: "Task") -> list[str]:
     """Return the reasons *task* must not be run — empty list when it is sound.
 
-    Today there is exactly one rule, and it exists because the failure it
-    prevents is silent and expensive.  An ``anneal`` step's duration is set by
-    its ``hold_time_s`` **param**, while its execution ceiling is the separate
+    Two rules, both for ``anneal`` and both because the failure each prevents
+    is silent and expensive.
+
+    **Hold vs ceiling.** An ``anneal`` step's duration is set by its
+    ``hold_time_s`` **param**, while its execution ceiling is the separate
     ``timeout_s`` **field**; a run-plan override
     (:attr:`~softae.core.run_plan.RunPhase.anneal_params`) rewrites the former
     and not the latter.  A task shipping an 8 h hold under a 600 s ceiling is
     killed mid-hold with the stage hot — overnight, unattended, no operator.
 
+    **Retired rate unit.** ``ramp_rate`` was °C/s; the rate is now
+    ``ramp_rate_C_per_min`` (operator ruling 2026-09-29).  The driver refuses
+    the old key too, but only when the anneal step runs — after a board has
+    been cast.  Refusing it here fails the catalog entry at load instead.
+
     :func:`~softae.core.deposition_recipe.anneal_timeout_s` already raises the
-    ceiling at *build* time for the deposition engine, so this is defence in
-    depth rather than the only guard — but it is the one that covers the paths
-    that hand a catalogued task straight to a step (Process Studio, the sandbox,
-    a hand-built workflow) and the one that catches the mistake in the file
-    rather than on the rig.
+    ceiling at *build* time for the deposition engine, so the first rule is
+    defence in depth rather than the only guard — but it is the one that covers
+    the paths that hand a catalogued task straight to a step (Process Studio,
+    the sandbox, a hand-built workflow) and the one that catches the mistake in
+    the file rather than on the rig.
     """
     if task.method != ANNEAL_METHOD:
         return []
+    problems = [p for p in (legacy_ramp_rate_problem(task.params),) if p]
     hold = _positive_float(task.params.get("hold_time_s"))
     if hold is None:  # no declared hold → nothing to outlast
-        return []
+        return problems
     if task.timeout_s is None:
-        return [
+        problems.append(
             f"anneal task declares hold_time_s={hold:g} s but no timeout_s; "
             f"the executor's default ceiling will kill the hold partway"
-        ]
-    if float(task.timeout_s) <= hold:
-        return [
+        )
+    elif float(task.timeout_s) <= hold:
+        problems.append(
             f"anneal task timeout_s={float(task.timeout_s):g} s does not exceed "
             f"hold_time_s={hold:g} s; the hold would be aborted with the stage hot "
             f"(allow the hold plus ramp, settle and setpoint restore)"
-        ]
-    return []
+        )
+    return problems
 
 
 @dataclass

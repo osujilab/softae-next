@@ -28,7 +28,7 @@ description = "Placeholder cure: ramp, hold, then restore the prior setpoint. ti
 [tasks.anneal_85C_8h.params]
 target_temp_C = 85
 hold_time_s = 28800
-ramp_rate = 5
+ramp_rate_C_per_min = 300  # = the former ramp_rate = 5 (C/s); unit is C/min since 2026-09-29
 tolerance = 1.0
 
 [tasks.final_flush]
