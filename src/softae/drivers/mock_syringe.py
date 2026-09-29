@@ -89,8 +89,8 @@ class MockSyringe(ParallelSyringeMixin, BaseInstrument):
         pump alone") — returned before fault injection, since a pump that is
         never commanded cannot time out.
         """
-        if self._is_noop_pump_command(dispense_vol):
-            logger.debug("mock_pump_skip", ID=ID, reason="zero_volume")
+        if self._is_noop_pump_command(dispense_vol, ID):
+            logger.debug("mock_pump_skip", ID=ID, reason="below_noop_floor")
             return
         if self._fail_next_n > 0:
             self._fail_next_n -= 1

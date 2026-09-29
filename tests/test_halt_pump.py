@@ -14,6 +14,7 @@ import types
 from unittest.mock import MagicMock, patch
 
 import pytest
+import structlog.testing
 
 from softae.core.reservoir import ReservoirLedger
 from softae.drivers.async_syringe import (
@@ -73,13 +74,21 @@ class TestTheHaltWritesTheSameProgram:
     def test_the_bytes_match_what_the_park_used_to_send_as_a_dispense(
         self, real_syringe
     ):
-        """Same program, different path. Only the path was broken."""
+        """Same program, different path. Only the path was broken.
+
+        ``HALT_VOLUME_UL`` now sits *below* :data:`PUMP_NOOP_VOLUME_UL`, so the
+        historical dispense expression of the halt would be skipped outright — the
+        coupling the floor's own docstring warned about, now realised and harmless
+        because ``halt_pump`` bypasses the filter. The floor is patched to zero
+        here purely to reach the old path and compare its bytes.
+        """
         syr, inst = real_syringe
         syr.halt_pump(2)
         halt_writes = _writes(inst)
 
         inst.write.reset_mock()
-        syr.single_pump(HALT_SVOLUME_ML, 2, HALT_RATE_UL_PER_MIN, HALT_VOLUME_UL)
+        with patch("softae.drivers.contracts.PUMP_NOOP_VOLUME_UL", 0.0):
+            syr.single_pump(HALT_SVOLUME_ML, 2, HALT_RATE_UL_PER_MIN, HALT_VOLUME_UL)
         assert _writes(inst) == halt_writes
 
 
@@ -102,14 +111,110 @@ class TestTheUndocumentedCouplings:
             syr.halt_pump(0)
         assert _writes(inst)[-1] == "0irun"
 
-    def test_the_shipped_floor_is_still_exactly_zero(self):
-        """Records *why* the old path survived at all, so a change is deliberate."""
-        assert PUMP_NOOP_VOLUME_UL == 0.0
-        assert HALT_VOLUME_UL > PUMP_NOOP_VOLUME_UL
+    def test_the_shipped_floor_is_a_physical_epsilon_not_zero(self):
+        """The floor moved off zero on 2026-09-24; pinned so a change is deliberate.
+
+        ``HALT_VOLUME_UL`` is now *below* it. That inversion would have deleted
+        the halt under the old design, which is exactly why ``halt_pump`` stopped
+        consulting the filter first — the test above proves it still writes.
+        """
+        assert PUMP_NOOP_VOLUME_UL == 0.01
+        assert HALT_VOLUME_UL < PUMP_NOOP_VOLUME_UL
 
     def test_the_halt_program_is_declared_with_an_integer_svolume(self):
         """``f"{ID} svolume {HALT_SVOLUME_ML} ml"`` — 1000.0 would change the bytes."""
         assert isinstance(HALT_SVOLUME_ML, int)
+
+
+# ── The no-op floor: a solver residue is not a dispense ──────────────────────
+#
+# Measured on the bench 2026-09-24: the formulation solver asked for EO:Li 15 /
+# silica 0 and returned pump 1 = 1.4210854715202004e-13 µL — *not* 0.0. At a
+# floor of exactly zero that passes the filter, `split_rate` gives it a
+# proportionally-split ~1e-13 µL/min, and `_validate_single_pump` raises
+# `SafetyError` against `min_rate = 0.05` **inside `precondition_flush`** — after
+# the plug has already been pushed through pumps 0 and 2.
+
+#: The residue the solver actually produced, verbatim.
+SOLVER_RESIDUE_UL = 1.4210854715202004e-13
+
+
+class TestTheNoopFloorIsPhysical:
+    def test_noop_floor_skips_solver_residue_volume(self):
+        syr = MockSyringe(config={"min_rate": 0.05})
+        assert syr._is_noop_pump_command(SOLVER_RESIDUE_UL) is True
+
+    def test_noop_floor_admits_a_meterable_volume(self):
+        """0.05 µL is a volume somebody meant; it must still reach the pump."""
+        syr = MockSyringe(config={"min_rate": 0.05})
+        assert syr._is_noop_pump_command(0.05) is False
+
+    def test_noop_floor_skip_is_logged_once(self):
+        """A silently skipped component is an invisible zeroed formulation.
+
+        Logged in ``contracts`` rather than in either driver so the mock and the
+        real pump cannot report a skip differently — the mock's own skip line is
+        ``DEBUG``, which would have made the bench event unobservable.
+        """
+        syr = MockSyringe(config={"min_rate": 0.05})
+        with structlog.testing.capture_logs() as logs:
+            syr.single_pump(1000, 1, 0.5, SOLVER_RESIDUE_UL)
+
+        skips = [e for e in logs if e.get("event") == "pump_skipped_below_floor"]
+        assert len(skips) == 1
+        assert skips[0]["log_level"] == "info"
+        assert skips[0]["dispense_vol_uL"] == SOLVER_RESIDUE_UL
+        assert skips[0]["floor_uL"] == PUMP_NOOP_VOLUME_UL
+
+    def test_noop_floor_logs_the_pump_id_that_was_skipped(self):
+        """Which component was zeroed is the whole content of the finding."""
+        syr = MockSyringe(config={"min_rate": 0.05})
+        with structlog.testing.capture_logs() as logs:
+            syr.single_pump(1000, 2, 0.5, SOLVER_RESIDUE_UL)
+
+        skips = [e for e in logs if e.get("event") == "pump_skipped_below_floor"]
+        assert [e["pump_id"] for e in skips] == [2]
+
+    def test_a_real_dispense_is_not_logged_as_a_skip(self):
+        """The check must be able to fail: a meterable volume logs no skip."""
+        syr = MockSyringe(config={"min_rate": 0.05})
+        with structlog.testing.capture_logs() as logs:
+            syr.single_pump(1000, 1, 5.0, 10.0)
+
+        assert [e for e in logs if e.get("event") == "pump_skipped_below_floor"] == []
+
+    def test_single_pump_residue_volume_does_not_raise_safety_error(self):
+        """The bench failure, end to end: residue volume + its split rate.
+
+        ``split_rate(1500, [86, 1.42e-13, 64])[1]`` is ~1.4e-12 µL/min, three
+        orders below ``min_rate``. Before the floor moved off zero this raised
+        ``SafetyError`` mid-cast.
+        """
+        from softae.core.dropcast_plan import split_rate
+
+        vols = [86.0, SOLVER_RESIDUE_UL, 64.0]
+        rates = split_rate(1500.0, vols)
+        assert rates[1] < 0.05          # the rate that used to trip the limit
+
+        syr = MockSyringe(config={"min_rate": 0.05})
+        syr.single_pump(1000, 1, rates[1], vols[1] * 2.0)   # flush_factor 2.0
+        assert syr._dispensed.get(1, 0.0) == 0.0
+
+    def test_the_residue_used_to_trip_the_min_rate_limit(self):
+        """Positive control: with the floor back at zero the SafetyError returns.
+
+        Without this the test above cannot distinguish "the floor works" from
+        "``min_rate`` never applied to this call in the first place".
+        """
+        from softae.core.dropcast_plan import split_rate
+
+        vols = [86.0, SOLVER_RESIDUE_UL, 64.0]
+        rates = split_rate(1500.0, vols)
+        syr = MockSyringe(config={"min_rate": 0.05})
+
+        with patch("softae.drivers.contracts.PUMP_NOOP_VOLUME_UL", 0.0):
+            with pytest.raises(SafetyError):
+                syr.single_pump(1000, 1, rates[1], vols[1] * 2.0)
 
 
 # ── The interlock, and the kwarg that was rejected ───────────────────────────
@@ -121,8 +226,12 @@ class TestTheLedgerCannotRefuseAHalt:
         ledger.refill(0, 200.0)
         syr.reservoir_ledger = ledger
 
+        # The contrast dispense must be a *meterable* volume: since the no-op
+        # floor moved to 0.01 µL, the halt's historical 0.001 µL expression is
+        # skipped before the ledger is ever consulted, which would make this a
+        # test that cannot fail.
         with pytest.raises(SafetyError):      # the dispense path still refuses
-            syr.single_pump(1000, 0, 0.1, 0.001)
+            syr.single_pump(1000, 0, 0.1, 1.0)
 
         syr.halt_pump(0)                      # the halt path does not
         assert _writes(inst)[-1] == "0irun"
@@ -203,8 +312,9 @@ class TestMockMirrorsReal:
         ledger.refill(0, 200.0)
         syr.reservoir_ledger = ledger
 
+        # A meterable volume, for the same reason as the real-driver twin above.
         with pytest.raises(SafetyError):
-            syr.single_pump(1000, 0, 0.1, 0.001)
+            syr.single_pump(1000, 0, 0.1, 1.0)
 
         syr.halt_pump(0)
         assert syr._halted == [0]

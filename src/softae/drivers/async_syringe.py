@@ -210,8 +210,8 @@ class AsyncSyringe(ParallelSyringeMixin, BaseInstrument):
         alone": the call returns immediately without validating or writing to the
         hardware, so a zeroed formulation component never trips ``min_rate``.
         """
-        if self._is_noop_pump_command(dispense_vol):
-            logger.info("syringe_pump_skip", pump_id=ID, reason="zero_volume")
+        if self._is_noop_pump_command(dispense_vol, ID):
+            logger.info("syringe_pump_skip", pump_id=ID, reason="below_noop_floor")
             return
 
         self._validate_single_pump(res_vol, rate, dispense_vol, ID)

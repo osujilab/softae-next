@@ -44,7 +44,36 @@ N_PUMPS = 3
 #: without a 0-volume pump — whose proportional rate is also 0 — tripping the
 #: ``min_rate`` safety limit.  Enforced at the :meth:`single_pump` choke point so
 #: it covers every pump actuation (deposit, flush, precondition, manual).
-PUMP_NOOP_VOLUME_UL = 0.0
+#:
+#: **A physical floor, not exact zero.** Until 2026-09-24 this was ``0.0``, which
+#: assumed a zeroed component arrives as a literal zero.  It does not: the
+#: formulation solver works in fractions and returns the *residue* of a
+#: cancellation.  Measured on the bench that day — EO:Li 15 / silica 0 gave pump 1
+#: ``1.4210854715202004e-13 µL``, which cleared a ``<= 0.0`` guard, was handed a
+#: proportionally-split ``~1e-12 µL/min`` by
+#: :func:`~softae.core.dropcast_plan.split_rate`, and raised
+#: :class:`~softae.errors.SafetyError` against ``min_rate`` **inside
+#: ``precondition_flush``** — after the plug had already gone through the other
+#: two pumps.  A floor of exact zero is therefore a floor that never fires on the
+#: case it was written for.
+#:
+#: **Why 0.01 µL, and why a constant rather than derived.** On the shipped
+#: 14.4 mm syringe, 0.01 µL is ~61 nm of plunger travel — below any mechanical
+#: resolution the chain has, so nothing at or below it is metered even when
+#: commanded.  It sits eleven orders above the observed residue and two orders
+#: below the smallest deliberate component in any recipe on file, so the
+#: separation is not delicate.  It is **not** derived from
+#: ``[instruments.syringe] min_rate`` or ``diameter`` deliberately: a config edit
+#: would then move a safety floor, which is the failure mode the ``HALT_*``
+#: constants in :mod:`softae.drivers.async_syringe` exist to prevent and which
+#: :func:`temp_setpoint_limits` argues against in the same breath — an interlock
+#: must only ever be tightenable, and never by accident.
+#:
+#: ``HALT_VOLUME_UL`` (0.001 µL) is now *below* this floor.  That inversion would
+#: have silently deleted the park's pump halt under the old design; it is safe
+#: only because :meth:`~softae.drivers.async_syringe.AsyncSyringe.halt_pump` no
+#: longer consults the no-op filter at all.  Pinned by ``tests/test_halt_pump.py``.
+PUMP_NOOP_VOLUME_UL = 0.01
 
 
 # ── Syringe ──────────────────────────────────────────────────────────────────
@@ -96,18 +125,43 @@ class ParallelSyringeMixin:
             count = self._parallel_syringes_by_pump.get(int(pump_id), self._parallel_syringes)
         return float(commanded_uL) / float(count)
 
-    def _is_noop_pump_command(self, dispense_vol: float) -> bool:
+    def _is_noop_pump_command(
+        self, dispense_vol: float, pump_id: int | None = None
+    ) -> bool:
         """True if *dispense_vol* means "leave this pump alone" (≤ the no-op floor).
 
         A no-op command is skipped entirely by :meth:`single_pump` — no safety
         validation and no hardware write — so a zeroed formulation component does
         not trip the ``min_rate`` limit.  Shared by MockSyringe and AsyncSyringe
         so both sides skip on exactly the same condition.
+
+        **The skip is announced here, in the predicate, on purpose.** A skipped
+        component is an invisible zeroed component, and a silent one is how a cast
+        goes out missing a stock with nothing in the record saying so.  Both
+        drivers do log a skip of their own, but at *different levels* — the real
+        pump at ``INFO``, the mock at ``DEBUG`` — so neither could be relied on to
+        appear.  This is the one site both share, it is called exactly once per
+        :meth:`single_pump`, and drift between the two sides is the thing this
+        module exists to prevent.
+
+        *pump_id* is optional only so the signature stays back-compatible; every
+        caller in this repo passes it, because **which** component was zeroed is
+        the entire content of the finding.
         """
         try:
-            return float(dispense_vol) <= PUMP_NOOP_VOLUME_UL
+            value = float(dispense_vol)
         except (TypeError, ValueError):
             return False
+        if value > PUMP_NOOP_VOLUME_UL:
+            return False
+        logger.info(
+            "pump_skipped_below_floor",
+            pump_id=None if pump_id is None else int(pump_id),
+            dispense_vol_uL=value,
+            floor_uL=PUMP_NOOP_VOLUME_UL,
+            instrument=getattr(self, "name", None),
+        )
+        return True
 
     def _validate_single_pump(
         self,
