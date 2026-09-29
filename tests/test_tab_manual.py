@@ -967,3 +967,244 @@ class TestTheStockDialogIsOpenedWithItsStore:
 
         assert "sol_catalog" not in calls[0]
         assert not hasattr(tab, "_sol_catalog")
+
+
+# ── Manual ramp: progress line, Abort, and the abort_ramp contract ───────────
+#
+# Spec: docs/SubAgent docs/manual_temp_ramp_progress_abort.md §3. The mock
+# controller's ramp is instant, so a ramp is held "running" by gating one of its
+# setpoint writes on an Event. Every gate is released at teardown, before the
+# tab fixture's close joins the worker.
+
+import threading as _threading
+
+from structlog.testing import capture_logs
+
+from softae.drivers.temp_ramp import ramp_schedule, ramp_span_s
+from softae.gui.tabs.tab_manual_workers import (
+    RAMP_ABORTING_TEXT,
+    RAMP_IDLE_TEXT,
+    RAMP_REFUSED_TEXT,
+    _RampWorker,
+)
+
+_GATE_BOUND_S = 5.0
+
+
+class _WriteGate:
+    """Holds the mock controller's *nth* ``write_sp`` call until released."""
+
+    def __init__(self, tc, nth: int) -> None:
+        self.entered, self.release = _threading.Event(), _threading.Event()
+        self.calls: list[float] = []
+        self._orig, self._nth = tc.write_sp, nth
+
+    def __call__(self, T_SP, print_flag=1):
+        self.calls.append(T_SP)
+        if len(self.calls) == self._nth:
+            self.entered.set()
+            assert self.release.wait(_GATE_BOUND_S), "write gate never released"
+        self._orig(T_SP, print_flag)
+
+
+@pytest.fixture
+def gate_writes(tab, monkeypatch):
+    # A gate that times out fails the worker, and `failed` opens a modal that
+    # would wedge the run; a failing test must fail, not hang.
+    monkeypatch.setattr("softae.gui.tabs.tab_manual.QMessageBox.warning",
+                        lambda *a, **k: None)
+    gates: list[_WriteGate] = []
+
+    def _make(nth: int = 1) -> _WriteGate:
+        tc = tab._manager.get("temp_controller")
+        gate = _WriteGate(tc, nth)
+        monkeypatch.setattr(tc, "write_sp", gate)
+        gates.append(gate)
+        return gate
+
+    yield _make
+    for gate in gates:
+        gate.release.set()
+
+
+def _wait_for(predicate, timeout_s: float = _GATE_BOUND_S) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        QApplication.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def _start_held_ramp(tab, gate_writes, nth: int = 1, end: float = 30.0) -> _WriteGate:
+    """Start a 25 -> *end* ramp held inside its *nth* setpoint write."""
+    gate = gate_writes(nth)
+    tab._spin_ramp_end.setValue(end)
+    tab._on_ramp()
+    assert gate.entered.wait(_GATE_BOUND_S), "the ramp never reached its write"
+    return gate
+
+
+class TestManualRampProgressAndAbort:
+    def test_ramp_progress_label_updates_from_signal(self, tab, gate_writes):
+        gate = _start_held_ramp(tab, gate_writes, nth=2)   # step 1 written
+        assert _wait_for(lambda: tab._lbl_ramp_progress.text().startswith("Step 1/"))
+        text = tab._lbl_ramp_progress.text()
+        assert "SP 25.0 °C → 30.0 °C" in text and "ETA" in text
+        assert "cooling is passive" not in text             # upward ramp
+        gate.release.set()
+
+    def test_ramp_progress_downward_appends_passive_cooling_note(self, tab, gate_writes):
+        gate = _start_held_ramp(tab, gate_writes, nth=2, end=20.0)
+        assert _wait_for(lambda: "cooling is passive" in tab._lbl_ramp_progress.text())
+        assert tab._lbl_ramp_progress.text().count("cooling is passive") == 1
+        gate.release.set()
+
+    def test_ramp_abort_button_enabled_only_while_running(self, tab, gate_writes, settle_qt):
+        assert not tab._btn_ramp_abort.isEnabled()
+        assert tab._lbl_ramp_progress.text() == RAMP_IDLE_TEXT
+        gate = _start_held_ramp(tab, gate_writes)
+        assert tab._btn_ramp_abort.isEnabled() and not tab._btn_ramp.isEnabled()
+        gate.release.set()
+        settle_qt(tab)
+        assert _wait_for(lambda: tab._ramp_worker is None)
+        assert not tab._btn_ramp_abort.isEnabled() and tab._btn_ramp.isEnabled()
+        assert tab._lbl_ramp_progress.text().startswith("Ramp complete — SP 30.0 °C")
+
+    def test_ramp_abort_sets_cancel_and_reports_holding(self, tab, gate_writes, settle_qt):
+        gate = _start_held_ramp(tab, gate_writes)            # step 1 in flight
+        worker = tab._ramp_worker
+        tab._btn_ramp_abort.click()
+        assert worker.cancel.is_set()
+        assert tab._lbl_ramp_progress.text() == RAMP_ABORTING_TEXT
+        assert not tab._btn_ramp_abort.isEnabled()
+        gate.release.set()
+        settle_qt(tab)
+        assert _wait_for(lambda: "holding SP" in tab._lbl_ramp_progress.text())
+        total = len(ramp_schedule(25.0, 30.0, ramp_span_s(25.0, 30.0, 1.0))[0])
+        assert tab._lbl_ramp_progress.text() == (
+            f"Ramp aborted at step 1/{total} — holding SP 25.0 °C")
+        assert gate.calls == [25.0], "the ramp wrote a step after the abort"
+
+    def test_ramp_zero_span_shows_already_at_target(self, tab, settle_qt):
+        tab._spin_ramp_end.setValue(25.0)                    # the mock SP
+        tab._on_ramp()
+        settle_qt(tab)
+        assert _wait_for(lambda: tab._ramp_worker is None)
+        assert tab._lbl_ramp_progress.text() == "Already at 25.0 °C — nothing to ramp"
+
+    def test_ramp_refused_shows_refusal_in_progress_label(
+            self, hosted_tab, rig_activity, monkeypatch, settle_qt):
+        rig_activity.acquire("campaign:phase_map:run-7")
+        calls = []
+        monkeypatch.setattr(hosted_tab._manager.get("temp_controller"), "ramp_linear",
+                            lambda *a, **k: calls.append(k))
+        hosted_tab._on_ramp()
+        settle_qt(hosted_tab)
+        assert calls == []
+        assert hosted_tab._lbl_ramp_progress.text() == RAMP_REFUSED_TEXT
+        assert hosted_tab._btn_ramp.isEnabled() and not hosted_tab._btn_ramp_abort.isEnabled()
+
+    def test_set_temp_disabled_while_ramp_runs(self, tab, gate_writes, settle_qt):
+        gate = _start_held_ramp(tab, gate_writes)
+        assert not tab._btn_set_temp.isEnabled()
+        assert tab._btn_set_temp.toolTip() == "Abort the ramp first"
+        gate.release.set()
+        settle_qt(tab)
+        assert _wait_for(lambda: tab._btn_set_temp.isEnabled())
+        assert tab._btn_set_temp.toolTip() == ""
+
+    def test_ramp_failure_shows_failed_text_and_reenables(self, tab, monkeypatch, settle_qt):
+        monkeypatch.setattr("softae.gui.tabs.tab_manual.QMessageBox.warning",
+                            lambda *a, **k: None)
+
+        def boom(**kwargs):
+            raise RuntimeError("SP above the safety limit")
+
+        monkeypatch.setattr(tab._manager.get("temp_controller"), "ramp_linear", boom)
+        tab._spin_ramp_end.setValue(30.0)
+        tab._on_ramp()
+        settle_qt(tab)
+        assert _wait_for(lambda: tab._ramp_worker is None)
+        assert tab._lbl_ramp_progress.text() == (
+            "Ramp failed before its first step: SP above the safety limit")
+        assert tab._btn_ramp.isEnabled() and tab._btn_set_temp.isEnabled()
+
+    def test_cleanup_mid_ramp_cancels_and_joins_worker(self, tab, gate_writes):
+        gate = _start_held_ramp(tab, gate_writes)
+        worker = tab._ramp_worker
+        reports = []
+        worker.completed.connect(reports.append, type=_direct())
+        # cleanup() joins on this thread, so the in-flight write is released from another.
+        _threading.Timer(0.2, gate.release.set).start()
+        tab.cleanup()
+        assert worker.cancel.is_set()
+        assert not worker.isRunning(), "cleanup() returned with the ramp still running"
+        assert reports and reports[0].cancelled and reports[0].last_sp == 25.0
+        assert gate.calls == [25.0]
+
+    def test_cleanup_ramp_join_timeout_logs_warning(self, tab, gate_writes, monkeypatch):
+        gate = _start_held_ramp(tab, gate_writes)
+        worker = tab._ramp_worker
+        monkeypatch.setattr(worker, "stop_worker",
+                            lambda timeout_ms=3000: (worker.cancel.set(), False)[1])
+        with capture_logs() as logs:
+            tab.cleanup()
+        assert "manual_ramp_join_timeout" in [e["event"] for e in logs]
+        gate.release.set()
+        worker.wait(int(_GATE_BOUND_S * 1000))
+
+
+def _direct():
+    from PySide6.QtCore import Qt
+
+    return Qt.ConnectionType.DirectConnection
+
+
+class TestAbortRampContract:
+    """``abort_ramp`` is called by ``MainWindow.notify_parked`` on every park."""
+
+    def test_abort_ramp_no_ramp_running_is_noop(self, tab):
+        tab.abort_ramp()
+        assert tab._lbl_ramp_progress.text() == RAMP_IDLE_TEXT
+        assert not tab._btn_ramp_abort.isEnabled() and tab._btn_ramp.isEnabled()
+
+    def test_abort_ramp_after_ramp_finished_is_noop(self, tab, settle_qt):
+        tab._spin_ramp_end.setValue(30.0)
+        tab._on_ramp()
+        settle_qt(tab)
+        assert _wait_for(lambda: tab._ramp_worker is None)
+        done = tab._lbl_ramp_progress.text()
+        assert done.startswith("Ramp complete")
+        tab.abort_ramp()
+        assert tab._lbl_ramp_progress.text() == done
+        assert tab._btn_ramp.isEnabled()
+
+    def test_abort_ramp_second_call_is_noop(self, tab, gate_writes, settle_qt):
+        gate = _start_held_ramp(tab, gate_writes)
+        with capture_logs() as logs:
+            tab.abort_ramp()
+            tab.abort_ramp()
+        assert [e["event"] for e in logs].count("manual_ramp_abort_requested") == 1
+        assert tab._lbl_ramp_progress.text() == RAMP_ABORTING_TEXT
+        gate.release.set()
+        settle_qt(tab)
+
+    def test_abort_ramp_while_write_blocked_returns_immediately(
+            self, tab, gate_writes, settle_qt):
+        """It sets the event and returns; it never joins. The ramp's write is
+        held for the whole call, so a join would block until the gate bound."""
+        gate = _start_held_ramp(tab, gate_writes)
+        worker = tab._ramp_worker
+        t0 = time.monotonic()
+        tab.abort_ramp()
+        elapsed = time.monotonic() - t0
+        assert elapsed < 0.5, f"abort_ramp blocked the GUI thread for {elapsed:.2f} s"
+        assert worker.cancel.is_set() and worker.isRunning()
+        assert not gate.release.is_set()
+        gate.release.set()
+        settle_qt(tab)
+
+    def test_ramp_worker_is_a_command_worker_joined_by_settle_qt(self):
+        assert issubclass(_RampWorker, _CommandWorker)

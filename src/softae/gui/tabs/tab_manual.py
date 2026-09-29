@@ -11,7 +11,17 @@ import os
 import tempfile
 from typing import TYPE_CHECKING, Iterable
 
-from .tab_manual_workers import _CommandWorker
+from .tab_manual_workers import (
+    RAMP_ABORTING_TEXT,
+    RAMP_IDLE_TEXT,
+    RAMP_REFUSED_TEXT,
+    RAMP_STARTING_TEXT,
+    _CommandWorker,
+    _RampWorker,
+    ramp_failed_text,
+    ramp_outcome_text,
+    ramp_running_text,
+)
 
 from PySide6.QtCore import (
     QMutex,
@@ -512,6 +522,12 @@ class ManualControlTab(QWidget):
         self._eis_scout: ScoutPlanner | None = None
         self._eis_series_window: QWidget | None = None  # multi-channel plot window
         self._pv_worker: _ManualPollingWorker | None = None
+        # The manual ramp: its worker while one runs, the last RampStep seen and
+        # when (GUI monotonic clock), and the target, for the final line.
+        self._ramp_worker: _RampWorker | None = None
+        self._ramp_last_step = None
+        self._ramp_step_seen_at = 0.0
+        self._ramp_end = 0.0
         self._manual_dispense_count_by_pump: dict[int, int] = {0: 0, 1: 0, 2: 0}
         self._build_ui()
         self._start_pv_polling()
@@ -635,7 +651,18 @@ class ManualControlTab(QWidget):
         self._btn_ramp = QPushButton("Start Ramp")
         self._btn_ramp.clicked.connect(self._on_ramp)
         ramp_row.addWidget(self._btn_ramp)
+        self._btn_ramp_abort = QPushButton("■  Abort ramp")
+        self._btn_ramp_abort.setEnabled(False)
+        self._btn_ramp_abort.clicked.connect(self.abort_ramp)
+        ramp_row.addWidget(self._btn_ramp_abort)
         temp_layout.addLayout(ramp_row)
+        self._lbl_ramp_progress = QLabel(RAMP_IDLE_TEXT)
+        self._lbl_ramp_progress.setWordWrap(True)
+        temp_layout.addWidget(self._lbl_ramp_progress)
+        # Re-renders elapsed/ETA between writes, which may be a minute apart.
+        self._ramp_timer = QTimer(self)
+        self._ramp_timer.setInterval(1000)
+        self._ramp_timer.timeout.connect(self._render_ramp_running)
 
         top.addWidget(temp_grp)
 
@@ -1466,35 +1493,112 @@ class ManualControlTab(QWidget):
 
         w = _CommandWorker(_do, parent=self)
         w.completed.connect(lambda _: self._lbl_temp_sp.setText(f"SP: {sp:.1f} °C"))
-        w.completed.connect(lambda _: self._btn_set_temp.setEnabled(True))
+        # A ramp started while this Set was in flight keeps Set disabled.
+        w.completed.connect(lambda _: self._btn_set_temp.setEnabled(self._ramp_worker is None))
         w.failed.connect(lambda e: QMessageBox.warning(self, "Temperature Error", e))
-        w.failed.connect(lambda _: self._btn_set_temp.setEnabled(True))
+        w.failed.connect(lambda _: self._btn_set_temp.setEnabled(self._ramp_worker is None))
         w.finished.connect(w.deleteLater)
         w.start()
 
     def _on_ramp(self) -> None:
         if refused(self._note_manual_actuation("temperature ramp", TEMP_INSTRUMENTS)):
+            self._lbl_ramp_progress.setText(RAMP_REFUSED_TEXT)
             return
+        from softae.drivers.temp_ramp import ramp_span_s
+
         end = self._spin_ramp_end.value()
-        rate = self._spin_ramp_rate.value()
-        self._btn_ramp.setEnabled(False)
+        rate = self._spin_ramp_rate.value()   # °C/min, the driver's unit too
+        self._ramp_end = end
+        self._ramp_last_step = None
+        self._set_ramp_controls(running=True)
+        self._lbl_ramp_progress.setText(RAMP_STARTING_TEXT)
 
         def _do():
             tc = self._manager.get("temp_controller")
             start = tc.get_sp()
-            # Spinbox rate is °C/min; the driver takes a total duration in
-            # seconds plus a setpoint-update interval (see
-            # AsyncTempController.ramp_linear / .anneal for the granularity).
-            t_span = abs(end - start) / rate * 60.0
-            up_int = max(t_span / 100.0, 1.0)
-            tc.ramp_linear(T_start=start, T_end=end, t_span=t_span, up_int=up_int, print_flag=0)
+            # up_int=None: the driver writes at least once a minute and no more
+            # often than the 0.1 °C register makes meaningful.
+            return tc.ramp_linear(
+                T_start=start, T_end=end, t_span=ramp_span_s(start, end, rate),
+                up_int=None, print_flag=0, on_step=w.progress.emit, cancel=w.cancel,
+            )
 
-        w = _CommandWorker(_do, parent=self)
-        w.completed.connect(lambda _: self._btn_ramp.setEnabled(True))
+        w = _RampWorker(_do, parent=self)
+        self._ramp_worker = w
+        w.progress.connect(self._on_ramp_progress)
+        w.completed.connect(self._on_ramp_completed)
+        w.failed.connect(self._on_ramp_failed)
         w.failed.connect(lambda e: QMessageBox.warning(self, "Ramp Error", e))
-        w.failed.connect(lambda _: self._btn_ramp.setEnabled(True))
+        w.finished.connect(self._on_ramp_finished)
         w.finished.connect(w.deleteLater)
         w.start()
+        self._ramp_timer.start()
+
+    def abort_ramp(self) -> None:
+        """Cancel a running manual ramp; the last-written setpoint holds.
+
+        The Abort button's slot, and what ``MainWindow.notify_parked`` calls on
+        **every** park (E-Stop, attached-mode takeover, Safe Exit) before the
+        park writes its own setpoint. Contract, each pinned in
+        ``tests/test_tab_manual.py``:
+
+        - a harmless no-op when no ramp is running, or one already finished;
+        - idempotent: a second call does nothing;
+        - never blocks: it sets the cancel event and updates the label, and does
+          **not** join. The driver re-checks the event under its setpoint-write
+          lock, which is what makes a following park write land last.
+
+        Not routed through :meth:`_note_manual_actuation`: it commands nothing,
+        and a refused abort would strand a ramp.
+        """
+        worker = self._ramp_worker
+        if worker is None or worker.cancel.is_set() or not worker.isRunning():
+            return
+        worker.cancel.set()
+        self._btn_ramp_abort.setEnabled(False)
+        self._lbl_ramp_progress.setText(RAMP_ABORTING_TEXT)
+        import structlog
+
+        structlog.get_logger(__name__).info("manual_ramp_abort_requested")
+
+    def _set_ramp_controls(self, *, running: bool) -> None:
+        """Start Ramp and Set are off while a ramp runs; Abort is on only then."""
+        self._btn_ramp.setEnabled(not running)
+        self._btn_set_temp.setEnabled(not running)
+        self._btn_set_temp.setToolTip("Abort the ramp first" if running else "")
+        self._btn_ramp_abort.setEnabled(running)
+
+    def _on_ramp_progress(self, step) -> None:
+        import time
+
+        self._ramp_last_step = step
+        self._ramp_step_seen_at = time.monotonic()
+        self._render_ramp_running()
+
+    def _render_ramp_running(self) -> None:
+        worker, step = self._ramp_worker, self._ramp_last_step
+        if step is None or worker is None or worker.cancel.is_set():
+            return
+        import time
+
+        elapsed = step.elapsed_s + (time.monotonic() - self._ramp_step_seen_at)
+        self._lbl_ramp_progress.setText(ramp_running_text(step, elapsed))
+
+    def _on_ramp_completed(self, result) -> None:
+        self._lbl_ramp_progress.setText(ramp_outcome_text(result, self._ramp_end))
+        self._end_ramp_ui()
+
+    def _on_ramp_failed(self, message: str) -> None:
+        self._lbl_ramp_progress.setText(ramp_failed_text(self._ramp_last_step, message))
+        self._end_ramp_ui()
+
+    def _on_ramp_finished(self) -> None:
+        self._ramp_worker = None
+        self._end_ramp_ui()
+
+    def _end_ramp_ui(self) -> None:
+        self._ramp_timer.stop()
+        self._set_ramp_controls(running=False)
 
     def _on_set_rh(self) -> None:
         if refused(self._note_manual_actuation("humidity setpoint", RH_INSTRUMENTS)):
@@ -2190,6 +2294,13 @@ class ManualControlTab(QWidget):
         timer = getattr(self, "_rig_owner_timer", None)
         if timer is not None:
             timer.stop()
+        # Close is abort-then-park (ruling Q2): the ramp must have stopped before
+        # the window's exit park writes its setpoint, or its next step wins.
+        ramp = getattr(self, "_ramp_worker", None)
+        if ramp is not None and ramp.isRunning() and not ramp.stop_worker(3000):
+            import structlog
+
+            structlog.get_logger(__name__).warning("manual_ramp_join_timeout")
         if self._pv_worker is not None and self._pv_worker.isRunning():
             self._pv_worker.stop_worker()
         eis = getattr(self, "_eis_thread", None)
