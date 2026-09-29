@@ -1,5 +1,8 @@
 """Tests for the optimizer subsystem (C1)."""
 
+import itertools
+import json
+
 import pytest
 
 from softae.errors import OptimizerError, SoftAEError
@@ -12,6 +15,21 @@ SIMPLE_SPACE = {
     "x": {"type": "float", "low": 0.0, "high": 10.0},
     "y": {"type": "float", "low": -5.0, "high": 5.0},
 }
+
+#: Rung 3c's shape: a handful of EXPLICIT compositions, enumerated as a
+#: categorical product rather than sampled from a continuous box.
+FOUR_COMPOSITIONS = {
+    "polymer": {"type": "categorical", "choices": ["PEO", "PVA"]},
+    "salt": {"type": "categorical", "choices": ["LiCl", "LiTFSI"]},
+}
+
+
+def _walk(opt):
+    """Every point an optimizer yields, in order, to exhaustion."""
+    out = []
+    while (p := opt.suggest()) is not None:
+        out.append(p)
+    return out
 
 MIXED_SPACE = {
     "temp": {"type": "float", "low": 25.0, "high": 80.0},
@@ -105,6 +123,71 @@ def test_grid_categorical_ignores_n_points():
         points.append(p["s"])
     assert set(points) == {"a", "b"}
     assert len(points) == 2  # not 100
+
+
+# ── Grid shuffle (rung 3c: explicit compositions, random cast order) ─────────
+
+
+def test_grid_shuffle_default_off_is_byte_identical():
+    """Off by default: the walk is still `itertools.product`, seed or no seed."""
+    product = [{"polymer": p, "salt": s}
+               for p in ("PEO", "PVA") for s in ("LiCl", "LiTFSI")]
+    assert _walk(GridSearchOptimizer(FOUR_COMPOSITIONS)) == product
+    assert _walk(GridSearchOptimizer(FOUR_COMPOSITIONS, seed=7)) == product
+    assert _walk(GridSearchOptimizer(FOUR_COMPOSITIONS, shuffle=False)) == product
+    assert GridSearchOptimizer(SIMPLE_SPACE, n_points=5)._grid == \
+        GridSearchOptimizer(SIMPLE_SPACE, n_points=5, shuffle=True)._grid
+
+
+def test_grid_shuffle_same_seed_same_order():
+    """Two optimizers on one seed walk one order; the order is not the product."""
+    a = GridSearchOptimizer(SIMPLE_SPACE, seed=17, n_points=5, shuffle=True)
+    b = GridSearchOptimizer(SIMPLE_SPACE, seed=17, n_points=5, shuffle=True)
+    walked = _walk(a)
+    assert walked == _walk(b)
+    assert walked != a._grid
+
+
+def test_grid_shuffle_is_a_permutation_of_the_product():
+    """Every product point exactly once — reordered, never resampled."""
+    opt = GridSearchOptimizer(SIMPLE_SPACE, seed=3, n_points=5, shuffle=True)
+    walked = _walk(opt)
+    assert len(walked) == opt.n_grid_points == 25
+    assert sorted(map(repr, walked)) == sorted(map(repr, opt._grid))
+    assert walked != opt._grid
+
+
+def test_grid_shuffle_survives_serialization_round_trip():
+    """A resume walks the SAME permutation: the order rides in the checkpoint,
+    so it holds even under ``seed=None``, where a redraw would differ."""
+    opt = GridSearchOptimizer(FOUR_COMPOSITIONS, seed=11, shuffle=True)
+    twin = GridSearchOptimizer(FOUR_COMPOSITIONS, seed=11, shuffle=True)
+    for _ in range(2):
+        opt.suggest()
+        twin.suggest()
+    restored = BaseOptimizer.from_dict(json.loads(json.dumps(opt.to_dict())))
+    assert isinstance(restored, GridSearchOptimizer)
+    assert _walk(restored) == _walk(twin)
+
+    unseeded = GridSearchOptimizer(SIMPLE_SPACE, seed=None, n_points=5, shuffle=True)
+    intended = [unseeded._grid[i] for i in unseeded._order]
+    for _ in range(2):
+        unseeded.suggest()
+    resumed = BaseOptimizer.from_dict(json.loads(json.dumps(unseeded.to_dict())))
+    assert _walk(resumed) == intended[2:]
+
+
+def test_grid_shuffle_precedes_replication_layout():
+    """Shuffling the grid does not disturb the interleaved replicate layout."""
+    from softae.optimizers.replicated import ReplicatingOptimizer
+
+    inner = GridSearchOptimizer(FOUR_COMPOSITIONS, seed=5, shuffle=True)
+    batch = ReplicatingOptimizer(inner, 2, layout="interleaved").suggest_batch(8)
+    assert len(batch) == 8
+    assert all(batch[i] == batch[i + 4] for i in range(4))
+    product = [dict(zip(("polymer", "salt"), c)) for c in
+               itertools.product(("PEO", "PVA"), ("LiCl", "LiTFSI"))]
+    assert sorted(map(repr, batch[:4])) == sorted(map(repr, product))
 
 
 # ── RandomSearchOptimizer tests ──────────────────────────────────────────────
