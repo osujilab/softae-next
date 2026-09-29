@@ -23,6 +23,7 @@ from softae.core.autonomous_wiring import (
     composition_target_objective,
     deposit_step_name,
     eis_impedance_objective_for_channel,
+    grid_order_identity,
     measure_step_name,
     optimizer_tuning_identity,
     replication_identity,
@@ -726,6 +727,78 @@ def test_replicates_below_one_is_refused_rather_than_read_as_one():
     turn ``replicates = 0`` into a silent 1."""
     with pytest.raises(ValueError, match="replicates"):
         _spec(replicates=0)
+
+
+# ── Grid shuffle (rung 3c) ───────────────────────────────────────────────────
+#
+# The optimizer half (`GridSearchOptimizer(shuffle=...)`) is afl's and tested in
+# test_optimizers.py; these pin the spec -> optimizer thread, the fingerprint
+# key and the desk-time refusals.
+
+def _grid_walk(opt):
+    out = []
+    while (p := opt.suggest()) is not None:
+        out.append(p)
+    return out
+
+
+def test_build_optimizer_threads_grid_shuffle_to_the_grid():
+    """RED if ``build_optimizer`` drops the field: the walk would stay product order."""
+    plain = build_optimizer(_spec(optimizer="grid"))
+    product = list(plain._grid)
+    assert _grid_walk(plain) == product
+
+    shuffled = _grid_walk(build_optimizer(_spec(optimizer="grid", grid_shuffle=True)))
+    assert shuffled != product
+    assert sorted(map(repr, shuffled)) == sorted(map(repr, product))
+    # Same seed, same route — the order is the seed's, not a fresh draw.
+    assert shuffled == _grid_walk(
+        build_optimizer(_spec(optimizer="grid", grid_shuffle=True)))
+
+
+def test_campaign_spec_fingerprint_grid_shuffle_default_contributes_no_key():
+    """Asserted on the helper, not only the hash, for the reason
+    ``replication_identity``'s test gives: an unconditional key cancels."""
+    assert grid_order_identity(_spec(optimizer="grid")) is None
+    assert grid_order_identity(_spec(optimizer="grid", grid_shuffle=True)) == \
+        {"grid_shuffle": True}
+    assert campaign_spec_fingerprint(_spec(optimizer="grid", grid_shuffle=True)) != \
+        campaign_spec_fingerprint(_spec(optimizer="grid"))
+
+
+def test_grid_shuffle_non_bool_is_refused_at_construction():
+    with pytest.raises(ValueError, match="grid_shuffle must be true or false"):
+        _spec(optimizer="grid", grid_shuffle="yes")
+
+
+def test_grid_shuffle_on_a_non_grid_optimizer_is_refused_rather_than_ignored():
+    """A misplaced ``grid_shuffle = true`` fails at ``softae-campaign check``
+    instead of being silently inert on a random/bayesian run."""
+    for kind in ("random", "bayesian"):
+        with pytest.raises(ValueError, match='requires optimizer = "grid"'):
+            _spec(optimizer=kind, grid_shuffle=True)
+    # Case-insensitive, matching build_optimizer's lowercasing.
+    assert _spec(optimizer="Grid", grid_shuffle=True).grid_shuffle is True
+
+
+def test_spec_load_grid_shuffle_round_trips_through_a_toml_file(tmp_path):
+    """Plain scalar path, no codec: the loader's legal keys are the dataclass
+    fields, so the key loads by name and ``spec_to_dict`` writes it back."""
+    from softae.core.campaign_spec_io import load_campaign_spec, spec_to_dict
+
+    path = tmp_path / "shuffled.toml"
+    path.write_text(
+        'name = "r3c"\noptimizer = "grid"\nbudget = 2\nseed = 20260924\n'
+        'grid_shuffle = true\nchannels = [21, 22]\n'
+        'vol_params = ["vol_p0", "vol_p1"]\n'
+        '[parameter_space.vol_p0]\ntype = "float"\nlow = 5.0\nhigh = 30.0\n'
+        '[parameter_space.vol_p1]\ntype = "float"\nlow = 5.0\nhigh = 30.0\n',
+        encoding="utf-8",
+    )
+    spec = load_campaign_spec(path)
+    assert spec.grid_shuffle is True
+    assert spec_to_dict(spec)["grid_shuffle"] is True
+    assert "grid_shuffle" not in spec_to_dict(_spec())
 
 
 # ── End-to-end campaign ──────────────────────────────────────────────────────
@@ -2546,12 +2619,16 @@ async def test_a_failing_trial_measured_hook_is_wired_to_a_campaign_event(
 # branch: the mock fixture sits at R0~4.8e4 / R1~1.8e6, the real one at R0~4.8e2 /
 # R1~1.8e4, two decades apart with no overlap in any asserted band.
 
+import math  # noqa: E402
 import types  # noqa: E402
 from unittest.mock import MagicMock, patch  # noqa: E402
 
 import numpy as np  # noqa: E402
 
-from softae.core.autonomous_wiring import _spectrum_report_from_raw  # noqa: E402
+from softae.core.autonomous_wiring import (  # noqa: E402
+    _scalar_from_eis_raw,
+    _spectrum_report_from_raw,
+)
 
 #: CPE exponent shared by both fixtures (matches the mock's own circuit).
 _CPE_ALPHA = 0.7
@@ -2651,6 +2728,64 @@ def test_spectrum_report_from_raw_real_palmsens_shape_builds_report():
     assert 1.0e4 < report.fit.R1 < 3.0e4, f"R1={report.fit.R1:g} is not the fed-in one"
     assert report.sigma.is_value
     assert 5.0e-3 < report.sigma.value < 5.0e-2
+
+
+def test_scalar_from_eis_raw_accepts_driver_mscriptvar_rows():
+    """The mean-|Z| branch reads the REAL driver's shape, not only the mock's.
+
+    T11.29 migrated ``_spectrum_report_from_raw`` (above) and ``router.py`` onto
+    ``EISResult.from_raw`` but left this function's own "legacy" branch
+    hand-rolling ``np.asarray(raw, dtype=float)``, which only reads the mock's
+    one-element-list-wrapped array. Every *real* spectrum raised ``TypeError``
+    into a bare ``except: return None`` — and because that ``except`` returns
+    before the σ path is ever consulted, the well became "unmeasured" whichever
+    objective the campaign was running. On rung 3b that silently cost all 8
+    wells with nothing in the log to say why.
+
+    Every other extractor test in the suite (``test_scalar_from_eis_raw_*``,
+    ``test_eis_objective.py``, ``test_quality_gate.py``) feeds a numpy-array
+    shape, so none of them could have caught this: this is the only one that
+    feeds what the bench actually returns.
+
+    The SDK boundary is faked via ``sys.modules`` exactly as the precedent test
+    above does, rather than hand-building ``MScriptVar`` rows (those need
+    correctly hex-encoded ``data`` strings).
+    """
+    columns = _real_shaped_columns()
+    #: What ``from_raw``'s palmsens branch must reconstruct: z = Z' + i·Z''.
+    expected = float(np.abs(columns[1] + 1j * columns[2]).mean())
+
+    ps_mscript = types.ModuleType("palmsens.mscript")
+    ps_mscript.get_values_by_column = MagicMock(
+        side_effect=lambda data, col: columns[col])
+    ps_root = types.ModuleType("palmsens")
+    ps_root.mscript = ps_mscript
+    mods = {"palmsens": ps_root, "palmsens.mscript": ps_mscript}
+
+    class _OpaqueRawData:
+        """Stands in for ``parse_result_lines``'s return: not float-castable."""
+
+    with patch.dict("sys.modules", mods):
+        value = _scalar_from_eis_raw(_OpaqueRawData(), channel=21,
+                                     kind="mean_abs_z")
+
+    assert value is not None, (
+        "the real driver's shape still does not reach the objective: every bench "
+        "spectrum silently becomes an unmeasured well")
+    assert value > 0.0 and math.isfinite(value)
+
+    # POSITIVE CONTROL that the palmsens branch is what ran: neither array branch
+    # of `from_raw` touches this function, so a non-zero count proves the `else`
+    # branch was entered rather than coincidentally matched. The count is `>= 3`,
+    # not `== 3`, because the σ shadow path below the extraction re-reads the same
+    # raw through its own `from_raw` — asserting equality here would pin an
+    # unrelated implementation detail of the shadow.
+    assert ps_mscript.get_values_by_column.call_count >= 3
+    assert [c.args[1] for c in ps_mscript.get_values_by_column.call_args_list[:3]] == [0, 1, 2]
+
+    # The value is the fed-in spectrum's own mean |Z|, so this cannot pass on data
+    # that took the mock branch (two decades away) or on a coincidental finite.
+    assert value == pytest.approx(expected, rel=1e-9)
 
 
 # ── T11.33: every well is followed through ───────────────────────────────────
@@ -3054,3 +3189,170 @@ async def test_a_stock_resolution_that_raises_skips_provenance_and_says_nothing(
     assert not (store.run_dir(result.run_id) / "provenance.json").exists()
     assert not [e for e in events if e["type"] == "stocks_resolved"]
     store.close()
+
+
+# ── Rung 3c prerequisites: the maturity guard, and the hold's alert row ──────
+
+
+@pytest.mark.asyncio
+async def test_maturity_guard_uses_the_midpoint_and_records_nothing(
+        connected, tmp_path: Path):
+    """The guard inspects a FEASIBLE representative trial, and writes nothing.
+
+    Two defects, one block. The guard built its representative trial from
+    ``{p: 1.0 for p in spec.resolved_vol_params()}`` — correct in volume mode,
+    where those names are pump volumes, but ``resolved_vol_params()`` falls back
+    to ``parameter_space.keys()`` when ``vol_params`` is unset. So in
+    *composition* mode it handed the solver ``eo_li_ratio = 1.0`` /
+    ``silica_vol_frac = 1.0``, which solves to an infeasible ~392 uL. And it
+    built that trial through ``workflow_builder`` — the *recording* closure — so
+    the guard's own sanity check tried to write ``formulations`` rows for a cast
+    that could never happen, failed with ``trial_formulation_record_failed`` on
+    the first channel, and left a scary log line on every composition-mode
+    launch. The cast itself was always correct; only the inspection was wrong.
+
+    The chemistry helper is imported from the composition module rather than
+    duplicated, the way ``test_eis_objective.py`` already imports it.
+    """
+    import structlog
+
+    from softae.core import lifecycle as _lc
+    from tests.test_autonomous_composition import SPACE as COMPOSITION_SPACE
+    from tests.test_autonomous_composition import _context
+
+    store = DataStore(tmp_path / "proj_guard")
+    spec = CampaignSpec(
+        name="guard_composition", channels=(21, 22),
+        pcb_name="SoftAE_EIS_4Stripe",
+        parameter_space=COMPOSITION_SPACE,   # axes, NOT volumes
+        formulation=_context(),
+        pump_ids=(0, 1, 2), optimizer="random", time_scale=0.0, budget=1, seed=7,
+    )
+    assert spec.vol_params == ()          # composition mode: volumes are solved
+    # The precondition this test exists for: the OLD nominal is out of range on
+    # both axes (silica_vol_frac is a fraction, bounded 0.0-0.2), which is why it
+    # solved to an infeasible volume.
+    assert spec.resolved_vol_params() == tuple(COMPOSITION_SPACE)
+    for axis, bounds in COMPOSITION_SPACE.items():
+        assert not (bounds["low"] <= 1.0 <= bounds["high"]) or axis == "eo_li_ratio"
+
+    #: What the guard handed the maturity check, and whether anything had been
+    #: written to `formulations` by the moment it did.
+    seen: list[tuple[object, int]] = []
+    real = _lc.maturity_warnings
+
+    def _spy(workflow, catalog, *, expected=None):
+        rows = store._conn.execute("SELECT COUNT(*) FROM formulations").fetchone()[0]
+        seen.append((workflow, int(rows)))
+        return real(workflow, catalog, expected=expected)
+
+    with structlog.testing.capture_logs() as logs:
+        _lc.maturity_warnings = _spy
+        try:
+            result = await run_autonomous_campaign(
+                spec, manager=connected, data_store=store)
+        finally:
+            _lc.maturity_warnings = real
+
+    events = {e.get("event") for e in logs}
+
+    # POSITIVE CONTROL, and the half that actually reds on the old code: the
+    # guard must have REACHED the maturity check. The old code raised inside
+    # `workflow_builder(nominal)` before this was ever called, so an
+    # absence-only assertion below would have passed on a guard that never ran.
+    assert seen, ("the maturity guard never reached the maturity check: it died "
+                  "building its representative trial")
+    workflow, rows_at_guard_time = seen[0]
+
+    # Side-effect-free: the guard is an inspection, so nothing may be recorded by
+    # the time it runs. The real cast records its own rows afterwards.
+    assert rows_at_guard_time == 0, (
+        "the guard wrote formulations rows for a trial that is never cast")
+
+    assert "maturity_check_skipped" not in events
+    assert "trial_formulation_record_failed" not in events
+
+    # WHICH point it built: the parameter-space midpoint, not the 1.0 placeholder.
+    # Compared against an independently-built midpoint workflow rather than to a
+    # hard-coded volume, so a corrected solver moves both together.
+    catalog = TaskCatalog.load_toml(loader.tasks_toml_path())
+    midpoint = {p: (float(d["low"]) + float(d["high"])) / 2.0
+                for p, d in COMPOSITION_SPACE.items()}
+    expected = build_trial_workflow(spec, midpoint, catalog=catalog)
+
+    def _vols(wf):
+        return [s.params["vols"] for s in wf.setup
+                if s.name.startswith("deposit_ch")]
+
+    assert _vols(workflow) == _vols(expected) != []
+
+    # Warn-and-proceed is unchanged: the run still completed.
+    assert result.n_trials == 1
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_anneal_hold_alert_row_carries_the_run_id(connected, tmp_path: Path):
+    """An `rh_fault` raised mid-cure must be attached to the run that caused it.
+
+    ``AsyncTempController.anneal`` passes ``self.data_store`` and ``self.run_id``
+    straight into ``run_anneal_hold``, and both default to ``None`` at
+    construction — nothing in production set them. So a humidity fault was
+    logged and then lost: with no store the row was never written, and a row
+    written with ``run_id`` NULL is orphaned from its run and invisible to
+    ``query_alerts(run_id=...)``. Both halves are therefore asserted here; one
+    without the other still fails to produce a findable row.
+
+    The hold is driven DIRECTLY rather than through an ANNEAL phase because
+    ``MockTempController.anneal`` deliberately skips ``run_anneal_hold``
+    entirely (an instant hold, so campaign tests need not wait out real cure
+    times) — on the mock rig no phase can ever raise this alert. What is under
+    test is the campaign's threading, so the hold is invoked exactly as the real
+    driver invokes it: reading both values off the controller, nowhere else.
+    """
+    from softae.drivers.contracts import ALERT_RH_FAULT, run_anneal_hold
+
+    store = DataStore(tmp_path / "proj_rh")
+    result = await run_autonomous_campaign(
+        _spec(optimizer="grid", budget=1), manager=connected, data_store=store)
+
+    # The fix itself: the campaign threaded both halves onto the controller.
+    tc = connected.get("temp_controller")
+    assert tc.run_id == result.run_id
+    assert tc.data_store is store
+
+    # A virtual clock, so the hold costs no wall time (the house pattern from
+    # tests/test_rh_hold_watchdog.py).
+    class _Clock:
+        def __init__(self) -> None:
+            self.t = 0.0
+
+        def now(self) -> float:
+            return self.t
+
+        def sleep(self, dt: float) -> None:
+            self.t += dt
+
+    clock = _Clock()
+    # An unreadable %RH is a fault on the FIRST sample -- `classify_rh_hold`
+    # returns RH_FAULT when no sample in the window is finite -- so this needs no
+    # grace window. A reader that *raises* would not work: `wrap_reader` swallows
+    # it before any sample is appended.
+    run_anneal_hold(
+        tc, 120.0, tc.get_pv(),
+        rh_reader=lambda: (85.0, float("nan")), rh_setpoint_pct=15.0,
+        data_store=tc.data_store, run_id=tc.run_id,   # exactly what `anneal` passes
+        sleep=clock.sleep, now=clock.now,
+    )
+
+    # Reopened: this is the morning-after query, and the one that returns nothing
+    # when the row carries a NULL run_id.
+    store.close()
+    with DataStore(tmp_path / "proj_rh") as ds2:
+        rows = ds2.query_alerts(run_id=result.run_id)
+        faults = [r for r in rows if r["kind"] == ALERT_RH_FAULT]
+        assert len(faults) == 1, (
+            "no rh_fault row is attached to this run: the hold's alert was "
+            "either never persisted or written with run_id NULL")
+        assert faults[0]["severity"] == "critical"
+        assert faults[0]["run_id"] == result.run_id

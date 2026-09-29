@@ -486,6 +486,14 @@ class CampaignSpec:
     #: a dispenser drift down the row). Values are
     #: :attr:`ReplicatingOptimizer.LAYOUTS`, the wrapper's own authority.
     replicate_layout: str = "adjacent"
+    #: Walk the grid in a seeded random order instead of ``itertools.product``
+    #: order (``optimizer = "grid"`` only; refused on any other optimizer). The
+    #: grid's *contents* are unchanged — only the cast order — so a systematic
+    #: drift along the cast sequence does not alias onto composition. The
+    #: permutation is applied before replication, so an ``interleaved`` pair
+    #: keeps its separation. Named ``grid_shuffle`` because ``shuffle`` already
+    #: means a level deck in ``thickness_series``.
+    grid_shuffle: bool = False
     #: What this campaign measures, and how (T2.4). One block naming a
     #: **modality** alongside its preset/overrides, so a second modality needs no
     #: new spec fields. Defaults to exactly today's behaviour: EIS, ``Quick``, no
@@ -745,6 +753,19 @@ class CampaignSpec:
                 "already casts a single suggestion onto every channel, so the "
                 "replicate count would be silently ignored."
             )
+        # ── Grid shuffle (rung 3c) ───────────────────────────────────────────
+        # Same desk-time reasoning. A non-grid optimizer never reads the field,
+        # so a misplaced `grid_shuffle = true` would otherwise be silently inert.
+        if not isinstance(self.grid_shuffle, bool):
+            raise ValueError(
+                "CampaignSpec.grid_shuffle must be true or false, got "
+                f"{self.grid_shuffle!r}"
+            )
+        if self.grid_shuffle and str(self.optimizer).lower() != "grid":
+            raise ValueError(
+                "CampaignSpec.grid_shuffle = true requires optimizer = \"grid\"; "
+                f"got optimizer = {self.optimizer!r}, which would ignore it."
+            )
 
         # One authority for what gets measured (T2.4). Runs on every
         # construction, including `dataclasses.replace`, so a spec is never
@@ -835,6 +856,9 @@ def campaign_spec_fingerprint(spec: "CampaignSpec") -> str:
     replication = replication_identity(spec)
     if replication is not None:
         payload.update(replication)
+    grid_order = grid_order_identity(spec)
+    if grid_order is not None:
+        payload.update(grid_order)
     blob = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -898,6 +922,21 @@ def replication_identity(spec: "CampaignSpec") -> dict[str, Any] | None:
     if layout != "adjacent":
         supplied["replicate_layout"] = layout
     return supplied or None
+
+
+def grid_order_identity(spec: "CampaignSpec") -> dict[str, Any] | None:
+    """``grid_shuffle``'s contribution to the resume fingerprint, or ``None``.
+
+    Fourth instance of the :func:`replication_identity` rule: an unshuffled spec
+    contributes no key, so every checkpoint written before the field existed
+    still verifies. A shuffled one contributes, because the permutation decides
+    which composition lands on which physical well — resuming a shuffled run
+    unshuffled (or the reverse) would re-cast wells already filled. The
+    permutation itself rides in the optimizer checkpoint (``grid_order``).
+
+    Read through ``getattr``: a checkpoint's spec may predate the field.
+    """
+    return {"grid_shuffle": True} if getattr(spec, "grid_shuffle", False) else None
 
 
 def _jsonable(value: Any) -> Any:
@@ -1085,7 +1124,8 @@ def build_optimizer(spec: CampaignSpec) -> BaseOptimizer:
         )
     if kind == "grid":
         return GridSearchOptimizer(
-            spec.parameter_space, spec.objective, spec.seed, n_points=spec.budget
+            spec.parameter_space, spec.objective, spec.seed, n_points=spec.budget,
+            shuffle=bool(getattr(spec, "grid_shuffle", False)),
         )
     if kind == "bayesian":
         tuning = resolve_optimizer_tuning(spec)
@@ -2821,17 +2861,23 @@ def _scalar_from_eis_raw(raw: Any, *, channel: int = 0,
         logger.warning("quality_gate_unavailable", exc_info=True)
 
     try:
-        import numpy as np
+        from softae.analysis.eis_data import EISResult
 
-        arr = np.asarray(raw[0] if isinstance(raw, (list, tuple)) else raw, dtype=float)
-        if arr.size == 0:
+        # BOTH driver shapes, not just the mock's — the same migration T11.29 made
+        # to `_spectrum_report_from_raw` below and to `router.py`, which this
+        # branch was left out of. The hand-rolled `np.asarray(..., dtype=float)`
+        # that stood here could only read the mock's one-element-list-wrapped
+        # array; the real driver's unwrapped `palmsens.mscript` object raised
+        # TypeError into the `except`, which returned None *without ever reaching
+        # the σ path below*. On rung 3b that turned all 8 real spectra into
+        # "unmeasured" with no trace in the log — hence the warning, too.
+        eis = EISResult.from_raw(raw, channel=channel)
+        if eis.z_magnitude.size == 0:
             return None
-        if arr.ndim >= 2 and arr.shape[1] >= 2:
-            value = float(np.mean(np.hypot(arr[:, -2], arr[:, -1])))
-        else:
-            value = float(np.mean(arr))
-        legacy = value if np.isfinite(value) else None
+        value = float(eis.z_magnitude.mean())
+        legacy = value if math.isfinite(value) else None
     except Exception:
+        logger.warning("objective_raw_unreadable", exc_info=True)
         return None
 
     # E1.5 — the objective becomes conductivity when the gated engine is selected.
@@ -3395,6 +3441,26 @@ async def run_autonomous_campaign(
             campaign=spec.name,
             config_hash=config_hash,
         )
+        # The anneal hold's humidity watchdog persists its verdict through
+        # `raise_alert(..., data_store=...)`, and both halves of that row live on
+        # the controller: `AsyncTempController.anneal` passes `self.data_store`
+        # and `self.run_id` straight into `run_anneal_hold`, and both default to
+        # None at construction (`async_temp_controller.py:84-85`, whose own
+        # comment names this as the host's job — "Set by whichever host owns the
+        # run, as `autonomous_wiring` already sets `syringe.purge_runner`").
+        # Nothing was setting them, so an `rh_fault` raised mid-cure was logged
+        # and then either dropped (no store) or written with `run_id` NULL —
+        # orphaned from the run that caused it, and invisible to
+        # `query_alerts(run_id=...)`.
+        #
+        # Both lines are needed: `data_store` is what makes the row exist at all
+        # and `run_id` is what attaches it to this run. Sited here because this is
+        # the first point `run_id` exists, and `manager` is fixed for the
+        # campaign's whole lifetime. Unconditional, on the precedent of
+        # `factory.py:215` (`mgr.get("temp_controller").manager = mgr`) — both
+        # drivers accept the attributes and only the real one reads them.
+        manager.get("temp_controller").run_id = run_id
+        manager.get("temp_controller").data_store = data_store
         # ── The rig is claimed for the whole campaign, not for each trial ────
         # `WorkflowExecutor.run` takes the lock per workflow and drops it in its
         # `finally`, and one trial is one `executor.run`. So between trials —
@@ -3832,15 +3898,41 @@ async def run_autonomous_campaign(
         def equilibration_builder() -> Workflow:
             return build_equilibration_workflow(spec)
 
+        # One representative concrete trial, defined once and used by both the
+        # maturity guard and the provenance write below — they want the same
+        # thing, and had drifted into wanting it differently.
+        def _parameter_midpoint() -> dict[str, Any]:
+            return {
+                p: ((float(d["low"]) + float(d["high"])) / 2.0
+                    if d.get("type") in ("float", "int")
+                    else (d.get("choices") or [None])[0])
+                for p, d in (spec.parameter_space or {}).items()
+            }
+
         # Warn-and-proceed maturity guard: surface (but don't block) any method
-        # this campaign will run that hasn't reached the expected maturity.  Scan
-        # a representative concrete trial (nominal unit volumes).
+        # this campaign will run that hasn't reached the expected maturity.
+        #
+        # Two things here were wrong and cost a scary log line on every
+        # composition-mode launch. `{p: 1.0 for p in spec.resolved_vol_params()}`
+        # names real pump volumes in volume mode, but `resolved_vol_params()`
+        # falls back to `parameter_space.keys()` when `vol_params` is unset — so in
+        # composition mode it handed the solver `eo_li_ratio = 1.0` /
+        # `silica_vol_frac = 1.0`, which solves to an infeasible ~392 µL. And it
+        # built that trial through `workflow_builder`, the *recording* closure,
+        # so the guard's own sanity check tried to write `formulations` rows and
+        # died with `trial_formulation_record_failed` on the first channel.
+        #
+        # The guard is an inspection, so it takes the side-effect-free
+        # `build_trial_workflow` directly and the parameter-space midpoint, which
+        # is feasible by construction in either mode. Each call site keeps its own
+        # try/except: the two are both best-effort and must not share a failure
+        # domain.
         try:
             from softae.core import lifecycle as _lc
 
-            nominal = {p: 1.0 for p in spec.resolved_vol_params()}
             for w in _lc.maturity_warnings(
-                workflow_builder(nominal), catalog, expected=spec.expected_maturity
+                build_trial_workflow(spec, _parameter_midpoint(), catalog=catalog),
+                catalog, expected=spec.expected_maturity
             ):
                 logger.warning("method_below_maturity", **w)
                 emit("maturity_warning", **w)
@@ -3875,12 +3967,7 @@ async def run_autonomous_campaign(
             _stocks = resolve_stocks(spec, load_loadout(data_store), _sols)
             emit("stocks_resolved", **stocks_resolved_event(_stocks))
 
-            _mid = {
-                p: ((float(d["low"]) + float(d["high"])) / 2.0
-                    if d.get("type") in ("float", "int")
-                    else (d.get("choices") or [None])[0])
-                for p, d in (spec.parameter_space or {}).items()
-            }
+            _mid = _parameter_midpoint()
             write_run_provenance(
                 data_store.run_dir(run_id),
                 spec=spec,
