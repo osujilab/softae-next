@@ -735,12 +735,20 @@ class MainWindow(QMainWindow):
 
         Held until an operator explicitly clears it. A park is not something the
         software gets to decide is over — it means a human may have reached in.
+        Once latched, any running manual temperature ramp is cancelled, so its
+        next step cannot re-command a setpoint over the park.
         """
         self._park_latch = str(reason) or "parked"
         # A parked rig is not at idle rest, whatever it was doing before.
         self._idle_rest.mark_left()
         logger.info("gui_park_latched", reason=self._park_latch)
         self._refresh_park_indicator()
+        # Every park route (E-Stop press, attached-mode ladder takeover, Safe
+        # Exit) arrives here, and a ramp left running re-commands its SP over it.
+        try:
+            self._tab_manual.abort_ramp()
+        except Exception:
+            logger.error("park_ramp_abort_failed", exc_info=True)
 
     def clear_park(self) -> None:
         """Operator has resolved the fault; unattended actuation may resume."""

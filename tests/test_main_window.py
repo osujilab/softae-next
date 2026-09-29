@@ -856,3 +856,56 @@ class TestPurgeWiring:
         qapp.processEvents()
         assert not mw._purge_timer.isActive()
         mw.deleteLater()
+
+
+# ── A park cancels a running manual temperature ramp ─────────────────────────
+
+class TestParkAbortsManualRamp:
+    """Operator ruling 2026-09-29: an E-Stop must cancel a running manual ramp.
+
+    A ramp left running re-commands its setpoint on its next step, over the
+    park. ``ManualControlTab.abort_ramp`` is afl-session's; these tests stub it
+    onto the real tab so they pin *this* window's half of the seam.
+    """
+
+    @pytest.fixture
+    def abort_ramp(self, main_window, monkeypatch):
+        from unittest.mock import MagicMock
+
+        stub = MagicMock(name="abort_ramp")
+        monkeypatch.setattr(main_window._tab_manual, "abort_ramp", stub, raising=False)
+        return stub
+
+    def test_notify_parked_aborts_a_running_manual_ramp(self, main_window, abort_ramp):
+        main_window.notify_parked("operator emergency stop")
+        abort_ramp.assert_called_once_with()
+        main_window.notify_parked("hard fault")
+        assert abort_ramp.call_count == 2
+
+    def test_estop_press_path_aborts_the_ramp(self, main_window, abort_ramp):
+        """The real signal, not a direct call — the wiring is what an E-Stop uses."""
+        main_window._estop.parked.emit("operator emergency stop")
+        abort_ramp.assert_called_once_with()
+        assert main_window._park_reason() == "operator emergency stop"
+
+    def test_ramp_abort_failure_never_blocks_the_park_latch(
+        self, main_window, abort_ramp, monkeypatch
+    ):
+        import softae.gui.main_window as mw_mod
+
+        errors: list[tuple[str, dict]] = []
+
+        class _Recorder:
+            def info(self, *a, **k):
+                pass
+
+            def error(self, event, **k):
+                errors.append((event, k))
+
+        monkeypatch.setattr(mw_mod, "logger", _Recorder())
+        abort_ramp.side_effect = RuntimeError("tab broken")
+
+        main_window.notify_parked("operator emergency stop")   # must not raise
+
+        assert main_window._park_reason() == "operator emergency stop"
+        assert errors == [("park_ramp_abort_failed", {"exc_info": True})]
