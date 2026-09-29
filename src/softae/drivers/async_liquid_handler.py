@@ -357,16 +357,31 @@ class AsyncLiquidHandler(BaseInstrument):
         await self._dwell(wick_dwell_s, time_scale)
         await self._syringe("head_retract")
 
-        # Push a rinsing-agent plug at the flush basin.
+        # Go to the flush basin and descend. **Not part of the plug block**, even
+        # though it reads like it: the head stays down from here through the
+        # preload below, which dispenses at this basin. Skipping the move with
+        # the plug would preload into wherever the head happened to be.
         await self._stage("move_to", x=flush_x, y=flush_y)
         await self._syringe("head_descend")
-        for plug_id in plug_ids:
-            await self._syringe(
-                "single_pump", res_vol=plug_res_vol, ID=int(plug_id),
-                rate=plug_rate, dispense_vol=plug_vol,
-            )
-            await self._dwell(plug_dwell_s, time_scale)
-        await self._dwell(plug_settle_s, time_scale)
+
+        # Push a rinsing-agent plug. An empty ``plug_ids`` is a deliberate
+        # configuration (operator ruling 2026-09-24: the campaign's precondition
+        # keeps the composition preload and drops the plug), and the loop is then
+        # empty on its own — but ``plug_settle_s`` is a settle for a plug that
+        # was never pushed, and at 80 s per channel that is 640 s of dead time on
+        # an 8-well run. It is skipped with the thing it waits for.
+        plug_ids = [int(p) for p in plug_ids]
+        if plug_ids:
+            for plug_id in plug_ids:
+                await self._syringe(
+                    "single_pump", res_vol=plug_res_vol, ID=plug_id,
+                    rate=plug_rate, dispense_vol=plug_vol,
+                )
+                await self._dwell(plug_dwell_s, time_scale)
+            await self._dwell(plug_settle_s, time_scale)
+        else:
+            logger.info("precondition_plug_skipped", ids=ids,
+                        skipped_settle_s=float(plug_settle_s))
 
         # Pre-load the next composition at scaled volumes.
         if dispense:

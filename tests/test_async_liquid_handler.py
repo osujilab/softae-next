@@ -360,6 +360,114 @@ async def test_precondition_flush_plug_then_preload(connected):
 
 
 @pytest.mark.asyncio
+async def test_precondition_flush_empty_plug_ids_skips_plug_and_settle(connected):
+    """No plug means no plug *settle* — but the basin visit still has to happen.
+
+    Operator ruling 2026-09-24: the campaign's precondition keeps the composition
+    preload and drops the rinsing plug, so the bench catalog task sets
+    ``plug_ids = []``. The plug loop is then empty on its own, but the 80 s
+    ``plug_settle_s`` still ran with nothing dispensed — 640 s of dead time per
+    8-well run.
+
+    What must **not** be skipped is the move to the basin and the descend: the
+    preload below dispenses at the basin with the head already down, so skipping
+    them would preload into wherever the head happened to be.
+    """
+    import structlog.testing
+
+    lh = connected.get("liquid_handler")
+    syringe = connected.get("syringe")
+    stage = connected.get("stage")
+
+    pumps: list[tuple[int, float, tuple[float, float]]] = []
+    moves: list[tuple[float, float]] = []
+    dwells: list[float] = []
+
+    orig_pump = syringe.single_pump
+    orig_move = stage.move_to
+    orig_dwell = type(lh)._dwell
+
+    def spy_pump(res_vol, ID, rate, dispense_vol):
+        st = stage.status()
+        pumps.append((int(ID), float(dispense_vol), (st["x"], st["y"])))
+        return orig_pump(res_vol=res_vol, ID=ID, rate=rate, dispense_vol=dispense_vol)
+
+    def spy_move(x, y, **kw):
+        moves.append((float(x), float(y)))
+        return orig_move(x=x, y=y, **kw)
+
+    async def spy_dwell(seconds, time_scale):
+        dwells.append(float(seconds))
+        return await orig_dwell(seconds, time_scale)
+
+    syringe.single_pump = spy_pump
+    stage.move_to = spy_move
+    type(lh)._dwell = staticmethod(spy_dwell)
+    try:
+        with structlog.testing.capture_logs() as logs:
+            result = await lh.execute(
+                "precondition_flush",
+                flush_x=-50.0, flush_y=50.0, wick_x=-50.0, wick_y=-25.0,
+                ids=[0, 1], rate_list=[75, 75], vol_list=[10.0, 20.0],
+                flush_factor=2.0, plug_ids=[], plug_rate=150, plug_vol=30,
+                plug_settle_s=80.0, plug_dwell_s=20.0,
+                time_scale=FAST,
+            )
+    finally:
+        syringe.single_pump = orig_pump
+        stage.move_to = orig_move
+        type(lh)._dwell = staticmethod(orig_dwell)
+
+    # No plug dispense: the only pump commands are the two preloads.
+    assert [(pid, vol) for pid, vol, _ in pumps] == [(0, 20.0), (1, 40.0)]
+    assert result["preload_uL"] == [20.0, 40.0]
+
+    # Neither the plug settle nor the per-plug dwell was paid.
+    assert 80.0 not in dwells
+    assert 20.0 not in dwells
+
+    # The preload still happened at the flush basin, head down.
+    assert all(xy == pytest.approx((-50.0, 50.0), abs=0.05) for _, _, xy in pumps)
+
+    # Both wicks still happen, and the routine still ends at the wick.
+    assert moves[0] == pytest.approx((-50.0, -25.0), abs=0.05)
+    assert (-50.0, 50.0) in [pytest.approx(m, abs=0.05) for m in moves]
+    assert moves[-1] == pytest.approx((-50.0, -25.0), abs=0.05)
+
+    skipped = [e for e in logs if e.get("event") == "precondition_plug_skipped"]
+    assert len(skipped) == 1
+    assert skipped[0]["log_level"] == "info"
+
+
+@pytest.mark.asyncio
+async def test_precondition_flush_with_plug_ids_still_settles(connected):
+    """The control: with a plug declared, the settle is still paid."""
+    lh = connected.get("liquid_handler")
+    dwells: list[float] = []
+    orig_dwell = type(lh)._dwell
+
+    async def spy_dwell(seconds, time_scale):
+        dwells.append(float(seconds))
+        return await orig_dwell(seconds, time_scale)
+
+    type(lh)._dwell = staticmethod(spy_dwell)
+    try:
+        await lh.execute(
+            "precondition_flush",
+            flush_x=-50.0, flush_y=50.0, wick_x=-50.0, wick_y=-25.0,
+            ids=[0, 1], rate_list=[75, 75], vol_list=[10.0, 20.0],
+            flush_factor=2.0, plug_ids=[0, 2], plug_rate=150, plug_vol=30,
+            plug_settle_s=80.0, plug_dwell_s=20.0,
+            time_scale=FAST,
+        )
+    finally:
+        type(lh)._dwell = staticmethod(orig_dwell)
+
+    assert 80.0 in dwells
+    assert 20.0 in dwells
+
+
+@pytest.mark.asyncio
 async def test_precondition_flush_length_mismatch_raises(connected):
     lh = connected.get("liquid_handler")
     with pytest.raises(Exception):
