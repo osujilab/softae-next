@@ -372,3 +372,70 @@ async def test_a_failed_payload_write_leaves_nulls_and_costs_nothing_else(
     assert len(data_store.query_fits(run_id=run_id)) == 1
     # No half-written payload left behind for a later reader to trust.
     assert list(data_store.payload_dir(run_id, "eis").glob("*.nc")) == []
+
+
+# ── The spectrum file carries the conditions it was measured under ──────────
+
+
+class _KnownTemp:
+    def get_sp(self):
+        return 10.0
+
+    def get_pv(self, n_avg=1):
+        return 26.4
+
+
+class _KnownRH:
+    def get_H(self):
+        return 20.9
+
+    def get_T(self):
+        return 24.1
+
+    def status(self):
+        return {"setpoint": 22.0}
+
+
+class _KnownManager:
+    """Exact, noise-free SP/PVs, so the header can be compared to literals."""
+
+    _instruments = {"temp_controller": _KnownTemp(), "rh_controller": _KnownRH()}
+    names = list(_instruments)
+
+    def get(self, name):
+        return self._instruments[name]
+
+
+@pytest.mark.asyncio
+async def test_router_saved_header_carries_environment_matching_conditions_row(
+    data_store,
+):
+    """The saved .txt header holds the same T/RH SP+PVs as the conditions row.
+
+    A file read without the database is only interpretable if it says what it
+    was measured under; one snapshot feeds both, so they cannot disagree.
+    """
+    from softae.analysis.eis.router import EISResultRouter, RouterContext
+    from softae.analysis.eis_data import EISResult
+
+    f = np.logspace(5, 0, 12)
+    z = np.full(12, 4000.0) + 1j * np.linspace(-50.0, -900.0, 12)
+    raw = np.column_stack([f, np.abs(z), np.angle(z, deg=True), z.real, -z.imag])
+    step = WorkflowStep(name="measure", instrument="pico1",
+                        method="sendscript_getdata",
+                        params={"mscrpath": "f.mscr", "outdir": "out", "chan": 3})
+    run_id = data_store.start_run("header_conditions")
+    ctx = RouterContext(data_store=data_store, run_id=run_id,
+                        manager=_KnownManager(), auto_fit=False)
+
+    assert await EISResultRouter().handle(step, raw, ctx) is not None
+
+    loaded = EISResult.load(data_store.eis_dir(run_id) / "measure_ch3.txt")
+    assert (loaded.T_sp, loaded.T_pv, loaded.rh_sp, loaded.rh_pv) == pytest.approx(
+        (10.0, 26.4, 22.0, 20.9))
+
+    (cond,) = data_store.query_conditions(run_id=run_id)
+    assert (cond["stage_temp_sp_C"], cond["stage_temp_pv_C"],
+            cond["rh_sp_pct"], cond["rh_pv_pct"]) == pytest.approx(
+        (loaded.T_sp, loaded.T_pv, loaded.rh_sp, loaded.rh_pv))
+    assert cond["chamber_air_C"] == pytest.approx(24.1)

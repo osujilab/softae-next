@@ -128,3 +128,28 @@ def _rh_setpoint(rh: Any) -> float | None:
     if isinstance(status, dict):
         return _clean(status.get("setpoint"))
     return None
+
+
+# ``EISResult`` header field <- ``Environment`` key. ``chamber_air_C`` has no header
+# slot and stays DB-only.
+_HEADER_FIELDS = (
+    ("T_sp", "stage_temp_sp_C"),
+    ("T_pv", "stage_temp_pv_C"),
+    ("rh_sp", "rh_sp_pct"),
+    ("rh_pv", "rh_pv_pct"),
+)
+
+
+def stamp_environment(eis_result: Any, env: Environment) -> None:
+    """Copy the four header-slot values from *env* onto *eis_result* in place.
+
+    A field is written only while it is still NaN: a caller that already stamped
+    a value (e.g. a temperature sweep recording its intended T) keeps it, because
+    that caller knows something about the measurement this snapshot does not. An
+    unreadable (``None``) env value leaves the field NaN rather than inventing one.
+    """
+    for attr, key in _HEADER_FIELDS:
+        value = env.get(key)
+        if value is None or not math.isnan(getattr(eis_result, attr)):
+            continue
+        setattr(eis_result, attr, float(value))

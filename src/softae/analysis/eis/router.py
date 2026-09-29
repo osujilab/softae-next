@@ -36,7 +36,7 @@ from softae.analysis.eis.engine import analyze_spectrum
 from softae.analysis.eis.geometry import CellConstant, cell_from_legacy_terms
 from softae.analysis.eis_data import EISResult
 from softae.analysis.measurement_result import MeasurementResult
-from softae.core.conditions_capture import read_environment
+from softae.core.conditions_capture import read_environment, stamp_environment
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # Annotation-only, and deliberately not a runtime import: `softae.workflows`
@@ -312,8 +312,9 @@ class EISResultRouter:
         """Persist EIS data to DataStore, and return it as a MeasurementResult.
 
         The legacy persistence half — the ``.txt`` file, the ``measurements``
-        row's original columns, conditions and the auto-fit — is unchanged and
-        must stay so; the golden test pins every one of them. Component 3 adds a
+        row's original columns, conditions and the auto-fit — is pinned by the
+        golden test. The ``.txt`` header's T_SP/T_PV/RH_SP/RH_PV come from the
+        same environment snapshot as the conditions row. Component 3 adds a
         netCDF payload beside the ``.txt`` (see :func:`_write_payload`), which
         cannot fail the measurement.
 
@@ -343,6 +344,10 @@ class EISResultRouter:
                 file_stem = step.name
             else:
                 file_stem = f"{step.name}_ch{eis_result.channel}"
+            # One snapshot, read before the save, feeds both the file header and
+            # the conditions row below, so the two cannot disagree.
+            env = read_environment(ctx.manager)
+            stamp_environment(eis_result, env)
             eis_path = eis_result.save(eis_dir / f"{file_stem}.txt")
             eis_result.raw_file_path = str(eis_path)
 
@@ -435,8 +440,7 @@ class EISResultRouter:
                 role=str(tags.get("role", "sample")),
             )
 
-            # Snapshot the chamber/stage/RH SP+PVs at measurement time.
-            env = read_environment(ctx.manager)
+            # The chamber/stage/RH SP+PVs snapshotted before the file was saved.
             if any(v is not None for v in env.values()):
                 ctx.data_store.record_conditions(
                     measurement_id, "measurement", **env
