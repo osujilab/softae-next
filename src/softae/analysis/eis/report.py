@@ -89,10 +89,18 @@ DEFAULT_ABOVE_CEILING_FRAC = 0.5
 #: **Blast radius is zero on the shipped configuration and this is still not cosmetic.**
 #: ``[eis] engine = "legacy"`` and ``_legacy_report`` hardcodes ``"split_bulk"``, so no
 #: stored row has ever carried the third basis. It goes live with the E6 flip.
+#: Regime-A bases (slice 1, ``analysis/eis/regime_route.py``). The fit's R_b is the film
+#: alone — every series element excluded, because K is film geometry. The passive token
+#: is also the ceiling basis of the bound ``σ ≤ K/R_b,min``.
+REGIME_A_FIT_RB = "regime_a_fit_rb"
+REGIME_A_PASSIVE = "regime_a_passive"
+
 BASIS_TEXT = {
     "split_bulk": "R_bulk",
     "sum": "R_series+R_bulk",
     BASIS_SUM_UNQUALIFIED: "R_series+R_bulk (unqualified)",
+    REGIME_A_FIT_RB: "R_b (regime-A fit, series excluded)",
+    REGIME_A_PASSIVE: "R_b,min (regime-A passive bound)",
 }
 
 
@@ -168,6 +176,20 @@ class SigmaReport:
     numerator_phase_deg: float = float("nan")
     numerator_phase_saturated: bool = False
     headroom_window: int = 1
+
+    #: Regime-aware σ, slice 1 — **additive**: present in both flag states, and with
+    #: ``[eis] regime_aware`` off every field above is exactly what it was before them.
+    #: ``regime`` is the classifier's label (A/B/C/U); ``""`` means *not classified*
+    #: (legacy engine, an early return, or a classifier failure), never ``U``.
+    #: ``regime_mode`` / ``regime_sigma`` are what the regime-A route says (value, or the
+    #: bound it states) and ``regime_sigma_lower`` is ``K/R_foot`` when it can state
+    #: neither. ``regime_active`` is whether that answer is the one reported above.
+    regime: str = ""
+    regime_reason: str = ""
+    regime_mode: str = ""
+    regime_sigma: float = float("nan")
+    regime_sigma_lower: float = float("nan")
+    regime_active: bool = False
 
     @property
     def is_bound(self) -> bool:
@@ -832,7 +854,7 @@ class SigmaCeiling:
     #: The ε that went in, recorded even when no ceiling came out.
     eps_rad: float = float("nan")
     #: ``"loss_at_numerator"`` | ``"magnitude_ceiling"`` | :data:`ARC_OPEN_CEILING`
-    #: | ``"unavailable"``. ``magnitude_ceiling`` is reachable **only** when ε is
+    #: | :data:`REGIME_A_PASSIVE` | ``"unavailable"``. ``magnitude_ceiling`` is reachable **only** when ε is
     #: unmeasured and :data:`ARC_OPEN_CEILING` **only** from ``engine.py``'s refusal
     #: (a) — this function never produces the latter; every other way of failing to
     #: produce a number is ``unavailable`` with a :attr:`reason`.

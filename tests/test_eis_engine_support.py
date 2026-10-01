@@ -297,3 +297,24 @@ class TestNoCovarianceReportsTheSum:
         assert seen["event"] == "eis_split_unqualified"
         assert "no covariance" in seen["msg"]
         assert seen["r_sum_ohm"] == pytest.approx(658.0 + 8889.0)
+
+
+# ── `pregate_settings` parses its two route flags strictly (spec D3) ──────────
+#
+# `bool(config.get(...))` made the string "false" ARM the route it names — truthy, so a
+# quoted "false" in the toml did the opposite of what it said. Only a TOML boolean arms.
+
+@pytest.mark.parametrize("raw", ["false", "true", "0", 1, None])
+def test_pregate_settings_non_boolean_flag_stays_off(raw):
+    from softae.analysis.eis.engine_support import pregate_settings
+
+    cfg = pregate_settings({"budget_cap": raw, "two_point_open": raw})
+    assert cfg.budget_cap is False and cfg.two_point_open is False
+    assert cfg.engaged is False
+
+
+def test_pregate_settings_boolean_true_arms_each_route():
+    from softae.analysis.eis.engine_support import pregate_settings
+
+    assert pregate_settings({"budget_cap": True}).budget_cap is True
+    assert pregate_settings({"two_point_open": True}).two_point_open is True

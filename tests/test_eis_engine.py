@@ -2104,3 +2104,122 @@ class TestBothRefusalsRunOutsideTheGateFlag:
         assert observing.quality.verdict is Verdict.SUSPECT
         assert "gates observing only" in observing.quality.issues
         assert _ladder(1e8, enabled=True).quality.verdict is Verdict.REJECT
+
+
+# ── Regime-aware σ, slice 1: with ``[eis] regime_aware`` off, nothing reported moves ──
+#
+# Three layers. The HEAD golden (captured from pre-slice source, pinned inputs) is the
+# hard requirement but lives under the gitignored ``tests/data/`` and skips without it;
+# the in-process pair below needs nothing on disk — flag-off against classification
+# disabled outright, which is the pre-slice engine by construction — and the forced-A
+# pair is its positive control.
+
+
+def _pre_slice(sigma) -> dict:
+    import dataclasses
+
+    return {f.name: getattr(sigma, f.name) for f in dataclasses.fields(sigma)
+            if not f.name.startswith("regime")}
+
+
+def _nan_equal(a: dict, b: dict) -> set:
+    def same(x, y):
+        return x == y or (isinstance(x, float) and isinstance(y, float)
+                          and x != x and y != y)
+    return {k for k in a if not same(a[k], b[k])}
+
+
+def _regime_run(eis, *, flag: bool, ch: int = 15):
+    from softae.analysis.eis.regime_route import RegimeSettings
+    from tests.eis_regime_golden import golden_inputs
+
+    return analyze_spectrum(eis, **golden_inputs(ch),
+                            regime=RegimeSettings(enabled=flag))
+
+
+@pytest.fixture()
+def forced_a(monkeypatch):
+    """Every spectrum classifies A — with an A synthetic's own verdict."""
+    from softae.analysis.eis import regime as regime_mod
+    from tests import eis_regime_synthetic as syn
+
+    Z = syn.regime_a_rs("inband", 3e3, 0.7, 1.0, 1e4, 1e5, 5e-6, False, seed=31)
+    verdict = regime_mod.classify_regime(syn.RIG_F, Z)
+    assert verdict.is_a
+    monkeypatch.setattr(regime_mod, "classify_regime", lambda *_a, **_k: verdict)
+    return verdict
+
+
+def _b_spectrum():
+    from tests import eis_regime_synthetic as syn
+
+    return syn.as_eis(syn.RIG_F, next(iter(syn.step1_regime_b()))[1])
+
+
+def test_analyze_spectrum_regime_flag_off_ignores_verdict(monkeypatch, forced_a):
+    eis = _b_spectrum()
+    forced = _regime_run(eis, flag=False)
+    assert forced.sigma.regime == "A" and forced.sigma.regime_active is False
+    _disable_classification(monkeypatch)
+    baseline = _regime_run(eis, flag=False)
+    assert baseline.sigma.regime == ""
+    assert _nan_equal(_pre_slice(forced.sigma), _pre_slice(baseline.sigma)) == set()
+    assert forced.fitter == baseline.fitter
+
+
+def test_analyze_spectrum_regime_flag_on_forced_a_changes_report(forced_a):
+    """POSITIVE CONTROL for the test above: the same forced A, flag ON, moves the report."""
+    eis = _b_spectrum()
+    off, on = _regime_run(eis, flag=False), _regime_run(eis, flag=True)
+    assert on.sigma.regime_active is True
+    assert _nan_equal(_pre_slice(off.sigma), _pre_slice(on.sigma)) != set()
+
+
+def _disable_classification(monkeypatch):
+    def boom(*_a, **_k):
+        raise RuntimeError("classification disabled: the pre-slice engine")
+
+    monkeypatch.setattr("softae.analysis.eis.regime.classify_regime", boom)
+
+
+def test_analyze_spectrum_regime_flag_off_matches_in_process_baseline(monkeypatch):
+    """Fresh-clone protection: real verdicts (A value, A unavailable, B), flag off, against
+    the engine with classification disabled — the pre-slice engine by construction."""
+    from tests import eis_regime_synthetic as syn
+
+    picks = [syn.regime_a_rs("inband", 3e3, 0.7, 1.0, 0.0, 1e5, 0.0, False, seed=500),
+             syn.regime_a_rs("compressed", 1.5e5, 0.6, 0.85, 1e5, 1e5, 20e-6, True,
+                             seed=503),
+             next(iter(syn.step1_regime_b()))[1]]
+    reports = [_regime_run(syn.as_eis(syn.RIG_F, Z), flag=False) for Z in picks]
+    assert [r.sigma.regime for r in reports] == ["A", "A", "B"]
+    _disable_classification(monkeypatch)
+    for Z, rep in zip(picks, reports):
+        base = _regime_run(syn.as_eis(syn.RIG_F, Z), flag=False)
+        assert base.sigma.regime == ""
+        assert _nan_equal(_pre_slice(rep.sigma), _pre_slice(base.sigma)) == set()
+        assert (rep.fitter, rep.quality.issues) == (base.fitter, base.quality.issues)
+
+
+def test_analyze_spectrum_regime_flag_off_matches_head_goldens(monkeypatch):
+    """The hard requirement: every pre-slice field byte-identical to HEAD (pinned inputs).
+
+    Captured by ``docs/SubAgent docs/evidence_regime_slice1/capture_goldens.py`` against
+    pre-slice source. Skips on a fresh clone (``tests/data/`` is gitignored).
+    """
+    import json
+
+    from softae.config import loader
+    from tests import eis_regime_golden as golden
+
+    if not golden.OUT.exists():
+        pytest.skip(f"HEAD goldens absent: {golden.OUT} (tests/data/ is gitignored)")
+    rows = json.loads(golden.OUT.read_text(encoding="utf-8"))["rows"]
+    monkeypatch.setattr(loader, "load", lambda *a, **k: {})
+    from softae.analysis.eis.regime_route import RegimeSettings
+
+    corpus = golden.corpus()
+    assert {name for name, _, _ in corpus} == set(rows)
+    for name, eis, ch in corpus:
+        report = golden.run_one(eis, ch, regime=RegimeSettings(enabled=False))
+        assert golden.record(report, list(rows[name]["sigma"])) == rows[name], name

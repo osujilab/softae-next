@@ -170,9 +170,19 @@ def pregate_settings(config: dict[str, Any] | None = None) -> PregateSettings:
             logger.warning("eis_pregate_key_unparseable", key=key, default=default)
             return default
 
+    def _flag(key: str) -> bool:
+        # Strict: only a TOML boolean arms a route. ``bool("false")`` is True, so a quoted
+        # "false" used to ARM the route it names — the opposite of the shipped-off fallback.
+        value = config.get(key, False)
+        if isinstance(value, bool):
+            return value
+        logger.warning("eis_pregate_key_unparseable", key=key, default=False,
+                       value=repr(value))
+        return False
+
     return PregateSettings(
-        budget_cap=bool(config.get("budget_cap", False)),
-        two_point_open=bool(config.get("two_point_open", False)),
+        budget_cap=_flag("budget_cap"),
+        two_point_open=_flag("two_point_open"),
         phase_low_max_deg=_f("phase_low_max_deg", defaults.phase_low_max_deg),
         max_nfev=int(_f("max_nfev", defaults.max_nfev)),
     )
