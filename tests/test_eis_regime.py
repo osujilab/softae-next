@@ -459,7 +459,7 @@ def test_regime_a_sigma_lower_bound_reports_foot_basis_and_r_foot():
 def test_regime_a_sigma_lower_bound_keeps_classifier_reason_route_detail_separate():
     v, s, _ = _route(CELL, *COMPRESSED)
     assert s.regime_reason == v.reason != rr.SERIES_NOT_SEPARABLE
-    assert s.regime_route_detail == "pair_disagrees"
+    assert s.regime_route_detail == rr.PAIR_UNAVAILABLE      # no circle: R_mf is NaN
 
 
 def test_regime_a_sigma_value_carries_r_foot_and_detail():
@@ -494,5 +494,54 @@ def test_regime_shadow_flag_off_carries_r_foot_and_detail_not_basis():
     off = _analyse(syn.as_eis(F, syn.regime_a_rs(*args, seed=seed)), flag=False)
     s = off.sigma
     assert s.regime == "A" and not s.regime_active
-    assert s.regime_route_detail == "pair_disagrees" and s.regime_R_foot_ohm > 0
+    assert s.regime_route_detail == rr.PAIR_UNAVAILABLE and s.regime_R_foot_ohm > 0
     assert s.R_basis != rr.REGIME_A_FOOT_LOWER
+
+
+# ── Arming wave (eis_regime_arming_review.md F4, F5) ─────────────────────────────────
+
+
+@pytest.mark.parametrize("R_fit, R_mf", [(2e5, float("nan")), (float("nan"), 1e5),
+                                         (2e5, -3e4)], ids=["mf_nan", "fit_nan", "mf_neg"])
+def test_regime_a_kind_pair_not_comparable_detail_pair_unavailable(R_fit, R_mf):
+    """F4: *could not compare* is not spelled *compared and disagreed* (§3.1(a))."""
+    for R_b_min, kind in ((9e4, "bound"), (-8e3, "unavailable")):
+        est = rr.RegimeAEstimates(R_fit=R_fit, R_mf=R_mf, R_b_min=R_b_min, R_foot=2.2e5,
+                                  span=2.0)
+        assert rr.regime_a_kind(est, "value") == (kind, rr.PAIR_UNAVAILABLE)
+
+
+def test_regime_a_kind_pair_compared_outside_band_detail_pair_disagrees():
+    est = rr.RegimeAEstimates(R_fit=2e5, R_mf=1e5, R_b_min=9e4, R_foot=2.2e5, span=2.0)
+    assert rr.regime_a_kind(est, "value") == ("bound", "pair_disagrees")
+
+
+def test_regime_a_sigma_value_cross_check_against_route_partner_not_today():
+    """F5: ``cross_check_pct`` is R_fit against the route's own R_mf; today's withdrawn
+    ``model_free_R_ohm`` (1/max Re Y) must not enter it, whatever it holds."""
+    from softae.analysis.eis.engine import _regime_a_sigma
+    from softae.analysis.eis.report import SigmaReport
+
+    *args, seed = INBAND
+    v = rg.classify_regime(F, syn.regime_a_rs(*args, seed=seed))
+    est = rr.regime_a_estimates(v)
+    expected = abs(est.R_fit - est.R_mf) / est.R_fit * 100.0
+    for today_mf in (float("nan"), 1.0, 1e9):
+        s, _, _ = _regime_a_sigma(v, SigmaReport(model_free_R_ohm=today_mf), cell=CELL,
+                                  envelope=ENV, tand_headroom_mult=3.0,
+                                  R_engine=float("nan"))
+        assert s.mode == "value"
+        assert s.cross_check_pct == pytest.approx(expected), today_mf
+    assert 0 < expected < 50.0          # a value implies the pair agreed within x1.5
+
+
+def test_regime_settings_repo_config_armed_as_boolean():
+    """Operator ruling 2026-10-01: the repo config arms the route, as a TOML boolean
+    (a string ``"true"`` would leave it off — see ``test_regime_settings_string_false_off``)."""
+    import tomllib
+    from pathlib import Path
+
+    cfg = tomllib.loads((Path(__file__).resolve().parents[1] / "softae_config.toml")
+                        .read_text(encoding="utf-8"))
+    assert cfg["eis"]["regime_aware"] is True
+    assert rr.regime_settings(cfg["eis"]).enabled is True

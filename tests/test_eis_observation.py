@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -60,6 +61,76 @@ def test_sigma_observation_legacy_value_flag_off_admitted():
     o = ob.sigma_observation(_report(mode="value", value=1e-5, R_reported_ohm=3e6))
     assert o.kind == ob.VALUE and o.admitted and o.basis == "split_bulk"
     assert not o.classified and o.regime == ""
+
+
+# ── Regime U, split by reason (F3 as narrowed by the operator, 2026-10-01) ─────────
+
+U_VALUE = dict(mode="value", value=1.8e-4, R_reported_ohm=3e5, regime="U")
+U_LEGACY_BOUND = {**LEGACY_BOUND, "regime": "U"}
+
+
+@pytest.mark.parametrize("reason", [*ob.U_BAD_DATA_REASONS, "", "a_reason_nobody_filed"])
+def test_sigma_observation_u_bad_data_value_recorded_not_admitted_not_measured(reason):
+    """Bad-data U — and, fail safe, a missing or unknown reason: no tell, counts to a park."""
+    o = ob.sigma_observation(_report(**U_VALUE, regime_reason=reason))
+    assert (o.kind, o.reported, o.regime, o.regime_reason) == (ob.VALUE, 1.8e-4, "U", reason)
+    assert not o.admitted and not o.classified
+    assert not o.counts_as_measured
+
+
+@pytest.mark.parametrize("reason", ob.U_SHAPE_REASONS)
+def test_sigma_observation_u_shape_value_admitted_and_measured(reason):
+    """Unrecognised-shape U is treated like B/C: today's value is told."""
+    o = ob.sigma_observation(_report(**U_VALUE, regime_reason=reason))
+    assert o.kind == ob.VALUE and o.admitted and o.classified and o.counts_as_measured
+
+
+@pytest.mark.parametrize("reason", ob.U_SHAPE_REASONS)
+def test_sigma_observation_u_shape_bound_or_nothing_measured_not_admitted(reason):
+    bound = ob.sigma_observation(_report(**U_LEGACY_BOUND, regime_reason=reason))
+    assert bound.kind == ob.UPPER_BOUND and not bound.admitted
+    assert bound.classified and bound.counts_as_measured
+    nothing = ob.sigma_observation(_report(mode="unavailable", regime="U",
+                                           regime_reason=reason))
+    assert nothing.kind is None and nothing.classified and nothing.counts_as_measured
+
+
+@pytest.mark.parametrize("reason", [*ob.U_SHAPE_REASONS, *ob.U_BAD_DATA_REASONS])
+def test_sigma_observation_u_not_ok_value_not_admitted_classification_unchanged(reason):
+    o = ob.sigma_observation(_report(ok=False, **U_VALUE, regime_reason=reason))
+    assert o.kind == ob.VALUE and not o.admitted
+    assert o.classified is (reason in ob.U_SHAPE_REASONS)
+
+
+def test_sigma_observation_u_reason_families_cover_every_classifier_u_token():
+    """The two families partition every U reason ``classify_regime`` can emit.
+
+    The tokens are retyped (``regime.py`` has no constants for them), so this reads the
+    classifier's own source: a new U reason fails here until someone files it — and until
+    then the code treats it as bad data, the fail-safe side.
+    """
+    import re
+
+    from softae.analysis.eis import regime as rg
+
+    src = Path(rg.__file__).read_text(encoding="utf-8")
+    emitted = set(re.findall(r'(?:RegimeVerdict|verdict)\(U,\s*"([a-z_]+)"', src))
+    shape, bad = set(ob.U_SHAPE_REASONS), set(ob.U_BAD_DATA_REASONS)
+    assert len(emitted) >= 8 and not shape & bad
+    assert emitted == shape | bad, emitted ^ (shape | bad)
+
+
+def test_unmeasured_u_without_reason_is_bad_data_with_shape_reason_classified():
+    assert not ob.unmeasured("U").classified
+    shaped = ob.unmeasured("U", "no_cpe_drop")
+    assert shaped.classified and shaped.counts_as_measured and shaped.kind is None
+
+
+@pytest.mark.parametrize("regime", ["", "A", "B", "C"])
+def test_sigma_observation_value_non_u_regime_admitted_and_measured(regime):
+    """Only bad-data U withholds; ``""`` (classifier did not run) keeps today's value."""
+    o = ob.sigma_observation(_report(**{**U_VALUE, "regime": regime}))
+    assert o.kind == ob.VALUE and o.admitted and o.counts_as_measured
 
 
 def test_sigma_observation_legacy_upper_bound_recorded_not_admitted():
@@ -180,3 +251,64 @@ def test_sigma_observation_engine_compressed_a_lower_only_with_flag_on():
     assert on.kind == ob.LOWER_BOUND and on.basis == REGIME_A_FOOT_LOWER
     assert on.R_film_ohm is not None and on.R_film_ohm > 0
     assert off.kind != ob.LOWER_BOUND and off.classified
+
+
+@pytest.mark.parametrize("flag", [False, True], ids=["flag_off", "flag_on"])
+def test_sigma_observation_engine_jagged_u_value_not_admitted(flag):
+    """§3.2 for F3: real data reaches it. Q5 (``142833Z`` ch25) classifies U, yet today's
+    route still states a value (~1.8e-4 S/cm, arming review §5.2) — in both flag states."""
+    from softae.analysis.eis.engine import analyze_spectrum
+    from softae.analysis.eis.regime_route import RegimeSettings
+    from softae.analysis.eis_data import EISResult
+    from tests.eis_regime_golden import DATA, golden_inputs
+
+    path = DATA / "jagged_20260820T142833Z_ch25.txt"
+    if not path.exists():
+        pytest.skip(f"real fixture absent: {path} (tests/data/ is gitignored)")
+    report = analyze_spectrum(EISResult.load(path), **golden_inputs(25),
+                              regime=RegimeSettings(enabled=flag))
+    assert report.sigma.regime == "U" and report.sigma.mode == "value"
+    assert report.sigma.regime_reason == "phase_incoherent"        # bad data: Q5 refused
+    o = ob.sigma_observation(report)
+    assert o.kind == ob.VALUE and o.reported is not None
+    assert not o.admitted and not o.counts_as_measured
+
+
+@pytest.mark.parametrize("flag", [False, True], ids=["flag_off", "flag_on"])
+def test_sigma_observation_mock_rig_floor_phase_ambiguous_value_admitted(flag):
+    """The mock rig's spectrum is unrecognised-shape U; through the campaign's own
+    raw -> report hop its value is told, so a mock-rig campaign does not park."""
+    from softae.analysis.eis.regime_route import RegimeSettings
+    from softae.core.autonomous_wiring import _spectrum_report_from_raw
+    from softae.drivers.mock_espico import _synthetic_eis
+
+    report = _spectrum_report_from_raw([_synthetic_eis(seed=0)], channel=5,
+                                       thickness_um=150.0,
+                                       regime=RegimeSettings(enabled=flag))
+    s = report.sigma
+    assert (s.regime, s.regime_reason, s.mode) == ("U", "floor_phase_ambiguous", "value")
+    o = ob.sigma_observation(report)
+    assert o.kind == ob.VALUE and o.admitted and o.classified
+
+
+#: Board-2 PAA well 14 (``eis_regime_arming_review.md`` §4): non_monotone U, old-route
+#: ceiling. Read in place from the run directory, read-only; skips where it is absent.
+PAA_NON_MONOTONE = Path(r"C:\Users\Osuji\softae_data\runs\20260929T150528Z_manual_eis"
+                        r"\eis\ch14_manual.txt")
+
+
+@pytest.mark.parametrize("flag", [False, True], ids=["flag_off", "flag_on"])
+def test_sigma_observation_engine_paa_non_monotone_bound_counts_as_measured(flag):
+    from softae.analysis.eis.engine import analyze_spectrum
+    from softae.analysis.eis.regime_route import RegimeSettings
+    from softae.analysis.eis_data import EISResult
+    from tests.eis_regime_golden import golden_inputs
+
+    if not PAA_NON_MONOTONE.exists():
+        pytest.skip(f"real spectrum absent: {PAA_NON_MONOTONE}")
+    report = analyze_spectrum(EISResult.load(PAA_NON_MONOTONE), **golden_inputs(14),
+                              regime=RegimeSettings(enabled=flag))
+    assert (report.sigma.regime, report.sigma.regime_reason) == ("U", "non_monotone")
+    o = ob.sigma_observation(report)
+    assert o.kind == ob.UPPER_BOUND and not o.admitted
+    assert o.classified and o.counts_as_measured

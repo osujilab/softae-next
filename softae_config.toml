@@ -461,6 +461,7 @@ max_abs_z        = 1e12    # |Z| at/above this = open circuit
 # absorb it: `tab_analysis` (x2), `tab_experiment`, `eis_visualizer_widget`.
 [eis]
 engine = "gated"           # "legacy" | "gated"
+regime_aware = true        # BOOLEAN; armed 2026-10-01 per docs/SubAgent docs/eis_regime_arming_review.md
 
 # What a campaign optimises against. `engine` chooses WHICH PHYSICS computes sigma (one
 # sigma everywhere, resolved in `analyze_spectrum` alone); `objective` chooses WHICH

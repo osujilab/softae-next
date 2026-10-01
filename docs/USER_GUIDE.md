@@ -493,12 +493,18 @@ print(report.fit.R0, report.fit.R1, report.fit.success)
 if report.sigma.mode == "value":
     print(report.sigma.value)                     # S/cm
 elif report.sigma.mode in ("bound", "bound_unqualified"):
-    print(report.sigma.upper_bound)               # instrument-limited upper bound
+    print(report.sigma.upper_bound)               # σ ≤ this
 else:                                             # "unavailable"
-    print("no per-sample thickness, or the spectrum was rejected")
+    print("no thickness, rejected, or (regime A) only a lower bound")
+
+# The store's and the campaign's reading of the same report — one mapping, never re-derived:
+from softae.analysis.eis.observation import sigma_observation
+obs = sigma_observation(report)   # obs.kind: "value" | "upper_bound" | "lower_bound" | None
+print(obs.kind, obs.reported, obs.lower, obs.regime, obs.admitted, obs.classified)
 ```
 
-Always check `report.sigma.mode` before reading `.value`.
+Always check `report.sigma.mode` before reading `.value`. What the three kinds mean, and which
+are admitted, is in [§14 *Regime-aware sigma*](#regime-aware-sigma-and-bounds).
 
 | Registry | Engine | Models |
 |---|---|---|
@@ -568,11 +574,12 @@ reconnecting instruments; both `softae-campaign` and the GUI re-confirm it befor
 the stage.
 
 **Faults, consumables, purge, alerts.** A failing trial is retried; a systematic-looking fault parks
-the run, keeping its checkpoint. An unmeasured trial is told to the optimizer as `None`, never
-`0.0`. Stock levels are tracked in a ledger and projected before a run alongside projected duration
-and waste accrual; undeclared stock is "unknown", never "empty". `[purge]` ships `actuate = false`,
-so windows are planned and logged without moving a pump. Parks, gate timeouts, board exchanges and
-stock warnings are written to the DataStore as alerts.
+the run, keeping its checkpoint. Only a value is told to the optimizer, never a `0.0` stand-in;
+a well that was measured but gave only a bound is recorded and not told, and what counts as
+*measured* for the park rule is in [§14](#regime-aware-sigma-and-bounds). Stock levels are
+tracked in a ledger and projected before a run alongside projected duration and waste accrual; undeclared stock is "unknown", never "empty". `[purge]` ships `actuate = false`,
+so windows are planned and logged without moving a pump. Parks, gate timeouts, board exchanges,
+bound streaks and stock warnings are written to the DataStore as alerts.
 
 ---
 
@@ -789,6 +796,11 @@ softae-campaign control pause|resume|abort [--run-dir DIR] [--reason TEXT]
 | `--mock` | run, resume | Mock instruments for a full dry rehearsal |
 | `--project DIR` | all | Overrides `[data] project_dir`, and decides where the resume checkpoint lives |
 | `--head-up` / `--head-down` | run, resume | Mutually exclusive; prompted on the terminal if omitted |
+| `--verbose` / `-v` | all | DEBUG logging. Accepted before *or* after the verb |
+
+Campaigns filter their log stream at `[logging] level` (INFO by default), which keeps the milestones,
+hold verdicts and status line and drops the RH controller's per-update `rh_duty_sent`. `-v` restores
+DEBUG, `rh_duty_sent` included — useful on a misbehaving approach, noisy over a six-hour run.
 
 `control` reaches a campaign already running; `--run-dir` defaults to reading the rig lock, and
 `--reason` is recorded verbatim in the transcript and, for `abort`, in the park alert.
@@ -856,8 +868,8 @@ name      = "peo_licl_scan"
 channels  = [21, 22, 23, 24]
 pcb_name  = "SoftAE_EIS_4Stripe"
 budget    = 40
-optimizer = "bayesian"
-two_phase = true
+optimizer   = "bayesian"
+recipe_name = "two_phase"
 
 [parameter_space.vol_p0]
 type = "float"
@@ -870,14 +882,40 @@ An unknown key is an error. Fields carrying live Python objects (`prior_mean`, `
 or from Tab 10. `general_formulation` is loadable (only the `formulation` key is refused), and so
 is `run_plan` in the `[[run_plan.phases]]` form below.
 
+**The cast recipe, and preconditioning.** A campaign compiles **`single_drop`** — one simultaneous
+drop-cast per channel, then a wick — unless the spec sets `recipe_name = "two_phase"` (the older
+`two_phase = true` selects the same recipe). Two-phase adds a per-channel **precondition** before
+each cast: wick, push a rinsing-agent plug at the flush basin, pre-load the next composition, wick
+again, so the lines hold the formulation about to be cast rather than the previous one.
+**Preconditioning is not the default** — a spec naming neither key casts straight from whatever the
+lines already hold, and `check` does not say which recipe it resolved.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `flush_factor` | `3.0` | Pre-load volume as a multiple of the cast volume |
+| `line_flush_rate` | `500.0` | Total pre-load rate in µL/min, split across the pumps |
+
+Both are read only on the two-phase path. Where the HT tab's process is the reference, set them to
+match the bench's `[dropcast]` values (`flush_factor`, `line_flush_rate_uL_min`) — the spec
+defaults are not those values, so the two surfaces otherwise precondition differently while naming
+the same recipe.
+
 **Casting one fixed recipe N times.** Pin a composition by writing it as a `[general_formulation]`
 axis with `low == high`; a pinned axis is left out of the optimizer's parameter space. Add one
 `int` axis to `[parameter_space]` (the shipped example calls it `replicate`) with `low = 1`,
-`high = N`, set `optimizer = "grid"` and `budget = N`. Write every axis out in full — all six keys
-(`kind`, `a`, `b`, `low`, `high`, `basis`), including `b = ""` on a `dried_fraction` axis — because
-an omitted key takes a default and casts a different composition. Any axis left searched
-(`low != high`) must also be named in `[parameter_space]`, or `check` refuses the spec.
+`high = N`, set `optimizer = "grid"` and `budget = N`. Write every axis out in full — all six
+required keys (`kind`, `a`, `b`, `low`, `high`, `basis`), including `b = ""` on a `dried_fraction`
+axis — because an omitted key takes a default and casts a different composition. Any axis left
+searched (`low != high`) must also be named in `[parameter_space]`, or `check` refuses the spec.
 `examples/bench_instance.toml` is the worked example.
+
+**Sampling an axis logarithmically.** A `[[general_formulation.axes]]` entry also takes an optional
+`scale`: `"linear"` (the default, and what every spec written before the key means) or `"log"`,
+which searches `log10` of the span so a 5 → 50 ratio axis spends as many draws in the low decade as
+the high one. The bounds are published to the optimizer's parameter space in log10 units; nothing
+else changes. A **pinned** axis ignores `scale` — its fixed value is used directly, never
+exponentiated — so a pinned axis may sit at zero while a searched log axis may not (`low > 0`, or
+the spec is refused).
 
 ### `[measurement]`
 
@@ -993,7 +1031,8 @@ A round is sized before anything is suggested, to the smallest of the requested 
 electrodes still free on the plate, and the unspent budget.
 
 - A full board is exchanged **before** the round, so no round is split across a plate swap.
-- The final round narrows to the budget: budget 5 with q=4 spends exactly 5 electrodes.
+- The final round narrows to the budget: budget 5 with q=4 spends exactly 5 electrodes
+  (`replicates = 1`; see below for what `budget` counts when it is not).
 - Board exchange prompts the operator and can be cancelled, stopping the run while keeping
   everything already measured. With no handler (fully headless) an exchange request stops cleanly
   rather than assuming a fresh plate.
@@ -1002,6 +1041,30 @@ electrodes still free on the plate, and the unspent budget.
   be set by hand between runs, from Tab 1 ([§4](#4-tab-reference)).
 - `--resume` is off by default. The checkpoint is fingerprinted against the spec; a changed
   parameter space, objective or optimizer setting is refused rather than continued into.
+- Every proposal is checked against the deposition twin before anything is cast — a draw that
+  would overflow the well is redrawn, never cast. Random draws are filtered the same way as
+  Bayesian ones. After 200 refused redraws the optimizer stops suggesting and logs
+  `search_space_infeasible` — a space the filter rejected is reported as that, not as a search
+  that finished.
+
+**Replicated casts.** `replicates = k` (default 1) casts each suggestion on `k` wells, and the
+optimizer is told once per **well** — k observations at the same point, which is the whole purpose
+and is never de-duplicated. `budget` then counts **distinct compositions**, so the loop ceiling is
+`budget × replicates` wells: `budget = 4, replicates = 2` searches four points and consumes eight.
+Replication is a batch-shape transform, so it requires `batch = true`; `replicates > 1` beside
+`batch = false` is refused rather than silently ignored.
+
+`replicate_layout` decides where a composition's wells land within the round. `"adjacent"` (the
+default) puts a pair on neighbouring channels; `"interleaved"` separates them — 4 compositions × 2
+across 8 channels gives 1 & 5, 2 & 6, 3 & 7, 4 & 8 — so a pair does not share a board
+neighbourhood. Both fields enter the resume fingerprint **only when set**, so a checkpoint written
+before they existed still resumes; once set, a run cannot be resumed under a different replicate
+count or layout, because the layout decides which physical well holds which composition.
+
+**The projection counts rounds, not wells.** Time-to-budget, stock draw and runway in `check` and
+in the Final-Check digest are all per **round** — one full-channel cast — since that is the unit a
+projected trial prices. On a batched campaign a round is `len(channels)` wells, so reading those
+figures as per-well overstates the run by that factor.
 
 ### `SOFTAE_SEED_DATASET`
 
@@ -1124,7 +1187,7 @@ no expiry.
 
 | `[eis] engine` | What it does |
 |---|---|
-| `gated` (**shipped**) | Admission gates, covariance, per-sample cell constant, upper bounds where the measurement is resolution-limited |
+| `gated` (**shipped**) | Admission gates, covariance, per-sample cell constant, upper bounds where the measurement is resolution-limited; with `[eis] regime_aware`, a separate route for regime-A spectra ([below](#regime-aware-sigma-and-bounds)) |
 | `legacy` | Fit `R0-CPE0-p(R1,C0)`, take `R1`, divide |
 
 Both return the same report shape, so flipping the key is the whole cutover and it is reversible
@@ -1205,6 +1268,77 @@ known value through the correction end to end — pick that load comparable to t
 `fixture_corrections` row, including a declined one with its reason; an absent row means
 uncorrected. Set `fixture_id` to match what you commission, since `softae-commission` takes its
 `--fixture` default from the same key.
+
+### Regime-aware sigma and bounds
+
+***Armed** 2026-10-01: `softae_config.toml` ships `[eis] regime_aware = true`. The route landed in
+`9e586d8`, the observation mapping and tell path in `5234d37`.*
+
+Every gated spectrum is first classified by shape; the classification is always logged
+(`sigma_regime_shadow`), whether or not the flag is on.
+
+| Regime | Shape | σ route |
+|---|---|---|
+| **A** | Bulk arc (or a compressed plateau), then the electrode's CPE spike | Flag on: the regime-A route below. Flag off: today's route |
+| **B** | HF feature, a capacitive valley, then a closed LF arc (rung 3b; board-2 PAA wells) | Today's route; no value until regime-B slice 2 *(coming soon)* |
+| **C** | Genuinely open arc; the −60° gate applies here | Today's route |
+| **U** | *Bad data* (`incoherent`, `too_many_nonphysical`, `too_few_points`, `a_too_many_nonphysical`, `phase_incoherent`; e.g. the empty well, jagged phase) or *unrecognised shape* (`non_monotone`, `floor_phase_ambiguous`, `no_cpe_drop`). An unknown reason counts as bad data | Today's route. Bad-data U is unmeasured; unrecognised-shape U is treated like B/C |
+
+The regime-A route reports the film only, σ = K/R_b with every series element excluded, from a
+small fit checked against a model-free partner (R_foot − R_HF) within ×1.5. The result is one of
+three claims:
+
+| Kind | Means | Admitted (may become the objective) |
+|---|---|---|
+| `value` | σ resolved in band; the pair agrees and the arc spans ≥ 1.5 dec | Yes, unless the spectrum is bad-data U |
+| `upper_bound` | σ ≤ the stated number. Route A's comes with its other side, so it is an interval [K/R_foot, K/R_b,min] | Route A's (`regime_a_passive`) only. Today's loss-ceiling bounds are recorded, never admitted: on A films they sit 0.5–3.5 dec below the truth |
+| `lower_bound` | σ ≥ K/R_foot (basis `regime_a_foot_lower`): a compressed plateau, where R_s and R_b cannot be separated in band | Yes (route A only) |
+
+**In a campaign.** An admitted value is told to the optimizer. An admitted bound is written to
+`doe_parameters` (`objective_reported`, `objective_kind`, `objective_lower`; `objective_value` stays
+value-only) and is **not told** — telling bounds needs a censored model, approved and deferred until
+a BO campaign is scheduled. Bounds from distinct wells are never averaged. Every well's DOE row is
+written before a round parks or converges. `DataStore.objective_observations(campaign_id)` reads
+them back.
+
+| Outcome per well | Park counter | Alert |
+|---|---|---|
+| Value told | Resets | — |
+| Measured, not told: any bound, or an A/B/C or unrecognised-shape-U spectrum with no admitted σ | Resets; the well is labelled feasible | 3 in a row → one `bound_streak` alert. **Never parks** |
+| Unmeasured: acquisition failure, unreadable report, bad-data U | Counts | 3 in a row → park |
+
+A bad-data-U spectrum is unmeasured even when today's route extracts a *value* from it: the value
+is recorded, never admitted or told, in either flag state. An unrecognised-shape U is handled like
+B/C: a today's-route value is admitted and told, and a bound counts as measured but is not admitted.
+
+**Reading a route-A report.** `regime_route_detail` names why the route chose its claim
+(`resolved_in_band`, `pair_disagrees`, `plateau_headroom_bound`, …); it reads `pair_unavailable`
+when the model-free partner could not be formed (no interior foot, so no circle), which is *could
+not compare*, not a disagreement. On a route-A value, `cross_check_pct` is the spread between the
+fit and that partner.
+
+**Where σ is stored.** A campaign writes **no `fit_results` rows**: the router auto-fits only a
+step that declares `circuit_model`, and the campaign's measure step declares none. A campaign's σ
+record is therefore `doe_parameters` plus the raw spectra. Workflows that do declare a model
+(equilibration rounds, the temperature sweep) write `fit_results` with the new columns
+`sigma_reported_S_per_cm`, `sigma_kind`, `sigma_lower_S_per_cm`, `R_film_ohm`, `R_film_basis`;
+there `R1` and `sigma_S_per_cm` remain the engine fit's, and can disagree with `sigma_kind` on a
+compressed A row. Read `sigma_kind` for the claim.
+
+**The flag.**
+
+- `[eis] regime_aware = true` must be a TOML **boolean**. The string `"true"` stays off and logs
+  `eis_regime_aware_unparseable`.
+- **To turn it off**, set `regime_aware = false` or remove the key. Every regime-A spectrum then
+  takes today's route, and no bound is admitted.
+- **Restart the GUI after any edit.** The config is cached per process, and a hand edit is
+  invisible to a running GUI.
+- A campaign reads the flag **once**, at build, and logs `campaign_regime_settings
+  regime_aware=True` (event `regime_settings`); `False` there means the run is unarmed. Check that
+  line at launch: Final-Check shows only the config digest, which moves when the key changes.
+- The flag is **global**. On regime-A spectra it changes the Analysis and HT tabs, router
+  auto-fit, the temperature sweep, equilibration and `eis_validate`. The Manual tab (which stores
+  the fit with no cell) and the campaign's settle (legacy engine) are unaffected.
 
 ---
 
@@ -1306,7 +1440,8 @@ fingerprint outright, so its population is attributed and de-duplicated.
 **Section 5b** (with `--project`) prints railed fits per channel — rows since the railed-fit
 demotion carry `success = 0` and an `error_msg` naming the bound, earlier rows carry `success = 1`
 with `R1` exactly on it — and arc-closure state counts, read column first with a `gate_log_json`
-fallback. `sigma_is_bound` is labelled a stamped default (0 on every row, not an observation).
+fallback. `sigma_is_bound` is labelled a stamped default (0 on every row, not an observation);
+rows written since `5234d37` carry the claim in `sigma_kind` instead ([§14](#regime-aware-sigma-and-bounds)).
 
 **Section 7** computes where each threshold would sit given the decision to arm, and never decides.
 

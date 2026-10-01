@@ -1535,13 +1535,14 @@ class AutonomousLoop:
         * **measured, not told** — an observation that ``counts_as_measured``
           but is not an admitted value: an admitted bound (its DOE row gets the
           number with its kind and the interval's other side), or a classified
-          spectrum with nothing admissible (row stays NULL, no kind — R3a). It
+          spectrum — A, B, C, or an unrecognised-shape U, treated like B/C — with
+          nothing admissible (row stays NULL, no kind — R3a). It
           is a successful measurement (operator, 2026-10-01), so it resets the
           failure streak (R1) and is labelled feasible by the caller through
           ``on_measured_untold`` (O4/R2); it is never told as a number (O5 is
           deferred), and a run of them alerts and never parks (O1).
         * **failed** — ``None``, or an observation that does not count as
-          measured (acquisition failure, regime U, nothing classified): counted
+          measured (acquisition failure, bad-data regime U, nothing classified): counted
           and checkpointed via :meth:`_count_trial_failure`. The park, if due,
           is returned for the caller to apply once its round is closed.
 

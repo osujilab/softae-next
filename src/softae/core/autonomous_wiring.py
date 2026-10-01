@@ -2929,15 +2929,17 @@ def _sigma_from_eis_raw(raw: Any, *, channel: int = 0,
     * **a float** — an admitted σ value, exactly as before; the loop tells it.
     * **a ``SigmaObservation``** — a successful measurement with no told value: an
       admitted bound (a regime-route bound, which the store records with its kind),
-      or a spectrum the regime classifier labelled A, B or C whose number is not
-      admissible (an old-route bound, or a gate-rejected value). Operator ruling
-      2026-10-01: a bound IS a measurement, with less nominal power than a value. It
+      or a classified spectrum — A, B, C, or an unrecognised-shape U (treated like
+      B/C) — whose number is not admissible (an old-route bound, or a gate-rejected
+      value). Operator ruling 2026-10-01: a bound IS a measurement, with less
+      nominal power than a value. It
       resets the park streak (R1), trains as feasible (O4/R2), and is never told to
       the optimizer as a number (O5 deferred). The *old-route* bound is still never
       admitted: on blocking-electrode films it sits 0.5–3.5 decades below the truth.
     * **``None``** — not measured: no report, no thickness (a σ campaign's
       geometry is missing, which is a wiring fault and must still park), or a
-      spectrum that is neither admitted nor classified (regime U, not classified).
+      spectrum that is neither admitted nor classified (bad-data U — a value from
+      one is never told — or not classified at all).
 
     *regime* is the campaign's one ``RegimeSettings`` (R6); ``None`` lets the
     engine read ``[eis] regime_aware`` itself, which is the direct-caller path.
@@ -3199,8 +3201,10 @@ def eis_impedance_objective(
 
     # Every member counts as measured, so at least one is classified (an admitted
     # bound is a regime-A route answer); that one's label makes the trial measured.
+    # The reason travels with the label: a shape-U anchor is classified only by it.
     anchor = next((o for o in untold if o.classified), untold[0])
-    return replace(unmeasured(anchor.regime), basis="replicates_not_combined")
+    return replace(unmeasured(anchor.regime, anchor.regime_reason),
+                   basis="replicates_not_combined")
 
 
 def eis_impedance_objective_for_channel(

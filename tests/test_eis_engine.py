@@ -20,6 +20,7 @@ from softae.analysis.eis.engine import analyze_spectrum
 from softae.analysis.eis.envelope import InstrumentEnvelope
 from softae.analysis.eis.geometry import CellConstant
 from softae.analysis.eis.policy import reduce_gates
+from softae.analysis.eis.regime_route import RegimeSettings
 from softae.analysis.eis.report import SigmaReport, SpectrumReport
 from softae.analysis.eis.settings import EISSettings, GateSettings, eis_settings
 from softae.analysis.quality import Verdict
@@ -32,6 +33,14 @@ from tests.eis_synthetic import (
 
 CELL = CellConstant(L_gap_cm=0.2, L_stripe_cm=0.2, thickness_cm=0.015,
                     thickness_method="predicted")
+
+
+#: Today's route, pinned. ``reference_spectrum`` classifies regime A, and with
+#: ``[eis] regime_aware`` armed in the repo config (2026-10-01) the A route replaces
+#: today's report and bypasses refusal (a) by design. Tests whose subject is today's
+#: route — the refusals, the blind-envelope bound, the failed-fit label — say so here
+#: instead of inheriting whatever the config says.
+TODAY_ROUTE = RegimeSettings(enabled=False)
 
 
 def _gated(enabled: bool = True) -> EISSettings:
@@ -560,7 +569,8 @@ class TestBoundReporting:
         blind = InstrumentEnvelope(phase_noise_measured=False,
                                    phase_noise_deg=float("nan"))
         report = analyze_spectrum(as_eis_result(*reference_spectrum()), cell=CELL,
-                                  settings=_gated(enabled=False), envelope=blind)
+                                  settings=_gated(enabled=False), envelope=blind,
+                                  regime=TODAY_ROUTE)
         assert report.sigma.mode == "bound_unqualified"
         assert report.sigma.provisional
         assert np.isnan(report.sigma.value)
@@ -1662,7 +1672,7 @@ class TestAGatedModelWithNoLegacyEquivalentDoesNotCrashWhenTheFitFails:
         monkeypatch.setattr(fitter_mod, "fit_spectrum", self._failed_fit)
         report = analyze_spectrum(as_eis_result(*reference_spectrum()), cell=CELL, engine="gated",
                                   model_name="blocking_coplanar",
-                                  settings=_gated(enabled=False))
+                                  settings=_gated(enabled=False), regime=TODAY_ROUTE)
 
         assert not report.sigma.is_value
         assert not (report.sigma.value == report.sigma.value)  # NaN, not a number
@@ -1867,7 +1877,7 @@ def _debye_sweep(r_ohms: float):
 
 def _refusal_report(eis, *, enabled: bool = False):
     return analyze_spectrum(eis, cell=CELL, envelope=UNCOMMISSIONED,
-                            settings=_gated(enabled=enabled))
+                            settings=_gated(enabled=enabled), regime=TODAY_ROUTE)
 
 
 def _ladder(r_ohms: float, *, enabled: bool = False):

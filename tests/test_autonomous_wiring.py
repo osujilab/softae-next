@@ -3497,35 +3497,137 @@ def test_eis_aggregate_objective_one_bound_returns_that_observation():
     assert out.kind == "upper_bound" and out.regime == "B"
 
 
+@pytest.fixture()
+def b_relabelled_shape_u(monkeypatch):
+    """The real classifier's verdict on every spectrum, relabelled U / ``non_monotone``.
+
+    The engine reports a non-A spectrum by today's route whatever its label, so this
+    is the B bound fixture as a shape-U bound — a shape production does produce
+    (board-2 PAA well 14, ``20260929T150528Z`` ch14: U ``non_monotone``, old-route
+    bound; pinned in ``tests/test_eis_observation.py``). No synthetic here yields one
+    natively: the only ``non_monotone`` in the slice-1 grids reports a value.
+    """
+    import dataclasses
+
+    from softae.analysis.eis import regime as regime_mod
+
+    real = regime_mod.classify_regime
+
+    def relabel(*args, **kwargs):
+        return dataclasses.replace(real(*args, **kwargs), label="U",
+                                   reason="non_monotone")
+
+    monkeypatch.setattr(regime_mod, "classify_regime", relabel)
+
+
+def _bad_data_u_bound_raw():
+    """The B bound fixture under 30 % multiplicative noise: U ``incoherent``, a bound."""
+    import itertools
+
+    import numpy as np
+
+    from tests.eis_regime_synthetic import RIG_F, step1_regime_b
+
+    _params, Z = next(itertools.islice(step1_regime_b(), 1, None))
+    Z = Z * (1 + 0.3 * np.random.default_rng(0).standard_normal(Z.size))
+    return [np.column_stack([RIG_F, np.abs(Z), np.degrees(np.angle(Z)),
+                             Z.real, -Z.imag])]
+
+
+def test_eis_aggregate_objective_two_shape_u_bounds_kindless_counts_as_measured(
+        b_relabelled_shape_u):
+    """Operator ruling 2026-10-01: shape U is treated like B/C. Two such replicate
+    bounds are not combined, and the trial observation keeps the reason that makes
+    it classified — dropping it would turn a measured trial into a park count."""
+    from softae.core.autonomous_wiring import eis_impedance_objective
+
+    out = eis_impedance_objective(
+        {measure_step_name(5): _b_bound_raw(), measure_step_name(6): _b_bound_raw()},
+        PARAMS, thickness_for=lambda ch: 150.0, kind="sigma", regime=_regime(True))
+
+    assert (out.regime, out.regime_reason) == ("U", "non_monotone")
+    assert out.kind is None and out.reported is None and out.admitted is False
+    assert out.classified is True and out.counts_as_measured is True
+    assert out.basis == "replicates_not_combined"
+
+
+def test_eis_aggregate_objective_two_bad_data_u_bounds_unmeasured():
+    """The counterpart: bad-data U never counts as measured, so nothing reaches the
+    replicate merge and the trial is ``None`` — a park count, as the ruling wants."""
+    from softae.core.autonomous_wiring import (
+        _sigma_from_eis_raw,
+        _spectrum_report_from_raw,
+        eis_impedance_objective,
+    )
+
+    report = _spectrum_report_from_raw(_bad_data_u_bound_raw(), channel=5,
+                                       thickness_um=150.0, regime=_regime(True))
+    assert (report.sigma.regime, report.sigma.regime_reason) == ("U", "incoherent")
+    assert report.sigma.is_bound              # the premise: an untold-shaped number
+    assert _sigma_from_eis_raw(_bad_data_u_bound_raw(), channel=5, thickness_um=150.0,
+                               regime=_regime(True)) is None
+
+    out = eis_impedance_objective(
+        {measure_step_name(5): _bad_data_u_bound_raw(),
+         measure_step_name(6): _bad_data_u_bound_raw()},
+        PARAMS, thickness_for=lambda ch: 150.0, kind="sigma", regime=_regime(True))
+    assert out is None
+
+
 @pytest.mark.asyncio
-async def test_campaign_regime_flag_read_once_mid_run_edit_does_not_reach_engine(
+async def test_campaign_regime_mid_run_config_edit_every_analysis_receives_campaign_settings(
         connected, tmp_path: Path, monkeypatch):
     """R6: `[eis] regime_aware` is read once; a mid-run edit changes nothing.
 
     The reader is patched to answer ``off`` on its first call and ``on`` on every
-    later one — an operator editing the config while the run is going. Every
-    analysis the campaign runs must still carry the start-of-run settings, and
-    the engine's own per-spectrum read must never be what decides.
+    later one — an operator editing the config while the run is going. **Every**
+    ``analyze_spectrum`` call the campaign makes must receive ``regime=`` as the
+    very object that first read returned: never absent, never ``None``.
+
+    Three surfaces are watched, because each holds its own binding and a spy on one
+    cannot see the others (SUBAGENT_RULES §3.1(d)):
+
+    * ``engine.analyze_spectrum`` — what ``_spectrum_report_from_raw`` resolves (it
+      imports the name function-locally, so it sees the patch at call time);
+    * ``router.analyze_spectrum`` — bound at the router's import. The campaign's
+      measure steps declare no ``circuit_model``, so the router does not analyse
+      today; if a campaign step ever gains one, its call arrives here without the
+      campaign's settings and this test goes red, which is the point;
+    * ``engine.regime_settings`` — the engine's own per-spectrum fallback read, bound
+      at the engine's import and so invisible to a patch on ``regime_route``.
     """
     import softae.analysis.eis.engine as engine
     import softae.analysis.eis.regime_route as rr
+    import softae.analysis.eis.router as router
 
-    reads: list[bool] = []
+    issued: list = []
 
     def edited_mid_run(config=None):
-        reads.append(True)
-        return rr.RegimeSettings(enabled=len(reads) > 1)
+        issued.append(rr.RegimeSettings(enabled=bool(issued)))
+        return issued[-1]
 
     monkeypatch.setattr(rr, "regime_settings", edited_mid_run)
-    real = engine.analyze_spectrum
-    passed: list = []
+    calls: list[tuple[str, object]] = []
+    _absent = object()
 
-    def spy(*args, **kwargs):
-        if "regime" in kwargs:
-            passed.append(kwargs["regime"])
-        return real(*args, **kwargs)
+    def spy_on(origin: str, real):
+        def spy(*args, **kwargs):
+            calls.append((origin, kwargs.get("regime", _absent)))
+            return real(*args, **kwargs)
+        return spy
 
-    monkeypatch.setattr(engine, "analyze_spectrum", spy)
+    monkeypatch.setattr(engine, "analyze_spectrum",
+                        spy_on("engine", engine.analyze_spectrum))
+    monkeypatch.setattr(router, "analyze_spectrum",
+                        spy_on("router", router.analyze_spectrum))
+    fallback_reads: list[bool] = []
+    real_fallback = engine.regime_settings
+
+    def engine_fallback(*args, **kwargs):
+        fallback_reads.append(True)
+        return real_fallback(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "regime_settings", engine_fallback)
     store = DataStore(tmp_path / "proj_regime")
     events: list[dict] = []
     try:
@@ -3535,10 +3637,13 @@ async def test_campaign_regime_flag_read_once_mid_run_edit_does_not_reach_engine
     finally:
         store.close()
 
-    assert reads == [True], "the campaign must read the flag exactly once"
-    assert passed, "no campaign-path analysis received the campaign's settings"
-    assert all(r is passed[0] for r in passed)
-    assert passed[0].enabled is False
+    assert len(issued) == 1, "the campaign must read the flag exactly once"
+    campaign = issued[0]
+    assert campaign.enabled is False
+    assert calls, "the campaign path made no analyze_spectrum call at all"
+    strays = [(origin, r) for origin, r in calls if r is not campaign]
+    assert not strays, f"analyses not given the campaign's settings: {strays}"
+    assert fallback_reads == [], "the engine re-read [eis] regime_aware per spectrum"
     assert [e["regime_aware"] for e in events if e["type"] == "regime_settings"] == [False]
 
 

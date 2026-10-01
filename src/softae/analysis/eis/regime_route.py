@@ -58,11 +58,13 @@ SPAN_MIN_DEC = 1.5
 SERIES_NOT_SEPARABLE = "series_not_separable"
 #: ``regime_route_detail`` when the route ran but had no K to divide by.
 NO_CELL_CONSTANT = "no_cell_constant"
+#: ``regime_route_detail`` when the pair could not be compared (``R_mf`` or ``R_fit`` absent).
+PAIR_UNAVAILABLE = "pair_unavailable"
 
 VALUE, BOUND, UNAVAILABLE = "value", "bound", "unavailable"
 
 __all__ = ["REGIME_A_FIT_RB", "REGIME_A_FOOT_LOWER", "REGIME_A_PASSIVE",
-           "SERIES_NOT_SEPARABLE", "NO_CELL_CONSTANT", "RegimeSettings",
+           "SERIES_NOT_SEPARABLE", "NO_CELL_CONSTANT", "PAIR_UNAVAILABLE", "RegimeSettings",
            "RegimeAEstimates", "plateau_decision", "regime_a_estimates", "regime_a_kind",
            "regime_settings", "log_shadow", "route_basis"]
 
@@ -214,10 +216,17 @@ def plateau_decision(verdict: RegimeVerdict, *, envelope: Any, cell: Any,
 
 def regime_a_kind(est: RegimeAEstimates, plateau_mode: str, *,
                   span_min: float = SPAN_MIN_DEC) -> tuple[str, str]:
-    """``(value|bound|unavailable, detail)`` — spec §4's three outcomes, first match wins."""
-    agree = est.pair_ratio <= PAIR_RATIO
+    """``(value|bound|unavailable, detail)`` — spec §4's three outcomes, first match wins.
+
+    A pair with a missing or non-positive side (no circle above a compressed foot, a
+    failed small fit) reads ``pair_unavailable``: *could not compare* is not spelled as
+    *compared and disagreed* (``SUBAGENT_RULES`` §3.1(a)). Either way it is no value.
+    """
+    ratio = est.pair_ratio
+    pair = ((ratio <= PAIR_RATIO, "pair_disagrees") if ratio == ratio
+            else (False, PAIR_UNAVAILABLE))
     checks = (
-        (agree, "pair_disagrees"),
+        pair,
         (est.span >= span_min, "arc_not_resolved_in_band"),
         (est.R_b_min > 0 and est.R_fit >= est.R_b_min, "fit_below_passive_bound"),
         (plateau_mode == VALUE, f"plateau_headroom_{plateau_mode or 'none'}"),

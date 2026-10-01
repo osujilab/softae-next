@@ -721,14 +721,16 @@ def _regime_a_sigma(verdict: Any, today: SigmaReport, *, cell: CellConstant | No
         regime_route_detail=log["route_detail"],
     )
     if kind == rr.VALUE:
-        mf = today.model_free_R_ohm
+        # The cross-check is against the route's own model-free partner R_mf, never
+        # today's ``model_free_R_ohm`` = 1/max(Re Y): the route withdrew that estimator,
+        # and against it a sound value read 37–93 % (arming review F5). A value implies
+        # the pair agreed, so R_mf is finite here.
+        pair_rel = abs(est.R_fit - est.R_mf) / est.R_fit
         common.update(
             mode="value", value=log["sigma_value"], regime_sigma=log["sigma_value"],
-            rel_uncertainty=cell.sigma_rel_uncertainty(
-                abs(est.R_fit - est.R_mf) / est.R_fit),
+            rel_uncertainty=cell.sigma_rel_uncertainty(pair_rel),
             provisional=plateau.provisional, R_reported_ohm=est.R_fit,
-            R_basis=rr.REGIME_A_FIT_RB,
-            cross_check_pct=abs(mf - est.R_fit) / est.R_fit * 100.0 if mf == mf else nan)
+            R_basis=rr.REGIME_A_FIT_RB, cross_check_pct=pair_rel * 100.0)
         return replace(today, **common), SigmaCeiling(reason="regime_a_value"), log
     if kind == rr.BOUND:
         ub = sig(est.R_b_min)
