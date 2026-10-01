@@ -30,6 +30,10 @@ from typing import Any
 import numpy as np
 import structlog
 
+# `observation`'s value / lower-bound / upper-bound vocabulary is IMPORTED below, not
+# re-spelled: the store's `sigma_kind` / `objective_kind` columns and the loop that tells
+# the optimizer key on one set of tokens ([e150]). Not a new upward dependency — this
+# module already imports `softae.analysis.eis`, which loads `observation`'s only import.
 from softae.analysis.conditions import resolve_temperature_C
 from softae.analysis.eis.calibration import (
     MEASUREMENT_ROLES,
@@ -37,6 +41,8 @@ from softae.analysis.eis.calibration import (
     electrode_mode_ok,
 )
 from softae.analysis.eis.geometry import THICKNESS_METHODS, CellConstant
+from softae.analysis.eis.observation import KINDS as OBSERVATION_KINDS
+from softae.analysis.eis.observation import VALUE, SigmaObservation, sigma_observation
 from softae.analysis.eis_data import EISResult
 
 # The liveness predicate is IMPORTED, not re-implemented. `softae.core.run_lock`
@@ -409,7 +415,19 @@ CREATE TABLE IF NOT EXISTS fit_results (
     chi2_reduced        REAL,
     r_squared           REAL,
     residual_rms_pct    REAL,
-    residual_max_pct    REAL
+    residual_max_pct    REAL,
+    -- The σ the engine STATED and what kind of claim it is ([e150], R3), from
+    -- `observation.sigma_observation(report)`. Declared here as well as in
+    -- `_migrate_censored_observation_columns`, verbatim, for the reason the gate
+    -- columns above give. `sigma_S_per_cm` keeps its meaning (a value or NULL, never
+    -- a bound); these hold EVERY kind, admitted or not, because this table is the full
+    -- record. All nullable with no default: NULL means *no report was passed*, or the
+    -- report stated nothing, which is not any of the three kinds.
+    sigma_reported_S_per_cm REAL,
+    sigma_kind              TEXT,
+    sigma_lower_S_per_cm    REAL,
+    R_film_ohm              REAL,
+    R_film_basis            TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_fit_results_measurement_id ON fit_results(measurement_id);
@@ -452,7 +470,15 @@ CREATE TABLE IF NOT EXISTS doe_parameters (
     objective_value     REAL,
     acquisition_fn      TEXT,
     outcome             TEXT,
-    failure_reason      TEXT
+    failure_reason      TEXT,
+    -- [e150] / R3: `objective_value` stays value-only; a bound's number goes here
+    -- with its kind, so a reader that never learned about kinds sees today's
+    -- behaviour rather than a bound read as a value. Mirrored in
+    -- `_migrate_censored_observation_columns`. Read back through
+    -- `DataStore.objective_observations`, which also interprets pre-feature rows.
+    objective_reported  REAL,
+    objective_kind      TEXT,
+    objective_lower     REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_doe_run_id ON doe_parameters(run_id);
@@ -689,6 +715,12 @@ def _f_or_none(value: Any) -> float | None:
     return f if f == f else None
 
 
+def _finite_or_none(value: Any) -> float | None:
+    """:func:`_f_or_none`, also refusing ±inf — for a number that must be a measurement."""
+    f = _f_or_none(value)
+    return f if f is not None and np.isfinite(f) else None
+
+
 def _fit_report_columns(report: Any | None) -> dict[str, Any]:
     """Gate/covariance columns for one ``fit_results`` row.
 
@@ -842,6 +874,44 @@ def _fit_quality_columns(fit_result: Any) -> dict[str, Any]:
     return {name: _f_or_none(quality.get(name)) for name in FIT_QUALITY_COLUMNS}
 
 
+#: The ``fit_results`` columns :func:`_sigma_observation_columns` fills ([e150], R3).
+SIGMA_OBSERVATION_COLUMNS: tuple[str, ...] = (
+    "sigma_reported_S_per_cm", "sigma_kind", "sigma_lower_S_per_cm",
+    "R_film_ohm", "R_film_basis",
+)
+
+
+def _sigma_observation_columns(
+    report: Any | None, observation: SigmaObservation | None = None
+) -> dict[str, Any]:
+    """The stated σ and its kind for one ``fit_results`` row.
+
+    From the *report* when one is given (it wins), else from a ready-made
+    *observation* — the route the campaign router takes, because passing it the whole
+    report would also move the gate columns, which is P.18 and operator-held.
+
+    One reading of the report — :func:`~softae.analysis.eis.observation.sigma_observation`
+    — so the row and the optimizer cannot classify the same spectrum differently.
+    Every kind is written, **admitted or not**: an old-route upper bound is never the
+    campaign objective, but it is what the engine said, and this table is the full
+    record. ``sigma_S_per_cm`` is not touched here and keeps its value-only meaning.
+
+    All NULL with neither, or when nothing was stated (kind ``None``): *nothing
+    stated* is not one of the three kinds.
+    """
+    obs = sigma_observation(report) if report is not None else observation
+    if obs is None or obs.kind is None:
+        return dict.fromkeys(SIGMA_OBSERVATION_COLUMNS)
+    return {
+        "sigma_reported_S_per_cm": _f_or_none(obs.reported),
+        "sigma_kind": obs.kind,
+        "sigma_lower_S_per_cm": _f_or_none(obs.lower),
+        "R_film_ohm": _f_or_none(obs.R_film_ohm),
+        # NULL rather than a basis for a resistance that is not there.
+        "R_film_basis": (obs.R_film_basis or None) if obs.R_film_ohm is not None else None,
+    }
+
+
 def _engine_label(engine: str, fit_result: Any) -> str:
     """Name the estimator that produced this row's ``R1``, not just the engine.
 
@@ -902,6 +972,23 @@ class PredictedThicknessRecord:
     um: float
     area_mm2: float | None
     method: str | None
+
+
+@dataclass(frozen=True)
+class ObjectiveObservation:
+    """One trial's stated objective and its kind ([e150]).
+
+    What :meth:`DataStore.objective_observations` returns.
+
+    ``kind`` is one of :data:`~softae.analysis.eis.observation.KINDS`. ``reported`` is
+    the value, or the bound; ``lower`` is the interval's other side when the row has
+    one (``None`` otherwise).
+    """
+
+    doe_id: int
+    reported: float
+    kind: str
+    lower: float | None
 
 
 # ---------------------------------------------------------------------------
@@ -985,6 +1072,8 @@ class DataStore:
         self._migrate_measurement_settle_verdict()
         # The per-campaign escalation counters, which the resume path reads by name.
         self._migrate_campaign_checkpoint_counters()
+        # [e150] / R3: a stated σ or objective, and what kind of claim it is.
+        self._migrate_censored_observation_columns()
         # LAST, always: the ledger records the epochs every migration above has
         # just finished establishing, so it must not claim them before they hold.
         self._migrate_schema_version()
@@ -1535,6 +1624,7 @@ class DataStore:
         t_cm: float | None = None,
         w_cm: float | None = None,
         report: Any | None = None,
+        observation: SigmaObservation | None = None,
     ) -> int:
         """Persist a circuit-fit result linked to a measurement.
 
@@ -1554,6 +1644,14 @@ class DataStore:
         exceptions to that split: they come from *fit_result*, never from *report*,
         so they populate whether or not a report is passed. :func:`_arc_columns` and
         :func:`_fit_quality_columns` say why.
+
+        :data:`SIGMA_OBSERVATION_COLUMNS` record the σ the engine stated and its kind
+        — value, lower or upper bound — for every kind, admitted or not, from *report*
+        or, failing that, from *observation* (a
+        :class:`~softae.analysis.eis.observation.SigmaObservation`). *observation*
+        fills **those five columns and nothing else**: every other column is exactly
+        what the same call without it writes. ``sigma_S_per_cm`` is untouched either
+        way: still ``K/R1`` from the legacy geometry, and NULL on a reported bound.
 
         Returns the new ``fit_id``.
         """
@@ -1589,6 +1687,7 @@ class DataStore:
         # inside `fit_circuit` and hang on the fit, so they reach this table from the
         # three call sites that pass no report at all. See `_fit_quality_columns`.
         extra.update(_fit_quality_columns(fit_result))
+        extra.update(_sigma_observation_columns(report, observation))
         extra["engine"] = _engine_label(extra["engine"], fit_result)
         # A bounded σ is not a value.  Storing it in ``sigma_S_per_cm`` would let any
         # reader that does not check ``sigma_is_bound`` treat a ceiling as a
@@ -1609,10 +1708,13 @@ class DataStore:
                 thickness_method, thickness_unc_cm,
                 arc_state, arc_f_peak_hz, arc_f_low_hz, arc_phase_low_deg,
                 chi2, chi2_reduced, r_squared, residual_rms_pct,
-                residual_max_pct)
+                residual_max_pct,
+                sigma_reported_S_per_cm, sigma_kind, sigma_lower_S_per_cm,
+                R_film_ohm, R_film_basis)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                        ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?,
                        ?, ?, ?, ?, ?)""",
             (
                 measurement_id,
@@ -1659,6 +1761,7 @@ class DataStore:
                 extra["r_squared"],
                 extra["residual_rms_pct"],
                 extra["residual_max_pct"],
+                *(extra[name] for name in SIGMA_OBSERVATION_COLUMNS),
             ),
         )
         self._conn.commit()
@@ -1839,14 +1942,88 @@ class DataStore:
         return doe_id  # type: ignore[return-value]
 
     def update_doe_objective(
-        self, doe_id: int, objective_value: float
+        self,
+        doe_id: int,
+        objective_value: float | None,
+        *,
+        kind: str = VALUE,
+        reported: float | None = None,
+        lower: float | None = None,
     ) -> None:
-        """Set the objective value for an existing DOE row."""
+        """Set the objective for an existing DOE row: a value, or a bound ([e150]).
+
+        ``kind="value"`` (the default, so positional callers are unchanged):
+        ``objective_value`` is written exactly as before, and ``objective_reported``
+        mirrors it with ``objective_kind='value'`` — or NULL kind when there is no
+        finite number, which is *unmeasured*, not a value. *reported* and *lower* are
+        ignored.
+
+        ``kind="lower_bound"`` / ``"upper_bound"``: ``objective_value`` is written
+        NULL **whatever was passed** — the column never holds a bound — and the bound
+        goes to ``objective_reported`` with its kind; *lower* is the interval's other
+        side, if any. Raises :class:`ValueError` for an unknown kind, or for a bound
+        whose *reported* is missing or non-finite: a bound with no number is not an
+        observation.
+
+        **Which bounds to write is the caller's decision, not this method's:** R3(a)
+        says only ADMITTED observations reach this table
+        (``SigmaObservation.admitted``); an old-route bound belongs in ``fit_results``.
+        """
+        if kind not in OBSERVATION_KINDS:
+            raise ValueError(
+                f"unknown objective kind {kind!r}; expected one of {OBSERVATION_KINDS}")
+        if kind == VALUE:
+            stated = _finite_or_none(objective_value)
+            row = (objective_value, stated, VALUE if stated is not None else None, None)
+        else:
+            bound = _finite_or_none(reported)
+            if bound is None:
+                raise ValueError(
+                    f"a {kind} needs a finite reported number, got {reported!r}")
+            row = (None, bound, kind, _finite_or_none(lower))
         self._conn.execute(
-            "UPDATE doe_parameters SET objective_value = ? WHERE doe_id = ?",
-            (objective_value, doe_id),
+            "UPDATE doe_parameters SET objective_value = ?, objective_reported = ?, "
+            "objective_kind = ?, objective_lower = ? WHERE doe_id = ?",
+            (*row, doe_id),
         )
         self._conn.commit()
+
+    def objective_observations(
+        self, campaign: str, *, run_id: str | None = None
+    ) -> list[ObjectiveObservation]:
+        """Every stated objective of *campaign*, values and bounds, in ``doe_id`` order.
+
+        The one sanctioned way to read bounds back (e.g. on resume): ``objective_value``
+        alone never holds one. *campaign* is ``experiments.campaign`` — the spec name
+        the resume checkpoint is keyed by — so the result spans every run the campaign
+        was started or resumed under. That includes a fresh restart under the same
+        name after a cleared checkpoint; pass *run_id* to narrow to one run.
+
+        A pre-feature row (NULL kind) with a non-NULL ``objective_value`` reads as a
+        value, which is what it was. Rows that state nothing are omitted.
+        """
+        sql = ("SELECT d.doe_id, d.objective_value, d.objective_reported, "
+               "d.objective_kind, d.objective_lower FROM doe_parameters d "
+               "JOIN experiments e ON e.run_id = d.run_id WHERE e.campaign = ?")
+        params: list[Any] = [str(campaign)]
+        if run_id is not None:
+            sql += " AND d.run_id = ?"
+            params.append(str(run_id))
+        out: list[ObjectiveObservation] = []
+        for doe_id, value, reported, kind, lower in self._conn.execute(
+                sql + " ORDER BY d.doe_id", params).fetchall():
+            if kind is None:
+                if value is None:
+                    continue
+                kind, reported = VALUE, value
+            elif reported is None:
+                reported = value
+            if reported is None:
+                continue
+            out.append(ObjectiveObservation(
+                doe_id=int(doe_id), reported=float(reported), kind=str(kind),
+                lower=None if lower is None else float(lower)))
+        return out
 
     def update_doe_outcome(
         self,
@@ -3714,6 +3891,50 @@ class DataStore:
                 self._conn.execute(
                     f"ALTER TABLE doe_parameters ADD COLUMN {column} TEXT"
                 )
+        self._conn.commit()
+
+    def _migrate_censored_observation_columns(self) -> None:
+        """A stated number and its kind, on ``doe_parameters`` and ``fit_results`` ([e150], R3).
+
+        A bound is a successful measurement with less nominal power than a value
+        (operator, O2), so it has to be stored — but **not** in ``objective_value`` or
+        ``sigma_S_per_cm``, whose every existing reader assumes a value. A reader that
+        forgets to check a kind column would then read a bound as a measurement and
+        raise nothing. Kept apart, the same omission only means that reader does not
+        see bounds, which is today's behaviour.
+
+        * ``doe_parameters``: ``objective_reported`` / ``objective_kind`` /
+          ``objective_lower`` — written by :meth:`DataStore.update_doe_objective`.
+        * ``fit_results``: ``sigma_reported_S_per_cm`` / ``sigma_kind`` /
+          ``sigma_lower_S_per_cm`` / ``R_film_ohm`` / ``R_film_basis`` — written by
+          :meth:`DataStore.record_fit` from the report.
+
+        One migration for both tables because they are one vocabulary. **All nullable,
+        no default, no backfill and no new** :data:`SCHEMA_EPOCHS` **row**, following
+        :meth:`_migrate_doe_outcome`: a shape change, and no stored number changes
+        meaning. A pre-feature ``doe_parameters`` row keeps NULL here and is read as a
+        value by :meth:`DataStore.objective_observations` when it holds one — that is
+        what it was. ``fit_results`` rows keep NULL, meaning *never classified*; their
+        report is gone, so a classification now would be invented.
+        """
+        additions = {
+            "doe_parameters": (("objective_reported", "REAL"),
+                               ("objective_kind", "TEXT"),
+                               ("objective_lower", "REAL")),
+            "fit_results": (("sigma_reported_S_per_cm", "REAL"),
+                            ("sigma_kind", "TEXT"),
+                            ("sigma_lower_S_per_cm", "REAL"),
+                            ("R_film_ohm", "REAL"),
+                            ("R_film_basis", "TEXT")),
+        }
+        for table, columns in additions.items():
+            cols = {row[1] for row in
+                    self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            for column, sql_type in columns:
+                if column not in cols:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"
+                    )
         self._conn.commit()
 
     def _migrate_schema_version(self) -> None:

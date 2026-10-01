@@ -367,8 +367,11 @@ def test_regime_a_route_e148_47_53_no_value(e148_reports):
             s = e148_reports[(rh, ch)].sigma
             assert s.regime == "A" and s.mode != "value", (rh, ch)
             if s.mode == "unavailable":
-                assert s.regime_reason == rr.SERIES_NOT_SEPARABLE
+                assert s.regime_reason not in ("", rr.SERIES_NOT_SEPARABLE), (rh, ch)
+                assert s.regime_route_detail, (rh, ch)
                 assert s.regime_sigma_lower > 0
+                assert s.R_basis == rr.REGIME_A_FOOT_LOWER
+                assert s.R_reported_ohm == s.regime_R_foot_ohm > 0
 
 
 @pytest.mark.xfail(strict=True, reason="criterion 3 (σ monotone in RH over four steps) is "
@@ -421,3 +424,75 @@ def test_regime_route_reached_by_real_fixtures():
         kind = rr.regime_a_kind(est, pl.mode)[0]
         seen[kind] = seen.get(kind, 0) + 1
     assert set(seen) == {"value", "bound", "unavailable"}, seen
+
+
+# ── R7, slice 1a: the lower-bound basis, R_foot, and the route's own why ─────────────
+
+
+def _route(cell, *pick):
+    """``_regime_a_sigma`` on one synthetic A's real verdict; ``(verdict, sigma, ceiling)``."""
+    from softae.analysis.eis.engine import _regime_a_sigma
+    from softae.analysis.eis.report import SigmaReport
+
+    *args, seed = pick
+    v = rg.classify_regime(F, syn.regime_a_rs(*args, seed=seed))
+    assert v.is_a
+    sigma, ceiling, _ = _regime_a_sigma(v, SigmaReport(), cell=cell, envelope=ENV,
+                                        tand_headroom_mult=3.0, R_engine=float("nan"))
+    return v, sigma, ceiling
+
+
+#: Compressed, R_s = R_b: the route can state only ``σ ≥ K/R_foot``.
+COMPRESSED = ("compressed", 1.5e5, 0.6, 0.85, 1e5, 1e5, 20e-6, True, 503)
+INBAND = ("inband", 3e3, 0.7, 1.0, 0.0, 1e5, 0.0, False, 500)
+
+
+def test_regime_a_sigma_lower_bound_reports_foot_basis_and_r_foot():
+    v, s, ceiling = _route(CELL, *COMPRESSED)
+    assert s.mode == "unavailable" and s.regime_mode == "unavailable"
+    assert s.R_basis == rr.REGIME_A_FOOT_LOWER
+    assert s.R_reported_ohm == s.regime_R_foot_ohm > 0
+    assert s.regime_sigma_lower == pytest.approx(CELL.sigma(s.regime_R_foot_ohm))
+    assert ceiling.reason == rr.SERIES_NOT_SEPARABLE
+
+
+def test_regime_a_sigma_lower_bound_keeps_classifier_reason_route_detail_separate():
+    v, s, _ = _route(CELL, *COMPRESSED)
+    assert s.regime_reason == v.reason != rr.SERIES_NOT_SEPARABLE
+    assert s.regime_route_detail == "pair_disagrees"
+
+
+def test_regime_a_sigma_value_carries_r_foot_and_detail():
+    _, s, _ = _route(CELL, *INBAND)
+    assert s.mode == "value" and s.R_basis == rr.REGIME_A_FIT_RB
+    assert s.regime_route_detail == "resolved_in_band"
+    assert s.regime_R_foot_ohm > 0
+
+
+@pytest.mark.parametrize("pick", [COMPRESSED, INBAND], ids=["compressed", "inband"])
+def test_regime_a_sigma_no_cell_constant_states_no_lower_bound(pick):
+    v, s, ceiling = _route(None, *pick)
+    assert s.mode == "unavailable" and s.regime_route_detail == rr.NO_CELL_CONSTANT
+    assert s.regime_reason == v.reason
+    assert s.R_basis != rr.REGIME_A_FOOT_LOWER and s.R_reported_ohm != s.R_reported_ohm
+    assert s.regime_sigma_lower != s.regime_sigma_lower
+    assert ceiling.reason == "no cell constant"
+    assert rr.route_basis(s.regime_mode, s.regime_sigma_lower) == ""
+
+
+def test_route_basis_unavailable_names_foot_only_with_a_number():
+    assert rr.route_basis("unavailable", 1e-4) == rr.REGIME_A_FOOT_LOWER
+    assert rr.route_basis("unavailable") == ""
+    assert rr.route_basis("bound", 1e-4) == rr.REGIME_A_PASSIVE
+    assert rr.route_basis("value") == rr.REGIME_A_FIT_RB
+    assert rr.route_basis("") == ""
+
+
+def test_regime_shadow_flag_off_carries_r_foot_and_detail_not_basis():
+    """The new shadow fields flow flag-off; the reported basis stays today's."""
+    *args, seed = COMPRESSED
+    off = _analyse(syn.as_eis(F, syn.regime_a_rs(*args, seed=seed)), flag=False)
+    s = off.sigma
+    assert s.regime == "A" and not s.regime_active
+    assert s.regime_route_detail == "pair_disagrees" and s.regime_R_foot_ohm > 0
+    assert s.R_basis != rr.REGIME_A_FOOT_LOWER

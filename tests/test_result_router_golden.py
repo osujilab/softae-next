@@ -272,6 +272,33 @@ async def test_golden_eis_routing_rows_and_files(connected_manager, data_store):
     assert fits[0]["measurement_id"] == 1
     assert fits[0]["model_name"] == "simpleSalt"
 
+    # ── R3 ([e150]): the five stated-σ columns, and ONLY those, are new ──
+    # The router passes `observation=`, not `report=` (P.18 stays operator-held), so
+    # every report-sourced column keeps the report-less value it had at HEAD...
+    from softae.analysis.eis.geometry import CellConstant
+
+    fit = fits[0]
+    assert {k: fit[k] for k in (
+        "engine", "gate_verdict", "gate_log_json", "n_points_used",
+        "n_points_dropped", "report_mode", "R_sum_ohm", "R_sum_se_ohm",
+        "rho_series_bulk", "sigma_is_bound", "sigma_rel_unc", "phase_headroom",
+        "model_free_R_ohm", "K_per_cm", "K_route", "dead_height_cm",
+        "thickness_method", "thickness_unc_cm")} == {
+        "engine": "unknown", "gate_verdict": None, "gate_log_json": "[]",
+        "n_points_used": None, "n_points_dropped": None, "report_mode": "split",
+        "R_sum_ohm": None, "R_sum_se_ohm": None, "rho_series_bulk": None,
+        "sigma_is_bound": 0, "sigma_rel_unc": None, "phase_headroom": None,
+        "model_free_R_ohm": None, "K_per_cm": None, "K_route": None,
+        "dead_height_cm": 0.0, "thickness_method": None, "thickness_unc_cm": None}
+    cell = CellConstant.from_legacy(0.5, 0.001, 0.1)
+    assert fit["sigma_S_per_cm"] == pytest.approx(cell.sigma(fit["R1"]), rel=1e-12)
+    # ...and the new five carry what the engine stated: a value, K over the film R.
+    assert fit["sigma_kind"] == "value"
+    assert fit["sigma_lower_S_per_cm"] is None
+    assert fit["R_film_ohm"] > 0 and fit["R_film_basis"]
+    assert fit["sigma_reported_S_per_cm"] == pytest.approx(
+        cell.sigma(fit["R_film_ohm"]), rel=1e-9)
+
     # ── Files on disk: numeric tables byte-equivalent to the mock spectra ─
     # MockESPico re-seeds from the channel on every call, so re-invoking it
     # reproduces the exact spectrum the run recorded — no fixture data to
@@ -372,6 +399,38 @@ async def test_a_failed_payload_write_leaves_nulls_and_costs_nothing_else(
     assert len(data_store.query_fits(run_id=run_id)) == 1
     # No half-written payload left behind for a later reader to trust.
     assert list(data_store.payload_dir(run_id, "eis").glob("*.nc")) == []
+
+
+@pytest.mark.asyncio
+async def test_router_observation_failure_keeps_fit_row_with_null_kind(
+    connected_manager, data_store, monkeypatch
+):
+    """The guard around ``sigma_observation`` costs five columns, never the row.
+
+    ``sigma_observation`` never raises by contract, so production cannot produce
+    this shape; the test proves only that the router's guard holds if it ever did.
+    """
+    from softae.analysis.eis import router as eis_router
+
+    def _explode(report):
+        raise RuntimeError("observation broke")
+
+    monkeypatch.setattr(eis_router, "sigma_observation", _explode)
+    run_id = data_store.start_run("observation_failure")
+    step = WorkflowStep(
+        name="measure", instrument="pico1", method="sendscript_getdata",
+        params={"mscrpath": "f.mscr", "outdir": "out", "chan": 1,
+                "circuit_model": "simpleSalt", "electrode_L_cm": 0.5,
+                "electrode_t_cm": 0.001, "electrode_w_cm": 0.1},
+    )
+    executor = WorkflowExecutor(connected_manager, data_store=data_store,
+                               run_id=run_id)
+    await executor.run(Workflow(name="observation_failure", setup=[step]))
+
+    assert executor.state == ExecutorState.COMPLETED
+    (fit,) = data_store.query_fits(run_id=run_id)
+    assert fit["sigma_S_per_cm"] is not None
+    assert fit["sigma_kind"] is None and fit["sigma_reported_S_per_cm"] is None
 
 
 # ── The spectrum file carries the conditions it was measured under ──────────

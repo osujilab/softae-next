@@ -172,8 +172,10 @@ class AutonomousLoop:
         manager: InstrumentManager,
         data_store: DataStore,
         run_id: str,
-        # May return None to mean "not measured" (never told to the optimizer).
-        objective_extractor: Callable[[dict[str, Any]], "float | None"],
+        # May return None to mean "not measured" (never told to the optimizer), or
+        # an observation object (see :meth:`_close_well`) for a measured well whose
+        # number is not a told value — a bound, or a classified spectrum.
+        objective_extractor: Callable[[dict[str, Any]], Any],
         *,
         workflow_builder: Callable[[dict[str, Any]], Workflow] | None = None,
         auto_approve: bool = False,
@@ -275,6 +277,12 @@ class AutonomousLoop:
         self._max_channel_retries = max_channel_retries
         self._park_after_failed_trials = park_after_failed_trials
         self._consecutive_failures = 0
+        # O1 (operator, 2026-10-01): measured wells that yield no told value — a
+        # bound, or a classified spectrum with nothing admissible — ALERT after
+        # this many in a row and never park. A separate counter on purpose: R1
+        # decoupled parking from admission, and merging the two would bring the
+        # park straight back. Reset only by a told value; not persisted.
+        self._consecutive_untold = 0
         self._park_reason: str | None = None
         self._gate_timeout_s = gate_timeout_s
 
@@ -313,6 +321,14 @@ class AutonomousLoop:
         self.on_state_change: Callable[[LoopState, LoopState], Any] | None = None
         self.on_suggestion: Callable[[int, dict[str, Any]], Any] | None = None
         self.on_result: Callable[[int, dict[str, Any], float], Any] | None = None
+        # A measured well that was NOT told (iteration, params, observation): a
+        # bound, or a classified spectrum with no admissible number. It is a
+        # successful measurement (operator, 2026-10-01), so the caller labels it
+        # feasible (O4/R2); it is simply not a number the optimizer may learn.
+        self.on_measured_untold: Callable[[int, dict[str, Any], Any], Any] | None = None
+        # O1: fired once per streak when ``park_after_failed_trials`` measured
+        # wells in a row yielded no told value (streak, limit). An alert, never a park.
+        self.on_bound_streak: Callable[[int, int], Any] | None = None
         self.on_converged: Callable[[int, tuple[dict[str, Any], float] | None], Any] | None = None
         # Fired when a board fills and an exchange is requested (board_index,
         # remaining_samples) — a notification hook distinct from the decision
@@ -387,9 +403,10 @@ class AutonomousLoop:
         Routing all advances through one helper is what keeps a future code path
         from silently skipping the checkpoint.
 
-        Failure paths reach it **through** :meth:`_note_trial_failure`, which
+        Failure paths reach it **through** :meth:`_count_trial_failure` (via
+        :meth:`_note_trial_failure` or a round's :meth:`_close_round`), which
         calls it after incrementing the streak so the checkpoint carries the new
-        count; see that method for why the order is load-bearing.
+        count; see :meth:`_note_trial_failure` for why the order is load-bearing.
         """
         self._iteration += 1
         self._checkpoint()
@@ -873,23 +890,12 @@ class AutonomousLoop:
                 continue
 
             # 5. TELL — never fabricate an observation for an unmeasured trial.
-            if self._is_unmeasured(objective, params):
-                if self._note_trial_failure("unmeasured"):
-                    break
+            told, park_reason = self._close_well(objective, params, doe_id)
+            if park_reason is not None:
+                self._park(park_reason)
+                break
+            if not told:
                 continue
-            self._note_trial_success()
-            self._optimizer.tell(params, objective)
-            self._data_store.update_doe_objective(doe_id, objective)
-            logger.info(
-                "loop_tell",
-                iteration=self._iteration,
-                objective=objective,
-                best=self._optimizer.best(),
-            )
-            if self.on_result:
-                self.on_result(self._iteration, params, objective)
-
-            self._advance_iteration()
 
             # 6. CONVERGENCE CHECK
             if self._convergence_fn(self._optimizer.history):
@@ -1192,38 +1198,13 @@ class AutonomousLoop:
                 f"execute: {type(exc).__name__}", wells=len(batch))
 
         # 4/5. ANALYZE + TELL each batch member against its own channel result.
+        # Every member is closed before the round acts on a park or convergence
+        # (R8) — the same rule as the placement round, see `_close_round`.
         self._set_state(LoopState.ANALYZING)
-        for k, params in enumerate(batch):
-            try:
-                objective = self._batch_extract(step_results, k, params)
-            except Exception as exc:
-                logger.error(
-                    "objective_extraction_error",
-                    iteration=self._iteration, error=str(exc),
-                )
-                if self._note_trial_failure(f"analyze: {type(exc).__name__}"):
-                    return False
-                continue
-            if self._is_unmeasured(objective, params):
-                if self._note_trial_failure("unmeasured"):
-                    return False
-                continue
-            self._note_trial_success()
-            self._optimizer.tell(params, objective)
-            self._data_store.update_doe_objective(doe_ids[k], objective)
-            if self.on_result:
-                self.on_result(self._iteration, params, objective)
-            self._advance_iteration()
-
-            # 6. CONVERGENCE (per evaluation, so a round can converge mid-batch)
-            if self._convergence_fn(self._optimizer.history):
-                logger.info("loop_converged", iteration=self._iteration)
-                self._set_state(LoopState.CONVERGED)
-                if self.on_converged:
-                    self.on_converged(self._iteration, self._optimizer.best())
-                return False
-
-        return True
+        return not self._close_round(
+            (params, doe_ids[k],
+             lambda k=k, params=params: self._batch_extract(step_results, k, params))
+            for k, params in enumerate(batch))
 
     # ── Board-aware round (sequential electrodes + board exchange) ───────
 
@@ -1508,6 +1489,20 @@ class AutonomousLoop:
         which is the one place that can see both counters at once, and therefore
         the only place the comparison can honestly live.
         """
+        reason = self._count_trial_failure(what, wells=wells)
+        if reason is None:
+            return False
+        self._park(reason)
+        return True
+
+    def _count_trial_failure(self, what: str, *, wells: int = 1) -> str | None:
+        """Steps 1 and 2 of :meth:`_note_trial_failure`: count, then checkpoint.
+
+        Returns the park reason when the streak has reached its limit, else
+        ``None``. Step 3 (the park) is the caller's, which lets a round close
+        every well it cast before it stops (R8) while keeping the order: the
+        resume point is still on disk before the run parks.
+        """
         self._consecutive_failures += 1
         logger.warning(
             "trial_failed",
@@ -1518,16 +1513,128 @@ class AutonomousLoop:
         for _ in range(max(1, int(wells))):
             self._advance_iteration()
         if self._consecutive_failures >= self._park_after_failed_trials:
-            self._park(
-                f"{self._consecutive_failures} consecutive trial failures "
-                f"({what}) — treating as a systematic fault"
-            )
-            return True
-        return False
+            return (f"{self._consecutive_failures} consecutive trial failures "
+                    f"({what}) — treating as a systematic fault")
+        return None
 
     def _note_trial_success(self) -> None:
         """Reset the consecutive-failure counter after a measured trial."""
         self._consecutive_failures = 0
+
+    # ── Closing a well: told, measured-untold, or failed ────────────────
+
+    def _close_well(
+        self, objective: Any, params: dict[str, Any], doe_id: Any
+    ) -> tuple[bool, str | None]:
+        """Close one well's observation. Returns ``(told, park_reason)``.
+
+        Three outcomes, decided here once for all three trial paths:
+
+        * **told** — a number, or an admitted ``value`` observation: today's path
+          (tell, DOE objective, ``on_result``, streak reset).
+        * **measured, not told** — an observation that ``counts_as_measured``
+          but is not an admitted value: an admitted bound (its DOE row gets the
+          number with its kind and the interval's other side), or a classified
+          spectrum with nothing admissible (row stays NULL, no kind — R3a). It
+          is a successful measurement (operator, 2026-10-01), so it resets the
+          failure streak (R1) and is labelled feasible by the caller through
+          ``on_measured_untold`` (O4/R2); it is never told as a number (O5 is
+          deferred), and a run of them alerts and never parks (O1).
+        * **failed** — ``None``, or an observation that does not count as
+          measured (acquisition failure, regime U, nothing classified): counted
+          and checkpointed via :meth:`_count_trial_failure`. The park, if due,
+          is returned for the caller to apply once its round is closed.
+
+        Observations are recognised by shape (``counts_as_measured``), so this
+        module stays free of the EIS analysis package.
+        """
+        if objective is not None and hasattr(objective, "counts_as_measured"):
+            if objective.kind == "value" and objective.admitted:
+                objective = float(objective.reported)
+            elif objective.counts_as_measured:
+                self._close_untold(objective, params, doe_id)
+                return False, None
+            else:
+                logger.warning("trial_unmeasured", iteration=self._iteration,
+                               params=params, regime=objective.regime,
+                               kind=objective.kind,
+                               msg="no usable measurement — not told to the optimizer")
+                return False, self._count_trial_failure("unmeasured")
+        if self._is_unmeasured(objective, params):
+            return False, self._count_trial_failure("unmeasured")
+        self._note_trial_success()
+        self._consecutive_untold = 0
+        self._optimizer.tell(params, objective)
+        self._data_store.update_doe_objective(doe_id, objective)
+        logger.info("loop_tell", iteration=self._iteration, objective=objective,
+                    best=self._optimizer.best())
+        if self.on_result:
+            self.on_result(self._iteration, params, objective)
+        self._advance_iteration()
+        return True, None
+
+    def _close_untold(self, obs: Any, params: dict[str, Any], doe_id: Any) -> None:
+        """The measured-but-not-told branch of :meth:`_close_well`."""
+        self._note_trial_success()
+        if obs.admitted and obs.kind in ("lower_bound", "upper_bound"):
+            self._data_store.update_doe_objective(
+                doe_id, None, kind=obs.kind, reported=obs.reported, lower=obs.lower)
+        logger.info("loop_measured_untold", iteration=self._iteration,
+                    kind=obs.kind, reported=obs.reported, lower=obs.lower,
+                    regime=obs.regime, admitted=obs.admitted)
+        if self.on_measured_untold:
+            self.on_measured_untold(self._iteration, params, obs)
+        self._advance_iteration()
+        self._consecutive_untold += 1
+        if self._consecutive_untold == self._park_after_failed_trials:
+            logger.warning("bound_streak", streak=self._consecutive_untold,
+                           iteration=self._iteration,
+                           msg="measured wells keep yielding no told value; "
+                               "alerting only — this never parks (O1)")
+            if self.on_bound_streak:
+                self.on_bound_streak(self._consecutive_untold,
+                                     self._park_after_failed_trials)
+
+    def _close_round(self, wells: Any) -> bool:
+        """Close every well of a round, THEN act on a park or convergence (R8).
+
+        *wells* yields ``(params, doe_id, extract)`` per cast well, lazily, so a
+        caller that writes its DOE row as it goes writes it at the right
+        iteration. Returning mid-round used to leave the round's remaining cast
+        wells with no tell (and, on the placement path, no DOE row). A streak
+        that reaches the limit anywhere in the round still parks — after the
+        last well is recorded — and a park outranks a convergence reached in the
+        same round, because only the park makes the rig safe. Returns ``True``
+        when the loop should stop.
+        """
+        park_reason: str | None = None
+        converged = False
+        for params, doe_id, extract in wells:
+            try:
+                objective = extract()
+            except Exception as exc:
+                logger.error("objective_extraction_error",
+                             iteration=self._iteration, error=str(exc))
+                reason = self._count_trial_failure(f"analyze: {type(exc).__name__}")
+            else:
+                told, reason = self._close_well(objective, params, doe_id)
+                if told and not converged:
+                    # Per told well, so a round can still converge mid-batch;
+                    # latched, and acted on once the round is closed.
+                    converged = bool(self._convergence_fn(self._optimizer.history))
+            park_reason = park_reason or reason
+        if park_reason is not None:
+            if converged:
+                logger.info("loop_converged_but_parked", iteration=self._iteration)
+            self._park(park_reason)
+            return True
+        if converged:
+            logger.info("loop_converged", iteration=self._iteration)
+            self._set_state(LoopState.CONVERGED)
+            if self.on_converged:
+                self.on_converged(self._iteration, self._optimizer.best())
+            return True
+        return False
 
     async def _await_gate(self, event: asyncio.Event, what: str) -> bool:
         """Wait on a human-in-the-loop gate, bounded by ``gate_timeout_s``.
@@ -1587,43 +1694,22 @@ class AutonomousLoop:
     def _tell_placed(
         self, cache: dict[str, Any], placed: list[tuple[dict[str, Any], int]]
     ) -> bool:
-        """Extract per-electrode objectives from *cache* and tell each.
+        """Extract per-electrode objectives from *cache* and close each well.
 
         Returns ``True`` when the loop should **stop** — either convergence was
         reached (state ``CONVERGED``) or the failure run-length triggered a park
-        (state ``STOPPED``). Either way the caller ends the round.
+        (state ``STOPPED``). Either way only after every well in the round has
+        its DOE row and every measured well has been told (R8, `_close_round`).
+
+        The row is recorded **before** extraction, as on the other two paths:
+        the well *was* cast whatever the extractor does, so an extraction error
+        no longer leaves a cast well with no row at all.
         """
-        for params, channel in placed:
-            try:
-                objective = self._placement_extract(cache, channel, params)
-            except Exception as exc:
-                logger.error(
-                    "objective_extraction_error",
-                    iteration=self._iteration, error=str(exc),
-                )
-                if self._note_trial_failure(f"analyze: {type(exc).__name__}"):
-                    return True   # parked — stop the round
-                continue
-            # Record the row even when unmeasured: the well *was* cast, so the
-            # provenance matters; only objective_value stays NULL.
-            doe_id = self._data_store.record_doe_parameter(
-                run_id=self._run_id, channel=channel,
-                iteration=self._iteration, parameters=params,
-            )
-            if self._is_unmeasured(objective, params):
-                if self._note_trial_failure("unmeasured"):
-                    return True   # parked — stop the round
-                continue
-            self._note_trial_success()
-            self._optimizer.tell(params, objective)
-            self._data_store.update_doe_objective(doe_id, objective)
-            if self.on_result:
-                self.on_result(self._iteration, params, objective)
-            self._advance_iteration()
-            if self._convergence_fn(self._optimizer.history):
-                logger.info("loop_converged", iteration=self._iteration)
-                self._set_state(LoopState.CONVERGED)
-                if self.on_converged:
-                    self.on_converged(self._iteration, self._optimizer.best())
-                return True
-        return False
+        return self._close_round(
+            (params,
+             self._data_store.record_doe_parameter(
+                 run_id=self._run_id, channel=channel,
+                 iteration=self._iteration, parameters=params),
+             lambda params=params, channel=channel: self._placement_extract(
+                 cache, channel, params))
+            for params, channel in placed)

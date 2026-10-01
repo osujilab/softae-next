@@ -70,6 +70,29 @@ def test_replicating_optimizer_tell_forwards_both_replicates_to_inner_history():
     assert ReplicatingOptimizer(inner, 2).history == inner.history
 
 
+def test_replicating_optimizer_tell_bound_is_refused_and_history_unchanged():
+    """R4: a bound on one replicate film is never one of the k observations.
+
+    The grid and random inners append whatever they are told, and the history
+    is what ``best()``, convergence and the surrogate read — so a bound that
+    slipped past the loop must fail loudly here rather than become a number.
+    """
+    from softae.analysis.eis.observation import SigmaObservation
+
+    inner = _inner()
+    opt = ReplicatingOptimizer(inner, 2)
+    pair = opt.suggest_batch(2)
+    bound = SigmaObservation(kind="lower_bound", reported=7e-3, lower=None,
+                             regime="A", basis="regime_a_foot_lower",
+                             R_film_ohm=None, admitted=True, classified=True)
+
+    with pytest.raises(OptimizerError, match="a bound is recorded, never told"):
+        opt.tell(pair[0], bound)
+    opt.tell(pair[1], 2)                     # an int is still a number
+
+    assert inner.history == [(pair[1], 2)]
+
+
 def test_replicating_optimizer_partial_round_warns_and_truncates():
     """q=7 with k=2 yields 7 wells and warns; a whole round warns not at all."""
     with capture_logs() as logs:

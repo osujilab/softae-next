@@ -3019,3 +3019,386 @@ class TestRunOwnerLiveness:
         from softae.core import run_lock
 
         assert ds_mod._pid_alive is run_lock._pid_alive
+
+
+# ---------------------------------------------------------------------------
+# [e150] / R3: a stated number and its kind (value / lower bound / upper bound)
+# ---------------------------------------------------------------------------
+
+SIGMA_OBS_COLUMNS = ("sigma_reported_S_per_cm", "sigma_kind", "sigma_lower_S_per_cm",
+                     "R_film_ohm", "R_film_basis")
+OBJECTIVE_COLUMNS = ("objective_reported", "objective_kind", "objective_lower")
+
+#: `doe_parameters` as it stood before the objective kind columns (post-T3.1b).
+_LEGACY_DOE_DDL = (
+    "CREATE TABLE doe_parameters ("
+    " doe_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL,"
+    " channel INTEGER NOT NULL, iteration INTEGER NOT NULL DEFAULT 0,"
+    " parameters_json TEXT NOT NULL DEFAULT '{}', objective_value REAL,"
+    " acquisition_fn TEXT, outcome TEXT, failure_reason TEXT)"
+)
+
+
+def _declarations(store: DataStore, table: str) -> dict[str, tuple]:
+    return {r[1]: (r[2].upper(), r[3], r[4]) for r in store._conn.execute(
+        f"PRAGMA table_info({table})").fetchall()}
+
+
+def _doe_row(store: DataStore, doe_id: int) -> dict:
+    return dict(store._conn.execute(
+        "SELECT objective_value, objective_reported, objective_kind, objective_lower "
+        "FROM doe_parameters WHERE doe_id = ?", (doe_id,)).fetchone())
+
+
+def _report(**sigma):
+    from softae.analysis.eis.report import SigmaReport, SpectrumReport
+
+    return SpectrumReport(engine="gated", sigma=SigmaReport(**sigma))
+
+
+class TestCensoredObservationMigration:
+    """One nullable sibling migration over both tables; old rows untouched."""
+
+    def test_migration_fresh_db_declares_all_eight_columns_nullable_without_default(
+        self, store: DataStore
+    ) -> None:
+        fit = _declarations(store, "fit_results")
+        doe = _declarations(store, "doe_parameters")
+        expected = {"sigma_reported_S_per_cm": "REAL", "sigma_kind": "TEXT",
+                    "sigma_lower_S_per_cm": "REAL", "R_film_ohm": "REAL",
+                    "R_film_basis": "TEXT"}
+        assert {k: fit[k] for k in expected} == {
+            k: (t, 0, None) for k, t in expected.items()}
+        assert {k: doe[k] for k in OBJECTIVE_COLUMNS} == {
+            "objective_reported": ("REAL", 0, None),
+            "objective_kind": ("TEXT", 0, None),
+            "objective_lower": ("REAL", 0, None)}
+
+    def test_migration_legacy_fit_results_gains_columns_old_row_reads_null(
+        self, tmp_path: Path
+    ) -> None:
+        project = tmp_path / "legacy_fits"
+        _build_legacy_fit_results_db(project)
+
+        with DataStore(project) as store:
+            row = dict(store._conn.execute(
+                "SELECT * FROM fit_results WHERE run_id = 'old_run'").fetchone())
+        assert (row["R0"], row["R1"], row["sigma_S_per_cm"]) == (50.0, 1000.0, None)
+        assert all(row[c] is None for c in SIGMA_OBS_COLUMNS)
+
+    def test_migration_legacy_doe_table_gains_columns_old_row_untouched(
+        self, tmp_path: Path
+    ) -> None:
+        project = tmp_path / "legacy_doe"
+        with DataStore(project) as store:
+            run_id = store.start_run("wf", campaign="c1")
+            store._conn.execute("DROP TABLE doe_parameters")
+            store._conn.execute(_LEGACY_DOE_DDL)
+            store._conn.execute(
+                "INSERT INTO doe_parameters (run_id, channel, objective_value, outcome)"
+                " VALUES (?, 3, 0.25, 'measured')", (run_id,))
+            store._conn.commit()
+
+        with DataStore(project) as store:
+            row = dict(store._conn.execute(
+                "SELECT * FROM doe_parameters").fetchone())
+            obs = store.objective_observations("c1")
+        assert (row["objective_value"], row["outcome"]) == (0.25, "measured")
+        assert all(row[c] is None for c in OBJECTIVE_COLUMNS)
+        # No backfill, yet the accessor reads the pre-feature row as what it was.
+        assert [(o.reported, o.kind) for o in obs] == [(0.25, "value")]
+
+    def test_migration_reopen_twice_is_noop(self, tmp_path: Path) -> None:
+        project = tmp_path / "reopen"
+        with DataStore(project) as store:
+            before = (_declarations(store, "fit_results"),
+                      _declarations(store, "doe_parameters"))
+        with DataStore(project) as store:
+            after = (_declarations(store, "fit_results"),
+                     _declarations(store, "doe_parameters"))
+        assert before == after
+
+    def test_migration_adds_no_schema_epoch_row(self) -> None:
+        """A change of shape: no stored number changes meaning."""
+        from softae.core.data_store import SCHEMA_EPOCHS
+
+        names = SIGMA_OBS_COLUMNS + OBJECTIVE_COLUMNS
+        assert not any(n in note for _, _, note in SCHEMA_EPOCHS for n in names)
+
+
+class TestUpdateDoeObjectiveKinds:
+    """`objective_value` is value-only; a bound's number goes beside it."""
+
+    @pytest.fixture()
+    def doe(self, store_with_run):
+        store, run_id = store_with_run
+        return store, store.record_doe_parameter(run_id, 1, 0, {"x": 1.0})
+
+    def test_update_doe_objective_legacy_positional_value_writes_value_and_kind(
+        self, doe
+    ) -> None:
+        store, doe_id = doe
+        store.update_doe_objective(doe_id, 0.42)
+        assert _doe_row(store, doe_id) == {
+            "objective_value": 0.42, "objective_reported": 0.42,
+            "objective_kind": "value", "objective_lower": None}
+
+    def test_update_doe_objective_legacy_positional_none_stays_unmeasured(
+        self, doe
+    ) -> None:
+        store, doe_id = doe
+        store.update_doe_objective(doe_id, None)
+        assert _doe_row(store, doe_id) == dict.fromkeys(
+            ("objective_value",) + OBJECTIVE_COLUMNS)
+
+    def test_update_doe_objective_lower_bound_nulls_value_column(self, doe) -> None:
+        store, doe_id = doe
+        store.update_doe_objective(doe_id, None, kind="lower_bound", reported=7.3e-3)
+        assert _doe_row(store, doe_id) == {
+            "objective_value": None, "objective_reported": 7.3e-3,
+            "objective_kind": "lower_bound", "objective_lower": None}
+
+    def test_update_doe_objective_upper_bound_ignores_passed_value_keeps_interval(
+        self, doe
+    ) -> None:
+        store, doe_id = doe
+        store.update_doe_objective(doe_id, 9.9, kind="upper_bound",
+                                   reported=1.15e-2, lower=7.3e-3)
+        assert _doe_row(store, doe_id) == {
+            "objective_value": None, "objective_reported": 1.15e-2,
+            "objective_kind": "upper_bound", "objective_lower": 7.3e-3}
+
+    def test_update_doe_objective_bound_after_value_clears_value_column(
+        self, doe
+    ) -> None:
+        store, doe_id = doe
+        store.update_doe_objective(doe_id, 0.42)
+        store.update_doe_objective(doe_id, None, kind="lower_bound", reported=5e-3)
+        assert _doe_row(store, doe_id)["objective_value"] is None
+
+    @pytest.mark.parametrize("kwargs", [
+        {"kind": "bound"},
+        {"kind": "lower bound", "reported": 1e-3},
+        {"kind": "lower_bound"},
+        {"kind": "upper_bound", "reported": float("nan")},
+        {"kind": "lower_bound", "reported": float("inf")},
+    ])
+    def test_update_doe_objective_invalid_kind_or_bound_raises_and_writes_nothing(
+        self, doe, kwargs
+    ) -> None:
+        store, doe_id = doe
+        store.update_doe_objective(doe_id, 0.42)
+        with pytest.raises(ValueError):
+            store.update_doe_objective(doe_id, None, **kwargs)
+        assert _doe_row(store, doe_id)["objective_kind"] == "value"
+
+
+class TestObjectiveObservations:
+    """The one sanctioned read of bounds, keyed by campaign (the resume key)."""
+
+    def test_objective_observations_spans_runs_omits_unstated_reads_legacy_as_value(
+        self, store: DataStore
+    ) -> None:
+        from softae.core.data_store import ObjectiveObservation
+
+        r1 = store.start_run("wf", campaign="paa")
+        r2 = store.start_run("wf", campaign="paa")
+        other = store.start_run("wf", campaign="other")
+        a = store.record_doe_parameter(r1, 1, 0, {})
+        store.update_doe_objective(a, 2e-4)
+        b = store.record_doe_parameter(r1, 2, 0, {})          # never measured
+        c = store.record_doe_parameter(r2, 3, 1, {})
+        store.update_doe_objective(c, None, kind="upper_bound",
+                                   reported=1.15e-2, lower=7.3e-3)
+        # A pre-feature row: objective_value only, kind columns NULL.
+        d = store.record_doe_parameter(r2, 4, 1, {}, objective_value=3e-5)
+        x = store.record_doe_parameter(other, 1, 0, {})
+        store.update_doe_objective(x, 1.0)
+
+        obs = store.objective_observations("paa")
+
+        assert obs == [
+            ObjectiveObservation(doe_id=a, reported=2e-4, kind="value", lower=None),
+            ObjectiveObservation(doe_id=c, reported=1.15e-2, kind="upper_bound",
+                                 lower=7.3e-3),
+            ObjectiveObservation(doe_id=d, reported=3e-5, kind="value", lower=None),
+        ]
+        assert b not in {o.doe_id for o in obs}
+        narrowed = store.objective_observations("paa", run_id=r2)
+        assert [o.doe_id for o in narrowed] == [c, d]
+
+    def test_objective_observations_unknown_campaign_returns_empty(
+        self, store: DataStore
+    ) -> None:
+        assert store.objective_observations("nope") == []
+
+
+class TestRecordFitSigmaObservation:
+    """`fit_results` is the full record: every kind, admitted or not."""
+
+    GEOMETRY = {"L_cm": 0.2, "t_cm": 0.015, "w_cm": 0.2}
+
+    def _record(self, store_with_run, report):
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        store.record_fit(mid, _FakeFitResult(), report=report, **self.GEOMETRY)
+        return store.query_fits(measurement_id=mid)[0]
+
+    @staticmethod
+    def _k_over_r1() -> float:
+        from softae.analysis.eis.geometry import CellConstant
+
+        return CellConstant.from_legacy(0.2, 0.015, 0.2).sigma(_FakeFitResult().R1)
+
+    def test_record_fit_value_report_fills_kind_and_keeps_sigma_column_k_over_r1(
+        self, store_with_run
+    ) -> None:
+        row = self._record(store_with_run, _report(
+            mode="value", value=1.2e-4, R_reported_ohm=5.0e4, R_basis="split_bulk"))
+        assert {c: row[c] for c in SIGMA_OBS_COLUMNS} == {
+            "sigma_reported_S_per_cm": 1.2e-4, "sigma_kind": "value",
+            "sigma_lower_S_per_cm": None, "R_film_ohm": 5.0e4,
+            "R_film_basis": "split_bulk"}
+        # Value-only and unchanged: still K/R1 from the legacy geometry.
+        assert row["sigma_S_per_cm"] == self._k_over_r1()
+
+    def test_record_fit_old_route_upper_bound_recorded_though_not_admitted(
+        self, store_with_run
+    ) -> None:
+        row = self._record(store_with_run, _report(
+            mode="bound", upper_bound=3.0e-6, upper_bound_basis="loss_at_numerator",
+            R_reported_ohm=2.0e6, R_basis="split_bulk"))
+        assert {c: row[c] for c in SIGMA_OBS_COLUMNS} == {
+            "sigma_reported_S_per_cm": 3.0e-6, "sigma_kind": "upper_bound",
+            "sigma_lower_S_per_cm": None, "R_film_ohm": 2.0e6,
+            "R_film_basis": "split_bulk"}
+        assert row["sigma_S_per_cm"] is None
+        assert row["sigma_is_bound"] == 1
+
+    def test_record_fit_route_a_upper_bound_stores_interval_lower_side(
+        self, store_with_run
+    ) -> None:
+        row = self._record(store_with_run, _report(
+            mode="bound", upper_bound=1.15e-2, upper_bound_basis="regime_a_passive",
+            R_reported_ohm=8.0e3, R_basis="regime_a_passive", regime="A",
+            regime_active=True, regime_sigma_lower=7.3e-3))
+        assert (row["sigma_kind"], row["sigma_reported_S_per_cm"],
+                row["sigma_lower_S_per_cm"]) == ("upper_bound", 1.15e-2, 7.3e-3)
+        assert row["sigma_S_per_cm"] is None
+
+    def test_record_fit_lower_bound_report_fills_foot_basis_sigma_column_unchanged(
+        self, store_with_run
+    ) -> None:
+        row = self._record(store_with_run, _report(
+            mode="unavailable", regime="A", regime_active=True,
+            regime_sigma_lower=7.3e-3, regime_R_foot_ohm=1.2e5))
+        assert {c: row[c] for c in SIGMA_OBS_COLUMNS} == {
+            "sigma_reported_S_per_cm": 7.3e-3, "sigma_kind": "lower_bound",
+            "sigma_lower_S_per_cm": None, "R_film_ohm": 1.2e5,
+            "R_film_basis": "regime_a_foot_lower"}
+        # `sigma_S_per_cm` is exactly what it was before these columns existed.
+        assert row["sigma_S_per_cm"] == self._k_over_r1()
+
+    def test_record_fit_rejected_report_still_records_kind_unadmitted(
+        self, store_with_run
+    ) -> None:
+        """Admission is the objective's business; this table records what was said."""
+        from dataclasses import replace
+
+        from softae.analysis.quality import QualityReport, Verdict
+
+        report = replace(_report(mode="value", value=1.2e-4, R_reported_ohm=5.0e4),
+                         quality=QualityReport(verdict=Verdict.REJECT))
+        assert not report.ok
+        row = self._record(store_with_run, report)
+        assert (row["sigma_kind"], row["sigma_reported_S_per_cm"],
+                row["gate_verdict"]) == ("value", 1.2e-4, "reject")
+
+    def test_record_fit_unavailable_inactive_report_leaves_columns_null(
+        self, store_with_run
+    ) -> None:
+        # Flag off: a lower value with `regime_active` False is not a stated bound.
+        row = self._record(store_with_run, _report(
+            mode="unavailable", regime="A", regime_sigma_lower=7.3e-3))
+        assert all(row[c] is None for c in SIGMA_OBS_COLUMNS)
+
+    def test_record_fit_without_report_leaves_columns_null(
+        self, store_with_run
+    ) -> None:
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        store.record_fit(mid, _FakeFitResult(), **self.GEOMETRY)
+        row = store.query_fits(measurement_id=mid)[0]
+        assert all(row[c] is None for c in SIGMA_OBS_COLUMNS)
+        assert row["sigma_S_per_cm"] == self._k_over_r1()
+
+
+#: Columns that differ between two rows of the same fit for reasons unrelated to R3.
+_ROW_IDENTITY = ("fit_id", "measurement_id", "fitted_at")
+
+#: One report per kind. The upper bound is the case `report=` would visibly move
+#: (`sigma_S_per_cm` nulled, `sigma_is_bound` set) and `observation=` must not.
+_KIND_REPORTS = {
+    "value": dict(mode="value", value=1.2e-4, R_reported_ohm=5.0e4,
+                  R_basis="split_bulk"),
+    "upper_bound": dict(mode="bound", upper_bound=3.0e-6,
+                        upper_bound_basis="loss_at_numerator",
+                        R_reported_ohm=2.0e6, R_basis="split_bulk"),
+    "lower_bound": dict(mode="unavailable", regime="A", regime_active=True,
+                        regime_sigma_lower=7.3e-3, regime_R_foot_ohm=1.2e5),
+}
+
+
+class TestRecordFitObservationKeyword:
+    """`observation=` (the campaign router's route) fills the five R3 columns ONLY.
+
+    P.18 — passing the router's report — would also move ~14 pre-existing columns,
+    and it is operator-held; this is the narrow alternative.
+    """
+
+    GEOMETRY = {"L_cm": 0.2, "t_cm": 0.015, "w_cm": 0.2}
+
+    def _row(self, store_with_run, **kwargs) -> dict:
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        fit = _annotated()
+        fit.quality = {"chi2": 1.0, "r_squared": 0.99}
+        store.record_fit(mid, fit, **self.GEOMETRY, **kwargs)
+        return store.query_fits(measurement_id=mid)[0]
+
+    @pytest.mark.parametrize("kind", sorted(_KIND_REPORTS))
+    def test_record_fit_observation_pre_existing_columns_identical_to_reportless_call(
+        self, store_with_run, kind
+    ) -> None:
+        from softae.analysis.eis.observation import sigma_observation
+
+        obs = sigma_observation(_report(**_KIND_REPORTS[kind]))
+        plain = self._row(store_with_run)
+        observed = self._row(store_with_run, observation=obs)
+        via_report = self._row(store_with_run, report=_report(**_KIND_REPORTS[kind]))
+
+        skip = set(_ROW_IDENTITY) | set(SIGMA_OBS_COLUMNS)
+        assert {k: v for k, v in observed.items() if k not in skip} == {
+            k: v for k, v in plain.items() if k not in skip}
+        # The five are the same whichever way they arrived.
+        assert {c: observed[c] for c in SIGMA_OBS_COLUMNS} == {
+            c: via_report[c] for c in SIGMA_OBS_COLUMNS}
+        assert observed["sigma_kind"] == kind
+
+    def test_record_fit_report_and_observation_report_wins(
+        self, store_with_run
+    ) -> None:
+        from softae.analysis.eis.observation import sigma_observation
+
+        other = sigma_observation(_report(**_KIND_REPORTS["lower_bound"]))
+        row = self._row(store_with_run, report=_report(**_KIND_REPORTS["value"]),
+                        observation=other)
+        assert (row["sigma_kind"], row["sigma_reported_S_per_cm"]) == ("value", 1.2e-4)
+
+    def test_record_fit_observation_of_unstated_report_leaves_columns_null(
+        self, store_with_run
+    ) -> None:
+        from softae.analysis.eis.observation import unmeasured
+
+        row = self._row(store_with_run, observation=unmeasured("U"))
+        assert all(row[c] is None for c in SIGMA_OBS_COLUMNS)

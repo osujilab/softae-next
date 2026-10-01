@@ -40,6 +40,7 @@ import structlog
 from softae.analysis.eis.regime import RegimeVerdict
 from softae.analysis.eis.report import (
     REGIME_A_FIT_RB,
+    REGIME_A_FOOT_LOWER,
     REGIME_A_PASSIVE,
     decide_report_mode,
 )
@@ -51,12 +52,17 @@ PAIR_RATIO = 1.5
 #: Decades from the foot to the top screened point below which the arc is not resolved.
 #: 1.5 leaves 10 false values on 2508 synthetic A, all compressed + HF artefact.
 SPAN_MIN_DEC = 1.5
-#: ``regime_reason`` when the route can state neither a value nor a bound.
+#: The :class:`~softae.analysis.eis.report.SigmaCeiling` reason when the passive bound
+#: is not positive, so no ceiling separates R_b from the series chain. A ceiling reason,
+#: never a ``regime_reason`` (that stays the classifier's) and never a basis.
 SERIES_NOT_SEPARABLE = "series_not_separable"
+#: ``regime_route_detail`` when the route ran but had no K to divide by.
+NO_CELL_CONSTANT = "no_cell_constant"
 
 VALUE, BOUND, UNAVAILABLE = "value", "bound", "unavailable"
 
-__all__ = ["REGIME_A_FIT_RB", "REGIME_A_PASSIVE", "SERIES_NOT_SEPARABLE", "RegimeSettings",
+__all__ = ["REGIME_A_FIT_RB", "REGIME_A_FOOT_LOWER", "REGIME_A_PASSIVE",
+           "SERIES_NOT_SEPARABLE", "NO_CELL_CONSTANT", "RegimeSettings",
            "RegimeAEstimates", "plateau_decision", "regime_a_estimates", "regime_a_kind",
            "regime_settings", "log_shadow", "route_basis"]
 
@@ -253,11 +259,16 @@ def log_shadow(channel: Any, verdict: RegimeVerdict, chosen: Any, today: Any, *,
         today_basis=(today.upper_bound_basis if today.mode != VALUE else today.R_basis),
         today_arc_gate=bool(today_arc_gate),
         regime_mode=chosen.regime_mode, regime_sigma=chosen.regime_sigma,
-        regime_basis=route_basis(chosen.regime_mode),
+        regime_basis=route_basis(chosen.regime_mode, chosen.regime_sigma_lower),
     )
 
 
-def route_basis(kind: str) -> str:
-    """The basis token the A route reports for each outcome; ``""`` when not A."""
-    return {VALUE: REGIME_A_FIT_RB, BOUND: REGIME_A_PASSIVE,
-            UNAVAILABLE: SERIES_NOT_SEPARABLE}.get(kind, "")
+def route_basis(kind: str, sigma_lower: float = float("nan")) -> str:
+    """The basis token the A route reports for each outcome; ``""`` when not A.
+
+    *unavailable* states the lower bound ``K/R_foot`` when it has one, and nothing — ``""``
+    — when it does not (no cell constant): an absent number has no basis.
+    """
+    if kind == UNAVAILABLE:
+        return REGIME_A_FOOT_LOWER if sigma_lower == sigma_lower else ""
+    return {VALUE: REGIME_A_FIT_RB, BOUND: REGIME_A_PASSIVE}.get(kind, "")

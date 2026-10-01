@@ -963,3 +963,309 @@ class TestPostMeasureReportsItsOwnHookFailing:
 
         assert loop.on_trial_measured_hook_failed is None
         await manager.disconnect_all()
+
+
+# ---------------------------------------------------------------------------
+# R1 / R2 / R8 / O1 — a measured well with no told value, and whole rounds
+# ---------------------------------------------------------------------------
+#
+# Operator rulings 2026-10-01 (`censored_tell_path_recommendations.md` R1–R8,
+# `censored_observation_tell_path.md` O1/O4): a bound is a successful
+# measurement. The park counter counts only wells that were not measured; a
+# classified spectrum or a bound resets it, is recorded, is never told as a
+# number, and a run of them alerts without parking. And a round closes every
+# well it cast before it parks or converges.
+
+
+def _obs(kind, *, regime="B", admitted=False, reported=1e-6, lower=None):
+    """A lane-A ``SigmaObservation``, the type the σ extractors hand the loop."""
+    from softae.analysis.eis.observation import CLASSIFIED_REGIMES, SigmaObservation
+
+    return SigmaObservation(
+        kind=kind, reported=reported if kind else None, lower=lower,
+        regime=regime, basis="test", R_film_ohm=None, admitted=admitted,
+        classified=regime in CLASSIFIED_REGIMES)
+
+
+#: Rung 3b / 3c-PAA shape: an old-route upper bound on a regime-B film.
+REGIME_B_BOUND = _obs("upper_bound", regime="B")
+
+
+def _unmeasured_u():
+    from softae.analysis.eis.observation import unmeasured
+
+    return unmeasured("U")
+
+
+def _scripted(outcomes):
+    """An extractor returning *outcomes* in order (an Exception is raised)."""
+    it = iter(outcomes)
+
+    def extract(*_args):
+        v = next(it)
+        if isinstance(v, Exception):
+            raise v
+        return v
+    return extract
+
+
+def _placement_loop(store, run_id, manager, outcomes, *, q=None, park_after=3,
+                    convergence_fn=None):
+    """Board-aware rounds over len(outcomes) wells; nothing is actually cast."""
+    from softae.core.electrode_allocator import ElectrodeAllocator
+    from softae.workflows.workflow_model import Workflow
+
+    n = len(outcomes)
+    return AutonomousLoop(
+        optimizer=GridSearchOptimizer(SIMPLE_SPACE, n_points=max(n, 2)),
+        workflow_template=Workflow(name="empty_trial"),
+        manager=manager, data_store=store, run_id=run_id,
+        objective_extractor=lambda r: 1.0,
+        auto_approve=True,
+        batch_size=q or n,
+        electrode_allocator=ElectrodeAllocator(capacity=max(n, 2)),
+        placement_workflow_builder=lambda batch, chs: Workflow(name="empty_trial"),
+        placement_objective_extractor=_scripted(outcomes),
+        max_iterations=n,
+        park_after_failed_trials=park_after,
+        convergence_fn=convergence_fn or (lambda h: False),
+    )
+
+
+def _three_path_loop(path, store, run_id, manager, outcomes, *, park_after=3):
+    """The same scripted wells through the single-point, batch or placement path."""
+    from softae.workflows.workflow_model import Workflow
+
+    n = len(outcomes)
+    if path == "placement":
+        return _placement_loop(store, run_id, manager, outcomes,
+                               park_after=park_after)
+    common = dict(
+        optimizer=GridSearchOptimizer(SIMPLE_SPACE, n_points=n),
+        workflow_template=Workflow(name="empty_trial"),
+        manager=manager, data_store=store, run_id=run_id,
+        auto_approve=True, max_iterations=n,
+        park_after_failed_trials=park_after,
+        convergence_fn=lambda h: False,
+    )
+    if path == "single":
+        return AutonomousLoop(objective_extractor=_scripted(outcomes), **common)
+    return AutonomousLoop(
+        objective_extractor=lambda r: 1.0, batch_size=n,
+        batch_workflow_builder=lambda batch: Workflow(name="empty_trial"),
+        batch_objective_extractor=_scripted(outcomes), **common)
+
+
+@pytest.fixture()
+async def mock_manager():
+    manager = _make_mock_manager()
+    await manager.connect_all()
+    yield manager
+    await manager.disconnect_all()
+
+
+class TestMeasuredButNotTold:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["single", "batch", "placement"])
+    async def test_close_well_three_regime_b_bounds_does_not_park(
+            self, store_with_run, mock_manager, path):
+        """R1: the rung-3b / 3c-PAA shape — every well a regime-B bound — measured.
+
+        Under the admission gate a B bound is not admitted, and before R1 that
+        made it *unmeasured*: three in a row parked the run, which is exactly
+        what O1 says a bound streak must never do. Parametrised over all three
+        tell paths, because a fix landing in one branch of three is this
+        codebase's recurring failure.
+        """
+        store, run_id = store_with_run
+        loop = _three_path_loop(path, store, run_id, mock_manager,
+                                [REGIME_B_BOUND] * 3)
+
+        await loop.run()
+
+        assert loop.park_reason is None
+        assert loop.consecutive_failures == 0
+        assert loop.iteration == 3
+        # Never told as a number (O5 deferred), so nothing reaches `best()`.
+        assert loop._optimizer.history == []
+        rows = store.query_doe_parameters(run_id=run_id)
+        assert len(rows) == 3
+        assert all(r["objective_value"] is None for r in rows)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["single", "batch", "placement"])
+    async def test_close_well_three_unmeasured_still_parks(
+            self, store_with_run, mock_manager, path):
+        """Positive control for the test above: unmeasured wells DO still park.
+
+        ``None`` (acquisition failure) and an observation that does not count as
+        measured (regime U, the empty well) are the systematic-fault shapes the
+        park counter exists for.
+        """
+        store, run_id = store_with_run
+        loop = _three_path_loop(path, store, run_id, mock_manager,
+                                [None, _unmeasured_u(), None])
+
+        await loop.run()
+
+        assert loop.park_reason is not None
+        assert "3 consecutive trial failures" in loop.park_reason
+        assert loop._optimizer.history == []
+
+    @pytest.mark.asyncio
+    async def test_close_well_measured_untold_is_reported_not_told(
+            self, store_with_run, mock_manager):
+        """R2/O4: the caller hears about the measurement (and labels it feasible)."""
+        store, run_id = store_with_run
+        loop = _placement_loop(store, run_id, mock_manager, [REGIME_B_BOUND])
+        untold: list[tuple] = []
+        results: list[tuple] = []
+        loop.on_measured_untold = lambda i, p, o: untold.append((i, o))
+        loop.on_result = lambda i, p, o: results.append((i, o))
+
+        await loop.run()
+
+        assert untold == [(0, REGIME_B_BOUND)]
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_close_well_admitted_bound_writes_kind_and_is_never_told(
+            self, store_with_run, mock_manager):
+        """O2/R3: an admitted bound's row carries the number, its kind and the
+        interval's other side; ``objective_value`` stays value-only (NULL)."""
+        store, run_id = store_with_run
+        bound = _obs("upper_bound", regime="A", admitted=True,
+                     reported=0.15, lower=0.031)
+        loop = _placement_loop(store, run_id, mock_manager, [bound, 2.0])
+
+        await loop.run()
+
+        rows = store.query_doe_parameters(run_id=run_id)
+        assert [r["objective_value"] for r in rows] == [None, 2.0]
+        assert rows[0]["objective_kind"] == "upper_bound"
+        assert rows[0]["objective_reported"] == pytest.approx(0.15)
+        assert rows[0]["objective_lower"] == pytest.approx(0.031)
+        # Only the value reached the optimizer.
+        assert [v for _, v in loop._optimizer.history] == [2.0]
+
+    @pytest.mark.asyncio
+    async def test_close_well_unadmitted_bound_writes_no_kind(
+            self, store_with_run, mock_manager):
+        """R3a: a kind is written only for an ADMITTED observation."""
+        store, run_id = store_with_run
+        loop = _placement_loop(store, run_id, mock_manager, [REGIME_B_BOUND])
+
+        await loop.run()
+
+        row, = store.query_doe_parameters(run_id=run_id)
+        assert row["objective_value"] is None
+        assert row.get("objective_kind") is None
+
+
+class TestBoundStreakAlert:
+    @pytest.mark.asyncio
+    async def test_close_well_bound_streak_alerts_once_and_never_parks(
+            self, store_with_run, mock_manager):
+        """O1: a run of measured-but-untold wells alerts, once, and never parks."""
+        store, run_id = store_with_run
+        loop = _placement_loop(store, run_id, mock_manager,
+                               [REGIME_B_BOUND] * 5, q=1)
+        alerts: list[tuple[int, int]] = []
+        loop.on_bound_streak = lambda streak, limit: alerts.append((streak, limit))
+
+        await loop.run()
+
+        assert alerts == [(3, 3)]
+        assert loop.park_reason is None
+        assert loop.iteration == 5
+
+    @pytest.mark.asyncio
+    async def test_close_well_told_value_resets_bound_streak(
+            self, store_with_run, mock_manager):
+        """Only a told value ends a streak; two short streaks never alert."""
+        store, run_id = store_with_run
+        loop = _placement_loop(
+            store, run_id, mock_manager,
+            [REGIME_B_BOUND, REGIME_B_BOUND, 1.0, REGIME_B_BOUND, REGIME_B_BOUND],
+            q=1)
+        alerts: list[tuple[int, int]] = []
+        loop.on_bound_streak = lambda streak, limit: alerts.append((streak, limit))
+
+        await loop.run()
+
+        assert alerts == []
+
+
+class TestRoundClosesEveryWell:
+    @pytest.mark.asyncio
+    async def test_tell_placed_park_on_well_two_still_records_wells_three_and_four(
+            self, store_with_run, mock_manager):
+        """R8: the streak hits its limit at well 2 of 4; wells 3–4 still land.
+
+        The old `_tell_placed` returned at the park, so the round's remaining
+        cast-and-measured wells got no DOE row and no tell. Now every row is
+        written and every measured well told, THEN the run parks — with the
+        resume point already on disk (count, checkpoint, park: preserved).
+        """
+        store, run_id = store_with_run
+        loop = _placement_loop(store, run_id, mock_manager,
+                               [None, None, 5.0, 6.0], park_after=2)
+        order: list[str] = []
+        loop.on_checkpoint = lambda i: order.append(f"ckpt{i}")
+        loop.on_park = lambda reason: order.append("park")
+
+        await loop.run()
+
+        assert loop.park_reason is not None
+        assert "2 consecutive trial failures" in loop.park_reason
+        rows = store.query_doe_parameters(run_id=run_id)
+        assert [r["objective_value"] for r in rows] == [None, None, 5.0, 6.0]
+        assert [v for _, v in loop._optimizer.history] == [5.0, 6.0]
+        assert order == ["ckpt1", "ckpt2", "ckpt3", "ckpt4", "park"]
+
+    @pytest.mark.asyncio
+    async def test_tell_placed_extraction_error_still_writes_the_row(
+            self, store_with_run, mock_manager):
+        """A cast well whose extractor raised still gets its DOE row (R8)."""
+        store, run_id = store_with_run
+        loop = _placement_loop(store, run_id, mock_manager,
+                               [RuntimeError("bad spectrum"), 7.0])
+
+        await loop.run()
+
+        rows = store.query_doe_parameters(run_id=run_id)
+        assert [r["objective_value"] for r in rows] == [None, 7.0]
+
+    @pytest.mark.asyncio
+    async def test_tell_placed_convergence_mid_round_still_tells_remaining_wells(
+            self, store_with_run, mock_manager):
+        """R8: a round that converges at well 2 still tells wells 3 and 4."""
+        store, run_id = store_with_run
+        loop = _placement_loop(store, run_id, mock_manager,
+                               [1.0, 2.0, 3.0, 4.0],
+                               convergence_fn=lambda h: len(h) >= 2)
+        converged: list[int] = []
+        loop.on_converged = lambda i, best: converged.append(i)
+
+        await loop.run()
+
+        assert loop.state is LoopState.CONVERGED
+        assert [v for _, v in loop._optimizer.history] == [1.0, 2.0, 3.0, 4.0]
+        rows = store.query_doe_parameters(run_id=run_id)
+        assert [r["objective_value"] for r in rows] == [1.0, 2.0, 3.0, 4.0]
+        assert converged == [4]
+
+    @pytest.mark.asyncio
+    async def test_batch_round_park_mid_round_still_tells_the_rest(
+            self, store_with_run, mock_manager):
+        """The batch round had the same early return; same rule, same result."""
+        store, run_id = store_with_run
+        loop = _three_path_loop("batch", store, run_id, mock_manager,
+                                [None, None, 5.0], park_after=2)
+
+        await loop.run()
+
+        assert loop.park_reason is not None
+        assert [v for _, v in loop._optimizer.history] == [5.0]
+        rows = store.query_doe_parameters(run_id=run_id)
+        assert [r["objective_value"] for r in rows] == [None, None, 5.0]

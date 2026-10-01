@@ -34,6 +34,7 @@ import structlog
 
 from softae.analysis.eis.engine import analyze_spectrum
 from softae.analysis.eis.geometry import CellConstant, cell_from_legacy_terms
+from softae.analysis.eis.observation import SigmaObservation, sigma_observation
 from softae.analysis.eis_data import EISResult
 from softae.analysis.measurement_result import MeasurementResult
 from softae.core.conditions_capture import read_environment, stamp_environment
@@ -181,6 +182,20 @@ def _cell_from_params(step: WorkflowStep) -> CellConstant | None:
                                       step.params["electrode_t_cm"],
                                       step.params["electrode_w_cm"])
     except (KeyError, TypeError):
+        return None
+
+
+def _observation_or_none(report: Any, step: WorkflowStep) -> SigmaObservation | None:
+    """The report's stated σ and kind for ``record_fit``, or ``None``.
+
+    ``sigma_observation`` never raises by contract; this guard keeps the router's
+    posture anyway, because a failure here must cost the five observation columns,
+    never the fit row or the measurement.
+    """
+    try:
+        return sigma_observation(report)
+    except Exception:  # noqa: BLE001 - the row matters more than its σ kind
+        logger.warning("eis_sigma_observation_failed", step=step.name, exc_info=True)
         return None
 
 
@@ -458,6 +473,10 @@ class EISResultRouter:
                 #
                 # ``report=`` is deliberately **not** passed to ``record_fit``: that
                 # is P.18, and it moves stored ``gate_verdict`` values.
+                #
+                # ``observation=`` is (R3, [e150]): it fills only the five stated-σ
+                # columns (``sigma_kind`` & co.) and leaves every other column exactly
+                # as the report-less call writes it, so P.18 stays operator-held.
                 report = analyze_spectrum(
                     eis_result,
                     cell=_cell_from_params(step),
@@ -484,6 +503,7 @@ class EISResultRouter:
                         L_cm=step.params.get("electrode_L_cm"),
                         t_cm=step.params.get("electrode_t_cm"),
                         w_cm=step.params.get("electrode_w_cm"),
+                        observation=_observation_or_none(report, step),
                     )
                     logger.info(
                         "eis_fit_autorouted",

@@ -103,7 +103,7 @@ from softae.core.phase_setpoints import PhaseSetpoints, baseline_event_payload
 from softae.core.production_read import take_production_read
 from softae.core.run_lock import held_run_lock, retitle_run_lock, rig_is_simulated
 from softae.core.run_plan import PhaseKind, RunPlan, SettlePlan
-from softae.core.alerts import CRITICAL, Alert, raise_alert
+from softae.core.alerts import CRITICAL, WARNING, Alert, raise_alert
 from softae.core.safe_park import safe_park
 from softae.core.shutdown import park_on_shutdown
 from softae.core.task_catalog import TaskCatalog
@@ -129,8 +129,12 @@ logger = structlog.get_logger(__name__)
 
 # (step_results, suggested_params) -> scalar objective.
 # Returns None to mean "no usable measurement"; the loop skips rather than
-# telling the optimizer a fabricated value. See eis_impedance_objective.
-ObjectiveExtractor = Callable[[dict[str, Any], dict[str, Any]], "float | None"]
+# telling the optimizer a fabricated value. See eis_impedance_objective. The EIS
+# σ extractors may also return a `SigmaObservation` for a measured well whose
+# number is not a told value (a bound, or a classified spectrum); the loop's
+# `_close_well` records it without telling it. A caller-supplied extractor
+# returning `float | None` is a subset of this and needs no change.
+ObjectiveExtractor = Callable[[dict[str, Any], dict[str, Any]], Any]
 
 # Event stream callback: receives a plain dict an agent/UI can react to.
 EventCallback = Callable[[dict[str, Any]], Any]
@@ -1930,9 +1934,13 @@ def settle_round_fits(
     channels: Sequence[int],
     *,
     thickness_for: Callable[[int], Any] | None = None,
+    regime: Any = None,
 ) -> list["RoundFit"]:
     """The criterion's tracked quantity per channel, one round — **always one
     entry per channel**.
+
+    *regime* is the campaign's one ``RegimeSettings`` (R6), so a settle round and
+    the scored read of the same film are analysed under the same flag read.
 
     A channel whose step did not complete comes back as an all-``None``
     :class:`~softae.analysis.equilibration.RoundFit` rather than being dropped,
@@ -1980,7 +1988,7 @@ def settle_round_fits(
         report = (None if raw is None else
                   _spectrum_report_from_raw(raw, channel=int(channel),
                                             thickness_um=thickness,
-                                            engine="legacy"))
+                                            engine="legacy", regime=regime))
         sigma = _report_sigma(report)
         # The tool path's own three-way split (`eis_validate_hold._round_fit`), reused
         # rather than re-spelled: a sweep that never happened and a fit that did not
@@ -2831,8 +2839,13 @@ def _trial_objective_kind(kind: str | None, *, has_thickness: bool) -> str:
 
 def _scalar_from_eis_raw(raw: Any, *, channel: int = 0,
                          thickness_um: float | None = None,
-                         kind: str | None = None) -> float | None:
-    """Mean impedance magnitude from one EIS step result, or None if unusable.
+                         kind: str | None = None,
+                         regime: Any = None) -> Any:
+    """The trial metric for one EIS step result, or None if unusable.
+
+    mean |Z| (a float) under a volume campaign; under a σ campaign, whatever
+    :func:`_sigma_from_eis_raw` returns — a float, a ``SigmaObservation`` or None.
+    *regime* is the campaign's one ``RegimeSettings`` (R6), passed through.
 
     Rejects non-finite results explicitly.  ``np.asarray(None, dtype=float)``
     yields ``array(nan)`` *without raising*, so a missing step result used to
@@ -2890,52 +2903,76 @@ def _scalar_from_eis_raw(raw: Any, *, channel: int = 0,
     # While mean |Z| is the campaign's metric the σ path still runs and logs what it
     # *would* have returned, so the two can be compared over a real campaign before
     # anything is flipped — the same observe-before-acting posture as [purge] actuate.
-    sigma = _sigma_from_eis_raw(raw, channel=channel, thickness_um=thickness_um)
+    sigma = _sigma_from_eis_raw(raw, channel=channel, thickness_um=thickness_um,
+                                regime=regime)
     if _trial_objective_kind(kind, has_thickness=thickness_um is not None) == "sigma":
         # No thickness under a σ campaign means *unmeasured*, never mean |Z|: handing
         # a maximiser an impedance for one channel would score the worst conductor in
         # the trial as its best result.
         return sigma
     if sigma is not None or legacy is not None:
-        logger.info("eis_objective_shadow", mean_abs_z=legacy, sigma=sigma,
+        logger.info("eis_objective_shadow", mean_abs_z=legacy,
+                    sigma=sigma if isinstance(sigma, float) else None,
+                    sigma_kind=getattr(sigma, "kind", None),
                     msg="σ objective observed; mean|Z| in use")
     return legacy
 
 
 def _sigma_from_eis_raw(raw: Any, *, channel: int = 0,
-                        thickness_um: float | None = None) -> float | None:
-    """Conductivity for one EIS step result, or ``None`` if it cannot be claimed.
+                        thickness_um: float | None = None,
+                        regime: Any = None) -> Any:
+    """σ for one EIS step result: a float, a ``SigmaObservation``, or ``None``.
 
-    Returns ``None`` — the existing *unmeasured* path — when the gates reject the
-    spectrum, when the fit is inadmissible, or when σ is only an **upper bound**. A
-    bound is a legitimate scientific result but it is not a value, and a campaign that
-    consumed one as a number would chase the instrument's own resolution limit.
+    Three answers, read off :func:`~softae.analysis.eis.observation.sigma_observation`
+    (the one mapping from a report to *value / lower bound / upper bound*):
+
+    * **a float** — an admitted σ value, exactly as before; the loop tells it.
+    * **a ``SigmaObservation``** — a successful measurement with no told value: an
+      admitted bound (a regime-route bound, which the store records with its kind),
+      or a spectrum the regime classifier labelled A, B or C whose number is not
+      admissible (an old-route bound, or a gate-rejected value). Operator ruling
+      2026-10-01: a bound IS a measurement, with less nominal power than a value. It
+      resets the park streak (R1), trains as feasible (O4/R2), and is never told to
+      the optimizer as a number (O5 deferred). The *old-route* bound is still never
+      admitted: on blocking-electrode films it sits 0.5–3.5 decades below the truth.
+    * **``None``** — not measured: no report, no thickness (a σ campaign's
+      geometry is missing, which is a wiring fault and must still park), or a
+      spectrum that is neither admitted nor classified (regime U, not classified).
+
+    *regime* is the campaign's one ``RegimeSettings`` (R6); ``None`` lets the
+    engine read ``[eis] regime_aware`` itself, which is the direct-caller path.
 
     Never raises: a broken analysis path must not discard a measurement.
     """
-    report = _spectrum_report_from_raw(raw, channel=channel, thickness_um=thickness_um)
+    report = _spectrum_report_from_raw(raw, channel=channel, thickness_um=thickness_um,
+                                       regime=regime)
     if report is None:
         return None
+    from softae.analysis.eis.observation import VALUE, sigma_observation
+
+    obs = sigma_observation(report)          # never raises
+    if obs.kind == VALUE and obs.admitted:
+        return obs.reported                  # finite and > 0 by construction
     try:
         if not report.ok:
             logger.warning("objective_rejected_by_gates",
                            reason=report.quality.summary())
-            return None
-        if not report.sigma.is_value:
+        else:
             logger.info("objective_declined_bound", mode=report.sigma.mode,
-                        upper_bound=report.sigma.upper_bound,
-                        msg="σ is an upper bound, not a value — reported as unmeasured")
-            return None
-        value = float(report.sigma.value)
+                        kind=obs.kind, reported=obs.reported, lower=obs.lower,
+                        regime=obs.regime, admitted=obs.admitted,
+                        msg="σ is not a value; recorded as a measurement, never told")
     except Exception:
         logger.warning("sigma_objective_unavailable", exc_info=True)
+    if thickness_um is None or not obs.counts_as_measured:
         return None
-    return value if math.isfinite(value) and value > 0 else None
+    return obs
 
 
 def _spectrum_report_from_raw(raw: Any, *, channel: int = 0,
                               thickness_um: float | None = None,
-                              engine: str | None = None) -> Any | None:
+                              engine: str | None = None,
+                              regime: Any = None) -> Any | None:
     """One EIS step result → a ``SpectrumReport``, or ``None`` if it cannot be built.
 
     **The single raw → physics hop on the campaign path.** σ and R₁ come out of
@@ -2948,6 +2985,11 @@ def _spectrum_report_from_raw(raw: Any, *, channel: int = 0,
     ``None`` it resolves ``[eis] engine``**, which is the objective's contract and
     must stay that way (see the T2.6b note below). Only the settle gate names an
     engine, and it names ``"legacy"`` — T11.15 / ``[a265]``.
+
+    ``regime`` is passed straight through too (R6). The campaign resolves
+    ``[eis] regime_aware`` **once** at build and hands the same ``RegimeSettings``
+    to every call, so a mid-run config edit cannot change the estimator under
+    values already told; ``None`` lets the engine read the key itself.
 
     Never raises: a broken analysis path must not discard a measurement.
     """
@@ -3009,7 +3051,8 @@ def _spectrum_report_from_raw(raw: Any, *, channel: int = 0,
         # in step, so naming ours here means the settle gate and the objective cannot
         # silently start fitting different circuits the day either default moves.
         return analyze_spectrum(eis, cell=cell, re_connection="bridged_by_sample",
-                                model_name=SETTLE_CIRCUIT_MODEL, engine=engine)
+                                model_name=SETTLE_CIRCUIT_MODEL, engine=engine,
+                                regime=regime)
     except Exception:
         logger.warning("sigma_objective_unavailable", exc_info=True)
         return None
@@ -3065,7 +3108,8 @@ def eis_impedance_objective(
     thickness_for: Callable[[int], float | None] | None = None,
     kind: str | None = None,
     step_tags: Mapping[str, Mapping[str, Any]] | None = None,
-) -> float | None:
+    regime: Any = None,
+) -> Any:
     """Default real objective, aggregated over the trial's EIS measurements.
 
     Averages the per-channel metric across every primary measurement step
@@ -3089,6 +3133,17 @@ def eis_impedance_objective(
     which the loop told the optimizer as a legitimate observation, making the
     surrogate confident about a point that was never measured. The loop skips a
     ``None`` instead of telling it.
+
+    **Bounds are never averaged (R4).** The replicates are distinct films, and a
+    bound on one film says nothing numeric about another, so only *values* enter
+    the mean. With at least one value the trial returns that mean, exactly as
+    before, and any bounds beside it are logged. With no value but at least one
+    measured channel (a bound, or a classified spectrum) the trial is a
+    measurement with nothing to tell: one channel's observation is returned as it
+    is, and several are not combined — the trial gets a classified, kind-less
+    observation, so it resets the park streak and labels feasible without
+    claiming a number for the trial row (``channel=0``). Each spectrum's own bound
+    is still on its ``fit_results`` row.
     """
     measured: list[tuple[str, int, Any]] = []  # (step name, channel, raw result)
     if step_tags is not None:
@@ -3119,14 +3174,33 @@ def eis_impedance_objective(
         kind, has_thickness=any(t is not None for t in thickness.values()))
 
     scalars: list[float] = []
+    untold: list[Any] = []                    # measured channels with no value
     for name, channel, raw in measured:
         value = _scalar_from_eis_raw(
-            raw, channel=channel, thickness_um=thickness[name], kind=settled)
-        if value is not None:
+            raw, channel=channel, thickness_um=thickness[name], kind=settled,
+            regime=regime)
+        if value is None:
+            continue
+        if hasattr(value, "counts_as_measured"):
+            untold.append(value)
+        else:
             scalars.append(value)
-    if not scalars:
+    if scalars:
+        if untold:
+            logger.info("objective_bounds_not_averaged", n_values=len(scalars),
+                        kinds=[o.kind for o in untold],
+                        msg="replicate bounds are kept out of the mean (R4)")
+        return float(sum(scalars) / len(scalars))
+    if not untold:
         return None
-    return float(sum(scalars) / len(scalars))
+    if len(untold) == 1:
+        return untold[0]
+    from softae.analysis.eis.observation import unmeasured
+
+    # Every member counts as measured, so at least one is classified (an admitted
+    # bound is a regime-A route answer); that one's label makes the trial measured.
+    anchor = next((o for o in untold if o.classified), untold[0])
+    return replace(unmeasured(anchor.regime), basis="replicates_not_combined")
 
 
 def eis_impedance_objective_for_channel(
@@ -3136,7 +3210,8 @@ def eis_impedance_objective_for_channel(
     thickness_for: Callable[[int], float | None] | None = None,
     kind: str | None = None,
     step_tags: Mapping[str, Mapping[str, Any]] | None = None,
-) -> float | None:
+    regime: Any = None,
+) -> Any:
     """Per-channel EIS objective — the batched (q-BO) analog of the aggregate.
 
     Reads only *this channel's* primary measurement so each of the q distinct
@@ -3153,6 +3228,9 @@ def eis_impedance_objective_for_channel(
     *kind* comes from the campaign, exactly as for the aggregate: the q members of a
     batched round are compared against each other by the optimizer, so they must all
     be scored in the same metric.
+
+    Under a σ campaign a measured well with no told value comes back as its
+    ``SigmaObservation`` (see :func:`_sigma_from_eis_raw`), never coerced.
     """
     if step_tags is None:
         raw = step_results.get(measure_step_name(channel))
@@ -3168,8 +3246,10 @@ def eis_impedance_objective_for_channel(
         return None
     thickness = thickness_for(channel) if thickness_for is not None else None
     scalar = _scalar_from_eis_raw(raw, channel=channel, thickness_um=thickness,
-                                  kind=kind)
-    return float(scalar) if scalar is not None else None
+                                  kind=kind, regime=regime)
+    if scalar is None or hasattr(scalar, "counts_as_measured"):
+        return scalar
+    return float(scalar)
 
 
 def composition_target_objective(
@@ -3786,6 +3866,16 @@ async def run_autonomous_campaign(
         # was previously resolved, or omitted, per extractor: the placement path
         # passed no thickness at all and so could never produce a σ.)
         _thickness_for = make_thickness_lookup(data_store, run_id)
+        # R6: `[eis] regime_aware` is read ONCE, here, and the same settings ride
+        # into every analysis this campaign runs (objective and settle alike).
+        # The engine would otherwise re-read the key per spectrum, and a mid-run
+        # config edit could change the estimator under values already told.
+        from softae.analysis.eis.regime_route import regime_settings
+
+        _regime = regime_settings()
+        logger.info("campaign_regime_settings", campaign=spec.name,
+                    regime_aware=_regime.enabled)
+        emit("regime_settings", regime_aware=_regime.enabled)
         _objective_kind: str | None = None
         _objective: ObjectiveSpec | None = None
         # Only a *registered* modality's objective has a physically required
@@ -3813,7 +3903,7 @@ async def run_autonomous_campaign(
             return _objective.channel_extractor(
                 step_results, channels[index],
                 thickness_for=_thickness_for, kind=_objective_kind,
-                step_tags=trial_step_tags)
+                step_tags=trial_step_tags, regime=_regime)
 
         if spec.batch and batch_size > 1:
             emit("batch_mode", q=batch_size, channels=channels)
@@ -3893,7 +3983,7 @@ async def run_autonomous_campaign(
             return _objective.channel_extractor(
                 step_results, channel,
                 thickness_for=_thickness_for, kind=_objective_kind,
-                step_tags=trial_step_tags)
+                step_tags=trial_step_tags, regime=_regime)
 
         def equilibration_builder() -> Workflow:
             return build_equilibration_workflow(spec)
@@ -3988,7 +4078,7 @@ async def run_autonomous_campaign(
                 return _objective.extractor(
                     step_results, params,
                     thickness_for=_thickness_for, kind=_objective_kind,
-                    step_tags=trial_step_tags)
+                    step_tags=trial_step_tags, regime=_regime)
         last_params: dict[str, Any] = {}
 
         def loop_extractor(step_results: dict[str, Any]) -> float:
@@ -4298,7 +4388,8 @@ async def run_autonomous_campaign(
                 channels=round_channels,
                 measure_round=lambda i: _settle_round(round_channels, i),
                 fits_from=lambda raws: settle_round_fits(
-                    raws, round_channels, thickness_for=_thickness_for),
+                    raws, round_channels, thickness_for=_thickness_for,
+                    regime=_regime),
                 r1_bound_ohms=settle_r1_bound_ohms(),
                 rh_for_round=_settle_round_rh,
                 on_round=_on_settle_round,
@@ -4533,13 +4624,14 @@ async def run_autonomous_campaign(
 
         def _on_result(i: int, p: dict[str, Any], o: float) -> None:
             emit("result", iteration=i, params=dict(p), objective=o)
-            # THE feasible label, recorded here and nowhere else, because "the
-            # composition mixed, cast, dried and measured" means *reached
-            # optimizer.tell* — which is exactly this callback and no earlier
-            # point. A spectrum that gates cleanly but whose σ is only an upper
-            # bound never gets here, and must not be labelled feasible: that
-            # would fabricate the same kind of fact the NULL discipline exists
-            # to refuse.
+            # The feasible label for a TOLD value. "The composition mixed, cast,
+            # dried and measured" is the label's meaning, and since the operator's
+            # 2026-10-01 rulings (O4, R2) a bound or a classified spectrum is a
+            # successful measurement too: those wells are labelled feasible by
+            # `_on_measured_untold` below, not here, because they never reach
+            # optimizer.tell. What still never earns the label is an unmeasured
+            # well (no spectrum, regime U, nothing classified) — that would
+            # fabricate the fact the NULL discipline exists to refuse.
             #
             # `channel=None` on purpose: this objective may aggregate several
             # replicate electrodes, so there is no single channel it belongs to.
@@ -4550,6 +4642,40 @@ async def run_autonomous_campaign(
                                          objective_value=o)
 
         loop.on_result = _on_result
+
+        def _on_measured_untold(i: int, p: dict[str, Any], obs: Any) -> None:
+            # A measured well with no told value (a bound, or a classified
+            # spectrum). Visible on the event stream, and feasible (O4/R2) with no
+            # objective value — the label claims the film measured, not a number.
+            emit("result_untold", iteration=i, params=dict(p), kind=obs.kind,
+                 reported=obs.reported, lower=obs.lower, regime=obs.regime,
+                 basis=obs.basis, admitted=obs.admitted)
+            label_engine.record_measured(params=p, channel=None,
+                                         objective_value=None)
+
+        loop.on_measured_untold = _on_measured_untold
+
+        def _on_bound_streak(streak: int, limit: int) -> None:
+            # O1: a run of measured wells with no told value ALERTS and never
+            # parks. Durable, like the park alert, because the event stream dies
+            # with the process.
+            emit("bound_streak", streak=streak, limit=limit,
+                 iteration=loop.iteration)
+            raise_alert(
+                Alert(
+                    kind="bound_streak",
+                    message=(f"Campaign '{spec.name}': {streak} measured wells in a "
+                             "row gave no value to tell (bounds or unadmitted σ); "
+                             "the run continues"),
+                    severity=WARNING,
+                    run_id=run_id,
+                    details={"iteration": loop.iteration, "streak": streak,
+                             "limit": limit},
+                ),
+                data_store=data_store,
+            )
+
+        loop.on_bound_streak = _on_bound_streak
         loop.on_trial_measured = (
             _equilibrate_then_label if settle_plan is not None else _confirm_and_label)
         loop.on_state_change = lambda old, new: emit("state", old=old.name, new=new.name)

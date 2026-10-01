@@ -3356,3 +3356,220 @@ async def test_anneal_hold_alert_row_carries_the_run_id(connected, tmp_path: Pat
             "either never persisted or written with run_id NULL")
         assert faults[0]["severity"] == "critical"
         assert faults[0]["run_id"] == result.run_id
+
+
+# ── R1 / R2 / R4 / R6 / O1: bounds on the campaign tell path ─────────────────
+#
+# Operator rulings 2026-10-01 (`censored_tell_path_recommendations.md` R1–R8,
+# `censored_observation_tell_path.md` O1/O2/O4). Every spectrum below is a
+# production shape: it goes through `analyze_spectrum` from the slice-1 regime
+# fixtures, never a hand-set report.
+
+
+def _regime_raw(gen, index: int):
+    """The *index*-th spectrum of a slice-1 regime fixture, as an EIS step result."""
+    import itertools
+
+    import numpy as np
+
+    from tests.eis_regime_synthetic import RIG_F
+
+    _params, Z = next(itertools.islice(gen(), index, None))
+    return [np.column_stack([RIG_F, np.abs(Z), np.degrees(np.angle(Z)),
+                             Z.real, -Z.imag])]
+
+
+def _b_bound_raw():
+    """Rung-3b mimic that the engine reports as an old-route upper bound, regime B."""
+    from tests.eis_regime_synthetic import step1_regime_b
+
+    return _regime_raw(step1_regime_b, 1)
+
+
+def _a_value_raw():
+    from tests.eis_regime_synthetic import step1_regime_a
+
+    return _regime_raw(step1_regime_a, 0)
+
+
+def _a_route_bound_raw():
+    """A regime-A film the active route answers with an interval (upper bound)."""
+    from tests.eis_regime_synthetic import rs_grid
+
+    return _regime_raw(rs_grid, 25)
+
+
+def _regime(enabled: bool):
+    from softae.analysis.eis.regime_route import RegimeSettings
+
+    return RegimeSettings(enabled=enabled)
+
+
+def test_sigma_extractor_regime_b_bound_returns_measured_observation():
+    """R1: a classified B bound is a measurement, not ``None`` (was: unmeasured)."""
+    from softae.core.autonomous_wiring import _sigma_from_eis_raw
+
+    obs = _sigma_from_eis_raw(_b_bound_raw(), channel=5, thickness_um=150.0,
+                              regime=_regime(True))
+
+    assert obs.regime == "B"
+    assert obs.kind == "upper_bound"
+    assert obs.admitted is False             # old-route bound: never admitted
+    assert obs.counts_as_measured is True
+
+
+def test_sigma_extractor_no_thickness_classified_spectrum_returns_none():
+    """A σ campaign with no geometry is a wiring fault and must still park."""
+    from softae.core.autonomous_wiring import _sigma_from_eis_raw
+
+    assert _sigma_from_eis_raw(_b_bound_raw(), channel=5,
+                               regime=_regime(True)) is None
+
+
+def test_sigma_extractor_route_a_bound_admitted_only_with_the_flag():
+    """The same A film: an admitted interval with the route on; today's answer off.
+
+    Off, today's route reports a value for this film, so the bound appears only
+    when the campaign's settings arm the route — the flag-off stream is today's.
+    """
+    from softae.core.autonomous_wiring import _sigma_from_eis_raw
+
+    on = _sigma_from_eis_raw(_a_route_bound_raw(), channel=5, thickness_um=150.0,
+                             regime=_regime(True))
+    off = _sigma_from_eis_raw(_a_route_bound_raw(), channel=5, thickness_um=150.0,
+                              regime=_regime(False))
+
+    assert (on.kind, on.admitted) == ("upper_bound", True)
+    assert on.lower is not None and on.lower < on.reported
+    assert isinstance(off, float)
+
+
+def test_eis_objective_for_channel_bound_returns_observation_not_float():
+    """The placement extractor hands the loop the observation, uncoerced."""
+    obs = eis_impedance_objective_for_channel(
+        {measure_step_name(5): _b_bound_raw()}, 5,
+        thickness_for=lambda ch: 150.0, kind="sigma", regime=_regime(True))
+
+    assert not isinstance(obs, float)
+    assert obs.counts_as_measured is True
+
+
+def test_eis_aggregate_objective_values_and_bounds_returns_mean_of_values_only():
+    """R4: a bound on one replicate film is never averaged into another's value."""
+    from softae.core.autonomous_wiring import eis_impedance_objective
+
+    value_only = eis_impedance_objective(
+        {measure_step_name(5): _a_value_raw()}, PARAMS,
+        thickness_for=lambda ch: 150.0, kind="sigma", regime=_regime(False))
+    mixed = eis_impedance_objective(
+        {measure_step_name(5): _a_value_raw(), measure_step_name(6): _b_bound_raw()},
+        PARAMS, thickness_for=lambda ch: 150.0, kind="sigma", regime=_regime(False))
+
+    assert isinstance(value_only, float)
+    assert mixed == pytest.approx(value_only, rel=1e-12)
+
+
+def test_eis_aggregate_objective_two_bounds_not_combined_returns_kindless_measured():
+    """R4: two replicate bounds are neither averaged nor merged into one bound.
+
+    The trial is still a measurement (no park, feasible), but its trial-grain
+    row claims no number: each film's bound stays on its own spectrum row.
+    """
+    from softae.core.autonomous_wiring import eis_impedance_objective
+
+    out = eis_impedance_objective(
+        {measure_step_name(5): _b_bound_raw(), measure_step_name(6): _b_bound_raw()},
+        PARAMS, thickness_for=lambda ch: 150.0, kind="sigma", regime=_regime(True))
+
+    assert out.kind is None and out.reported is None
+    assert out.admitted is False
+    assert out.counts_as_measured is True
+    assert out.basis == "replicates_not_combined"
+
+
+def test_eis_aggregate_objective_one_bound_returns_that_observation():
+    from softae.core.autonomous_wiring import eis_impedance_objective
+
+    out = eis_impedance_objective(
+        {measure_step_name(5): _b_bound_raw()}, PARAMS,
+        thickness_for=lambda ch: 150.0, kind="sigma", regime=_regime(True))
+
+    assert out.kind == "upper_bound" and out.regime == "B"
+
+
+@pytest.mark.asyncio
+async def test_campaign_regime_flag_read_once_mid_run_edit_does_not_reach_engine(
+        connected, tmp_path: Path, monkeypatch):
+    """R6: `[eis] regime_aware` is read once; a mid-run edit changes nothing.
+
+    The reader is patched to answer ``off`` on its first call and ``on`` on every
+    later one — an operator editing the config while the run is going. Every
+    analysis the campaign runs must still carry the start-of-run settings, and
+    the engine's own per-spectrum read must never be what decides.
+    """
+    import softae.analysis.eis.engine as engine
+    import softae.analysis.eis.regime_route as rr
+
+    reads: list[bool] = []
+
+    def edited_mid_run(config=None):
+        reads.append(True)
+        return rr.RegimeSettings(enabled=len(reads) > 1)
+
+    monkeypatch.setattr(rr, "regime_settings", edited_mid_run)
+    real = engine.analyze_spectrum
+    passed: list = []
+
+    def spy(*args, **kwargs):
+        if "regime" in kwargs:
+            passed.append(kwargs["regime"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "analyze_spectrum", spy)
+    store = DataStore(tmp_path / "proj_regime")
+    events: list[dict] = []
+    try:
+        await run_autonomous_campaign(
+            _spec(optimizer="grid", budget=2), manager=connected,
+            data_store=store, on_event=events.append)
+    finally:
+        store.close()
+
+    assert reads == [True], "the campaign must read the flag exactly once"
+    assert passed, "no campaign-path analysis received the campaign's settings"
+    assert all(r is passed[0] for r in passed)
+    assert passed[0].enabled is False
+    assert [e["regime_aware"] for e in events if e["type"] == "regime_settings"] == [False]
+
+
+@pytest.mark.asyncio
+async def test_campaign_regime_b_bounds_alert_record_and_never_park(
+        connected, tmp_path: Path):
+    """R1 + R2 + O1 end to end: four B bounds in a row.
+
+    No park; every well emits ``result_untold`` and is labelled feasible
+    (``outcome = measured``) with a NULL objective; one durable WARNING alert
+    says the streak happened; nothing reaches the optimizer.
+    """
+    from softae.core.autonomous_wiring import _sigma_from_eis_raw
+
+    bound = _sigma_from_eis_raw(_b_bound_raw(), channel=5, thickness_um=150.0,
+                                regime=_regime(True))
+    store = DataStore(tmp_path / "proj_bounds")
+    events: list[dict] = []
+    result = await run_autonomous_campaign(
+        _spec(optimizer="grid", budget=4), manager=connected, data_store=store,
+        objective_extractor=lambda results, params: bound,
+        on_event=events.append)
+    rows = store.query_doe_parameters(run_id=result.run_id)
+    alerts = store.query_alerts(run_id=result.run_id)
+    store.close()
+
+    assert result.park_reason is None
+    assert result.history == []
+    assert sum(e["type"] == "result_untold" for e in events) == 4
+    assert [e["streak"] for e in events if e["type"] == "bound_streak"] == [3]
+    assert len(rows) == 4
+    assert all(r["objective_value"] is None for r in rows)
+    assert all(r["outcome"] == "measured" for r in rows)
+    assert [(a["kind"], a["severity"]) for a in alerts] == [("bound_streak", "warning")]

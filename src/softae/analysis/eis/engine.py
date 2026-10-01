@@ -707,7 +707,7 @@ def _regime_a_sigma(verdict: Any, today: SigmaReport, *, cell: CellConstant | No
                sigma_value=sig(est.R_fit), sigma_sum=sig(est.R_fit + est.R_fit_s),
                sigma_lower=sig(est.R_foot))
     if cell is None:
-        kind, log["route_detail"] = rr.UNAVAILABLE, "no_cell_constant"
+        kind, log["route_detail"] = rr.UNAVAILABLE, rr.NO_CELL_CONSTANT
     common = dict(
         value=nan, upper_bound=nan, upper_bound_f_hz=nan, upper_bound_basis="unavailable",
         rel_uncertainty=nan, R_reported_se_ohm=nan, rho=nan, cross_check_pct=nan,
@@ -717,7 +717,8 @@ def _regime_a_sigma(verdict: Any, today: SigmaReport, *, cell: CellConstant | No
         numerator_phase_saturated=plateau.numerator_phase_saturated,
         headroom_window=plateau.window,
         regime=verdict.label, regime_reason=verdict.reason, regime_mode=kind,
-        regime_sigma_lower=log["sigma_lower"],
+        regime_sigma_lower=log["sigma_lower"], regime_R_foot_ohm=est.R_foot,
+        regime_route_detail=log["route_detail"],
     )
     if kind == rr.VALUE:
         mf = today.model_free_R_ohm
@@ -736,9 +737,17 @@ def _regime_a_sigma(verdict: Any, today: SigmaReport, *, cell: CellConstant | No
                       R_basis=rr.REGIME_A_PASSIVE, regime_sigma=ub)
         return (replace(today, **common),
                 SigmaCeiling(value=ub, basis=rr.REGIME_A_PASSIVE), log)
-    common.update(mode="unavailable", provisional=False, R_reported_ohm=nan,
-                  R_basis=rr.REGIME_A_FIT_RB, regime_reason=rr.SERIES_NOT_SEPARABLE)
-    return replace(today, **common), SigmaCeiling(reason=rr.SERIES_NOT_SEPARABLE), log
+    # Neither a value nor a ceiling. With a lower bound, the resistance behind it is
+    # R_foot and the row says so; without one (no cell constant, or no positive R_foot)
+    # nothing was stated, and the basis stays the fit's R_b at NaN — never the foot's.
+    lower = log["sigma_lower"]
+    if lower == lower:
+        common.update(R_reported_ohm=est.R_foot, R_basis=rr.REGIME_A_FOOT_LOWER)
+    else:
+        common.update(R_reported_ohm=nan, R_basis=rr.REGIME_A_FIT_RB)
+    common.update(mode="unavailable", provisional=False)
+    why = "no cell constant" if cell is None else rr.SERIES_NOT_SEPARABLE
+    return replace(today, **common), SigmaCeiling(reason=why), log
 
 
 def _regime_report(eis_result: Any, verdict: Any, route_a: bool, today: SigmaReport,
@@ -763,7 +772,8 @@ def _regime_report(eis_result: Any, verdict: Any, route_a: bool, today: SigmaRep
         shadow = dict(regime=verdict.label, regime_reason=verdict.reason)
         if a_sigma is not None:
             shadow.update({k: getattr(a_sigma, k) for k in (
-                "regime_reason", "regime_mode", "regime_sigma", "regime_sigma_lower")})
+                "regime_reason", "regime_mode", "regime_sigma", "regime_sigma_lower",
+                "regime_R_foot_ohm", "regime_route_detail")})
         chosen = (replace(a_sigma, regime_active=True) if route_a and a_sigma is not None
                   else replace(today, **shadow))
         log_shadow(getattr(eis_result, "channel", None), verdict, chosen, today,

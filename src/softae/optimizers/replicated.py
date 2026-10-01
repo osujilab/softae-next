@@ -15,6 +15,7 @@ is what replicates are for and must never be de-duplicated.
 
 from __future__ import annotations
 
+import numbers
 from typing import Any
 
 import structlog
@@ -145,7 +146,19 @@ class ReplicatingOptimizer(BaseOptimizer):
 
     def tell(self, params: dict[str, Any], result: float) -> None:
         """One call per WELL: the inner deliberately receives k observations at
-        the same x, which is the scatter replication exists to measure."""
+        the same x, which is the scatter replication exists to measure.
+
+        **Never an average, and never a bound (R4).** The k replicates are
+        distinct films, so they are told one by one and nothing here combines
+        them, and a bound on one film is not a number for any of them. The loop
+        keeps bounds away from ``tell`` (O5 is deferred); a non-number reaching
+        here is refused loudly rather than stored, because the inner's history
+        is what ``best()``, convergence and the surrogate all read.
+        """
+        if isinstance(result, bool) or not isinstance(result, numbers.Real):
+            raise OptimizerError(
+                f"ReplicatingOptimizer.tell takes a number per well, got "
+                f"{type(result).__name__}; a bound is recorded, never told")
         self._inner.tell(params, result)
 
     def best(self) -> tuple[dict[str, Any], float] | None:

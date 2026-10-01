@@ -91,9 +91,12 @@ DEFAULT_ABOVE_CEILING_FRAC = 0.5
 #: stored row has ever carried the third basis. It goes live with the E6 flip.
 #: Regime-A bases (slice 1, ``analysis/eis/regime_route.py``). The fit's R_b is the film
 #: alone — every series element excluded, because K is film geometry. The passive token
-#: is also the ceiling basis of the bound ``σ ≤ K/R_b,min``.
+#: is also the ceiling basis of the bound ``σ ≤ K/R_b,min``. The foot token is the
+#: lower bound ``σ ≥ K/R_foot`` when neither a value nor a ceiling can be stated: R_foot
+#: is R_s + R_b, so it over-states R_b and the σ it gives can only be low (R7).
 REGIME_A_FIT_RB = "regime_a_fit_rb"
 REGIME_A_PASSIVE = "regime_a_passive"
+REGIME_A_FOOT_LOWER = "regime_a_foot_lower"
 
 BASIS_TEXT = {
     "split_bulk": "R_bulk",
@@ -101,6 +104,7 @@ BASIS_TEXT = {
     BASIS_SUM_UNQUALIFIED: "R_series+R_bulk (unqualified)",
     REGIME_A_FIT_RB: "R_b (regime-A fit, series excluded)",
     REGIME_A_PASSIVE: "R_b,min (regime-A passive bound)",
+    REGIME_A_FOOT_LOWER: "R_foot (regime-A lower bound, series included)",
 }
 
 
@@ -184,12 +188,17 @@ class SigmaReport:
     #: ``regime_mode`` / ``regime_sigma`` are what the regime-A route says (value, or the
     #: bound it states) and ``regime_sigma_lower`` is ``K/R_foot`` when it can state
     #: neither. ``regime_active`` is whether that answer is the one reported above.
+    #: ``regime_reason`` is always the **classifier's** reason; why the A route chose its
+    #: outcome (``pair_disagrees``, ``no_cell_constant``, …) is ``regime_route_detail``.
+    #: ``regime_R_foot_ohm`` is the resistance behind ``regime_sigma_lower``.
     regime: str = ""
     regime_reason: str = ""
     regime_mode: str = ""
     regime_sigma: float = float("nan")
     regime_sigma_lower: float = float("nan")
     regime_active: bool = False
+    regime_R_foot_ohm: float = float("nan")
+    regime_route_detail: str = ""
 
     @property
     def is_bound(self) -> bool:
