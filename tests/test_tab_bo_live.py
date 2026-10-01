@@ -76,6 +76,19 @@ def test_tab_constructs(qapp, manager):
     assert spec.seed_observations == ()
 
 
+def test_layout_settings_scroll_and_controls_beside_log(qapp, manager):
+    """Settings scroll instead of squashing; the campaign stop sits by the log."""
+    from PySide6.QtWidgets import QScrollArea
+
+    tab = LiveBOCampaignTab(manager)
+    scroll = tab._settings_scroll
+    assert isinstance(scroll, QScrollArea) and scroll.widgetResizable()
+    for setting in (tab._tbl_params, tab._combo_search_mode):
+        assert scroll.widget().isAncestorOf(setting)
+    assert not scroll.parentWidget().isAncestorOf(tab._campaign_controls)
+    assert tab._campaign_controls.parentWidget() is tab._log.parentWidget().parentWidget()
+
+
 def test_build_config_carries_priors(qapp, manager):
     tab = LiveBOCampaignTab(manager)
     tab._combo_prior.setCurrentText("linear (demo)")

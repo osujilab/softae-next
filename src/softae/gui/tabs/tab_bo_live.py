@@ -56,6 +56,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -63,6 +64,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QSplitter,
@@ -204,10 +206,28 @@ class LiveBOCampaignTab(AutonomousRunMixin, BOTabBase):
         col.addWidget(self._grp_priors())
         col.addStretch()
 
+        # Scroll rather than squash: without this, a column shorter than the
+        # groups' combined natural height compresses every row below its size
+        # hint, and the rows then overlap and clip.
+        self._settings_scroll = QScrollArea()
+        self._settings_scroll.setWidget(params)
+        self._settings_scroll.setWidgetResizable(True)
+        self._settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._settings_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        # Horizontal scrolling is off, so the column must never be narrower
+        # than its content: measured, not a constant, because the long checkbox
+        # and board-combo texts scale with the display's font and DPI.
+        self._settings_scroll.setMinimumWidth(
+            params.minimumSizeHint().width()
+            + self._settings_scroll.verticalScrollBar().sizeHint().width()
+        )
+
         wrap = QWidget()
         wrap_v = QVBoxLayout(wrap)
         wrap_v.setContentsMargins(0, 0, 0, 0)
-        wrap_v.addWidget(params, stretch=1)
+        wrap_v.addWidget(self._settings_scroll, stretch=1)
         # Live campaigns have no exportable JSON result object → no export button,
         # and no in-process Abort: the campaign runs in another process, so the
         # cooperative flag that button sets would reach nothing while reporting
@@ -216,13 +236,6 @@ class LiveBOCampaignTab(AutonomousRunMixin, BOTabBase):
             self._make_control_bar(run_label="▶  Run Live Campaign",
                                    with_export=False, with_abort=False)
         )
-        # The only stop this tab offers, and the only one that can work: a
-        # request written to the campaign's run directory, actioned inside the
-        # process that holds the sessions. Campaign-scoped, so it belongs in the
-        # tab that surfaces the campaign; the rig-scale stop stays on the toolbar.
-        self._campaign_controls = CampaignControlBar(parent=wrap)
-        self._campaign_controls.acknowledged.connect(self._on_control_ack)
-        wrap_v.addWidget(self._campaign_controls)
         return wrap
 
     def _on_control_ack(self, ack: dict[str, Any]) -> None:
@@ -604,7 +617,24 @@ class LiveBOCampaignTab(AutonomousRunMixin, BOTabBase):
         tabs.addTab(sc, "Suggested points")
 
         right.addWidget(tabs)
-        right.addWidget(self._make_log_pane(title="Campaign Log"))
+
+        # The campaign's log and the campaign's stop, together: an answer to a
+        # Pause/Abort request lands in the log directly above the buttons.
+        log_and_controls = QWidget()
+        lc_v = QVBoxLayout(log_and_controls)
+        lc_v.setContentsMargins(0, 0, 0, 0)
+        lc_v.addWidget(self._make_log_pane(title="Campaign Log"), stretch=1)
+        # The only stop this tab offers, and the only one that can work: a
+        # request written to the campaign's run directory, actioned inside the
+        # process that holds the sessions. Campaign-scoped, so it belongs in the
+        # tab that surfaces the campaign; the rig-scale stop stays on the toolbar.
+        self._campaign_controls = CampaignControlBar(parent=log_and_controls)
+        self._campaign_controls.acknowledged.connect(self._on_control_ack)
+        # A splitter squeezes to minimumSizeHint, which ignores the word-wrapped
+        # note's height-for-width and clips its last line; the log gives way instead.
+        self._campaign_controls.setMinimumHeight(self._campaign_controls.sizeHint().height())
+        lc_v.addWidget(self._campaign_controls)
+        right.addWidget(log_and_controls)
         right.setStretchFactor(0, 4)
         right.setStretchFactor(1, 1)
         return right
