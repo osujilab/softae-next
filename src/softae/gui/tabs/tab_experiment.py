@@ -1926,6 +1926,21 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
         if display_name.startswith("measure_eis_ch") and result is not None:
             try:
                 eis = self._raw_to_eis_result(result, ch)
+                # One snapshot, read before the append, feeds both the header that
+                # "Save EIS Data…" writes (no DataStore needed) and the conditions
+                # row below, so the two cannot disagree. A failed read must never
+                # cost the spectrum: it is kept with its header still NaN.
+                env = None
+                try:
+                    from softae.core.conditions_capture import (
+                        read_environment,
+                        stamp_environment,
+                    )
+
+                    env = read_environment(self._manager)
+                    stamp_environment(eis, env)
+                except Exception as exc:
+                    logger.warning("eis_env_read_error", channel=ch, error=str(exc))
                 self._eis_results.append(eis)
                 detail = f"{eis.npts} pts, f=[{eis.frequency.min():.0f}-{eis.frequency.max():.0f}] Hz"
                 # Pair the spectrum with the run that produced it, here where
@@ -1940,10 +1955,7 @@ class ExperimentBuilderTab(DaemonRunnerMixin, QWidget):
                         measurement_id = self._data_store.record_measurement(
                             self._ds_run_id, eis, channel=ch_int,
                         )
-                        from softae.core.conditions_capture import read_environment
-
-                        env = read_environment(self._manager)
-                        if any(v is not None for v in env.values()):
+                        if env is not None and any(v is not None for v in env.values()):
                             self._data_store.record_conditions(
                                 measurement_id, "measurement", **env
                             )

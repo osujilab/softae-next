@@ -1807,3 +1807,78 @@ class TestPredictedThickness:
         chem, sol = catalogs_from_data_root()
         stocks = {n: sol.get(n) for n in sol.list_names()}
         assert tab._uncounted_particulates(stocks, chem) == []
+
+
+# ── Environment stamp on captured spectra (Save EIS Data… header) ─────────
+
+#: A known snapshot, as ``read_environment`` returns it.
+_ENV = {
+    "stage_temp_sp_C": 60.0,
+    "chamber_air_C": 25.5,
+    "stage_temp_pv_C": 59.4,
+    "rh_sp_pct": 40.0,
+    "rh_pv_pct": 41.2,
+}
+_READ_ENV = "softae.core.conditions_capture.read_environment"
+
+
+def _capture(tab, channel: int = 3) -> None:
+    """Drive one completed EIS step through ``_ui_step_complete``."""
+    with patch.object(tab, "_raw_to_eis_result", return_value=_eis(channel)):
+        tab._ui_step_complete(f"measure_eis_ch{channel}", 0, 1, object(), 0.0)
+
+
+def _headers(eis) -> tuple[float, float, float, float]:
+    return (eis.T_sp, eis.T_pv, eis.rh_sp, eis.rh_pv)
+
+
+class TestEnvironmentStamp:
+    """The HT tab's captured spectra carry the env header the Save button writes.
+
+    ``_on_save_eis_data`` writes ``self._eis_results`` straight to ``.txt``, so a
+    spectrum not stamped at capture time is exported with ``nan`` headers.
+    """
+
+    def test_step_complete_with_store_stamps_header(self, tab: ExperimentBuilderTab):
+        tab._data_store = MagicMock()
+        tab._ds_run_id = "run-1"
+        with patch(_READ_ENV, return_value=dict(_ENV)):
+            _capture(tab)
+
+        assert _headers(tab._eis_results[-1]) == (60.0, 59.4, 40.0, 41.2)
+
+    def test_step_complete_without_store_still_stamps(self, tab: ExperimentBuilderTab):
+        """The Save button needs no DataStore, so neither does the stamp."""
+        tab._data_store = None
+        tab._ds_run_id = None
+        with patch(_READ_ENV, return_value=dict(_ENV)):
+            _capture(tab)
+
+        assert _headers(tab._eis_results[-1]) == (60.0, 59.4, 40.0, 41.2)
+
+    def test_step_complete_env_read_raises_spectrum_kept(self, tab: ExperimentBuilderTab):
+        import math
+
+        tab._data_store = None
+        with patch(_READ_ENV, side_effect=RuntimeError("bus fault")) as read:
+            _capture(tab)
+
+        assert read.call_count == 1                   # the read was attempted
+        assert len(tab._eis_results) == 1
+        assert all(math.isnan(v) for v in _headers(tab._eis_results[-1]))
+
+    def test_step_complete_with_store_one_read_feeds_conditions(
+        self, tab: ExperimentBuilderTab
+    ):
+        store = MagicMock()
+        store.record_measurement.return_value = 17
+        tab._data_store = store
+        tab._ds_run_id = "run-1"
+        with patch(_READ_ENV, return_value=dict(_ENV)) as read:
+            _capture(tab, 3)
+            _capture(tab, 4)
+
+        assert read.call_count == 2                   # exactly one per spectrum
+        assert store.record_conditions.call_count == 2
+        store.record_conditions.assert_called_with(17, "measurement", **_ENV)
+        assert [_headers(e) for e in tab._eis_results] == [(60.0, 59.4, 40.0, 41.2)] * 2
