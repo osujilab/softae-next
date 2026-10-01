@@ -32,7 +32,9 @@ softae-next.code-workspace
 # lab records, not source; they live in the DataStore, not in git.
 # catalogs (tasks.toml, recipes.toml) + chemicals/solutions CSVs
 # BY POLICY, not oversight: each instance develops its own catalog for its own hardware.
-/data/
+# deliberately unanchored so every data directory stays out of git, at any depth
+# (catalogs at the root, test fixtures under tests/data/, ...).
+data/
 # real experimental results DB at repo root
 softae_results.db
 # a DataStore opened on a mis-resolved project path lands its db in the tree;
