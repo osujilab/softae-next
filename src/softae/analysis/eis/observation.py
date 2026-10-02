@@ -59,17 +59,21 @@ engine, early return) is not U and keeps the value admitted.
 unrecognised-shape U was acquired and screened, which is what the park counter means by
 *measured* (R1), whether or not its σ is admissible.
 
-No I/O and no config reads; never raises.
+No I/O and no config reads (a warning is logged on an unreadable report); never raises.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
+
+import structlog
 
 from softae.analysis.eis.regime import A, B, C, U
 from softae.analysis.eis.report import REGIME_A_FOOT_LOWER, REGIME_A_PASSIVE
+
+logger = structlog.get_logger(__name__)
 
 VALUE = "value"
 LOWER_BOUND = "lower_bound"
@@ -181,7 +185,11 @@ def sigma_observation(report: Any) -> SigmaObservation:
     try:
         return _observe(report.sigma, bool(report.ok), regime, reason, aware)
     except Exception:  # noqa: BLE001 - a malformed report is unmeasured, not a crash
-        return unmeasured(regime, reason, regime_aware=aware)
+        logger.warning("sigma_observation_unreadable", regime=regime, reason=reason,
+                       regime_aware=aware, exc_info=True)
+        # A crash is never a measurement, whatever the label (ruling 2026-10-01); the
+        # labels stay as a record.
+        return replace(unmeasured(regime, reason, regime_aware=aware), classified=False)
 
 
 def _observe(s: Any, ok: bool, regime: str, reason: str, aware: bool) -> SigmaObservation:

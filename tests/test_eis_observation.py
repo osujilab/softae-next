@@ -215,7 +215,31 @@ def test_sigma_observation_malformed_report_unmeasured_never_raises():
     assert ob.sigma_observation(broken) == ob.unmeasured("B", regime_aware=False)
     assert not ob.sigma_observation(broken).classified
     stamped = SimpleNamespace(ok=True, sigma=SimpleNamespace(regime="B", regime_aware=True))
-    assert ob.sigma_observation(stamped) == ob.unmeasured("B", regime_aware=True)
+    assert ob.sigma_observation(stamped) == dataclasses.replace(
+        ob.unmeasured("B", regime_aware=True), classified=False)
+
+
+class _SigmaThatRaises:
+    """A stamped ``SigmaReport`` stand-in whose labels read cleanly but whose body raises
+    inside ``_observe`` -- an analysis crash after the classifier has labelled it."""
+
+    def __init__(self, regime: str, regime_aware: bool) -> None:
+        self.regime, self.regime_reason, self.regime_aware = regime, "", regime_aware
+
+    @property
+    def regime_active(self):
+        raise RuntimeError("analysis crashed")
+
+
+@pytest.mark.parametrize("aware", [True, False])
+@pytest.mark.parametrize("regime", ["A", "B", "C"])
+def test_sigma_observation_exception_classified_regime_never_counts_as_measured(regime, aware):
+    """Ruling 2026-10-01: a crash is never a measurement, whatever the flag or label; the
+    labels are kept as a record."""
+    o = ob.sigma_observation(SimpleNamespace(ok=True, sigma=_SigmaThatRaises(regime, aware)))
+    assert o.classified is False and o.counts_as_measured is False and o.admitted is False
+    assert o.kind is None
+    assert (o.regime, o.regime_reason, o.regime_aware) == (regime, "", aware)
 
 
 def test_unmeasured_is_nothing_stateable():
