@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -1476,12 +1476,23 @@ class TestRunIdCollision:
         ids = [store.start_run("import_blank_open") for _ in range(7)]
         assert len(set(ids)) == 7
 
-    def test_the_first_id_keeps_its_exact_historical_spelling(self, store) -> None:
+    def test_the_first_id_keeps_its_exact_historical_spelling(
+            self, store, monkeypatch) -> None:
         # Suffixing rather than widening the stamp: every run_id already on disk keeps
         # its name, and the format stays lexically sortable by time.
+        # The clock is frozen because the assertion needs a *collision*: two live calls
+        # that straddle a second boundary get distinct stamps and no suffix at all.
+        frozen = datetime(2026, 3, 6, 12, 0, 0, tzinfo=timezone.utc)
+
+        class _FrozenDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return frozen
+
+        monkeypatch.setattr("softae.core.data_store.datetime", _FrozenDatetime)
         first = store.start_run("ht_experiment")
         second = store.start_run("ht_experiment")
-        assert not first.endswith("_2")
+        assert first == "20260306T120000Z_ht_experiment"
         assert second == f"{first}_2"
 
     def test_each_deduplicated_run_is_a_real_row(self, store) -> None:
