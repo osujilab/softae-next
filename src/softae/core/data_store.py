@@ -427,7 +427,24 @@ CREATE TABLE IF NOT EXISTS fit_results (
     sigma_kind              TEXT,
     sigma_lower_S_per_cm    REAL,
     R_film_ohm              REAL,
-    R_film_basis            TEXT
+    R_film_basis            TEXT,
+    -- T11.43: the calibration and phase floor this row's verdicts were read against,
+    -- from `_fit_provenance_columns`. Declared here as well as in
+    -- `_migrate_fit_provenance_columns`, verbatim, for the reason the gate columns
+    -- give. All nullable, no default: NULL means *not stated* (no report passed, or
+    -- one predating the field). `calibration_stale_reason = ''` is a different fact
+    -- -- resolved and fresh -- and is never coerced to NULL. `floor_row_ids` is a
+    -- JSON list of calibration row ids, named for its source field
+    -- `HeadroomDecision.floor_row_ids`; `HeadroomDecision.floor_rows_used` is a
+    -- separate COUNT and is not stored here. '[]' says no rows backed the floor,
+    -- NULL says nobody said which.
+    calibration_hash        TEXT,
+    calibration_stale_reason TEXT,
+    tand_floor              REAL,
+    phase_noise_at_ohm      REAL,
+    floor_row_ids           TEXT,
+    floor_class_provisional INTEGER,
+    regime_aware            INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_fit_results_measurement_id ON fit_results(measurement_id);
@@ -912,6 +929,69 @@ def _sigma_observation_columns(
     }
 
 
+#: The ``fit_results`` columns :func:`_fit_provenance_columns` fills (T11.43).
+FIT_PROVENANCE_COLUMNS: tuple[str, ...] = (
+    "calibration_hash", "calibration_stale_reason", "tand_floor",
+    "phase_noise_at_ohm", "floor_row_ids", "floor_class_provisional",
+    "regime_aware",
+)
+
+
+def _str_or_none(value: Any) -> str | None:
+    """A real ``str`` (``""`` included), else ``None`` — a Mock is not a hash."""
+    return value if isinstance(value, str) else None
+
+
+def _flag_or_none(value: Any) -> int | None:
+    """``1``/``0`` for a real bool or int 0/1, else ``None``.
+
+    ``None`` is *not stated*; folding it into ``0`` would spell an unknown like a
+    checked "no" (``SUBAGENT_RULES`` §3.1(a)).
+    """
+    if isinstance(value, (bool, int)) and value in (0, 1):
+        return int(value)
+    return None
+
+
+def _floor_row_ids_json(headroom: Any) -> str | None:
+    """``floor_row_ids`` as a JSON list, or ``None`` when the decision names none.
+
+    Absent attribute → ``None``, never ``"[]"``: a count-only decision (today's
+    ``HeadroomDecision``) did not say *which* rows, and ``"[]"`` would claim none did.
+    """
+    ids = getattr(headroom, "floor_row_ids", None)
+    if ids is None:
+        return None
+    try:
+        return _safe_json([int(i) for i in ids])
+    except (TypeError, ValueError):
+        return None
+
+
+def _fit_provenance_columns(source: Any | None) -> dict[str, Any]:
+    """Calibration + phase-floor provenance for one ``fit_results`` row (T11.43).
+
+    *source* is report-shaped — the ``report=`` or ``provenance=`` handed to
+    ``record_fit`` — and is read only by ``getattr``, so no ``analysis`` type is
+    imported into ``core`` and a field the engine has not grown yet lands as NULL
+    rather than raising. **Never raises**: the router's fit row is worth more than
+    its provenance. All NULL with no *source*.
+    """
+    headroom = getattr(source, "headroom", None)
+    return {
+        "calibration_hash": _str_or_none(getattr(source, "calibration_hash", None)),
+        "calibration_stale_reason": _str_or_none(
+            getattr(source, "calibration_stale_reason", None)),
+        "tand_floor": _f_or_none(getattr(headroom, "floor_tand", None)),
+        "phase_noise_at_ohm": _f_or_none(getattr(headroom, "floor_z_anchor_ohm", None)),
+        "floor_row_ids": _floor_row_ids_json(headroom),
+        "floor_class_provisional": _flag_or_none(
+            getattr(headroom, "floor_class_provisional", None)),
+        "regime_aware": _flag_or_none(
+            getattr(getattr(source, "sigma", None), "regime_aware", None)),
+    }
+
+
 def _engine_label(engine: str, fit_result: Any) -> str:
     """Name the estimator that produced this row's ``R1``, not just the engine.
 
@@ -1074,6 +1154,8 @@ class DataStore:
         self._migrate_campaign_checkpoint_counters()
         # [e150] / R3: a stated σ or objective, and what kind of claim it is.
         self._migrate_censored_observation_columns()
+        # T11.43: which calibration and phase floor a fit was read against.
+        self._migrate_fit_provenance_columns()
         # LAST, always: the ledger records the epochs every migration above has
         # just finished establishing, so it must not claim them before they hold.
         self._migrate_schema_version()
@@ -1625,6 +1707,7 @@ class DataStore:
         w_cm: float | None = None,
         report: Any | None = None,
         observation: SigmaObservation | None = None,
+        provenance: Any | None = None,
     ) -> int:
         """Persist a circuit-fit result linked to a measurement.
 
@@ -1652,6 +1735,12 @@ class DataStore:
         fills **those five columns and nothing else**: every other column is exactly
         what the same call without it writes. ``sigma_S_per_cm`` is untouched either
         way: still ``K/R1`` from the legacy geometry, and NULL on a reported bound.
+
+        :data:`FIT_PROVENANCE_COLUMNS` (T11.43) record the calibration and phase
+        floor the row was read against, from *report* or, failing that, from
+        *provenance* — a report-shaped object consulted for **those seven columns
+        plus** ``phase_headroom`` **and nothing else**, so the router can annotate a
+        row without passing ``report=`` and moving the gate columns (P.18).
 
         Returns the new ``fit_id``.
         """
@@ -1688,6 +1777,13 @@ class DataStore:
         # three call sites that pass no report at all. See `_fit_quality_columns`.
         extra.update(_fit_quality_columns(fit_result))
         extra.update(_sigma_observation_columns(report, observation))
+        # Same precedence as the observation columns: the report wins.
+        extra.update(_fit_provenance_columns(report if report is not None else provenance))
+        if report is None and provenance is not None:
+            # `_fit_report_columns` fills this from a report; the provenance route
+            # carries the same margin, and it is the number the floor columns divide.
+            extra["phase_headroom"] = _f_or_none(
+                getattr(getattr(provenance, "sigma", None), "phase_headroom", None))
         extra["engine"] = _engine_label(extra["engine"], fit_result)
         # A bounded σ is not a value.  Storing it in ``sigma_S_per_cm`` would let any
         # reader that does not check ``sigma_is_bound`` treat a ceiling as a
@@ -1710,12 +1806,16 @@ class DataStore:
                 chi2, chi2_reduced, r_squared, residual_rms_pct,
                 residual_max_pct,
                 sigma_reported_S_per_cm, sigma_kind, sigma_lower_S_per_cm,
-                R_film_ohm, R_film_basis)
+                R_film_ohm, R_film_basis,
+                calibration_hash, calibration_stale_reason, tand_floor,
+                phase_noise_at_ohm, floor_row_ids, floor_class_provisional,
+                regime_aware)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                        ?, ?, ?, ?,
                        ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?)""",
             (
                 measurement_id,
                 run_id,
@@ -1762,6 +1862,7 @@ class DataStore:
                 extra["residual_rms_pct"],
                 extra["residual_max_pct"],
                 *(extra[name] for name in SIGMA_OBSERVATION_COLUMNS),
+                *(extra[name] for name in FIT_PROVENANCE_COLUMNS),
             ),
         )
         self._conn.commit()
@@ -3935,6 +4036,31 @@ class DataStore:
                     self._conn.execute(
                         f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"
                     )
+        self._conn.commit()
+
+    def _migrate_fit_provenance_columns(self) -> None:
+        """Calibration + phase-floor provenance on ``fit_results`` (T11.43).
+
+        Written by :meth:`DataStore.record_fit` through
+        :func:`_fit_provenance_columns`. **All nullable, no default, no backfill and
+        no new** :data:`SCHEMA_EPOCHS` **row**, for the reason
+        :meth:`_migrate_censored_observation_columns` gives: a shape change, and no
+        stored number changes meaning. A pre-feature row keeps NULL — *not stated* —
+        because the calibration it was read against was never recorded, and naming
+        one now would be invented.
+        """
+        cols = {row[1] for row in
+                self._conn.execute("PRAGMA table_info(fit_results)").fetchall()}
+        for column, sql_type in (("calibration_hash", "TEXT"),
+                                 ("calibration_stale_reason", "TEXT"),
+                                 ("tand_floor", "REAL"),
+                                 ("phase_noise_at_ohm", "REAL"),
+                                 ("floor_row_ids", "TEXT"),
+                                 ("floor_class_provisional", "INTEGER"),
+                                 ("regime_aware", "INTEGER")):
+            if column not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE fit_results ADD COLUMN {column} {sql_type}")
         self._conn.commit()
 
     def _migrate_schema_version(self) -> None:

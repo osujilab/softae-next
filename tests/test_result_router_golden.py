@@ -281,15 +281,17 @@ async def test_golden_eis_routing_rows_and_files(connected_manager, data_store):
     assert {k: fit[k] for k in (
         "engine", "gate_verdict", "gate_log_json", "n_points_used",
         "n_points_dropped", "report_mode", "R_sum_ohm", "R_sum_se_ohm",
-        "rho_series_bulk", "sigma_is_bound", "sigma_rel_unc", "phase_headroom",
+        "rho_series_bulk", "sigma_is_bound", "sigma_rel_unc",
         "model_free_R_ohm", "K_per_cm", "K_route", "dead_height_cm",
         "thickness_method", "thickness_unc_cm")} == {
         "engine": "unknown", "gate_verdict": None, "gate_log_json": "[]",
         "n_points_used": None, "n_points_dropped": None, "report_mode": "split",
         "R_sum_ohm": None, "R_sum_se_ohm": None, "rho_series_bulk": None,
-        "sigma_is_bound": 0, "sigma_rel_unc": None, "phase_headroom": None,
+        "sigma_is_bound": 0, "sigma_rel_unc": None,
         "model_free_R_ohm": None, "K_per_cm": None, "K_route": None,
         "dead_height_cm": 0.0, "thickness_method": None, "thickness_unc_cm": None}
+    # T11.43: `provenance=` fills `phase_headroom` (and only it, of the eighteen).
+    assert fit["phase_headroom"] == FINITE
     cell = CellConstant.from_legacy(0.5, 0.001, 0.1)
     assert fit["sigma_S_per_cm"] == pytest.approx(cell.sigma(fit["R1"]), rel=1e-12)
     # ...and the new five carry what the engine stated: a value, K over the film R.
@@ -431,6 +433,46 @@ async def test_router_observation_failure_keeps_fit_row_with_null_kind(
     (fit,) = data_store.query_fits(run_id=run_id)
     assert fit["sigma_S_per_cm"] is not None
     assert fit["sigma_kind"] is None and fit["sigma_reported_S_per_cm"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("regime_aware", [True, False])
+async def test_router_provenance_stores_regime_aware_gate_columns_unchanged(
+    connected_manager, data_store, monkeypatch, regime_aware
+):
+    """T11.43: the router's row carries the report's provenance, never its gates.
+
+    Both flag values are forced onto the real report, so the stored column cannot
+    pass by agreeing with whatever ``softae_config.toml`` happens to say. The gate
+    columns must still read the report-less shape: that is the P.18 guard.
+    """
+    from dataclasses import replace
+
+    from softae.analysis.eis import router as eis_router
+
+    real = eis_router.analyze_spectrum
+
+    def _forced(*args, **kwargs):
+        report = real(*args, **kwargs)
+        return replace(report, sigma=replace(report.sigma, regime_aware=regime_aware))
+
+    monkeypatch.setattr(eis_router, "analyze_spectrum", _forced)
+    run_id = data_store.start_run("provenance")
+    step = WorkflowStep(
+        name="measure", instrument="pico1", method="sendscript_getdata",
+        params={"mscrpath": "f.mscr", "outdir": "out", "chan": 1,
+                "circuit_model": "simpleSalt", "electrode_L_cm": 0.5,
+                "electrode_t_cm": 0.001, "electrode_w_cm": 0.1},
+    )
+    executor = WorkflowExecutor(connected_manager, data_store=data_store,
+                               run_id=run_id)
+    await executor.run(Workflow(name="provenance", setup=[step]))
+
+    assert executor.state == ExecutorState.COMPLETED
+    (fit,) = data_store.query_fits(run_id=run_id)
+    assert fit["regime_aware"] == int(regime_aware)
+    assert (fit["engine"], fit["gate_verdict"], fit["report_mode"]) == (
+        "unknown", None, "split")
 
 
 # ── The spectrum file carries the conditions it was measured under ──────────

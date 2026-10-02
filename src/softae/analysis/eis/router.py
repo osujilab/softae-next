@@ -477,6 +477,10 @@ class EISResultRouter:
                 # ``observation=`` is (R3, [e150]): it fills only the five stated-σ
                 # columns (``sigma_kind`` & co.) and leaves every other column exactly
                 # as the report-less call writes it, so P.18 stays operator-held.
+                #
+                # ``provenance=`` is (T11.43) on the same terms: the report is read
+                # for the seven calibration/floor columns plus ``phase_headroom``
+                # only, never for the gate columns, so it does not move P.18 either.
                 report = analyze_spectrum(
                     eis_result,
                     cell=_cell_from_params(step),
@@ -504,6 +508,7 @@ class EISResultRouter:
                         t_cm=step.params.get("electrode_t_cm"),
                         w_cm=step.params.get("electrode_w_cm"),
                         observation=_observation_or_none(report, step),
+                        provenance=report,
                     )
                     logger.info(
                         "eis_fit_autorouted",

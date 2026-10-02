@@ -3413,3 +3413,170 @@ class TestRecordFitObservationKeyword:
 
         row = self._row(store_with_run, observation=unmeasured("U", regime_aware=True))
         assert all(row[c] is None for c in SIGMA_OBS_COLUMNS)
+
+
+# ---------------------------------------------------------------------------
+# T11.43: calibration + phase-floor provenance on `fit_results`
+# ---------------------------------------------------------------------------
+
+FIT_PROV_COLUMNS = ("calibration_hash", "calibration_stale_reason", "tand_floor",
+                    "phase_noise_at_ohm", "floor_row_ids", "floor_class_provisional",
+                    "regime_aware")
+
+
+def _headroom(**fields):
+    """A `HeadroomDecision` stand-in: `floor_row_ids` does not exist on the real one yet."""
+    from types import SimpleNamespace
+
+    base = dict(floor_tand=2.5e-3, floor_z_anchor_ohm=1.0e7, floor_class_provisional=False)
+    return SimpleNamespace(**{**base, **fields})
+
+
+def _carrier(report, **attrs):
+    """A real report carrying afl's not-yet-landed fields, set past `frozen`."""
+    for name, value in attrs.items():
+        object.__setattr__(report, name, value)
+    return report
+
+
+def _prov(regime_aware=True, phase_headroom=4.2, **attrs):
+    """A report-shaped `provenance=` with a full carrier (fresh calibration)."""
+    from types import SimpleNamespace
+
+    base = dict(calibration_hash="abc123", calibration_stale_reason="",
+                headroom=_headroom(floor_row_ids=(11, 12)))
+    return SimpleNamespace(
+        sigma=SimpleNamespace(regime_aware=regime_aware, phase_headroom=phase_headroom),
+        **{**base, **attrs})
+
+
+class TestFitProvenanceColumns:
+    """Seven nullable columns: which calibration and floor a fit was read against."""
+
+    GEOMETRY = {"L_cm": 0.2, "t_cm": 0.015, "w_cm": 0.2}
+
+    def _row(self, store_with_run, **kwargs) -> dict:
+        store, run_id = store_with_run
+        mid = store.record_measurement(run_id, _make_eis_result())
+        store.record_fit(mid, _annotated(), **self.GEOMETRY, **kwargs)
+        return store.query_fits(measurement_id=mid)[0]
+
+    def test_migration_legacy_fit_results_gains_seven_old_row_is_null(
+        self, tmp_path: Path
+    ) -> None:
+        project = tmp_path / "legacy_fits"
+        _build_legacy_fit_results_db(project)
+
+        with DataStore(project) as store:
+            decls = _declarations(store, "fit_results")
+            nulls = store._conn.execute(
+                "SELECT " + ", ".join(f"{c} IS NULL" for c in FIT_PROV_COLUMNS)
+                + " FROM fit_results WHERE run_id = 'old_run'").fetchone()
+        assert {c: decls[c][1:] for c in FIT_PROV_COLUMNS} == dict.fromkeys(
+            FIT_PROV_COLUMNS, (0, None))
+        assert tuple(nulls) == (1,) * 7
+
+    def test_migration_adds_no_schema_epoch_row(self) -> None:
+        """A change of shape: no stored number changes meaning."""
+        from softae.core.data_store import SCHEMA_EPOCHS
+
+        assert not any(n in note for _, _, note in SCHEMA_EPOCHS for n in FIT_PROV_COLUMNS)
+
+    def test_record_fit_stale_calibration_stores_hash_and_reason(
+        self, store_with_run
+    ) -> None:
+        report = _carrier(_report(mode="value", value=1e-4),
+                          calibration_hash="abc123",
+                          calibration_stale_reason="hardware_hash moved: pid_kd")
+        row = self._row(store_with_run, report=report)
+        assert (row["calibration_hash"], row["calibration_stale_reason"]) == (
+            "abc123", "hardware_hash moved: pid_kd")
+
+    def test_record_fit_applied_calibration_keeps_empty_reason_and_floor_row_ids(
+        self, store_with_run
+    ) -> None:
+        report = _carrier(_report(mode="value", value=1e-4),
+                          calibration_hash="abc123", calibration_stale_reason="",
+                          headroom=_headroom(floor_row_ids=(11, 12)))
+        row = self._row(store_with_run, report=report)
+        # "" is *resolved and fresh*; NULL would say nobody looked.
+        assert row["calibration_stale_reason"] == ""
+        assert (row["calibration_hash"], row["floor_row_ids"]) == ("abc123", "[11, 12]")
+        assert (row["tand_floor"], row["phase_noise_at_ohm"]) == (2.5e-3, 1.0e7)
+        assert row["floor_class_provisional"] == 0
+
+    def test_record_fit_no_report_no_provenance_all_seven_null(
+        self, store_with_run
+    ) -> None:
+        row = self._row(store_with_run)
+        assert {c: row[c] for c in FIT_PROV_COLUMNS} == dict.fromkeys(FIT_PROV_COLUMNS)
+
+    def test_record_fit_nan_floor_stores_null(self, store_with_run) -> None:
+        row = self._row(store_with_run, provenance=_prov(
+            headroom=_headroom(floor_tand=float("nan"), floor_row_ids=())))
+        assert row["tand_floor"] is None
+        assert row["phase_noise_at_ohm"] == 1.0e7
+
+    @pytest.mark.parametrize("headroom, expected", [
+        (_headroom(floor_row_ids=()), "[]"),
+        (_headroom(), None),          # count-only decision: no attribute at all
+        (None, None),
+    ])
+    def test_record_fit_floor_row_ids_empty_is_list_absent_attr_is_null(
+        self, store_with_run, headroom, expected
+    ) -> None:
+        row = self._row(store_with_run, provenance=_prov(headroom=headroom))
+        assert row["floor_row_ids"] == expected
+
+    @pytest.mark.parametrize("flag, expected", [(True, 1), (False, 0), ("absent", None)])
+    def test_record_fit_regime_aware_bool_to_int_absent_null(
+        self, store_with_run, flag, expected
+    ) -> None:
+        prov = _prov(regime_aware=flag)
+        if flag == "absent":
+            del prov.sigma.regime_aware
+        row = self._row(store_with_run, provenance=prov)
+        assert row["regime_aware"] == expected
+
+    def test_record_fit_non_str_hash_and_non_bool_flag_store_null(
+        self, store_with_run
+    ) -> None:
+        from unittest.mock import Mock
+
+        row = self._row(store_with_run, provenance=_prov(
+            calibration_hash=Mock(), headroom=_headroom(floor_class_provisional=Mock())))
+        assert (row["calibration_hash"], row["floor_class_provisional"]) == (None, None)
+
+    def test_record_fit_provenance_alone_moves_only_seven_and_phase_headroom(
+        self, store_with_run
+    ) -> None:
+        plain = self._row(store_with_run)
+        source = _prov()
+        # Fields the GATE columns would read if provenance ever leaked into the
+        # `report=` path (P.18): a bound would null `sigma_S_per_cm` and set
+        # `sigma_is_bound`, so a leak cannot hide behind an all-default stand-in.
+        source.sigma.mode, source.sigma.is_bound = "bound", True
+        source.sigma.rel_uncertainty = 0.1
+        prov = self._row(store_with_run, provenance=source)
+
+        skip = set(_ROW_IDENTITY) | set(FIT_PROV_COLUMNS) | {"phase_headroom"}
+        assert {k: v for k, v in prov.items() if k not in skip} == {
+            k: v for k, v in plain.items() if k not in skip}
+        assert {c: prov[c] for c in FIT_PROV_COLUMNS} == {
+            "calibration_hash": "abc123", "calibration_stale_reason": "",
+            "tand_floor": 2.5e-3, "phase_noise_at_ohm": 1.0e7,
+            "floor_row_ids": "[11, 12]", "floor_class_provisional": 0,
+            "regime_aware": 1}
+        assert (plain["phase_headroom"], prov["phase_headroom"]) == (None, 4.2)
+
+    def test_record_fit_report_and_provenance_report_wins(
+        self, store_with_run
+    ) -> None:
+        report = _carrier(_report(mode="value", value=1e-4, regime_aware=False,
+                                  phase_headroom=9.0),
+                          calibration_hash="from_report")
+        row = self._row(store_with_run, report=report, provenance=_prov())
+        assert (row["calibration_hash"], row["regime_aware"],
+                row["phase_headroom"]) == ("from_report", 0, 9.0)
+        # Not merged field by field: what the report lacks stays NULL.
+        assert row["floor_row_ids"] is None
