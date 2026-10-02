@@ -331,7 +331,9 @@ def test_regime_a_route_skips_arc_open_refusal():
 
 
 def test_regime_flag_on_non_a_fixtures_unchanged():
-    """Criterion 4: B, C and U spectra report identically in both flag states."""
+    """Criterion 4: B, C and U spectra report identically in both flag states — every
+    field but the ``regime_aware`` stamp, which is the one thing that must differ (it is
+    what lets ``observation.py`` roll the campaign decision back with the flag off)."""
     import dataclasses
 
     synth = [syn.as_eis(F, Z) for gen in (syn.step1_regime_b, syn.step1_regime_c)
@@ -340,8 +342,38 @@ def test_regime_flag_on_non_a_fixtures_unchanged():
     for eis in synth + real:
         off, on = _analyse(eis, flag=False), _analyse(eis, flag=True)
         assert on.sigma.regime != "A" and not on.sigma.regime_active
+        assert (off.sigma.regime_aware, on.sigma.regime_aware) == (False, True)
         a, b = dataclasses.asdict(off.sigma), dataclasses.asdict(on.sigma)
-        assert {k for k in a if not _same(a[k], b[k])} == set()
+        assert {k for k in a if not _same(a[k], b[k])} == {"regime_aware"}
+
+
+@pytest.mark.parametrize("flag", [False, True], ids=["flag_off", "flag_on"])
+def test_analyze_spectrum_regime_aware_stamped_from_passed_settings(flag):
+    """The stamp is the settings the engine used: an explicit ``regime=`` (router, campaign)."""
+    eis = syn.as_eis(F, next(iter(syn.step1_regime_b()))[1])
+    assert _analyse(eis, flag=flag).sigma.regime_aware is flag
+
+
+@pytest.mark.parametrize("flag", [False, True], ids=["flag_off", "flag_on"])
+def test_analyze_spectrum_regime_aware_stamped_from_config_when_not_passed(monkeypatch,
+                                                                           flag):
+    """``regime=None`` reads config; the stamp follows what was read, not the default."""
+    from softae.analysis.eis import engine
+    from softae.analysis.eis.engine import analyze_spectrum
+
+    monkeypatch.setattr(engine, "regime_settings", lambda: rr.RegimeSettings(enabled=flag))
+    eis = syn.as_eis(F, next(iter(syn.step1_regime_b()))[1])
+    assert analyze_spectrum(eis, **golden_inputs(15)).sigma.regime_aware is flag
+
+
+def test_analyze_spectrum_legacy_engine_report_unstamped():
+    """No classification, no stamp: the legacy engine takes the pre-regime rule."""
+    from softae.analysis.eis.engine import analyze_spectrum
+
+    eis = syn.as_eis(F, next(iter(syn.step1_regime_b()))[1])
+    report = analyze_spectrum(eis, **{**golden_inputs(15), "engine": "legacy"},
+                              regime=rr.RegimeSettings(enabled=True))
+    assert report.sigma.regime == "" and report.sigma.regime_aware is False
 
 
 @pytest.fixture(scope="module")

@@ -26,9 +26,15 @@ from softae.analysis.eis.report import (
 NAN = float("nan")
 
 
-def _report(ok: bool = True, **sigma) -> SpectrumReport:
+def _unstamped_report(ok: bool = True, **sigma) -> SpectrumReport:
     quality = None if ok else SimpleNamespace(ok=False)
     return SpectrumReport(engine="gated", sigma=SigmaReport(**sigma), quality=quality)
+
+
+def _report(ok: bool = True, **sigma) -> SpectrumReport:
+    """A report as the engine stamps it with ``[eis] regime_aware`` on (the armed rules);
+    the flag-off rollback is exercised through :func:`_unstamped_report`."""
+    return _unstamped_report(ok=ok, **{"regime_aware": True, **sigma})
 
 
 #: Route-A states as the engine builds them (``engine._regime_a_sigma``).
@@ -121,8 +127,8 @@ def test_sigma_observation_u_reason_families_cover_every_classifier_u_token():
 
 
 def test_unmeasured_u_without_reason_is_bad_data_with_shape_reason_classified():
-    assert not ob.unmeasured("U").classified
-    shaped = ob.unmeasured("U", "no_cpe_drop")
+    assert not ob.unmeasured("U", regime_aware=True).classified
+    shaped = ob.unmeasured("U", "no_cpe_drop", regime_aware=True)
     assert shaped.classified and shaped.counts_as_measured and shaped.kind is None
 
 
@@ -172,7 +178,7 @@ def test_sigma_observation_flag_off_lower_bound_never_appears():
 
 def test_sigma_observation_unavailable_without_lower_is_unmeasured():
     o = ob.sigma_observation(_report(**{**A_LOWER, "regime_sigma_lower": NAN}))
-    assert o == ob.unmeasured("A")
+    assert o == ob.unmeasured("A", regime_aware=True)
 
 
 def test_sigma_observation_not_ok_recorded_not_admitted():
@@ -202,13 +208,18 @@ def test_sigma_observation_regime_label_sets_classified(regime, classified):
 
 
 def test_sigma_observation_malformed_report_unmeasured_never_raises():
-    assert ob.sigma_observation(None) == ob.unmeasured()
+    """Unreadable = unstamped = the pre-regime rule: nothing classified. A stamped report
+    that fails mid-read keeps the armed classification."""
+    assert ob.sigma_observation(None) == ob.unmeasured(regime_aware=False)
     broken = SimpleNamespace(ok=True, sigma=SimpleNamespace(regime="B"))
-    assert ob.sigma_observation(broken) == ob.unmeasured("B")
+    assert ob.sigma_observation(broken) == ob.unmeasured("B", regime_aware=False)
+    assert not ob.sigma_observation(broken).classified
+    stamped = SimpleNamespace(ok=True, sigma=SimpleNamespace(regime="B", regime_aware=True))
+    assert ob.sigma_observation(stamped) == ob.unmeasured("B", regime_aware=True)
 
 
 def test_unmeasured_is_nothing_stateable():
-    o = ob.unmeasured()
+    o = ob.unmeasured(regime_aware=True)
     assert (o.kind, o.reported, o.lower, o.R_film_ohm) == (None, None, None, None)
     assert (o.regime, o.basis, o.admitted, o.classified) == ("", "", False, False)
     assert not o.counts_as_measured
@@ -224,7 +235,7 @@ def test_unmeasured_is_nothing_stateable():
 ])
 def test_sigma_observation_counts_as_measured_truth_table(kind, admitted, classified,
                                                           expected):
-    o = dataclasses.replace(ob.unmeasured(), kind=kind, admitted=admitted,
+    o = dataclasses.replace(ob.unmeasured(regime_aware=True), kind=kind, admitted=admitted,
                             classified=classified)
     assert o.counts_as_measured is expected
 
@@ -237,7 +248,8 @@ def test_sigma_observation_kinds_are_the_store_vocabulary():
 
 
 def test_sigma_observation_engine_compressed_a_lower_only_with_flag_on():
-    """The production path: flag on → an admitted foot lower bound; flag off → not."""
+    """The production path: flag on → an admitted foot lower bound; flag off → not, and
+    nothing classified (the rollback)."""
     from softae.analysis.eis.engine import analyze_spectrum
     from softae.analysis.eis.regime_route import RegimeSettings
     from tests import eis_regime_synthetic as syn
@@ -250,13 +262,15 @@ def test_sigma_observation_engine_compressed_a_lower_only_with_flag_on():
         for flag in (True, False))
     assert on.kind == ob.LOWER_BOUND and on.basis == REGIME_A_FOOT_LOWER
     assert on.R_film_ohm is not None and on.R_film_ohm > 0
-    assert off.kind != ob.LOWER_BOUND and off.classified
+    assert on.classified and on.counts_as_measured
+    assert off.kind != ob.LOWER_BOUND and not off.classified
 
 
 @pytest.mark.parametrize("flag", [False, True], ids=["flag_off", "flag_on"])
 def test_sigma_observation_engine_jagged_u_value_not_admitted(flag):
     """§3.2 for F3: real data reaches it. Q5 (``142833Z`` ch25) classifies U, yet today's
-    route still states a value (~1.8e-4 S/cm, arming review §5.2) — in both flag states."""
+    route still states a value (~1.8e-4 S/cm, arming review §5.2) — in both flag states.
+    Refused flag on (F3); told flag off, exactly as before ``5234d37`` (rollback ruling)."""
     from softae.analysis.eis.engine import analyze_spectrum
     from softae.analysis.eis.regime_route import RegimeSettings
     from softae.analysis.eis_data import EISResult
@@ -271,7 +285,8 @@ def test_sigma_observation_engine_jagged_u_value_not_admitted(flag):
     assert report.sigma.regime_reason == "phase_incoherent"        # bad data: Q5 refused
     o = ob.sigma_observation(report)
     assert o.kind == ob.VALUE and o.reported is not None
-    assert not o.admitted and not o.counts_as_measured
+    assert o.admitted is (not flag) and o.counts_as_measured is (not flag)
+    assert not o.classified
 
 
 @pytest.mark.parametrize("flag", [False, True], ids=["flag_off", "flag_on"])
@@ -288,7 +303,8 @@ def test_sigma_observation_mock_rig_floor_phase_ambiguous_value_admitted(flag):
     s = report.sigma
     assert (s.regime, s.regime_reason, s.mode) == ("U", "floor_phase_ambiguous", "value")
     o = ob.sigma_observation(report)
-    assert o.kind == ob.VALUE and o.admitted and o.classified
+    assert o.kind == ob.VALUE and o.admitted and o.counts_as_measured
+    assert o.classified is flag                 # flag off: nothing is classified
 
 
 #: Board-2 PAA well 14 (``eis_regime_arming_review.md`` §4): non_monotone U, old-route
@@ -311,4 +327,128 @@ def test_sigma_observation_engine_paa_non_monotone_bound_counts_as_measured(flag
     assert (report.sigma.regime, report.sigma.regime_reason) == ("U", "non_monotone")
     o = ob.sigma_observation(report)
     assert o.kind == ob.UPPER_BOUND and not o.admitted
-    assert o.classified and o.counts_as_measured
+    # Flag off: an old-route bound is unmeasured and counts to a park, as before 5234d37.
+    assert o.classified is flag and o.counts_as_measured is flag
+
+
+# ── Flag off is a clean rollback to the pre-5234d37 decision (operator ruling 2026-10-01) ──
+
+
+def _pre_5234d37_told(report) -> float | None:
+    """The campaign decision before ``5234d37``, reproduced from git, not from memory.
+
+    ``git show 5234d37^:src/softae/core/autonomous_wiring.py``, ``_sigma_from_eis_raw``
+    (unchanged by ``9e586d8``, which touched neither wiring nor the loop)::
+
+        if report is None: return None
+        if not report.ok: return None                      # objective_rejected_by_gates
+        if not report.sigma.is_value: return None          # objective_declined_bound
+        value = float(report.sigma.value)                  # except -> None
+        return value if math.isfinite(value) and value > 0 else None
+
+    ``is_value`` is ``mode == "value"`` (``report.py``). The loop then told any non-None
+    number and counted ``None`` as unmeasured, toward the park (``_is_unmeasured``).
+    """
+    if report is None or not report.ok or report.sigma.mode != "value":
+        return None
+    try:
+        value = float(report.sigma.value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def _flag_off_decision(report) -> tuple[float | None, bool]:
+    """Today's campaign decision: ``(told number or None, counts toward the park)``.
+
+    Read the way ``_sigma_from_eis_raw`` and ``AutonomousLoop._close_well`` read it: an
+    admitted ``value`` is told; anything else is measured-untold if it
+    ``counts_as_measured``, else unmeasured. The feasibility label and the DOE outcome
+    follow from exactly these two facts.
+    """
+    o = ob.sigma_observation(report)
+    told = o.reported if (o.kind == ob.VALUE and o.admitted) else None
+    return told, (told is None and not o.counts_as_measured)
+
+
+def _old_decision(report) -> tuple[float | None, bool]:
+    told = _pre_5234d37_told(report)
+    return told, told is None
+
+
+#: Flag-off reports as the engine leaves them: classifier labels set (the shadow runs in
+#: both flag states), ``regime_active`` False, and no ``regime_aware`` stamp.
+FLAG_OFF_CASES = {
+    **{f"value_{r or 'unclassified'}": dict(U_VALUE, regime=r) for r in ("", "A", "B", "C")},
+    "value_u_incoherent": dict(U_VALUE, regime_reason="incoherent"),
+    "value_u_phase_incoherent": dict(U_VALUE, regime_reason="phase_incoherent"),
+    "value_u_shape_non_monotone": dict(U_VALUE, regime_reason="non_monotone"),
+    "old_bound_b": {**LEGACY_BOUND, "regime": "B", "regime_reason": "valley_then_rise"},
+    "old_bound_c": {**LEGACY_BOUND, "regime": "C", "regime_reason": "no_plateau"},
+    "old_bound_a": LEGACY_BOUND,
+    "old_bound_unqualified_b": {**LEGACY_BOUND, "mode": "bound_unqualified", "regime": "B"},
+    "old_bound_u_shape": {**LEGACY_BOUND, "regime": "U", "regime_reason": "non_monotone"},
+    "a_shadow_passive_bound": {**A_BOUND, "regime_active": False},
+    "a_shadow_lower_unavailable": {**A_LOWER, "regime_active": False},
+    # Route-A states with no stamp (hand-built, or older than the field): stored as
+    # stated, never admitted.
+    "a_route_bound_unstamped": A_BOUND,
+    "a_route_lower_unstamped": A_LOWER,
+    "a_route_value_unstamped": A_VALUE,
+    "c_unavailable": dict(mode="unavailable", regime="C", regime_reason="no_plateau"),
+    "u_unavailable_shape": dict(mode="unavailable", regime="U",
+                                regime_reason="floor_phase_ambiguous"),
+    **{f"value_b_{tag}": dict(U_VALUE, regime="B", value=v)
+       for tag, v in (("nan", NAN), ("inf", math.inf), ("zero", 0.0), ("neg", -1e-4))},
+}
+
+
+@pytest.mark.parametrize("ok", [True, False], ids=["ok", "not_ok"])
+@pytest.mark.parametrize("name", sorted(FLAG_OFF_CASES))
+def test_sigma_observation_flag_off_constructed_matches_pre_5234d37_decision(name, ok):
+    """No stamp = ``regime_aware`` False, the field's default: the old rule, every kind."""
+    report = _unstamped_report(ok=ok, **FLAG_OFF_CASES[name])
+    assert _flag_off_decision(report) == _old_decision(report)
+
+
+def _flag_off_corpus():
+    """The 34-spectrum probe set: six Step-1 A/B/C each, plus the real regime corpus."""
+    import itertools
+
+    from tests import eis_regime_synthetic as syn
+    from tests.eis_regime_golden import real_corpus
+
+    for family, gen in (("A", syn.step1_regime_a), ("B", syn.step1_regime_b),
+                        ("C", syn.step1_regime_c)):
+        for i, (_, Z) in enumerate(itertools.islice(gen(), 6)):
+            yield f"step1_{family}{i}", syn.as_eis(syn.RIG_F, Z), True
+    for name, eis in real_corpus():
+        yield name, eis, False
+
+
+def test_sigma_observation_flag_off_engine_corpus_matches_pre_5234d37_decision():
+    """§3.2: the rollback holds on reports the production path builds, flag off.
+
+    Also asserts the branches the defect lived on are actually visited by the synthetic
+    half (always present; ``tests/data/`` is gitignored): an old-route bound on a
+    classified regime (C), a classified unavailable (C) and a U — so a green here is not
+    a green over a population that never reached them. Flag off, a Step-1 A spectrum
+    reports today's route, so the A-route bound/unavailable never appear (by design).
+    """
+    from softae.analysis.eis.engine import analyze_spectrum
+    from softae.analysis.eis.regime_route import RegimeSettings
+    from tests.eis_regime_golden import golden_inputs
+
+    mismatches, visited = [], set()
+    for name, eis, synthetic in _flag_off_corpus():
+        report = analyze_spectrum(eis, **golden_inputs(15),
+                                  regime=RegimeSettings(enabled=False))
+        if synthetic:
+            visited.add((report.sigma.regime, report.sigma.mode))
+        now, old = _flag_off_decision(report), _old_decision(report)
+        if now != old:
+            mismatches.append((name, report.sigma.regime, report.sigma.regime_reason,
+                               report.sigma.mode, now, old))
+    assert {("A", "value"), ("B", "value"), ("C", "bound"), ("C", "unavailable"),
+            ("U", "bound")} <= visited, visited
+    assert mismatches == []

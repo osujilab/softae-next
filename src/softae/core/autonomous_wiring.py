@@ -989,8 +989,13 @@ def _run_plan_digest(run_plan: "RunPlan | None") -> str | None:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
-def serialize_campaign_spec(spec: "CampaignSpec") -> str:
+def serialize_campaign_spec(spec: "CampaignSpec", *, regime: Any = None) -> str:
     """JSON snapshot of a spec for the resume checkpoint.
+
+    *regime* is the launch's ``RegimeSettings`` (R6). When given it is recorded
+    under a top-level ``"regime"`` key, **outside** the fingerprint, so
+    :func:`check_resume_regime` can refuse a resume across an estimator change
+    without rehashing every in-flight checkpoint.
 
     Deliberately **not** a full round-trip. Several fields are live Python
     objects — ``prior_mean`` is an arbitrary callable, ``formulation`` /
@@ -1036,7 +1041,44 @@ def serialize_campaign_spec(spec: "CampaignSpec") -> str:
             "seed_observations": len(spec.seed_observations),
         },
     }
+    if regime is not None:
+        payload["regime"] = asdict(regime)
     return json.dumps(payload, sort_keys=True)
+
+
+#: ``RegimeSettings`` field -> the ``[eis]`` key an operator edits to change it.
+_REGIME_CONFIG_KEYS = {"enabled": "regime_aware"}
+
+
+def check_resume_regime(spec_json: str | None, current: Any, *, campaign: str) -> str | None:
+    """Refuse a resume whose EIS estimator settings changed since launch (R6).
+
+    The resume fingerprint covers only the spec, so a run could park, have
+    ``[eis] regime_aware`` edited, and resume — telling one search σ values from
+    two estimators. Raises ``ResumeMismatchError`` on an explicit difference.
+
+    A checkpoint written before the settings were recorded cannot answer: that is
+    returned as a warning string (and ``None`` on a match), never refused, so a
+    run launched before this check stays resumable.
+    """
+    from softae.core.campaign_resume import ResumeMismatchError
+
+    recorded = json.loads(spec_json or "{}").get("regime")
+    if not isinstance(recorded, dict):
+        return (f"Checkpoint for '{campaign}' predates recorded EIS regime settings; "
+                f"resuming under the current [eis] regime_aware = "
+                f"{json.dumps(bool(current.enabled))}, which cannot be checked "
+                f"against the estimator its earlier values were told under.")
+    now = asdict(current)
+    diffs = [f"{_REGIME_CONFIG_KEYS.get(k, k)} = {json.dumps(v)} at launch, "
+             f"{json.dumps(now.get(k))} now"
+             for k, v in sorted(recorded.items()) if now.get(k) != v]
+    if diffs:
+        raise ResumeMismatchError(
+            f"Checkpoint for '{campaign}' was told under different EIS estimator "
+            f"settings ([eis] {'; '.join(diffs)}). Resuming would mix σ values from "
+            f"two estimators in one search. Restore the setting, or start a fresh run.")
+    return None
 
 
 # ── Optimizer construction ───────────────────────────────────────────────────
@@ -3203,7 +3245,8 @@ def eis_impedance_objective(
     # bound is a regime-A route answer); that one's label makes the trial measured.
     # The reason travels with the label: a shape-U anchor is classified only by it.
     anchor = next((o for o in untold if o.classified), untold[0])
-    return replace(unmeasured(anchor.regime, anchor.regime_reason),
+    return replace(unmeasured(anchor.regime, anchor.regime_reason,
+                              regime_aware=anchor.regime_aware),
                    basis="replicates_not_combined")
 
 
@@ -3674,18 +3717,48 @@ async def run_autonomous_campaign(
                     emit("budget_from_board", pcb=_pcb_name, well_capacity_uL=cap)
                     logger.info("budget_from_board", pcb=_pcb_name, well_capacity_uL=cap)
 
+        # R6: `[eis] regime_aware` is read ONCE, here, and the same settings ride
+        # into every analysis this campaign runs (objective and settle alike).
+        # The engine would otherwise re-read the key per spectrum, and a mid-run
+        # config edit could change the estimator under values already told.
+        # Read before the resume below, which must compare it with the launch's.
+        from softae.analysis.eis.regime_route import regime_settings
+
+        _regime = regime_settings()
+        logger.info("campaign_regime_settings", campaign=spec.name,
+                    regime_aware=_regime.enabled)
+        emit("regime_settings", regime_aware=_regime.enabled)
+
         # Resume (P3.3): rebuild the optimizer from the checkpoint rather than
         # starting a fresh search. Seed observations are NOT re-applied — they
         # are already inside the restored history, and re-telling them would
         # double-count prior knowledge on every resume.
         resume_plan = None
         if resume:
-            from softae.core.campaign_resume import load_resume_plan
+            from softae.core.campaign_resume import ResumeMismatchError, load_resume_plan
 
             resume_plan = load_resume_plan(data_store, spec)
             if resume_plan is None:
                 emit("resume_no_checkpoint", campaign=spec.name)
                 logger.info("resume_no_checkpoint", campaign=spec.name)
+            else:
+                # The fingerprint covers only the spec; the estimator is checked
+                # here, against what the checkpoint recorded at launch.
+                _cp = data_store.campaign_checkpoint(spec.name) or {}
+                try:
+                    _note = check_resume_regime(_cp.get("spec_json"), _regime,
+                                                campaign=spec.name)
+                except ResumeMismatchError as exc:
+                    emit("resume_refused", campaign=spec.name,
+                         reason="regime_settings", detail=str(exc))
+                    logger.error("resume_refused", campaign=spec.name,
+                                 reason="regime_settings", detail=str(exc))
+                    raise
+                if _note:
+                    emit("resume_regime_unrecorded", campaign=spec.name,
+                         regime_aware=_regime.enabled, detail=_note)
+                    logger.warning("resume_regime_unrecorded", campaign=spec.name,
+                                   regime_aware=_regime.enabled, detail=_note)
 
         if resume_plan is not None:
             optimizer = resume_plan.optimizer
@@ -3870,16 +3943,7 @@ async def run_autonomous_campaign(
         # was previously resolved, or omitted, per extractor: the placement path
         # passed no thickness at all and so could never produce a σ.)
         _thickness_for = make_thickness_lookup(data_store, run_id)
-        # R6: `[eis] regime_aware` is read ONCE, here, and the same settings ride
-        # into every analysis this campaign runs (objective and settle alike).
-        # The engine would otherwise re-read the key per spectrum, and a mid-run
-        # config edit could change the estimator under values already told.
-        from softae.analysis.eis.regime_route import regime_settings
-
-        _regime = regime_settings()
-        logger.info("campaign_regime_settings", campaign=spec.name,
-                    regime_aware=_regime.enabled)
-        emit("regime_settings", regime_aware=_regime.enabled)
+        # `_regime` (R6) was resolved once, above the resume block.
         _objective_kind: str | None = None
         _objective: ObjectiveSpec | None = None
         # Only a *registered* modality's objective has a physically required
@@ -4755,7 +4819,9 @@ async def run_autonomous_campaign(
                 run_id=run_id,
                 loop_state=loop.state.name,
                 board_id=data_store.current_board_id(),
-                spec_json=serialize_campaign_spec(spec),
+                # The launch's regime settings ride in the snapshot, outside its
+                # fingerprint, so a resume can refuse an estimator change (R6).
+                spec_json=serialize_campaign_spec(spec, regime=_regime),
                 optimizer_json=json.dumps(optimizer.to_dict()),
                 # Deliberately columns and not keys inside `spec_json`: that blob
                 # is fingerprint-verified *spec identity*, and counters that

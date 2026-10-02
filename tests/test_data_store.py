@@ -3411,5 +3411,5 @@ class TestRecordFitObservationKeyword:
     ) -> None:
         from softae.analysis.eis.observation import unmeasured
 
-        row = self._row(store_with_run, observation=unmeasured("U"))
+        row = self._row(store_with_run, observation=unmeasured("U", regime_aware=True))
         assert all(row[c] is None for c in SIGMA_OBS_COLUMNS)

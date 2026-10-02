@@ -1225,6 +1225,9 @@ def analyze_spectrum(
         cell=cell, envelope=env, tand_headroom_mult=gate_cfg.tand_headroom_mult,
         R_engine=R if fit.success else float("nan"),
     )
+    # The flag state this report was analysed under, for observation.py: with it off
+    # the campaign decision must be the pre-regime rule, and only this field can say so.
+    sigma = _replace(sigma, regime_aware=bool(reg_cfg.enabled))
 
     # Front 2 — how well determined is the answer? These read the fit from ctx and
     # never remove points: by the time a fit exists the data has been admitted.

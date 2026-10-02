@@ -994,7 +994,7 @@ REGIME_B_BOUND = _obs("upper_bound", regime="B")
 def _unmeasured_u():
     from softae.analysis.eis.observation import unmeasured
 
-    return unmeasured("U")
+    return unmeasured("U", regime_aware=True)
 
 
 def _scripted(outcomes):

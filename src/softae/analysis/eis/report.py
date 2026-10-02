@@ -199,6 +199,13 @@ class SigmaReport:
     regime_active: bool = False
     regime_R_foot_ohm: float = float("nan")
     regime_route_detail: str = ""
+    #: The ``[eis] regime_aware`` setting the engine **actually used** for this report,
+    #: stamped by ``analyze_spectrum`` whether it came from ``regime=`` or from config.
+    #: ``regime_active`` cannot stand in for it: it marks only a taken A route, so a B/C/U
+    #: report is identical in both flag states except for this field. ``False`` — every
+    #: report that never passed the stamp (legacy engine, early returns, hand-built or
+    #: older reports) — means the pre-regime campaign rule (``observation.py``).
+    regime_aware: bool = False
 
     @property
     def is_bound(self) -> bool:

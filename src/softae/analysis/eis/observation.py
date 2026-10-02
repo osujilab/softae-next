@@ -22,8 +22,16 @@ admitted, and its *classified* status is unaffected.
 **Admitted** means the number may become the campaign objective. An old-route upper bound
 is recorded but never admitted: on regime-A films the legacy loss ceiling sits 0.5–3.5
 decades below the film's σ, so it is a statement about the instrument, not the sample.
-With ``[eis] regime_aware`` off, ``regime_active`` is never set, so no lower bound ever
-appears and no bound is ever admitted.
+
+**Flag off is a clean rollback** (operator ruling 2026-10-01). Everything in the tables
+here applies only when the report's ``sigma.regime_aware`` is ``True`` — the flag state
+``analyze_spectrum`` stamped. With it ``False`` (flag off, or any report that never
+passed the stamp) the campaign decision is the pre-``5234d37`` rule exactly: a value is
+admitted when ``report.ok`` and it is finite and > 0, whatever the regime; nothing is
+classified; no bound is admitted; so ``counts_as_measured``
+is "an admitted value". ``regime_active`` cannot gate this: it marks only a taken A
+route, and a B/C/U report is otherwise identical in both flag states. The stored kind,
+number and basis are unchanged by the flag — only admission and classification are.
 
 **Regime U splits by its reason** (operator ruling 2026-10-01, narrowing arming review F3):
 
@@ -112,6 +120,10 @@ class SigmaObservation:
     R_film_basis: str = ""
     #: The classifier's reason (``SigmaReport.regime_reason``); what splits regime U.
     regime_reason: str = ""
+    #: The report's ``SigmaReport.regime_aware``: whether the regime rules above decided
+    #: :attr:`admitted` and :attr:`classified`. Carried so a caller rebuilding an
+    #: observation (the replicate merge) can pass it on to :func:`unmeasured`.
+    regime_aware: bool = True
 
     @property
     def counts_as_measured(self) -> bool:
@@ -124,15 +136,17 @@ def is_classified(regime: str, reason: str = "") -> bool:
     return regime in CLASSIFIED_REGIMES or (regime == U and reason in U_SHAPE_REASONS)
 
 
-def unmeasured(regime: str = "", reason: str = "") -> SigmaObservation:
+def unmeasured(regime: str = "", reason: str = "", *,
+               regime_aware: bool) -> SigmaObservation:
     """Nothing stateable — for acquisition failures and unreadable reports.
 
     A ``"U"`` with no *reason* is bad data (unclassified), by the fail-safe rule above.
+    With *regime_aware* ``False`` nothing is classified (the flag-off rollback).
     """
     return SigmaObservation(kind=None, reported=None, lower=None, regime=regime, basis="",
                             R_film_ohm=None, admitted=False,
-                            classified=is_classified(regime, reason),
-                            regime_reason=reason)
+                            classified=regime_aware and is_classified(regime, reason),
+                            regime_reason=reason, regime_aware=regime_aware)
 
 
 def _positive(x: Any) -> float | None:
@@ -152,37 +166,47 @@ def _label(report: Any, field: str) -> str:
     return label if isinstance(label, str) else ""
 
 
+def _regime_aware(report: Any) -> bool:
+    """The stamped flag state; anything but a literal ``True`` is the pre-regime rule."""
+    try:
+        return getattr(report.sigma, "regime_aware", False) is True
+    except Exception:  # noqa: BLE001 - never raises, by contract
+        return False
+
+
 def sigma_observation(report: Any) -> SigmaObservation:
     """Map a ``SpectrumReport`` to its :class:`SigmaObservation`. Never raises."""
     regime, reason = _label(report, "regime"), _label(report, "regime_reason")
+    aware = _regime_aware(report)
     try:
-        return _observe(report.sigma, bool(report.ok), regime, reason)
+        return _observe(report.sigma, bool(report.ok), regime, reason, aware)
     except Exception:  # noqa: BLE001 - a malformed report is unmeasured, not a crash
-        return unmeasured(regime, reason)
+        return unmeasured(regime, reason, regime_aware=aware)
 
 
-def _observe(s: Any, ok: bool, regime: str, reason: str) -> SigmaObservation:
-    active = bool(s.regime_active)
-    classified = is_classified(regime, reason)
+def _observe(s: Any, ok: bool, regime: str, reason: str, aware: bool) -> SigmaObservation:
+    active = bool(s.regime_active)    # what is STATED; the flag gates only admission
+    classified = aware and is_classified(regime, reason)
     R_film = _positive(s.R_reported_ohm)
     if s.mode == "value":
         kind, reported, lower, basis = VALUE, _positive(s.value), None, s.R_basis
-        admitted = regime != U or classified          # bad-data U never tells (F3)
+        # Bad-data U never tells (F3) — under the regime rules only.
+        admitted = not aware or regime != U or classified
     elif s.mode in ("bound", "bound_unqualified"):
         kind, reported, basis = UPPER_BOUND, _positive(s.upper_bound), s.upper_bound_basis
         lower = _positive(s.regime_sigma_lower) if active else None
-        admitted = active and basis in ROUTE_A_BOUND_BASES
+        admitted = aware and active and basis in ROUTE_A_BOUND_BASES
     elif s.mode == "unavailable" and active and _positive(s.regime_sigma_lower) is not None:
         kind, reported, lower = LOWER_BOUND, _positive(s.regime_sigma_lower), None
         basis, R_film = REGIME_A_FOOT_LOWER, _positive(s.regime_R_foot_ohm)
-        admitted = True
+        admitted = aware
     else:
-        return unmeasured(regime, reason)
+        return unmeasured(regime, reason, regime_aware=aware)
     if reported is None:
-        return unmeasured(regime, reason)
+        return unmeasured(regime, reason, regime_aware=aware)
     return SigmaObservation(
         kind=kind, reported=reported, lower=lower, regime=regime, basis=str(basis),
         R_film_ohm=R_film, admitted=admitted and ok, classified=classified,
         R_film_basis=(REGIME_A_FOOT_LOWER if kind == LOWER_BOUND else str(s.R_basis)),
-        regime_reason=reason,
+        regime_reason=reason, regime_aware=aware,
     )
