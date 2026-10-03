@@ -57,6 +57,7 @@ from softae.core.campaign_events import (
     liveness,
     read_events,
 )
+from softae.gui.widgets.rig_owner import RELAUNCH_TO_TAKE_RIG
 
 logger = structlog.get_logger(__name__)
 
@@ -213,10 +214,9 @@ class CampaignStreamView:
         the rig lock. A bare "Idle" is true and useless — it is the same word an
         operator sees on a free rig, at the moment the difference matters most —
         so this says *why*, and follows the stream: when the run finishes, the
-        sentence becomes the one that names the way back in.
+        sentence becomes the one that names the way back in — a relaunch, since
+        an attached window cannot take the rig itself.
         """
         if self._finished:
-            return (
-                f"idle — {self.name} has finished; Init → Connect All takes the rig"
-            )
+            return f"idle — {self.name} has finished; {RELAUNCH_TO_TAKE_RIG}"
         return f"idle — {self.name} holds the rig"

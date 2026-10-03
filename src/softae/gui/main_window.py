@@ -294,9 +294,10 @@ class MainWindow(QMainWindow):
         Deliberately has no setter. Construction *branches* on the mode (no exit
         park and no purge timer in attached mode), so a window that could be
         re-moded afterwards would carry a mode its own wiring did not match —
-        which is the drift the launch-time decision exists to rule out. The one
-        way out of attach mode is the operator act that also acquires the
-        sessions: Init tab → Connect All.
+        which is the drift the launch-time decision exists to rule out. There
+        is no way out of attach mode inside the window: Init tab → Connect All
+        refuses in it, and the operator closes every SoftAE window and relaunches
+        once the run has finished, which starts an owner-mode window.
         """
         return self._launch_mode
 
@@ -315,7 +316,12 @@ class MainWindow(QMainWindow):
         self._tabs.setMinimumWidth(600)
 
         # --- Full tab stack ---
-        self._tab_init = InitCalibrationTab(self._manager, data_store=self._data_store)
+        # Passed for the same reason as Manual Control's below: an attached
+        # window's Connect All must refuse rather than claim a rig this window
+        # would still not act on.
+        self._tab_init = InitCalibrationTab(
+            self._manager, data_store=self._data_store, launch_mode=self._launch_mode
+        )
         self._tab_liquid_model = LiquidModelTab(self._manager)
         # The launch mode is passed, not looked up: Manual Control's controls are
         # the ones that would command sessions this window may not have opened,

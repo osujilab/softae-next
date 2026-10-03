@@ -3580,3 +3580,83 @@ class TestFitProvenanceColumns:
                 row["phase_headroom"]) == ("from_report", 0, 9.0)
         # Not merged field by field: what the report lacks stays NULL.
         assert row["floor_row_ids"] is None
+
+
+# ---------------------------------------------------------------------------
+# D2 (rung 3c): `doe_parameters.observation_json` — every stated observation
+# ---------------------------------------------------------------------------
+
+class TestDoeObservationJson:
+    """What the engine stated for a well, admitted or not — never an objective."""
+
+    @pytest.fixture()
+    def doe(self, store_with_run):
+        store, run_id = store_with_run
+        return store, store.record_doe_parameter(run_id, 1, 0, {"x": 1.0})
+
+    @staticmethod
+    def _stored(store: DataStore, doe_id: int):
+        import json
+
+        raw = store._conn.execute(
+            "SELECT observation_json FROM doe_parameters WHERE doe_id = ?",
+            (doe_id,)).fetchone()[0]
+        return None if raw is None else json.loads(raw)
+
+    def test_migration_fresh_db_declares_observation_json_nullable_text(
+        self, store: DataStore
+    ) -> None:
+        assert _declarations(store, "doe_parameters")["observation_json"] == (
+            "TEXT", 0, None)
+
+    def test_migration_legacy_doe_table_gains_observation_json_row_reads_null(
+        self, tmp_path: Path
+    ) -> None:
+        project = tmp_path / "legacy_doe_obs"
+        with DataStore(project) as store:
+            run_id = store.start_run("wf", campaign="c1")
+            store._conn.execute("DROP TABLE doe_parameters")
+            store._conn.execute(_LEGACY_DOE_DDL)
+            store._conn.execute(
+                "INSERT INTO doe_parameters (run_id, channel) VALUES (?, 3)", (run_id,))
+            store._conn.commit()
+
+        with DataStore(project) as store:
+            row = dict(store._conn.execute("SELECT * FROM doe_parameters").fetchone())
+        assert row["observation_json"] is None          # not recorded, never invented
+
+    def test_record_doe_observation_unadmitted_bound_round_trips_not_objective(
+        self, doe
+    ) -> None:
+        from softae.analysis.eis.observation import SigmaObservation
+
+        store, doe_id = doe
+        obs = SigmaObservation(kind="upper_bound", reported=4.65e-7, lower=None,
+                               regime="C", basis="loss_at_numerator",
+                               R_film_ohm=None, admitted=False, classified=True,
+                               regime_reason="no_plateau")
+        store.record_doe_observation(doe_id, obs)
+
+        stored = self._stored(store, doe_id)
+        assert stored["kind"] == "upper_bound"
+        assert stored["reported"] == pytest.approx(4.65e-7)
+        assert (stored["regime"], stored["regime_reason"]) == ("C", "no_plateau")
+        assert (stored["admitted"], stored["classified"]) == (False, True)
+        assert set(stored) == set(DataStore.DOE_OBSERVATION_FIELDS)
+        # The objective columns are untouched: R3a keeps them admitted-only.
+        assert _doe_row(store, doe_id) == dict.fromkeys(
+            ("objective_value",) + OBJECTIVE_COLUMNS)
+
+    def test_record_doe_observation_non_finite_and_missing_fields_are_null(
+        self, doe
+    ) -> None:
+        from types import SimpleNamespace
+
+        store, doe_id = doe
+        store.record_doe_observation(
+            doe_id, SimpleNamespace(kind="value", reported=float("nan")))
+
+        stored = self._stored(store, doe_id)
+        assert stored["kind"] == "value"
+        assert stored["reported"] is None               # NaN never stored as a number
+        assert stored["regime"] is None                 # absent field: written, null

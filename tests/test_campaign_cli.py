@@ -622,6 +622,66 @@ class TestCLI:
         assert rc == cli.EXIT_DECLINED
         assert "Head position unknown" in capsys.readouterr().out
 
+    @pytest.mark.parametrize("flag,head,is_up", [("--head-up", "up", True),
+                                                 ("--head-down", "down", False)])
+    def test_run_records_the_head_registration_in_the_event_stream(
+            self, tmp_path, flag, head, is_up):
+        """The flag the run was given is reconstructable from its transcript.
+
+        Every conditional head flip the campaign makes is decided against this
+        belief, and rung 3c's diagnosis could not tell which flag it had
+        (gui_reclaim_after_campaign.md §4, H2). The two cases are each other's
+        control: a record that ignored the flag passes at most one of them.
+        """
+        import json
+
+        rc = cli.main(["run", str(_write(tmp_path, DEMO)), "--mock", "--yes", flag,
+                       "--project", str(tmp_path / "proj")])
+        assert rc == cli.EXIT_OK
+
+        streams = list((tmp_path / "proj").rglob("events.jsonl"))
+        assert len(streams) == 1
+        records = [json.loads(line) for line in
+                   streams[0].read_text(encoding="utf-8").splitlines()]
+        types = [r["type"] for r in records]
+        assert types.count(cli.HEAD_REGISTERED) == 1
+        # Directly after `run_started`: the belief the run *started* from.
+        assert types.index(cli.HEAD_REGISTERED) == types.index("run_started") + 1
+        rec = records[types.index(cli.HEAD_REGISTERED)]
+        assert rec["head"] == head and rec["is_up"] is is_up
+        assert rec["source"] == flag
+        assert rec["applied"] is True
+        assert "seq" not in rec          # the narrator's counter is not ours
+
+    def test_head_registration_from_the_prompt_says_so(self, monkeypatch):
+        from types import SimpleNamespace
+
+        class _Tty:
+            def isatty(self):
+                return True
+
+        class _Syringe:
+            def set_head_state(self, is_up):
+                self.is_up = is_up
+
+        syringe = _Syringe()
+        manager = SimpleNamespace(get=lambda name: syringe)
+        monkeypatch.setattr(cli.sys, "stdin", _Tty())
+        monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+
+        head = cli._register_head_state(
+            manager, SimpleNamespace(head_up=False, head_down=False))
+
+        assert head == {"head": "down", "is_up": False, "source": "prompt",
+                        "applied": True}
+        assert syringe.is_up is False
+
+    def test_head_registration_that_cannot_be_written_does_not_raise(
+            self, tmp_path, capsys):
+        missing = tmp_path / "no" / "such" / "run"
+        cli._record_head_registration(missing, {"head": "up"})
+        assert "could not record the head registration" in capsys.readouterr().out
+
     def test_resume_is_an_alias_for_run_resume(self, tmp_path):
         args = cli.build_parser().parse_args(
             ["resume", str(_write(tmp_path, DEMO)),

@@ -33,8 +33,9 @@ if TYPE_CHECKING:
     from softae.core.data_store import DataStore
     from softae.server.manager import InstrumentManager
 
+from softae.gui.launch_mode import OWNER_MODE, LaunchMode
 from softae.gui.widgets.position_map import PositionMapWidget
-from softae.gui.widgets.rig_owner import OCCUPIED
+from softae.gui.widgets.rig_owner import OCCUPIED, attached_connect_refusal
 from softae.gui.widgets.worker_thread import StoppableWorker
 
 
@@ -193,10 +194,14 @@ class InitCalibrationTab(QWidget):
         manager: InstrumentManager,
         parent: QWidget | None = None,
         data_store: "DataStore | None" = None,
+        launch_mode: LaunchMode | None = None,
     ):
         super().__init__(parent)
         self._manager = manager
         self._data_store = data_store
+        # Owner or attached, as decided at launch; ``None`` is owner mode, the
+        # historical behaviour. Only the connect buttons branch on it.
+        self._launch_mode = launch_mode if launch_mode is not None else OWNER_MODE
         self._rig_lock = None          # last polled cross-process rig lock
         self._pcb_configs = _load_pcb_configs()
         self._build_ui()
@@ -617,6 +622,30 @@ class InitCalibrationTab(QWidget):
         if hasattr(self, "_poll_worker"):
             self._poll_worker.poke()
 
+    def _refuse_if_attached(self, action: str) -> bool:
+        """Whether *action* must not proceed because this window launched attached.
+
+        Checked before the lock, and regardless of it: the defect this closes is
+        the attached window whose campaign has *finished*, where the lock is gone
+        and the claim would succeed — leaving a window that holds the rig and
+        open ports while every Manual Control command, head retract included,
+        still refuses, because its mode is fixed for its lifetime
+        (``docs/SubAgent docs/gui_reclaim_after_campaign.md``). Claiming nothing
+        and saying so is the honest answer; an in-place takeover is a separate,
+        unruled design.
+        """
+        if self._launch_mode.owner:
+            return False
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "connect_refused_while_attached: %s (%s)", action,
+            self._launch_mode.reason)
+        QMessageBox.warning(
+            self, "This window cannot take the rig",
+            attached_connect_refusal(action, self._launch_mode.campaign))
+        return True
+
     def _refuse_if_rig_held(self, action: str) -> bool:
         """Whether *action* must not proceed because another process owns the rig.
 
@@ -689,6 +718,8 @@ class InitCalibrationTab(QWidget):
             release_rig_session()
 
     def _on_connect_all(self) -> None:
+        if self._refuse_if_attached("Connect All"):
+            return
         if self._refuse_if_rig_held("Connect All"):
             return
         if not self._claim_rig("Connect All"):
@@ -726,7 +757,9 @@ class InitCalibrationTab(QWidget):
 
     def _on_connect_selected(self) -> None:
         name = self._selected_instrument()
-        if not name or self._refuse_if_rig_held(f"Connect '{name}'"):
+        if not name or self._refuse_if_attached(f"Connect '{name}'"):
+            return
+        if self._refuse_if_rig_held(f"Connect '{name}'"):
             return
         # One port is a session too — the claim is rig-wide because the lock is.
         if self._claim_rig(f"Connect '{name}'"):

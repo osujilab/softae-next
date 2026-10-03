@@ -95,6 +95,12 @@ class AsyncTempController(BaseInstrument):
         #: sets ``syringe.purge_runner``.
         self.data_store: Any = None
         self.run_id: str | None = None
+        #: ``(event_type, payload)`` — the host's durable event stream, set by
+        #: ``autonomous_wiring`` for the campaign's lifetime (D8, rung 3c: the
+        #: cure and cool-down left no record a run directory could answer "did
+        #: it reach temperature?" from). Called from the I/O worker thread.
+        #: ``None`` leaves every method exactly as it was.
+        self.on_event: Callable[[str, dict[str, Any]], Any] | None = None
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -212,21 +218,29 @@ class AsyncTempController(BaseInstrument):
             Extra hold time (seconds) after reaching band.
         timeout : float
             Maximum wait (seconds). ``None`` → infinite.
+
+        A timeout still **returns** (no raise; that is a separate operator
+        ruling) — but it is now reported through :attr:`on_event` as
+        ``temp_wait_timeout``, beside ``temp_wait_reached`` and
+        ``temp_wait_aborted``, so the outcome outlives the process log.
         """
         t0 = time.time()
         deadline = None if timeout is None else t0 + timeout
 
+        def _outcome(event: str, sp: float, pv: float | None) -> None:
+            self._note(event, sp_C=sp, pv_C=pv, within_C=within,
+                       timeout_s=timeout, waited_s=round(time.time() - t0, 1))
+
         while abs(self.get_sp() - self.get_pv()) > within:
             if self._stop_wait.is_set():
-                logger.info("temp_wait_aborted", sp=self.get_sp())
+                sp = self.get_sp()
+                logger.info("temp_wait_aborted", sp=sp)
+                _outcome("temp_wait_aborted", sp, None)  # PV not read: aborting
                 return
             if deadline is not None and time.time() >= deadline:
-                logger.warning(
-                    "temp_wait_timeout",
-                    timeout=timeout,
-                    sp=self.get_sp(),
-                    pv=self.get_pv(),
-                )
+                sp, pv = self.get_sp(), self.get_pv()
+                logger.warning("temp_wait_timeout", timeout=timeout, sp=sp, pv=pv)
+                _outcome("temp_wait_timeout", sp, pv)
                 return
             time.sleep(5)
 
@@ -234,7 +248,24 @@ class AsyncTempController(BaseInstrument):
             logger.info("temp_equilibrating", duration=equilibration_time)
             time.sleep(equilibration_time)
 
-        logger.info("temp_ready", pv=self.get_pv(), sp=self.get_sp())
+        sp, pv = self.get_sp(), self.get_pv()
+        logger.info("temp_ready", pv=pv, sp=sp)
+        _outcome("temp_wait_reached", sp, pv)
+
+    def _note(self, event_type: str, **payload: Any) -> None:
+        """Report one event to :attr:`on_event`, if set. Never raises.
+
+        A reporting failure must not become a thermal one: this sits inside the
+        anneal and the approach wait, and the hold must go on regardless.
+        """
+        hook = self.on_event
+        if hook is None:
+            return
+        try:
+            hook(event_type, payload)
+        except Exception:
+            logger.warning("temp_event_hook_failed", event_type=event_type,
+                           exc_info=True)
 
     def ramp_linear(
         self,
@@ -315,6 +346,8 @@ class AsyncTempController(BaseInstrument):
         refuse_unknown_anneal_kwargs(legacy)
         original_sp = self.get_sp()
         logger.info("anneal_start", target=target_temp_C, hold_time=hold_time_s, original_sp=original_sp)
+        self._note("anneal_started", target_C=target_temp_C, hold_s=hold_time_s,
+                   ramp_C_per_min=ramp_rate_C_per_min, original_sp_C=original_sp)
         try:
             if ramp_rate_C_per_min is not None and ramp_rate_C_per_min > 0:
                 t_span = ramp_span_s(original_sp, target_temp_C, ramp_rate_C_per_min)
@@ -323,14 +356,20 @@ class AsyncTempController(BaseInstrument):
                 self.write_sp(target_temp_C, print_flag=0)
             self.wait(within=tolerance)
             logger.info("anneal_hold_start", target=target_temp_C, duration_s=hold_time_s)
+            self._note_hold_start(target_temp_C, hold_time_s, tolerance)
             from softae.drivers.contracts import run_anneal_hold
 
             rh_reader, rh_setpoint_pct = self._rh_watch_source()
-            report = run_anneal_hold(
-                self, hold_time_s, target_temp_C,
-                rh_reader=rh_reader, rh_setpoint_pct=rh_setpoint_pct,
-                data_store=self.data_store, run_id=self.run_id,
-            )
+            try:
+                report = run_anneal_hold(
+                    self, hold_time_s, target_temp_C,
+                    rh_reader=rh_reader, rh_setpoint_pct=rh_setpoint_pct,
+                    data_store=self.data_store, run_id=self.run_id,
+                )
+            except Exception as exc:
+                self._note("anneal_hold_failed", target_C=target_temp_C,
+                           error=f"{type(exc).__name__}: {exc}"[:300])
+                raise
             # ``rh`` is None when no reader could be resolved -- a controller with
             # no registry attached, or a rig with no RH controller on it -- and in
             # that case this is exactly the thermal-only hold it has always been.
@@ -340,9 +379,32 @@ class AsyncTempController(BaseInstrument):
                 n_warn=report.n_warn, aborted=report.aborted,
                 rh=report.rh.state if report.rh else None,
             )
+            self._note("anneal_hold_ended", target_C=target_temp_C,
+                       held_s=round(report.held_s, 1), n_samples=report.n_samples,
+                       excursion_C=report.excursion_C, n_warn=report.n_warn,
+                       aborted=report.aborted,
+                       rh=report.rh.state if report.rh else None)
         finally:
             logger.info("anneal_return", original_sp=original_sp)
             self.write_sp(original_sp, print_flag=0)
+            self._note("anneal_restored", restore_sp_C=original_sp)
+
+    def _note_hold_start(self, target_C: float, hold_s: float, tolerance: float) -> None:
+        """Report the hold starting, with whether PV had actually reached the band.
+
+        ``wait`` returns on timeout, so a hold can start out of band; this is the
+        record that says so. Only reached when someone is listening, so a bare
+        controller makes no extra serial reads.
+        """
+        if self.on_event is None:
+            return
+        try:
+            pv = self.get_pv()
+        except Exception:
+            pv = None
+        self._note("anneal_hold_started", target_C=target_C, hold_s=hold_s,
+                   pv_C=pv, tolerance_C=tolerance,
+                   in_band=None if pv is None else abs(pv - target_C) <= tolerance)
 
     def _rh_watch_source(self) -> tuple[Any, float | None]:
         """``(reader, commanded %RH)`` for the hold's humidity watch, or two ``None``.

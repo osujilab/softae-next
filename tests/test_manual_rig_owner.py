@@ -482,6 +482,22 @@ class TestAttachedWindowRefuses:
         assert not attached_tab._lbl_rig_owner.isHidden()
         assert ATTACHED in attached_tab._lbl_rig_owner.text()
 
+    def test_attached_refusal_names_relaunch_not_connect_all_as_the_way_out(
+            self, attached_tab):
+        """The old sentence promised Connect All would make this window actuate.
+
+        Nothing implemented that — the mode is fixed for the window's lifetime —
+        so an operator who followed it held the rig and still could not retract
+        the head (gui_reclaim_after_campaign.md).
+        """
+        attached_tab._note_manual_actuation("dispenser head retract")
+        for surface in (attached_tab._lbl_rig_owner.text(),
+                        attached_tab._lbl_last_command.text()):
+            assert "relaunch" in surface
+            assert "cannot take control" in surface
+            assert "Connect All" not in surface
+            assert "actuates again" not in surface
+
     def test_attached_refusal_leaves_a_log_line_naming_the_run(self, attached_tab):
         with structlog.testing.capture_logs() as logs:
             attached_tab._note_manual_actuation("pump 0 dispense")

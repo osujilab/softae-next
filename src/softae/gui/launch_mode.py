@@ -18,8 +18,13 @@ Three properties, and each is load-bearing:
 *It is decided at launch, not at the moment of danger.* The alternative — read the
 lock again on the way out and branch — puts a filesystem read that
 :func:`softae.core.run_lock.read_run_lock` can fail on inside the decision "do I
-make the rig safe?". Ownership changes only by an operator act (Init tab →
-Connect All, which is guarded by the same predicate), never by re-derivation.
+make the rig safe?". Ownership is never re-derived in-process: an attached
+window cannot take the rig — its Init tab → Connect All refuses — so the way to
+an owner window is to close every SoftAE window and relaunch once the run has
+finished. One path still claims in-process: the E-Stop ladder's takeover rung
+breaks the holder's lock and claims for this process, but the window stays
+attached afterwards. That is an open item for the in-place takeover design (F2
+in ``docs/SubAgent docs/gui_reclaim_after_campaign.md``).
 
 *It is a pure function.* ``gui/app.py`` constructs a ``QApplication`` and so can
 carry no tests of its own; extracting the decision is what makes the rule

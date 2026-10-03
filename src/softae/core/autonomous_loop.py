@@ -104,6 +104,22 @@ class BoardCheck(Enum):
     CANCEL = auto()    # abort before casting
 
 
+def cast_channel(step: Any) -> int | None:
+    """The electrode a step casts onto, or ``None`` when it casts nothing.
+
+    The predicate is the executor's own (``tags["phase"] == "deposit"``, see
+    ``WorkflowExecutor._run_linear_with_recovery``), so "this step put material
+    in a well" means one thing on both sides of the seam.
+    """
+    tags = getattr(step, "tags", None) or {}
+    if tags.get("phase") != "deposit":
+        return None
+    try:
+        return int(tags["channel"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Convergence criteria
 # ---------------------------------------------------------------------------
@@ -329,6 +345,17 @@ class AutonomousLoop:
         # O1: fired once per streak when ``park_after_failed_trials`` measured
         # wells in a row yielded no told value (streak, limit). An alert, never a park.
         self.on_bound_streak: Callable[[int, int], Any] | None = None
+        # D1 (rung 3c): a well closed as NOT measured, or a round that failed to
+        # execute. One payload dict per failure (iteration, wells, channel, what,
+        # why, regime, reason, kind, consecutive, limit). Before this the only
+        # trace was a structlog warning, so a well that gave nothing was silent
+        # in the run's durable record.
+        self.on_trial_unmeasured: Callable[[dict[str, Any]], Any] | None = None
+        # D5/D4: a well was cast — fired from the deposit step itself, not at
+        # round end, with (board, channel, iteration, params, sample_uuid,
+        # confirmed). ``confirmed`` is False when the deposit step failed: the
+        # well may hold material, so it is recorded occupied all the same.
+        self.on_well_cast: Callable[[dict[str, Any]], Any] | None = None
         self.on_converged: Callable[[int, tuple[dict[str, Any], float] | None], Any] | None = None
         # Fired when a board fills and an exchange is requested (board_index,
         # remaining_samples) — a notification hook distinct from the decision
@@ -875,7 +902,8 @@ class AutonomousLoop:
                 if self._is_hard_fault(exc):
                     self._park(f"hard fault: {type(exc).__name__}: {exc}")
                     break
-                if self._note_trial_failure(f"execute: {type(exc).__name__}"):
+                if self._note_trial_failure(f"execute: {type(exc).__name__}",
+                                            why=str(exc)[:300]):
                     break
                 continue
 
@@ -885,7 +913,8 @@ class AutonomousLoop:
                 objective = self._extract_objective(step_results)
             except Exception as exc:
                 logger.error("objective_extraction_error", iteration=self._iteration, error=str(exc))
-                if self._note_trial_failure(f"analyze: {type(exc).__name__}"):
+                if self._note_trial_failure(f"analyze: {type(exc).__name__}",
+                                            why=str(exc)[:300]):
                     break
                 continue
 
@@ -998,7 +1027,10 @@ class AutonomousLoop:
 
         return await self._run_workflow(trial_wf)
 
-    async def _run_workflow(self, trial_wf: Workflow) -> dict[str, Any]:
+    async def _run_workflow(
+        self, trial_wf: Workflow, *,
+        on_cast: Callable[[int, bool], None] | None = None,
+    ) -> dict[str, Any]:
         """Execute a concrete workflow and collect step results by name.
 
         Runs with the executor's **graceful channel recovery** enabled: a
@@ -1008,6 +1040,12 @@ class AutonomousLoop:
         simply absent from ``results``, so the objective extractor returns
         ``None`` and :meth:`_is_unmeasured` skips that trial rather than telling
         the optimizer a fabricated value.
+
+        *on_cast* ``(channel, confirmed)`` fires the moment a deposit step
+        (:func:`cast_channel`) completes (``confirmed=True``) or fails
+        (``False`` — material may be in the well). It must not raise: it runs
+        inside the executor's step callbacks, where a raise after a completed
+        dispense would read as a failed step and be *replayed*.
         """
         results: dict[str, Any] = {}
 
@@ -1028,11 +1066,19 @@ class AutonomousLoop:
         # this stays robust to callback-signature growth.
         def _step_done(step, idx, total, result, *_) -> None:
             results[step.name] = result
+            if on_cast is not None and (ch := cast_channel(step)) is not None:
+                on_cast(ch, True)
             # A step boundary is the only place a Pause may take hold inside a
             # trial, and this is the loop's existing view of one.
             self._hold_executor_if_quiescent()
 
         executor.on_step_complete = _step_done
+        if on_cast is not None:
+            def _step_failed(step, *_) -> None:
+                if (ch := cast_channel(step)) is not None:
+                    on_cast(ch, False)
+
+            executor.on_step_error = _step_failed
         # Anti-clog purge alongside co-runnable steps (P8). Set from the loop so
         # every campaign gets it, GUI or headless, without each host wiring it.
         executor.on_purge_window = self.on_purge_window
@@ -1195,7 +1241,8 @@ class AutonomousLoop:
             # ``+= len(batch)`` here skipped the checkpoint, and a resume from
             # the stale point would have re-cast the whole round's used wells.
             return not self._note_trial_failure(
-                f"execute: {type(exc).__name__}", wells=len(batch))
+                f"execute: {type(exc).__name__}", wells=len(batch),
+                why=str(exc)[:300])
 
         # 4/5. ANALYZE + TELL each batch member against its own channel result.
         # Every member is closed before the round acts on a park or convergence
@@ -1203,7 +1250,8 @@ class AutonomousLoop:
         self._set_state(LoopState.ANALYZING)
         return not self._close_round(
             (params, doe_ids[k],
-             lambda k=k, params=params: self._batch_extract(step_results, k, params))
+             lambda k=k, params=params: self._batch_extract(step_results, k, params),
+             self._batch_channels[k] if self._batch_channels else None)
             for k, params in enumerate(batch))
 
     # ── Board-aware round (sequential electrodes + board exchange) ───────
@@ -1272,6 +1320,41 @@ class AutonomousLoop:
                            exc_info=True)
             return None
 
+    def _record_cast(self, board: int, channel: int, iteration: int,
+                     params: dict[str, Any] | None, *, confirmed: bool,
+                     notify: bool = True) -> None:
+        """Mark one well occupied (when tracked) and say so. Never raises.
+
+        Called from inside the executor's step callbacks (see
+        :meth:`_run_workflow`), so a failure here is logged and swallowed: the
+        occupancy row is a safety record, but raising would turn a completed
+        dispense into a "failed" step the executor replays into the same well.
+        """
+        sample_uuid = self._sample_uuid(channel)
+        if self._track_occupancy:
+            try:
+                self._data_store.record_electrode_cast(
+                    board, channel, run_id=self._run_id, iteration=iteration,
+                    sample_uuid=sample_uuid)
+            except Exception:
+                logger.warning("occupancy_record_failed", channel=channel,
+                               exc_info=True)
+        if notify:
+            self._notify("on_well_cast", {
+                "board": board, "channel": channel, "iteration": iteration,
+                "params": dict(params or {}), "sample_uuid": sample_uuid,
+                "confirmed": confirmed})
+
+    def _notify(self, hook: str, payload: dict[str, Any]) -> None:
+        """Fire a payload hook if one is set; a raising hook is logged, not fatal."""
+        fn = getattr(self, hook, None)
+        if fn is None:
+            return
+        try:
+            fn(payload)
+        except Exception:
+            logger.warning("loop_hook_failed", hook=hook, exc_info=True)
+
     async def _run_board_aware_round(self, q: int) -> bool:
         """Run one round of q suggestions on **one** board. Returns ``False`` to stop.
 
@@ -1335,9 +1418,31 @@ class AutonomousLoop:
             logger.info("optimizer_exhausted", iteration=self._iteration)
             return False
         self._set_state(LoopState.EXECUTING)
+        # D5: each well is recorded occupied when ITS deposit step finishes, not
+        # when the whole round returns — the round spans cure, cool-down, settle
+        # and production read (~10 h on rung 3c), and a crash or park inside it
+        # used to leave every cast well unrecorded and open to a re-cast. Wells
+        # are told in placement order, so channel k belongs to iteration
+        # start + k, the same iteration its DOE row gets in `_tell_placed`.
+        start = self._iteration
+        placed = {ch: (start + k, params)
+                  for k, (params, ch) in enumerate(zip(batch, alloc.channels))}
+        recorded: dict[int, bool] = {}
+
+        def _on_cast(ch: int, confirmed: bool) -> None:
+            # A failed deposit records once; a later success (a replay) re-stamps
+            # the row with the real cast time. Anything else is a repeat.
+            if ch not in placed or recorded.get(ch) is True or (
+                    ch in recorded and not confirmed):
+                return
+            recorded[ch] = confirmed
+            iteration, params = placed[ch]
+            self._record_cast(alloc.board_index, ch, iteration, params,
+                              confirmed=confirmed)
+
         try:
             wf = self._placement_builder(batch, alloc.channels)
-            round_cache = await self._run_workflow(wf)
+            round_cache = await self._run_workflow(wf, on_cast=_on_cast)
         except AbortedError:
             logger.warning("trial_aborted", iteration=self._iteration)
             self._set_state(LoopState.STOPPED)
@@ -1352,22 +1457,18 @@ class AutonomousLoop:
             # even though nothing was measured — mirroring the batch round. The
             # failure itself is still counted once for the whole round.
             return not self._note_trial_failure(
-                f"execute: {type(exc).__name__}", wells=len(alloc.channels))
+                f"execute: {type(exc).__name__}", wells=len(alloc.channels),
+                why=str(exc)[:300])
 
-        # Persist single-use occupancy for the wells just cast (keyed by this
-        # board's id, so a later session can detect re-casts). The sample uuid,
-        # when the builder minted one, makes the row say *which* sample occupies
-        # the well rather than only that something does.
-        if self._track_occupancy:
-            for ch in alloc.channels:
-                try:
-                    self._data_store.record_electrode_cast(
-                        alloc.board_index, ch,
-                        run_id=self._run_id, iteration=self._iteration,
-                        sample_uuid=self._sample_uuid(ch),
-                    )
-                except Exception:
-                    logger.warning("occupancy_record_failed", exc_info=True)
+        # Round-end fallback: every allocated well not already recorded at its
+        # cast — a builder whose steps carry no deposit tag, or a channel the
+        # executor skipped before its deposit ran. Wells recorded at cast time
+        # are left alone, so their `cast_at` stays the real cast time.
+        for ch in alloc.channels:
+            if ch not in recorded:
+                iteration, params = placed[ch]
+                self._record_cast(alloc.board_index, ch, iteration, params,
+                                  confirmed=False, notify=False)
 
         # 4. ANALYZE + TELL the whole round.
         self._set_state(LoopState.ANALYZING)
@@ -1452,7 +1553,7 @@ class AutonomousLoop:
                 logger.warning("on_park_failed", exc_info=True)
         self._set_state(LoopState.STOPPED)
 
-    def _note_trial_failure(self, what: str, *, wells: int = 1) -> bool:
+    def _note_trial_failure(self, what: str, *, wells: int = 1, why: str = "") -> bool:
         """Count a failed/unmeasured trial, close it out; ``True`` → park.
 
         Only failures that already survived the executor's own retries reach
@@ -1489,29 +1590,45 @@ class AutonomousLoop:
         which is the one place that can see both counters at once, and therefore
         the only place the comparison can honestly live.
         """
-        reason = self._count_trial_failure(what, wells=wells)
+        reason = self._count_trial_failure(what, wells=wells, why=why)
         if reason is None:
             return False
         self._park(reason)
         return True
 
-    def _count_trial_failure(self, what: str, *, wells: int = 1) -> str | None:
+    def _count_trial_failure(self, what: str, *, wells: int = 1,
+                             channel: int | None = None, obs: Any = None,
+                             why: str = "") -> str | None:
         """Steps 1 and 2 of :meth:`_note_trial_failure`: count, then checkpoint.
 
         Returns the park reason when the streak has reached its limit, else
         ``None``. Step 3 (the park) is the caller's, which lets a round close
         every well it cast before it stops (R8) while keeping the order: the
         resume point is still on disk before the run parks.
+
+        Every failure path funnels through here, so this is where it becomes
+        durable (D1): ``on_trial_unmeasured`` fires after the checkpoint, with
+        the well's channel and, when an observation came back, its regime.
         """
         self._consecutive_failures += 1
+        iteration = self._iteration
         logger.warning(
             "trial_failed",
-            iteration=self._iteration, what=what,
+            iteration=iteration, what=what,
             consecutive=self._consecutive_failures,
             limit=self._park_after_failed_trials,
         )
         for _ in range(max(1, int(wells))):
             self._advance_iteration()
+        self._notify("on_trial_unmeasured", {
+            "iteration": iteration, "wells": max(1, int(wells)),
+            "channel": channel, "what": what, "why": why,
+            "regime": getattr(obs, "regime", None),
+            "reason": getattr(obs, "regime_reason", None),
+            "kind": getattr(obs, "kind", None),
+            "consecutive": self._consecutive_failures,
+            "limit": self._park_after_failed_trials,
+        })
         if self._consecutive_failures >= self._park_after_failed_trials:
             return (f"{self._consecutive_failures} consecutive trial failures "
                     f"({what}) — treating as a systematic fault")
@@ -1524,7 +1641,8 @@ class AutonomousLoop:
     # ── Closing a well: told, measured-untold, or failed ────────────────
 
     def _close_well(
-        self, objective: Any, params: dict[str, Any], doe_id: Any
+        self, objective: Any, params: dict[str, Any], doe_id: Any,
+        *, channel: int | None = None,
     ) -> tuple[bool, str | None]:
         """Close one well's observation. Returns ``(told, park_reason)``.
 
@@ -1547,9 +1665,13 @@ class AutonomousLoop:
           is returned for the caller to apply once its round is closed.
 
         Observations are recognised by shape (``counts_as_measured``), so this
-        module stays free of the EIS analysis package.
+        module stays free of the EIS analysis package. Whatever the outcome, an
+        observation is written to its DOE row's ``observation_json`` (D2): the
+        objective columns stay admitted-only (R3a), and this is where an
+        unadmitted bound or a classified-but-unmeasured spectrum still lands.
         """
         if objective is not None and hasattr(objective, "counts_as_measured"):
+            self._record_observation(doe_id, objective)
             if objective.kind == "value" and objective.admitted:
                 objective = float(objective.reported)
             elif objective.counts_as_measured:
@@ -1560,9 +1682,13 @@ class AutonomousLoop:
                                params=params, regime=objective.regime,
                                kind=objective.kind,
                                msg="no usable measurement — not told to the optimizer")
-                return False, self._count_trial_failure("unmeasured")
+                return False, self._count_trial_failure(
+                    "unmeasured", channel=channel, obs=objective,
+                    why="observation does not count as measured")
         if self._is_unmeasured(objective, params):
-            return False, self._count_trial_failure("unmeasured")
+            return False, self._count_trial_failure(
+                "unmeasured", channel=channel,
+                why="no observation (the extractor returned None)")
         self._note_trial_success()
         self._consecutive_untold = 0
         self._optimizer.tell(params, objective)
@@ -1573,6 +1699,18 @@ class AutonomousLoop:
             self.on_result(self._iteration, params, objective)
         self._advance_iteration()
         return True, None
+
+    def _record_observation(self, doe_id: Any, obs: Any) -> None:
+        """D2: persist what the engine stated for this well. Never raises.
+
+        Best-effort like the occupancy write: a failure here must not cost the
+        tell that follows, and it is logged rather than silent.
+        """
+        try:
+            self._data_store.record_doe_observation(doe_id, obs)
+        except Exception:
+            logger.warning("doe_observation_record_failed", doe_id=doe_id,
+                           exc_info=True)
 
     def _close_untold(self, obs: Any, params: dict[str, Any], doe_id: Any) -> None:
         """The measured-but-not-told branch of :meth:`_close_well`."""
@@ -1599,9 +1737,9 @@ class AutonomousLoop:
     def _close_round(self, wells: Any) -> bool:
         """Close every well of a round, THEN act on a park or convergence (R8).
 
-        *wells* yields ``(params, doe_id, extract)`` per cast well, lazily, so a
-        caller that writes its DOE row as it goes writes it at the right
-        iteration. Returning mid-round used to leave the round's remaining cast
+        *wells* yields ``(params, doe_id, extract, channel)`` per cast well,
+        lazily, so a caller that writes its DOE row as it goes writes it at the
+        right iteration. Returning mid-round used to leave the round's remaining cast
         wells with no tell (and, on the placement path, no DOE row). A streak
         that reaches the limit anywhere in the round still parks — after the
         last well is recorded — and a park outranks a convergence reached in the
@@ -1610,15 +1748,18 @@ class AutonomousLoop:
         """
         park_reason: str | None = None
         converged = False
-        for params, doe_id, extract in wells:
+        for params, doe_id, extract, channel in wells:
             try:
                 objective = extract()
             except Exception as exc:
                 logger.error("objective_extraction_error",
                              iteration=self._iteration, error=str(exc))
-                reason = self._count_trial_failure(f"analyze: {type(exc).__name__}")
+                reason = self._count_trial_failure(
+                    f"analyze: {type(exc).__name__}", channel=channel,
+                    why=str(exc)[:300])
             else:
-                told, reason = self._close_well(objective, params, doe_id)
+                told, reason = self._close_well(objective, params, doe_id,
+                                                channel=channel)
                 if told and not converged:
                     # Per told well, so a round can still converge mid-batch;
                     # latched, and acted on once the round is closed.
@@ -1712,5 +1853,6 @@ class AutonomousLoop:
                  run_id=self._run_id, channel=channel,
                  iteration=self._iteration, parameters=params),
              lambda params=params, channel=channel: self._placement_extract(
-                 cache, channel, params))
+                 cache, channel, params),
+             channel)
             for params, channel in placed)

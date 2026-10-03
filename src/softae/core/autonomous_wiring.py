@@ -3413,6 +3413,49 @@ async def _prepare_electrode_allocator(
     )
 
 
+def config_snapshot() -> tuple[str, str, str]:
+    """``(text, source, reason)`` — the config this process loaded, for ``start_run``.
+
+    D3 (rung 3c): every campaign run recorded ``config_snapshot.toml`` as ``{}``
+    because nothing passed one; recovery leaned on ``config_hash`` matching a
+    committed file. ``source`` says which of three answers this is:
+
+    * ``"file"`` — the TOML text, verbatim, **only if it still hashes to**
+      ``loader.config_hash()``; then the snapshot is provably the loaded config;
+    * ``"loaded"`` — the file changed since it was loaded, so the snapshot is the
+      in-memory config actually in effect, as JSON (its key set, not its bytes);
+    * ``"unavailable"`` — no config could be read; the text is ``"{}"`` and
+      *reason* says why, so ``{}`` is never mistaken for an empty config.
+    """
+    try:
+        expected = loader.config_hash()
+        raw = loader.config_path().read_bytes()
+        if hashlib.sha256(raw).hexdigest() == expected:
+            return raw.decode("utf-8"), "file", ""
+        return (json.dumps(loader.load(), sort_keys=True, default=str), "loaded",
+                "config file changed on disk after it was loaded")
+    except Exception as exc:
+        return "{}", "unavailable", f"{type(exc).__name__}: {exc}"
+
+
+def _provenance_trial_note(spec: "CampaignSpec", trial: dict[str, Any]) -> dict[str, Any]:
+    """D4: say plainly that ``provenance.json``'s ``workflow`` is not a cast.
+
+    The representative trial puts a numeric axis at its midpoint and a
+    categorical axis at ``choices[0]`` — a placeholder, so on rung 3c it showed
+    every well casting the 0 % PAA anchor. The per-well casts are the run's
+    ``well_cast`` events and the ``formulations`` rows.
+    """
+    space = spec.parameter_space or {}
+    return {"workflow_trial": {
+        "role": "representative compile check, NOT the cast of any well",
+        "params": dict(trial),
+        "categorical_axes_not_applicable": sorted(
+            p for p, d in space.items() if d.get("type") not in ("float", "int")),
+        "per_well_casts": "events.jsonl `well_cast` events; DB table `formulations`",
+    }}
+
+
 # ── The hook ─────────────────────────────────────────────────────────────────
 
 async def run_autonomous_campaign(
@@ -3525,6 +3568,11 @@ async def run_autonomous_campaign(
         if on_event:
             on_event({"type": event_type, **payload})
 
+    def _temp_event(event_type: str, payload: dict[str, Any]) -> None:
+        # Called from the driver's worker thread; `emit` is lock-safe there
+        # (the narrator holds a lock for exactly this case).
+        emit(event_type, **payload)
+
     run_id: str | None = None
     run_finalized = False
     # Set by `_on_park`: a campaign parks once, so a crash *after* the loop has
@@ -3560,8 +3608,10 @@ async def run_autonomous_campaign(
         except Exception:
             pass
 
+        snapshot_text, snapshot_source, snapshot_reason = config_snapshot()
         run_id = data_store.start_run(
             spec.name,
+            snapshot_text,
             mode="autonomous",
             pcb_name=resolve_pcb(spec.pcb_name)[0],
             eis_preset=spec.measurement.preset,
@@ -3588,6 +3638,13 @@ async def run_autonomous_campaign(
         # drivers accept the attributes and only the real one reads them.
         manager.get("temp_controller").run_id = run_id
         manager.get("temp_controller").data_store = data_store
+        # D8 (rung 3c): the cure and the cool-down left no durable record — the
+        # heartbeat read `phase="state"` for 6.9 h. The real driver now reports
+        # anneal start / hold start (with whether PV was in band) / hold end and
+        # every approach wait's outcome, including a TIMEOUT, through this hook;
+        # it is detached in the teardown below so a later manual anneal cannot
+        # write into a finished run's stream. Recording only: no wait changes.
+        manager.get("temp_controller").on_event = _temp_event
         # ── The rig is claimed for the whole campaign, not for each trial ────
         # `WorkflowExecutor.run` takes the lock per workflow and drops it in its
         # `finally`, and one trial is one `executor.run`. So between trials —
@@ -3660,6 +3717,11 @@ async def run_autonomous_campaign(
         # cannot be read apart from one written before the field existed.
         _ev, _payload = baseline_event_payload(spec)
         emit(_ev, **_payload)
+        # D3: say which snapshot `start_run` recorded, so a `{}` can be read as
+        # "unavailable, because ..." rather than as an empty config. After the
+        # baseline, which is pinned as the transcript's second line.
+        emit("config_snapshot", source=snapshot_source, reason=snapshot_reason,
+             config_hash=config_hash)
 
         # Beats on the event loop, not between steps. Sync instrument methods
         # are dispatched through `run_in_executor` (`server/base_instrument.py`),
@@ -4131,7 +4193,7 @@ async def run_autonomous_campaign(
                 spec=spec,
                 workflow=build_trial_workflow(spec, _mid, catalog=catalog),
                 tasks=catalog, chemicals=_chems, solutions=_sols,
-                stocks=_stocks,
+                stocks=_stocks, extra=_provenance_trial_note(spec, _mid),
             )
         except Exception:
             logger.warning("run_provenance_skipped", exc_info=True)
@@ -4744,6 +4806,14 @@ async def run_autonomous_campaign(
             )
 
         loop.on_bound_streak = _on_bound_streak
+        # D1: a well that gave nothing — or a round that never executed — is a
+        # line in the durable stream, not only a structlog warning. Rung 3c's
+        # wells 22 and 24 left `events.jsonl` with 6 outcomes for 8 trials.
+        loop.on_trial_unmeasured = lambda info: emit("trial_unmeasured", **info)
+        # D5/D4: each well as it is cast, with the params actually cast into it,
+        # so the per-well mapping is on record without reconstructing it from
+        # the suggestion order and the allocator.
+        loop.on_well_cast = lambda info: emit("well_cast", **info)
         loop.on_trial_measured = (
             _equilibrate_then_label if settle_plan is not None else _confirm_and_label)
         loop.on_state_change = lambda old, new: emit("state", old=old.name, new=new.name)
@@ -5025,6 +5095,14 @@ async def run_autonomous_campaign(
         # campaign teardown must not queue behind a monitoring read.
         if conditions is not None:
             await conditions.aclose()
+        # D8's hook goes before the narrator it writes to, and only if it is
+        # still ours: a manager outlives the campaign it served.
+        try:
+            _tc = manager.get("temp_controller")
+            if getattr(_tc, "on_event", None) is _temp_event:
+                _tc.on_event = None
+        except Exception:
+            logger.warning("temp_event_detach_failed", exc_info=True)
         # Then: stop beating. Every event worth narrating — `run_finished`, or
         # the `park`/`safe_park` pair from the catch-all above — has already been
         # emitted by now, and a heartbeat that outlived the campaign would tell a

@@ -134,7 +134,8 @@ def run_app(*, mock: bool | None = None) -> int:
     #
     # Not in attached mode: arming licenses *this* process to drive, and a
     # process that holds no instrument sessions must not carry that licence.
-    # It is re-evaluated on the way out of attach mode (Init tab → Connect All).
+    # Nothing re-evaluates it: an attached window stays unarmed for its lifetime
+    # (its Connect All refuses), and the way to an armed window is a relaunch.
     from softae.core.hardware_safety import arm_hardware, real_motion_instruments
 
     if mode.owner and real_motion_instruments(manager):
@@ -193,10 +194,11 @@ def run_app(*, mock: bool | None = None) -> int:
         # is still closing.
         #
         # Asked unconditionally, and *not* branched on the launch decision: a
-        # window that started attached may have taken the rig since, via Init tab
-        # → Connect All, which is the one way out of attached mode. The release
-        # is keyed on what this process actually holds, which is the only thing
-        # true in every one of those paths.
+        # window that started attached may have taken the rig since — not by
+        # Connect All, which refuses there, but by the E-Stop ladder's takeover
+        # rung, which breaks the holder's lock and claims for this process. The
+        # release is keyed on what this process actually holds, which is the
+        # only thing true in every one of those paths.
         from softae.core.rig_session import release_rig_session
 
         release_rig_session()

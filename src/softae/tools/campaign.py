@@ -61,11 +61,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from contextlib import ExitStack
+from datetime import datetime, timezone
 from typing import Any
 
-from softae.core.campaign_events import EVENTS_FILENAME
+from softae.core.campaign_events import EVENTS_FILENAME, events_path
 from softae.core.campaign_spec_io import SpecLoadError, load_campaign_spec
 from softae.tools import add_verbosity_flag, configure_logging, use_utf8_console
 
@@ -152,28 +154,74 @@ def _confirm(prompt: str, *, assume_yes: bool) -> bool:
         return False
 
 
-def _register_head_state(manager, args) -> bool:
-    """Establish the dispenser-head belief before anything moves."""
+#: Event type for the head belief the run started from. See
+#: :func:`_record_head_registration`.
+HEAD_REGISTERED = "head_registered"
+
+
+def _register_head_state(manager, args) -> dict[str, Any] | None:
+    """Establish the dispenser-head belief before anything moves.
+
+    Returns the registration as an event payload — the belief, and where it came
+    from — or ``None`` when no belief was established (the caller declines the
+    run). The payload is what :func:`_record_head_registration` writes into the
+    run's event stream once the run exists.
+    """
     if args.head_up or args.head_down:
         is_up = bool(args.head_up)
+        source = "--head-up" if args.head_up else "--head-down"
     else:
         if not sys.stdin or not sys.stdin.isatty():
             print("Head position unknown: pass --head-up or --head-down "
                   "(the loop issues conditional head commands, so it must not "
                   "be guessed).")
-            return False
+            return None
         answer = input("Is the dispenser head raised? [y/N] ").strip().lower()
         is_up = answer in ("y", "yes")
+        source = "prompt"
 
     try:
         syringe = manager.get("syringe")
-        if hasattr(syringe, "set_head_state"):
+        applied = hasattr(syringe, "set_head_state")
+        if applied:
             syringe.set_head_state(is_up)
     except Exception as exc:
         print(f"Could not register head state: {exc}")
-        return False
+        return None
     print(f"   head registered as {'raised' if is_up else 'LOWERED'}")
-    return True
+    # `applied` is recorded rather than assumed: a syringe without the setter
+    # keeps its driver default, and a transcript claiming the flag reached it
+    # would answer the diagnostic question this event exists for wrongly.
+    return {"head": "up" if is_up else "down", "is_up": is_up,
+            "source": source, "applied": applied}
+
+
+def _record_head_registration(run_dir: Any, head: dict[str, Any]) -> None:
+    """Append the run's starting head belief to its ``events.jsonl``. Never raises.
+
+    Every conditional head command the campaign issues (``anneal_rest_all``'s
+    descend, ``anneal_leave_rest_all``'s retract) is a flip decided against this
+    belief, so a wrong flag inverts all of them — and without this record a later
+    diagnosis cannot tell which flag the run was given
+    (``docs/SubAgent docs/gui_reclaim_after_campaign.md`` §4, H2).
+
+    Written here, at ``run_started``, because the belief is registered before the
+    run — and so its directory — exists. The campaign's own narrator persists
+    each event *before* dispatching it, so this line lands directly after
+    ``run_started``. It carries no ``seq``: that is the narrator's own record
+    counter, and a second writer reusing it would put two records under one
+    number.
+    """
+    record ={"ts": datetime.now(tz=timezone.utc).isoformat(),
+              "type": HEAD_REGISTERED, **head}
+    try:
+        with open(events_path(run_dir), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except Exception as exc:
+        # A transcript line does not get to stop a campaign that has already
+        # claimed the rig and connected; say so where the operator is looking.
+        print(f"   note: could not record the head registration ({exc})",
+              flush=True)
 
 
 # ── Anti-clog purge (P8) — the same wiring the GUI does ──────────────────────
@@ -513,7 +561,8 @@ def _cmd_run(args) -> int:
         raise
 
     try:
-        if not _register_head_state(manager, args):
+        head = _register_head_state(manager, args)
+        if head is None:
             return EXIT_DECLINED
         if not _project(spec, manager, assume_yes=args.yes, store=store):
             return EXIT_DECLINED
@@ -563,7 +612,8 @@ def _cmd_run(args) -> int:
               f"{' (resuming)' if args.resume else ''}...", flush=True)
 
         def _on_event(event: dict[str, Any]) -> None:
-            """``_emit``, plus a one-time pointer at the durable transcript.
+            """``_emit``, plus the head registration and a one-time pointer at
+            the durable transcript.
 
             Printed at ``run_started`` rather than at the end so it survives the
             exits that matter: an operator who comes back to a killed process
@@ -573,6 +623,7 @@ def _cmd_run(args) -> int:
             _emit(event)
             if event.get("type") == "run_started":
                 run_dir = store.run_dir(str(event.get("run_id")))
+                _record_head_registration(run_dir, head)
                 print(f"   transcript: {run_dir / EVENTS_FILENAME}", flush=True)
 
         async def _go():

@@ -495,7 +495,12 @@ CREATE TABLE IF NOT EXISTS doe_parameters (
     -- `DataStore.objective_observations`, which also interprets pre-feature rows.
     objective_reported  REAL,
     objective_kind      TEXT,
-    objective_lower     REAL
+    objective_lower     REAL,
+    -- D2 (rung 3c): what the engine STATED for this well, admitted or not, as
+    -- JSON. Never an objective: the three columns above stay admitted-only
+    -- (R3a). NULL = no observation object reached the loop. Mirrored in
+    -- `_migrate_doe_observation_column`.
+    observation_json    TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_doe_run_id ON doe_parameters(run_id);
@@ -1156,6 +1161,8 @@ class DataStore:
         self._migrate_censored_observation_columns()
         # T11.43: which calibration and phase floor a fit was read against.
         self._migrate_fit_provenance_columns()
+        # D2 (rung 3c): every well's stated observation, admitted or not.
+        self._migrate_doe_observation_column()
         # LAST, always: the ledger records the epochs every migration above has
         # just finished establishing, so it must not claim them before they hold.
         self._migrate_schema_version()
@@ -1217,9 +1224,11 @@ class DataStore:
         (run_dir / "eis").mkdir(parents=True, exist_ok=True)
         (run_dir / "images").mkdir(exist_ok=True)
 
-        # Persist config snapshot to disk.
+        # Persist config snapshot to disk — verbatim (``newline=""``), so a
+        # snapshot of the config file still hashes to the run's ``config_hash``
+        # rather than having its line endings rewritten on Windows.
         (run_dir / "config_snapshot.toml").write_text(
-            config_snapshot, encoding="utf-8"
+            config_snapshot, encoding="utf-8", newline=""
         )
 
         # Write annotation as a plain-text notes file for quick identification.
@@ -2086,6 +2095,35 @@ class DataStore:
             "UPDATE doe_parameters SET objective_value = ?, objective_reported = ?, "
             "objective_kind = ?, objective_lower = ? WHERE doe_id = ?",
             (*row, doe_id),
+        )
+        self._conn.commit()
+
+    #: The fields of a stated observation that :meth:`record_doe_observation`
+    #: keeps — :class:`SigmaObservation`'s, read by name so any observation of
+    #: that shape is accepted.
+    DOE_OBSERVATION_FIELDS = ("kind", "reported", "lower", "regime", "regime_reason",
+                              "basis", "admitted", "classified", "regime_aware",
+                              "R_film_ohm", "R_film_basis")
+
+    def record_doe_observation(self, doe_id: int, observation: Any) -> None:
+        """Write what the engine stated for this well to ``observation_json`` (D2).
+
+        Every observation the loop closes is recorded here — a told value, an
+        admitted bound, an UNADMITTED bound, a classified spectrum with nothing
+        stateable — because R3a keeps the objective columns admitted-only, and
+        before this an unadmitted bound reached no table at all (rung 3c wells
+        17, 20, 21: only ``events.jsonl`` held them). It is a record, never an
+        objective: :meth:`objective_observations` does not read it.
+
+        Every key in :attr:`DOE_OBSERVATION_FIELDS` is always written (``null``
+        when the observation lacks it), so the record has one fixed shape;
+        non-finite numbers become ``null`` at the JSON boundary (:func:`_safe_json`).
+        """
+        record = {name: getattr(observation, name, None)
+                  for name in self.DOE_OBSERVATION_FIELDS}
+        self._conn.execute(
+            "UPDATE doe_parameters SET observation_json = ? WHERE doe_id = ?",
+            (_safe_json(record), int(doe_id)),
         )
         self._conn.commit()
 
@@ -4061,6 +4099,21 @@ class DataStore:
             if column not in cols:
                 self._conn.execute(
                     f"ALTER TABLE fit_results ADD COLUMN {column} {sql_type}")
+        self._conn.commit()
+
+    def _migrate_doe_observation_column(self) -> None:
+        """``doe_parameters.observation_json`` (D2, rung 3c).
+
+        Nullable, no default, no backfill and no new :data:`SCHEMA_EPOCHS` row,
+        for :meth:`_migrate_censored_observation_columns`' reason: a shape change,
+        and no stored number changes meaning. A pre-feature row keeps NULL —
+        *not recorded* — because its observation object is gone.
+        """
+        cols = {row[1] for row in
+                self._conn.execute("PRAGMA table_info(doe_parameters)").fetchall()}
+        if "observation_json" not in cols:
+            self._conn.execute(
+                "ALTER TABLE doe_parameters ADD COLUMN observation_json TEXT")
         self._conn.commit()
 
     def _migrate_schema_version(self) -> None:

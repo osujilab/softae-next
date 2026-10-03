@@ -149,7 +149,11 @@ class TestCampaignStreamView:
         _write_events(tmp_path, {"type": "run_finished", "status": "CONVERGED"})
         view.poll()
         assert "CONVERGED" in view.auto_status()
-        assert "Connect All" in view.ht_status()
+        # The way back in is a relaunch: Connect All refuses in an attached
+        # window (gui_reclaim_after_campaign.md), so naming it here would send
+        # the operator to a button that cannot help.
+        assert "relaunch" in view.ht_status()
+        assert "Connect All" not in view.ht_status()
 
     def test_view_ht_slot_says_why_it_is_idle(self, tmp_path):
         """"Idle" alone is the same word a free rig shows — useless here."""
@@ -513,3 +517,32 @@ class TestAttachedWindowRender:
     def test_window_closing_stops_the_campaign_tick(self, attached_window):
         attached_window.close()
         assert not attached_window._campaign_timer.isActive()
+
+    def test_window_attached_init_tab_refuses_connect_all_with_a_dialog(
+        self, attached_window, monkeypatch, tmp_path
+    ):
+        """The window hands its launch mode to the Init tab, not only to Manual.
+
+        Pinned at the window rather than the tab because the defect was in the
+        wiring: an Init tab built without the mode is an owner tab, and its
+        Connect All claims and connects from a window that stays attached. The
+        rig is free here (the run finished), so nothing but the attach guard can
+        refuse.
+        """
+        from unittest.mock import patch
+
+        from softae.core import run_lock as rl
+
+        monkeypatch.setattr(rl, "DEFAULT_SCOPE", tmp_path / "lockscope")
+        tab = attached_window._tab_init
+        with patch("softae.gui.tabs.tab_init.QMessageBox.warning") as warn, \
+             patch.object(tab, "_schedule_async",
+                          side_effect=lambda coro: coro.close()) as sched:
+            tab._on_connect_all()
+
+        assert sched.call_count == 0
+        assert warn.call_count == 1
+        assert "relaunch" in warn.call_args.args[2]
+
+    def test_window_owner_init_tab_is_owner_mode(self, owner_window):
+        assert owner_window._tab_init._launch_mode.owner

@@ -38,8 +38,12 @@ Three things keep that inside the ruling rather than around it:
   handler is the forbidden lockout no matter what it is called.
 * **It removes no capability**, because an attached window has none to remove.
   It replaces a driver exception naming nothing with a sentence naming the run.
-* **It is leavable in one operator act** — Init tab → Connect All — after which
-  the window owns sessions and refuses nothing.
+* **It is left by relaunching, and only by relaunching.** The mode is fixed for
+  the window's lifetime, so Connect All in an attached window refuses rather
+  than claiming a rig the window would still not act on (the defect in
+  ``docs/SubAgent docs/gui_reclaim_after_campaign.md``). Once the run has
+  finished, closing every SoftAE window and relaunching starts an owner-mode
+  window: see :data:`RELAUNCH_TO_TAKE_RIG`.
 
 A window that owns its own sessions is *unchanged*: it is told who else is on the
 rig, and then it actuates, foreign lock or not.
@@ -65,6 +69,13 @@ CAMPAIGN_PREFIX = "campaign:"
 #: while this window still owns its own instruments, and that case is not this
 #: one. Shared by the toolbar notice and the Manual Control banner.
 ATTACHED = "ATTACHED"
+
+#: The one way an attached window's operator gets the rig back. The launch mode
+#: is decided once and never re-derived, so nothing *inside* an attached window
+#: can make it act — a fresh launch with the rig free is what starts an owner
+#: window. Shared by every surface that says so, so none of them can again
+#: promise an in-window way out that the code does not implement.
+RELAUNCH_TO_TAKE_RIG = "close every SoftAE window and relaunch to take the rig"
 
 
 def owner_line(rig_lock: Any) -> str:
@@ -163,12 +174,7 @@ def attached_owner_line(
     degenerate case — something holds the rig and publishes no identity — and is
     rendered as "another process" rather than invented into a campaign.
     """
-    if campaign:
-        name, run_id = campaign
-        who = f"campaign '{name}' (run {run_id})" if run_id else f"campaign '{name}'"
-    else:
-        who = "another process"
-    line = f"{ATTACHED} — {who} owns the rig"
+    line = f"{ATTACHED} — {_holder_phrase(campaign)} owns the rig"
     return line if rig_lock is None else f"{line}: {owner_line(rig_lock)}"
 
 
@@ -190,9 +196,35 @@ def attached_refusal_line(
         "instrument sessions, so manual commands are not sent from here — they "
         "would reach nothing. To act on the rig: pause or abort the campaign "
         "from the process that owns it, or use the E-Stop on the main toolbar "
-        "to park the whole rig. Once that run has finished, Connect All on the "
-        "Init tab takes ownership and this window actuates again."
+        "to park the whole rig. This window cannot take control: once that run "
+        f"has finished, {RELAUNCH_TO_TAKE_RIG}."
     )
+
+
+def attached_connect_refusal(
+    action: str,
+    campaign: tuple[str, str] | None,
+) -> str:
+    """Why Connect All (or Connect) is not attempted from an attached window.
+
+    Refusing is the honest answer rather than claiming: a claim taken here would
+    hold the rig for a window whose mode — and so every refusal downstream of it,
+    Manual Control's included — is fixed for its lifetime. The operator would own
+    the rig and still be unable to retract the head.
+    """
+    return (
+        f"{action} was not attempted. This window was opened while "
+        f"{_holder_phrase(campaign)} held the rig and cannot take control. "
+        f"Once that run has finished, {RELAUNCH_TO_TAKE_RIG}."
+    )
+
+
+def _holder_phrase(campaign: tuple[str, str] | None) -> str:
+    """``campaign 'x' (run y)``, or ``another process`` when no identity was published."""
+    if not campaign:
+        return "another process"
+    name, run_id = campaign
+    return f"campaign '{name}' (run {run_id})" if run_id else f"campaign '{name}'"
 
 
 def campaign_identity(rig_lock: Any) -> tuple[str, str] | None:

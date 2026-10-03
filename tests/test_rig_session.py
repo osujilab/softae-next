@@ -472,9 +472,15 @@ class TestGuiAttachedModeClaimsNothing:
 
         assert rl.read_run_lock() is not None
 
-    def test_run_app_releases_a_claim_taken_after_launch_out_of_attached_mode(
+    def test_run_app_releases_a_claim_taken_after_an_attached_launch(
             self, rig_scope, monkeypatch):
-        """Init tab → Connect All is the documented way out of attached mode.
+        """An attached window can still come to hold the rig — by E-Stop takeover.
+
+        Not by Init tab → Connect All, which refuses in an attached window (see
+        ``TestInitTabHandOff``). The E-Stop ladder's takeover rung is the path
+        that remains: it breaks the holder's lock and claims for this process
+        (``estop_ladder.default_ladder_collaborators``: ``break_run_lock`` then
+        ``claim_rig_session``), which is exactly what the stub below does.
 
         A release branched on the *launch* decision would leave that claim behind
         on exit — held by a PID that no longer exists, and cleared only when the
@@ -486,13 +492,13 @@ class TestGuiAttachedModeClaimsNothing:
         _write_foreign_lock(rig_scope)
         stubs = _stub_run_app(monkeypatch)
 
-        def _operator_takes_the_rig_while_the_window_is_up():
-            rl.break_run_lock()          # the other run finished
+        def _estop_takeover_while_the_window_is_up():
+            rl.break_run_lock()
             claim_rig_session(_real_heater_mock_stage_manager())
             return 0
 
         stubs.qasync.QEventLoop.return_value.run_forever.side_effect = (
-            _operator_takes_the_rig_while_the_window_is_up)
+            _estop_takeover_while_the_window_is_up)
 
         run_app(mock=None)
 
@@ -510,6 +516,73 @@ def real_tab(qapp, rig_scope):
     yield widget
     widget.cleanup()
     widget.close()
+
+
+@pytest.fixture
+def attached_tab_after_the_run(qapp, rig_scope):
+    """An Init tab launched while a campaign held the rig, after that run ended.
+
+    The launch decision is taken by the real :func:`decide_launch_mode` against a
+    live foreign lock, and the lock is then removed — the campaign finished, as in
+    rung 3c. That is the case the refusal exists for: with the lock gone, nothing
+    *else* on the connect path refuses, so a pass here is the attach guard's.
+    """
+    from softae.gui.launch_mode import decide_launch_mode
+    from softae.gui.tabs.tab_init import InitCalibrationTab
+
+    _write_foreign_lock(rig_scope, log_path=str(rig_scope / "run_042"))
+    mode = decide_launch_mode()
+    assert mode.attached and mode.campaign == ("phase_map", "run_042")
+    rl.break_run_lock()
+    assert rl.read_run_lock() is None
+
+    widget = InitCalibrationTab(_real_heater_mock_stage_manager(), launch_mode=mode)
+    yield widget
+    widget.cleanup()
+    widget.close()
+
+
+class TestInitTabAttachedWindowRefuses:
+    """Connect All in an attached window claims nothing and opens nothing.
+
+    It used to claim the rig and connect while the window stayed attached for its
+    lifetime, so Manual Control went on refusing every command — head retract
+    included — from a window that now held the rig
+    (``docs/SubAgent docs/gui_reclaim_after_campaign.md``). The refusal must be a
+    dialog naming the way out, because the status line is where the operator was
+    not looking.
+    """
+
+    @pytest.mark.parametrize("press", ["all", "selected"])
+    def test_attached_connect_claims_nothing_opens_nothing_and_says_relaunch(
+            self, attached_tab_after_the_run, press):
+        tab = attached_tab_after_the_run
+        with patch("softae.gui.tabs.tab_init.QMessageBox.warning") as warn, \
+             patch.object(tab, "_selected_instrument", return_value="temp_controller"), \
+             patch.object(tab, "_schedule_async",
+                          side_effect=lambda coro: coro.close()) as sched:
+            if press == "all":
+                tab._on_connect_all()
+            else:
+                tab._on_connect_selected()
+
+        assert sched.call_count == 0, "opened ports from an attached window"
+        assert rl.read_run_lock() is None, "claimed the rig for an attached window"
+        assert warn.call_count == 1
+        text = warn.call_args.args[2]
+        assert "cannot take control" in text
+        assert "relaunch" in text
+        assert "campaign 'phase_map'" in text
+        assert "Connect All on" not in text
+
+    def test_owner_tab_is_not_refused_by_the_attach_guard(self, real_tab):
+        """The positive control: same press, owner mode, it claims and connects."""
+        with patch("softae.gui.tabs.tab_init.QMessageBox.warning") as warn, \
+             patch.object(real_tab, "_schedule_async",
+                          side_effect=lambda coro: coro.close()) as sched:
+            real_tab._on_connect_all()
+        assert warn.call_count == 0 and sched.call_count == 1
+        assert rl.read_run_lock() is not None
 
 
 class TestInitTabHandOff:

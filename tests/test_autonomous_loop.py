@@ -1269,3 +1269,342 @@ class TestRoundClosesEveryWell:
         assert [v for _, v in loop._optimizer.history] == [5.0]
         rows = store.query_doe_parameters(run_id=run_id)
         assert [r["objective_value"] for r in rows] == [None, None, 5.0]
+
+
+# ---------------------------------------------------------------------------
+# Rung 3c defects (`docs/SubAgent docs/rung3c_paa_outcome.md` §5)
+# ---------------------------------------------------------------------------
+#
+# D5: occupancy is written when each well is CAST, not when the ~10 h round
+# returns. D1: a well closed as unmeasured reaches the event hook. D2: every
+# closed observation lands in `doe_parameters.observation_json`.
+#
+# The "casts" below are real executor steps on the mock rig, tagged exactly as
+# the deposition engine tags a deposit (`phase="deposit"`, `channel`), so the
+# cast hook is reached through `WorkflowExecutor`'s own callbacks rather than by
+# calling the loop's private hook directly.
+
+
+class _ProcessDied(BaseException):
+    """Stands in for the process dying mid-round: nothing catches a BaseException."""
+
+
+def _deposit_step(ch: int, method: str = "get_sp"):
+    from softae.workflows.workflow_model import WorkflowStep
+
+    return WorkflowStep(name=f"deposit_ch{ch}", instrument="temp_controller",
+                        method=method, params={},
+                        tags={"phase": "deposit", "channel": str(ch)})
+
+
+def _raising_step(manager, exc: BaseException, name: str = "anneal_all"):
+    """A board-level step after the casts that raises *exc* (the cure, say)."""
+    from softae.workflows.workflow_model import WorkflowStep
+
+    async def _boom():
+        raise exc
+
+    manager.get("temp_controller").r3c_boom = _boom
+    return WorkflowStep(name=name, instrument="temp_controller",
+                        method="r3c_boom", params={})
+
+
+def _casting_loop(store, run_id, manager, n, steps_for, *, outcomes=None,
+                  park_after=3):
+    """A board-aware round of *n* wells whose workflow is ``steps_for(channels)``."""
+    from softae.core.electrode_allocator import ElectrodeAllocator
+    from softae.workflows.workflow_model import Workflow
+
+    return AutonomousLoop(
+        optimizer=GridSearchOptimizer(SIMPLE_SPACE, n_points=max(n, 2)),
+        workflow_template=Workflow(name="empty_trial"),
+        manager=manager, data_store=store, run_id=run_id,
+        objective_extractor=lambda r: 1.0, auto_approve=True, batch_size=n,
+        electrode_allocator=ElectrodeAllocator(capacity=8),
+        placement_workflow_builder=lambda batch, chs: Workflow(
+            name="cast_round", setup=steps_for(chs)),
+        placement_objective_extractor=_scripted(outcomes or [1.0] * n),
+        max_iterations=n, park_after_failed_trials=park_after,
+        convergence_fn=lambda h: False, track_occupancy=True,
+    )
+
+
+class TestOccupancyRecordedAtCast:
+    """D5 (SAFETY): a well is on record the moment it is cast."""
+
+    @pytest.mark.asyncio
+    async def test_board_round_process_dies_after_cast_cast_wells_stay_occupied(
+            self, store_with_run, mock_manager):
+        """The rung-3c window: casts done, the round dies in the cure.
+
+        Before D5 nothing was written until `_run_workflow` returned, so a
+        process death anywhere in the ~10 h round left every cast well free to
+        be cast into again.
+        """
+        store, run_id = store_with_run
+        died = _raising_step(mock_manager, _ProcessDied())
+        loop = _casting_loop(store, run_id, mock_manager, 3,
+                             lambda chs: [*map(_deposit_step, chs), died])
+
+        with pytest.raises(_ProcessDied):
+            await loop.run()
+
+        assert store.occupied_electrodes(0) == {1, 2, 3}
+        rows = store.electrode_occupancy_rows(0)
+        assert [r["iteration"] for r in rows] == [0, 1, 2]   # start + k, as told
+        assert all(r["run_id"] == run_id for r in rows)
+
+    @pytest.mark.asyncio
+    async def test_board_round_dies_mid_cast_only_cast_wells_are_occupied(
+            self, store_with_run, mock_manager):
+        """Not a blanket write: a well whose deposit never ran stays free."""
+        store, run_id = store_with_run
+        died = _raising_step(mock_manager, _ProcessDied())
+        loop = _casting_loop(
+            store, run_id, mock_manager, 3,
+            lambda chs: [_deposit_step(chs[0]), _deposit_step(chs[1]), died,
+                         _deposit_step(chs[2])])
+
+        with pytest.raises(_ProcessDied):
+            await loop.run()
+
+        assert store.occupied_electrodes(0) == {1, 2}
+
+    @pytest.mark.asyncio
+    async def test_board_round_trial_error_after_cast_parks_with_wells_occupied(
+            self, store_with_run, mock_manager):
+        """The handled shape too: a round that fails after casting and parks."""
+        store, run_id = store_with_run
+        boom = _raising_step(mock_manager, RuntimeError("heater fault"))
+        loop = _casting_loop(store, run_id, mock_manager, 2,
+                             lambda chs: [*map(_deposit_step, chs), boom],
+                             park_after=1)
+
+        await loop.run()
+
+        assert loop.park_reason is not None
+        assert store.occupied_electrodes(0) == {1, 2}
+
+    @pytest.mark.asyncio
+    async def test_board_round_cast_at_is_the_cast_time_not_round_end(
+            self, store_with_run, mock_manager):
+        """The round-end write is idempotent: it leaves a cast-time row alone."""
+        store, run_id = store_with_run
+        loop = _casting_loop(store, run_id, mock_manager, 2,
+                             lambda chs: list(map(_deposit_step, chs)))
+        at_cast: dict[int, str] = {}
+        loop.on_well_cast = lambda info: at_cast.update(
+            {r["electrode"]: r["cast_at"] for r in store.electrode_occupancy_rows(0)})
+
+        await loop.run()
+
+        assert set(at_cast) == {1, 2}
+        final = {r["electrode"]: r["cast_at"] for r in store.electrode_occupancy_rows(0)}
+        assert final == at_cast
+
+    @pytest.mark.asyncio
+    async def test_board_round_well_cast_hook_carries_each_wells_params(
+            self, store_with_run, mock_manager):
+        store, run_id = store_with_run
+        loop = _casting_loop(store, run_id, mock_manager, 2,
+                             lambda chs: list(map(_deposit_step, chs)))
+        suggested: list[dict] = []
+        loop.on_suggestion = lambda i, p: suggested.append(dict(p))
+        casts: list[dict] = []
+        loop.on_well_cast = casts.append
+
+        await loop.run()
+
+        assert [(c["channel"], c["iteration"], c["confirmed"]) for c in casts] == [
+            (1, 0, True), (2, 1, True)]
+        assert [c["params"] for c in casts] == suggested
+        assert all(c["board"] == 0 for c in casts)
+
+    @pytest.mark.asyncio
+    async def test_board_round_failed_deposit_records_the_well_unconfirmed(
+            self, store_with_run, mock_manager):
+        """A deposit that raised may have put material down: occupied, unconfirmed."""
+        store, run_id = store_with_run
+        loop = _casting_loop(
+            store, run_id, mock_manager, 1,
+            lambda chs: [_deposit_step(chs[0], method="no_such_method")],
+            park_after=1)
+        casts: list[dict] = []
+        loop.on_well_cast = casts.append
+
+        await loop.run()
+
+        assert [(c["channel"], c["confirmed"]) for c in casts] == [(1, False)]
+        assert store.occupied_electrodes(0) == {1}
+
+    @pytest.mark.asyncio
+    async def test_board_round_untagged_builder_still_records_at_round_end(
+            self, store_with_run, mock_manager):
+        """Fallback: a workflow with no deposit tag keeps today's round-end write."""
+        store, run_id = store_with_run
+        loop = _placement_loop(store, run_id, mock_manager, [1.0, 2.0])
+        loop._track_occupancy = True
+        casts: list[dict] = []
+        loop.on_well_cast = casts.append
+
+        await loop.run()
+
+        assert store.occupied_electrodes(0) == {1, 2}
+        assert casts == []          # nothing was SEEN cast, so nothing is claimed
+
+    @pytest.mark.asyncio
+    async def test_board_round_raising_cast_hook_does_not_fail_the_deposit(
+            self, store_with_run, mock_manager):
+        """A raise inside a step callback would read as a failed dispense and be
+        replayed into the same well; the hook's failure must stay its own."""
+        store, run_id = store_with_run
+        loop = _casting_loop(store, run_id, mock_manager, 2,
+                             lambda chs: list(map(_deposit_step, chs)))
+
+        def broken(info):
+            raise RuntimeError("narrator gone")
+
+        loop.on_well_cast = broken
+
+        await loop.run()
+
+        assert store.occupied_electrodes(0) == {1, 2}
+        assert loop.park_reason is None
+        assert [v for _, v in loop._optimizer.history] == [1.0, 1.0]
+
+
+class TestUnmeasuredWellIsAnEvent:
+    """D1: a well closed as unmeasured fires `on_trial_unmeasured`."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["single", "batch", "placement"])
+    async def test_close_well_unmeasured_fires_one_event_per_well(
+            self, store_with_run, mock_manager, path):
+        store, run_id = store_with_run
+        loop = _three_path_loop(path, store, run_id, mock_manager,
+                                [None, _unmeasured_u(), 3.0], park_after=5)
+        events: list[dict] = []
+        loop.on_trial_unmeasured = events.append
+
+        await loop.run()
+
+        assert [(e["iteration"], e["what"]) for e in events] == [
+            (0, "unmeasured"), (1, "unmeasured")]
+        assert events[0]["regime"] is None and "None" in events[0]["why"]
+        assert events[1]["regime"] == "U"
+        assert [e["consecutive"] for e in events] == [1, 2]
+        expected_channels = [1, 2] if path == "placement" else [None, None]
+        assert [e["channel"] for e in events] == expected_channels
+
+    @pytest.mark.asyncio
+    async def test_close_well_measured_or_told_wells_fire_no_unmeasured_event(
+            self, store_with_run, mock_manager):
+        """Positive control: the hook is not simply called for every well."""
+        store, run_id = store_with_run
+        loop = _placement_loop(store, run_id, mock_manager, [REGIME_B_BOUND, 2.0])
+        events: list[dict] = []
+        loop.on_trial_unmeasured = events.append
+
+        await loop.run()
+
+        assert events == []
+
+    @pytest.mark.asyncio
+    async def test_tell_placed_extraction_error_is_an_unmeasured_event(
+            self, store_with_run, mock_manager):
+        store, run_id = store_with_run
+        loop = _placement_loop(store, run_id, mock_manager,
+                               [RuntimeError("bad spectrum"), 7.0])
+        events: list[dict] = []
+        loop.on_trial_unmeasured = events.append
+
+        await loop.run()
+
+        assert len(events) == 1
+        assert events[0]["what"] == "analyze: RuntimeError"
+        assert events[0]["why"] == "bad spectrum"
+        assert events[0]["channel"] == 1
+
+    @pytest.mark.asyncio
+    async def test_failed_board_round_is_one_event_naming_every_well(
+            self, store_with_run, mock_manager):
+        store, run_id = store_with_run
+        boom = _raising_step(mock_manager, RuntimeError("heater fault"))
+        loop = _casting_loop(store, run_id, mock_manager, 2,
+                             lambda chs: [*map(_deposit_step, chs), boom],
+                             park_after=5)
+        events: list[dict] = []
+        loop.on_trial_unmeasured = events.append
+
+        await loop.run()
+
+        assert len(events) == 1
+        assert (events[0]["wells"], events[0]["iteration"]) == (2, 0)
+        assert events[0]["what"].startswith("execute: ")
+
+    @pytest.mark.asyncio
+    async def test_raising_unmeasured_hook_keeps_count_and_checkpoint(
+            self, store_with_run, mock_manager):
+        """The hook fires after the checkpoint and cannot undo it."""
+        store, run_id = store_with_run
+        loop = _placement_loop(store, run_id, mock_manager, [None, None],
+                               park_after=2)
+        checkpoints: list[int] = []
+        loop.on_checkpoint = checkpoints.append
+
+        def broken(info):
+            raise RuntimeError("narrator gone")
+
+        loop.on_trial_unmeasured = broken
+
+        await loop.run()
+
+        assert checkpoints == [1, 2]
+        assert "2 consecutive trial failures" in (loop.park_reason or "")
+
+
+def _stored_observations(store, run_id) -> list:
+    import json as _json
+
+    return [None if r["observation_json"] is None
+            else _json.loads(r["observation_json"])
+            for r in store.query_doe_parameters(run_id=run_id)]
+
+
+class TestEveryObservationIsStored:
+    """D2: what the engine stated reaches `doe_parameters.observation_json`."""
+
+    @pytest.mark.asyncio
+    async def test_close_well_unadmitted_bound_is_stored_but_not_an_objective(
+            self, store_with_run, mock_manager):
+        """Rung 3c wells 17/20/21: before D2 this bound reached no table at all."""
+        store, run_id = store_with_run
+        bound = _obs("upper_bound", regime="B", admitted=False, reported=8.56e-6)
+        loop = _placement_loop(store, run_id, mock_manager, [bound])
+
+        await loop.run()
+
+        row, = store.query_doe_parameters(run_id=run_id)
+        assert row["objective_kind"] is None          # R3a: still admitted-only
+        assert row["objective_reported"] is None
+        stored, = _stored_observations(store, run_id)
+        assert stored["kind"] == "upper_bound"
+        assert stored["reported"] == pytest.approx(8.56e-6)
+        assert stored["regime"] == "B"
+        assert stored["admitted"] is False
+        assert store.objective_observations("dev", run_id=run_id) == []
+
+    @pytest.mark.asyncio
+    async def test_close_well_every_observation_shape_is_stored_floats_are_not(
+            self, store_with_run, mock_manager):
+        store, run_id = store_with_run
+        told = _obs("value", regime="A", admitted=True, reported=6e-4)
+        loop = _placement_loop(store, run_id, mock_manager,
+                               [told, _unmeasured_u(), 2.0])
+
+        await loop.run()
+
+        stored = _stored_observations(store, run_id)
+        assert stored[0]["kind"] == "value" and stored[0]["admitted"] is True
+        assert stored[1]["kind"] is None and stored[1]["regime"] == "U"
+        assert stored[2] is None          # a bare float carries no observation

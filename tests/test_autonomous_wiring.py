@@ -3678,3 +3678,315 @@ async def test_campaign_regime_b_bounds_alert_record_and_never_park(
     assert all(r["objective_value"] is None for r in rows)
     assert all(r["outcome"] == "measured" for r in rows)
     assert [(a["kind"], a["severity"]) for a in alerts] == [("bound_streak", "warning")]
+
+
+# ── Rung 3c defects (`docs/SubAgent docs/rung3c_paa_outcome.md` §5) ─────────
+
+
+def _campaign_events_file(store: DataStore, run_id: str) -> list[dict]:
+    from softae.core.campaign_events import EVENTS_FILENAME
+
+    path = store.run_dir(run_id) / EVENTS_FILENAME
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+
+
+@pytest.mark.asyncio
+async def test_campaign_config_snapshot_is_the_loaded_config_verbatim(
+        connected, tmp_path: Path):
+    """D3: the run records the config it ran under, byte for byte.
+
+    Every non-simulation run (325/325 at rung 3c) recorded ``{}`` because the
+    campaign passed no snapshot.
+    """
+    import hashlib
+
+    store = DataStore(tmp_path / "proj_cfg")
+    events: list[dict] = []
+    result = await run_autonomous_campaign(
+        _spec(budget=1), manager=connected, data_store=store, on_event=events.append)
+    snapshot = (store.run_dir(result.run_id) / "config_snapshot.toml").read_bytes()
+    row = store.query_runs()[-1]
+    store.close()
+
+    assert snapshot == loader.config_path().read_bytes()
+    assert hashlib.sha256(snapshot).hexdigest() == loader.config_hash()
+    assert row["config_snapshot_json"] == snapshot.decode("utf-8")
+    said = [e for e in events if e["type"] == "config_snapshot"]
+    assert [(e["source"], e["reason"]) for e in said] == [("file", "")]
+
+
+def test_config_snapshot_file_changed_since_load_falls_back_to_loaded_json(
+        monkeypatch):
+    from softae.core.autonomous_wiring import config_snapshot
+
+    monkeypatch.setattr(loader, "config_hash", lambda: "0" * 64)
+    text, source, reason = config_snapshot()
+
+    assert source == "loaded" and "changed" in reason
+    assert json.loads(text) == json.loads(json.dumps(loader.load(), default=str))
+
+
+def test_config_snapshot_unreadable_config_says_why_never_a_silent_empty(
+        monkeypatch):
+    """``{}`` alone reads as an empty config; the reason is what tells them apart."""
+    from softae.core.autonomous_wiring import config_snapshot
+
+    def _gone():
+        raise FileNotFoundError("softae_config.toml")
+
+    monkeypatch.setattr(loader, "config_path", _gone)
+    assert config_snapshot() == (
+        "{}", "unavailable", "FileNotFoundError: softae_config.toml")
+
+
+def test_provenance_trial_note_marks_categorical_axes_not_applicable():
+    """D4: the representative trial's categorical value is a placeholder."""
+    from types import SimpleNamespace
+
+    from softae.core.autonomous_wiring import _provenance_trial_note
+
+    spec = SimpleNamespace(parameter_space={
+        "paa_frac": {"type": "categorical", "choices": [0.0, 0.08, 0.15, 0.26]},
+        "eo_li": {"type": "float", "low": 8.0, "high": 20.0},
+    })
+    note = _provenance_trial_note(spec, {"paa_frac": 0.0, "eo_li": 14.0})["workflow_trial"]
+
+    assert note["categorical_axes_not_applicable"] == ["paa_frac"]
+    assert "NOT the cast" in note["role"]
+    assert note["params"] == {"paa_frac": 0.0, "eo_li": 14.0}
+
+
+@pytest.mark.asyncio
+async def test_campaign_provenance_says_its_workflow_is_not_the_cast(
+        connected, tmp_path: Path):
+    store = DataStore(tmp_path / "proj_prov")
+    result = await run_autonomous_campaign(
+        _spec(budget=1), manager=connected, data_store=store)
+    document = json.loads((store.run_dir(result.run_id) / "provenance.json")
+                          .read_text(encoding="utf-8"))
+    store.close()
+
+    trial = document["extra"]["workflow_trial"]
+    assert "NOT the cast" in trial["role"]
+    assert trial["categorical_axes_not_applicable"] == []      # SPACE is all-float
+
+
+@pytest.mark.asyncio
+async def test_board_campaign_well_cast_events_name_each_wells_params(
+        connected, tmp_path: Path):
+    """D5/D4 on the REAL recipe engine's workflow, not a hand-tagged one.
+
+    The loop's cast hook keys on the deposit tag; this proves the engine's
+    deposit steps actually carry it, so the branch is reached by production's
+    workflow shape and occupancy is written at cast time on a real campaign.
+    """
+    from softae.core.autonomous_loop import BoardDecision
+
+    store = DataStore(tmp_path / "proj_cast")
+    events: list[dict] = []
+    result = await run_autonomous_campaign(
+        _spec(budget=3, electrode_capacity=8, equilibration_s=0.0),
+        manager=connected, data_store=store, on_event=events.append,
+        on_board_exchange=lambda b: BoardDecision.PROCEED)
+    on_file = _campaign_events_file(store, result.run_id)
+    rows = store.electrode_occupancy_rows(0)
+    store.close()
+
+    casts = [e for e in events if e["type"] == "well_cast"]
+    assert [(c["channel"], c["iteration"], c["confirmed"]) for c in casts] == [
+        (1, 0, True), (2, 1, True), (3, 2, True)]
+    suggested = {e["iteration"]: e["params"] for e in events
+                 if e["type"] == "suggestion"}
+    assert [c["params"] for c in casts] == [suggested[i] for i in range(3)]
+    assert all(c["sample_uuid"] for c in casts)
+    assert [r["sample_uuid"] for r in rows] == [c["sample_uuid"] for c in casts]
+    assert sum(e["type"] == "well_cast" for e in on_file) == 3      # durable
+
+
+@pytest.mark.asyncio
+async def test_campaign_unmeasured_wells_emit_trial_unmeasured_events(
+        connected, tmp_path: Path):
+    """D1: rung 3c's wells 22 and 24 left no line in ``events.jsonl``."""
+    store = DataStore(tmp_path / "proj_unmeasured")
+    events: list[dict] = []
+    result = await run_autonomous_campaign(
+        _spec(optimizer="grid", budget=2), manager=connected, data_store=store,
+        objective_extractor=lambda results, params: None,
+        on_event=events.append)
+    on_file = _campaign_events_file(store, result.run_id)
+    store.close()
+
+    said = [e for e in events if e["type"] == "trial_unmeasured"]
+    assert [(e["iteration"], e["what"], e["consecutive"]) for e in said] == [
+        (0, "unmeasured", 1), (1, "unmeasured", 2)]
+    assert sum(e["type"] == "trial_unmeasured" for e in on_file) == 2
+
+
+@pytest.mark.asyncio
+async def test_campaign_unadmitted_bound_lands_in_observation_json(
+        connected, tmp_path: Path):
+    """D2 through the wiring, with the real observation `_sigma_from_eis_raw` makes."""
+    from softae.core.autonomous_wiring import _sigma_from_eis_raw
+
+    bound = _sigma_from_eis_raw(_b_bound_raw(), channel=5, thickness_um=150.0,
+                                regime=_regime(True))
+    assert bound.admitted is False                     # the rung-3c shape
+    store = DataStore(tmp_path / "proj_obs")
+    result = await run_autonomous_campaign(
+        _spec(optimizer="grid", budget=1), manager=connected, data_store=store,
+        objective_extractor=lambda results, params: bound)
+    row, = store.query_doe_parameters(run_id=result.run_id)
+    store.close()
+
+    stored = json.loads(row["observation_json"])
+    assert (stored["kind"], stored["regime"], stored["admitted"]) == (
+        bound.kind, bound.regime, False)
+    assert stored["reported"] == pytest.approx(bound.reported)
+    assert row["objective_kind"] is None
+
+
+# ── D8: the cure and the cool-down leave a durable record ────────────────────
+
+
+def _stub_temp_controller(sp: float = 25.0, pv: float = 25.0):
+    """A real ``AsyncTempController`` with only the Modbus surface stubbed.
+
+    Subclassed rather than faked whole: the thing under test is the real
+    driver's ``wait``/``anneal``, which a stand-in would not exercise.
+    """
+    from softae.drivers.async_temp_controller import AsyncTempController
+
+    class _Stub(AsyncTempController):
+        def get_sp(self) -> float:
+            return self.sp
+
+        def get_pv(self, n_avg: int = 1) -> float:
+            return self.pv
+
+        def write_sp(self, T_SP: float, print_flag: int = 1) -> None:
+            self.sp = float(T_SP)
+
+    tc = _Stub(name="temp_controller", config={})
+    tc.sp, tc.pv = sp, pv
+    seen: list[tuple[str, dict]] = []
+    tc.on_event = lambda kind, payload: seen.append((kind, payload))
+    return tc, seen
+
+
+def test_temp_wait_timeout_is_reported_and_still_returns():
+    """Recording only: the wait's behaviour (return, no raise) is unchanged."""
+    tc, seen = _stub_temp_controller(sp=25.0, pv=28.0)
+
+    assert tc.wait(within=2.0, timeout=0) is None
+
+    assert [k for k, _ in seen] == ["temp_wait_timeout"]
+    payload = seen[0][1]
+    assert (payload["sp_C"], payload["pv_C"], payload["within_C"],
+            payload["timeout_s"]) == (25.0, 28.0, 2.0, 0)
+
+
+def test_temp_wait_reached_is_reported():
+    tc, seen = _stub_temp_controller(sp=25.0, pv=26.0)
+    tc.wait(within=2.0, timeout=0)
+    assert [k for k, _ in seen] == ["temp_wait_reached"]
+
+
+def test_temp_wait_with_no_hook_is_unchanged():
+    tc, _ = _stub_temp_controller(sp=25.0, pv=28.0)
+    tc.on_event = None
+    assert tc.wait(within=2.0, timeout=0) is None
+
+
+def test_anneal_reports_start_hold_and_restore_in_order(monkeypatch):
+    from types import SimpleNamespace
+
+    from softae.drivers import contracts
+
+    report = SimpleNamespace(held_s=7200.0, n_samples=12, excursion_C=0.4,
+                             n_warn=0, aborted=False, rh=None)
+    monkeypatch.setattr(contracts, "run_anneal_hold", lambda *a, **k: report)
+    tc, seen = _stub_temp_controller(sp=25.0, pv=110.0)
+
+    tc.anneal(110.0, 7200.0)
+
+    assert [k for k, _ in seen] == [
+        "anneal_started", "temp_wait_reached", "anneal_hold_started",
+        "anneal_hold_ended", "anneal_restored"]
+    by = dict(seen)
+    assert by["anneal_hold_started"]["in_band"] is True
+    assert by["anneal_hold_ended"]["held_s"] == 7200.0
+    assert by["anneal_restored"]["restore_sp_C"] == 25.0
+
+
+def test_anneal_hold_out_of_band_and_failed_hold_are_reported(monkeypatch):
+    """A hold that started out of band, then faulted: both on record, and the
+    fault still propagates (the watchdog's behaviour is not this change's)."""
+    from softae.drivers import contracts
+    from softae.errors import SafetyError
+
+    def _fault(*a, **k):
+        raise SafetyError("PV left the band", instrument="temp_controller")
+
+    monkeypatch.setattr(contracts, "run_anneal_hold", _fault)
+    tc, seen = _stub_temp_controller(sp=25.0, pv=60.0)
+    monkeypatch.setattr(type(tc), "wait", lambda self, **kw: None)
+
+    with pytest.raises(SafetyError):
+        tc.anneal(110.0, 60.0)
+
+    kinds = [k for k, _ in seen]
+    assert kinds == ["anneal_started", "anneal_hold_started", "anneal_hold_failed",
+                     "anneal_restored"]
+    assert dict(seen)["anneal_hold_started"]["in_band"] is False
+
+
+def test_anneal_raising_event_hook_never_costs_the_hold(monkeypatch):
+    from types import SimpleNamespace
+
+    from softae.drivers import contracts
+
+    held: list[float] = []
+
+    def _hold(_tc, hold_s, *_a, **_k):
+        held.append(hold_s)
+        return SimpleNamespace(held_s=hold_s, n_samples=1, excursion_C=0.0,
+                               n_warn=0, aborted=False, rh=None)
+
+    monkeypatch.setattr(contracts, "run_anneal_hold", _hold)
+    tc, _ = _stub_temp_controller(sp=25.0, pv=110.0)
+
+    def _broken(kind, payload):
+        raise RuntimeError("narrator gone")
+
+    tc.on_event = _broken
+    tc.anneal(110.0, 30.0)
+
+    assert held == [30.0]
+    assert tc.sp == 25.0                        # restored all the same
+
+
+@pytest.mark.asyncio
+async def test_campaign_attaches_temp_events_to_the_run_stream_and_detaches(
+        connected, tmp_path: Path):
+    """The wiring half of D8: the hook writes into ``events.jsonl`` while the run
+    is live and is removed at teardown, so a later manual anneal cannot write
+    into a finished run's stream."""
+    tc = connected.get("temp_controller")
+    attached: list = []
+
+    def _on_event(event: dict) -> None:
+        if event["type"] == "run_started":
+            attached.append(tc.on_event)
+            tc.on_event("temp_wait_timeout", {"sp_C": 25.0, "pv_C": 28.0})
+
+    store = DataStore(tmp_path / "proj_temp_events")
+    result = await run_autonomous_campaign(
+        _spec(budget=1), manager=connected, data_store=store, on_event=_on_event)
+    on_file = _campaign_events_file(store, result.run_id)
+    store.close()
+
+    assert attached and attached[0] is not None
+    timeouts = [e for e in on_file if e["type"] == "temp_wait_timeout"]
+    assert [(e["sp_C"], e["pv_C"]) for e in timeouts] == [(25.0, 28.0)]
+    assert tc.on_event is None
