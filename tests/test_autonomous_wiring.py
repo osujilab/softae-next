@@ -2011,6 +2011,24 @@ def _closed_arc_raw():
                                         R_bulk=50000.0, C_par=1e-9))
 
 
+#: The regime-A film the objective can TELL (operator ruling 2026-10-02: with
+#: `[eis] regime_aware` on, a value from a B or unrecognised-shape U spectrum is
+#: recorded, never told — and `_closed_arc_raw` classifies B `valley_then_rise`).
+#: The wells-15/16 positive control, as `tests/test_eis_objective.py`'s
+#: `_measurable_spectrum`: series term, film R_f ∥ cell capacitance, electrode CPE.
+_A_FILM_R_F_OHM = 1.0e5
+
+
+def _regime_a_film_raw():
+    """A regime-A film on the Quick grid: both engines state a told σ value."""
+    from softae.drivers.mock_espico import MOCK_R0_OHM
+    from tests.eis_synthetic import log_frequencies, reference_spectrum
+    return _eis_raw(*reference_spectrum(
+        freq=log_frequencies(f_lo=6.475, f_hi=200_000, npts=27),
+        R_series=MOCK_R0_OHM, R_bulk=_A_FILM_R_F_OHM, C_par=3.4e-10,
+        Q=1.0e-7, n=0.8, noise_pct=1.0, seed=3))
+
+
 def _open_arc_raw():
     """The default reference spectrum: still capacitive at the sweep floor."""
     from tests.eis_synthetic import reference_spectrum
@@ -2455,7 +2473,7 @@ def test_sigma_from_eis_raw_still_resolves_the_configured_engine(monkeypatch):
 
     monkeypatch.setattr(eis_engine, "analyze_spectrum", analyze_spy)
 
-    sigma = wiring._sigma_from_eis_raw(_closed_arc_raw(), channel=7,
+    sigma = wiring._sigma_from_eis_raw(_regime_a_film_raw(), channel=7,
                                        thickness_um=_SETTLE_THICKNESS_UM)
 
     assert called == []
@@ -2476,13 +2494,39 @@ def test_sigma_from_eis_raw_still_resolves_the_configured_engine(monkeypatch):
     # So the honest verdict is a value, and the assertion moves to what this test has
     # always been for. The guard is that the objective must not return the settle
     # feeder's `1/R₁` proxy: the two differ by exactly the cell constant (K = 200 cm⁻¹
-    # at 50 µm), so a leak reads ~2.0e-5 where the geometry-resolved σ reads ~4.0e-3 —
+    # at 50 µm), so a leak reads ~1e-5 where the geometry-resolved σ reads ~2e-3 —
     # two orders apart, and no tolerance can confuse them. `called == []` above is the
     # structural half; this is the numeric half, and it is now a stronger guard than
     # `is None` was, because `None` was also what a fully broken analysis would return.
+    #
+    # The spectrum moved off `_closed_arc_raw` on 2026-10-02: that arc classifies
+    # regime B, whose value the armed `[eis] regime_aware` now records and never tells
+    # (operator ruling, `[a410]`), so the objective rightly returned `None` for it. A
+    # regime-A film is told; under the shipped gated engine its σ is route A's K/R_f,
+    # which also excludes the series term (K/(R_s+R_f) would read 1.35e-3, 1.48x off).
     assert sigma is not None
-    assert sigma == pytest.approx(200.0 / 50_000.0, rel=0.05)
-    assert sigma != pytest.approx(1.0 / 50_000.0, rel=0.5)
+    assert sigma == pytest.approx(200.0 / _A_FILM_R_F_OHM, rel=0.05)
+    assert sigma != pytest.approx(1.0 / _A_FILM_R_F_OHM, rel=0.5)
+
+    # And the configured engine is what decides the number: flip `[eis] engine` and
+    # the told value moves (legacy/gated measured 1.033 on this spectrum, 33x the pin).
+    # Without this, an objective that hard-coded one engine would pass everything
+    # above whenever the config happened to name that engine.
+    from softae.analysis.eis.settings import eis_settings
+
+    configured = eis_settings().engine          # read before the patch below
+    told = {}
+    for name in ("gated", "legacy"):
+        monkeypatch.setattr("softae.analysis.eis.engine.eis_settings",
+                            lambda *a, _n=name, **k: eis_settings({"engine": _n}))
+        told[name] = wiring._sigma_from_eis_raw(_regime_a_film_raw(), channel=7,
+                                                thickness_um=_SETTLE_THICKNESS_UM)
+    assert told["gated"] is not None and told["legacy"] is not None
+    # rel=1e-6, not 1e-12: the patched settings carry only `engine`, and the shipped
+    # config's other `[eis]` keys move the number by ~3e-8 — far below the 3.3 % gap.
+    assert told[configured] == pytest.approx(sigma, rel=1e-6)
+    assert told["legacy"] != pytest.approx(told["gated"], rel=1e-3)
+    assert [kw.get("engine") for kw in seen] == [None, None, None]
 
 
 def test_settle_round_fits_requests_the_legacy_engine():

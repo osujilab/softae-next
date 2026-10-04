@@ -9,7 +9,7 @@ from ``SigmaReport`` to *value / lower bound / upper bound* exists exactly once
 =================================  ===============  ========================  ====================
 Engine state                       ``kind``         ``reported``              admitted
 =================================  ===============  ========================  ====================
-``value``                          ``value``        ``value``                 unless bad-data U
+``value``                          ``value``        ``value``                 unless B or U
 ``bound`` / ``bound_unqualified``  ``upper_bound``  ``upper_bound``           route A only
 ``unavailable``, active route,     ``lower_bound``  ``regime_sigma_lower``    yes
 finite ``regime_sigma_lower``
@@ -22,6 +22,13 @@ admitted, and its *classified* status is unaffected.
 **Admitted** means the number may become the campaign objective. An old-route upper bound
 is recorded but never admitted: on regime-A films the legacy loss ceiling sits 0.5–3.5
 decades below the film's σ, so it is a statement about the instrument, not the sample.
+
+**A value from regime B or U is never admitted** (operator ruling 2026-10-02, enforcing
+the 09-30 Q5 ruling): a regime-B spectrum carries two features, and today's single-arc fit
+picks one of them — on rung 3c, twins whose series resistance and double-layer capacitance
+agree within 0.08 dec were told σ 0.74 dec apart. Its value, and an unrecognised-shape
+U's, is recorded but not told until a two-feature analysis exists; the spectrum still
+counts as measured, so it never parks a run (:data:`VALUE_WITHHELD_REGIMES`).
 
 **Flag off is a clean rollback** (operator ruling 2026-10-01). Everything in the tables
 here applies only when the report's ``sigma.regime_aware`` is ``True`` — the flag state
@@ -43,7 +50,7 @@ bad data               ``incoherent``,                     no                no
                        ``too_few_points``,
                        ``a_too_many_nonphysical``,
                        ``phase_incoherent``, *any other*
-unrecognised shape     ``non_monotone``,                   yes               yes
+unrecognised shape     ``non_monotone``,                   no                yes
                        ``floor_phase_ambiguous``,
                        ``no_cpe_drop``
 =====================  ==================================  ================  ==============
@@ -51,9 +58,9 @@ unrecognised shape     ``non_monotone``,                   yes               yes
 *Bad data* means the spectrum itself is not a measurement (an unclosed reference electrode,
 a jagged phase trace — Q5): a number today's route still extracts from it is recorded and
 never told, and the read counts toward a park. *Unrecognised shape* means the data are
-coherent but fit none of A/B/C: treated exactly like B and C, so today's value is told and
-anything else is a measured, untold read. ``""`` (the classifier did not run: legacy
-engine, early return) is not U and keeps the value admitted.
+coherent but fit none of A/B/C: treated exactly like B, so any number is a measured,
+untold read. ``""`` (the classifier did not run: legacy engine, early return) is not U
+and keeps the value admitted.
 
 **Classified** is independent of admission: a spectrum labelled A, B, C or
 unrecognised-shape U was acquired and screened, which is what the park counter means by
@@ -97,10 +104,14 @@ U_BAD_DATA_REASONS = ("incoherent", "too_many_nonphysical", "too_few_points",
                       "a_too_many_nonphysical", "phase_incoherent")
 #: Upper-bound bases the regime-A route produces. Only these may be admitted.
 ROUTE_A_BOUND_BASES = (REGIME_A_PASSIVE,)
+#: Regimes whose ``value`` is recorded but never admitted under the regime rules
+#: (ruling 2026-10-02). U covers both families: bad data was already refused (F3), and
+#: an unrecognised shape now is too. A, C and ``""`` keep the value admitted.
+VALUE_WITHHELD_REGIMES = (B, U)
 
 __all__ = ["VALUE", "LOWER_BOUND", "UPPER_BOUND", "KINDS", "CLASSIFIED_REGIMES",
-           "U_SHAPE_REASONS", "U_BAD_DATA_REASONS", "SigmaObservation", "is_classified",
-           "sigma_observation", "unmeasured"]
+           "U_SHAPE_REASONS", "U_BAD_DATA_REASONS", "VALUE_WITHHELD_REGIMES",
+           "SigmaObservation", "is_classified", "sigma_observation", "unmeasured"]
 
 
 @dataclass(frozen=True)
@@ -198,8 +209,8 @@ def _observe(s: Any, ok: bool, regime: str, reason: str, aware: bool) -> SigmaOb
     R_film = _positive(s.R_reported_ohm)
     if s.mode == "value":
         kind, reported, lower, basis = VALUE, _positive(s.value), None, s.R_basis
-        # Bad-data U never tells (F3) — under the regime rules only.
-        admitted = not aware or regime != U or classified
+        # B and U never tell (F3; ruling 2026-10-02) — under the regime rules only.
+        admitted = not aware or regime not in VALUE_WITHHELD_REGIMES
     elif s.mode in ("bound", "bound_unqualified"):
         kind, reported, basis = UPPER_BOUND, _positive(s.upper_bound), s.upper_bound_basis
         lower = _positive(s.regime_sigma_lower) if active else None

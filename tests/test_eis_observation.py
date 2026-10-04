@@ -85,10 +85,13 @@ def test_sigma_observation_u_bad_data_value_recorded_not_admitted_not_measured(r
 
 
 @pytest.mark.parametrize("reason", ob.U_SHAPE_REASONS)
-def test_sigma_observation_u_shape_value_admitted_and_measured(reason):
-    """Unrecognised-shape U is treated like B/C: today's value is told."""
+def test_sigma_observation_u_shape_value_recorded_not_admitted_but_measured(reason):
+    """Ruling 2026-10-02: an unrecognised-shape U's value is recorded, never told, and
+    the spectrum still counts as measured (feasible, never parks)."""
     o = ob.sigma_observation(_report(**U_VALUE, regime_reason=reason))
-    assert o.kind == ob.VALUE and o.admitted and o.classified and o.counts_as_measured
+    assert (o.kind, o.reported, o.regime_reason) == (ob.VALUE, 1.8e-4, reason)
+    assert not o.admitted
+    assert o.classified and o.counts_as_measured
 
 
 @pytest.mark.parametrize("reason", ob.U_SHAPE_REASONS)
@@ -132,11 +135,32 @@ def test_unmeasured_u_without_reason_is_bad_data_with_shape_reason_classified():
     assert shaped.classified and shaped.counts_as_measured and shaped.kind is None
 
 
-@pytest.mark.parametrize("regime", ["", "A", "B", "C"])
-def test_sigma_observation_value_non_u_regime_admitted_and_measured(regime):
-    """Only bad-data U withholds; ``""`` (classifier did not run) keeps today's value."""
+@pytest.mark.parametrize("regime", ["", "A", "C"])
+def test_sigma_observation_value_a_c_or_unclassified_admitted(regime):
+    """A and C keep today's value; so does ``""`` (the classifier did not run)."""
     o = ob.sigma_observation(_report(**{**U_VALUE, "regime": regime}))
     assert o.kind == ob.VALUE and o.admitted and o.counts_as_measured
+    assert o.classified is (regime != "")
+
+
+def test_sigma_observation_b_value_recorded_not_admitted_but_measured():
+    """Ruling 2026-10-02: a two-feature spectrum's value is the fit's choice of feature,
+    not the film's σ — recorded with its regime, never told, and measured (no park)."""
+    o = ob.sigma_observation(_report(**{**U_VALUE, "regime": "B",
+                                        "regime_reason": "valley_then_rise"}))
+    assert (o.kind, o.reported, o.regime) == (ob.VALUE, 1.8e-4, "B")
+    assert not o.admitted
+    assert o.classified and o.counts_as_measured
+
+
+@pytest.mark.parametrize("regime, reason", [("B", "valley_then_rise"),
+                                            *(("U", r) for r in ob.U_SHAPE_REASONS)])
+def test_sigma_observation_withheld_value_flag_off_told_as_pre_5234d37(regime, reason):
+    """Flag off is the clean rollback: the same B / shape-U value is told, unclassified."""
+    report = _unstamped_report(**{**U_VALUE, "regime": regime, "regime_reason": reason})
+    o = ob.sigma_observation(report)
+    assert o.kind == ob.VALUE and o.admitted and not o.classified
+    assert o.reported == _pre_5234d37_told(report) == 1.8e-4
 
 
 def test_sigma_observation_legacy_upper_bound_recorded_not_admitted():
@@ -314,9 +338,10 @@ def test_sigma_observation_engine_jagged_u_value_not_admitted(flag):
 
 
 @pytest.mark.parametrize("flag", [False, True], ids=["flag_off", "flag_on"])
-def test_sigma_observation_mock_rig_floor_phase_ambiguous_value_admitted(flag):
-    """The mock rig's spectrum is unrecognised-shape U; through the campaign's own
-    raw -> report hop its value is told, so a mock-rig campaign does not park."""
+def test_sigma_observation_mock_rig_floor_phase_ambiguous_value_told_only_flag_off(flag):
+    """The mock rig's default spectrum is unrecognised-shape U. Through the campaign's
+    own raw -> report hop its value is told flag off (rollback) and withheld flag on
+    (ruling 2026-10-02) — but measured either way, so a mock-rig campaign never parks."""
     from softae.analysis.eis.regime_route import RegimeSettings
     from softae.core.autonomous_wiring import _spectrum_report_from_raw
     from softae.drivers.mock_espico import _synthetic_eis
@@ -327,8 +352,38 @@ def test_sigma_observation_mock_rig_floor_phase_ambiguous_value_admitted(flag):
     s = report.sigma
     assert (s.regime, s.regime_reason, s.mode) == ("U", "floor_phase_ambiguous", "value")
     o = ob.sigma_observation(report)
-    assert o.kind == ob.VALUE and o.admitted and o.counts_as_measured
+    assert o.kind == ob.VALUE and o.reported is not None and o.counts_as_measured
+    assert o.admitted is (not flag)
     assert o.classified is flag                 # flag off: nothing is classified
+
+
+@pytest.mark.parametrize("flag", [False, True], ids=["flag_off", "flag_on"])
+def test_sigma_observation_engine_b_value_withheld_flag_on_a_value_admitted(flag):
+    """§3.2 for the 2026-10-02 ruling: engine-built reports reach both sides. A Step-1 B
+    spectrum states a value in both flag states (the report is identical); flag on it is
+    recorded untold but measured, flag off it is told by the pre-``5234d37`` rule. A
+    Step-1 A spectrum's value is told in both."""
+    from softae.analysis.eis.engine import analyze_spectrum
+    from softae.analysis.eis.regime_route import RegimeSettings
+    from tests import eis_regime_synthetic as syn
+    from tests.eis_regime_golden import golden_inputs
+
+    def observe(gen):
+        _, Z = next(gen())
+        report = analyze_spectrum(syn.as_eis(syn.RIG_F, Z), **golden_inputs(15),
+                                  regime=RegimeSettings(enabled=flag))
+        return report, ob.sigma_observation(report)
+
+    b_report, b = observe(syn.step1_regime_b)
+    assert (b_report.sigma.regime, b_report.sigma.mode) == ("B", "value")
+    assert b.kind == ob.VALUE and b.reported is not None and b.counts_as_measured
+    assert b.admitted is (not flag)
+    if not flag:
+        assert b.reported == _pre_5234d37_told(b_report)
+
+    a_report, a = observe(syn.step1_regime_a)
+    assert (a_report.sigma.regime, a_report.sigma.mode) == ("A", "value")
+    assert a.kind == ob.VALUE and a.admitted and a.counts_as_measured
 
 
 #: Board-2 PAA well 14 (``eis_regime_arming_review.md`` §4): non_monotone U, old-route

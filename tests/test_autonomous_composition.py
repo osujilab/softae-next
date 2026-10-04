@@ -45,16 +45,18 @@ SPACE = {
 POINT = {"eo_li_ratio": 10.0, "silica_vol_frac": 0.1}
 
 #: The -Z'' apex the mock films are synthesised at, and the reason they are
-#: synthesised here at all (T11.45). ``mock_espico``'s shipped films are far too
-#: resistive for the COMMISSIONED phase floor: ch21/ch22 land at a
-#: windowed-minimum tan δ of 0.0555/0.0888 against a floor of 0.1072, so every σ
-#: comes back a *bound*, ``_sigma_from_eis_raw`` declines it as unmeasured, and
-#: three declined trials trip the loop's own safety park. At 750 Hz the same
-#: statistic is 0.3723 — clear of 3x today's single-anchor fallback floor
-#: (3 x 0.1072 = 0.32) and of 3x the post-re-derive resistor ladder's (~0.026),
-#: so one value holds in both regimes. **The floor is never loosened to suit a
-#: fixture**; it is the fixture that is made lossy.
-LOSSY_APEX_HZ = 750.0
+#: synthesised here at all. ``mock_espico``'s shipped films are far too resistive
+#: for the COMMISSIONED phase floor (T11.45: every σ a *bound*, declined), so 750 Hz
+#: was chosen to clear it. **Raised to 15 kHz by the operator ruling of 2026-10-02**
+#: (a value from a regime-B or unrecognised-shape-U spectrum is recorded, never
+#: told): at 750 Hz the electrode CPE never takes over above the Quick floor, the
+#: spectrum classifies U ``floor_phase_ambiguous``, and these campaigns told nothing
+#: and finished with no ``best_params``. At 15 kHz, ``R1`` = 9.6e4 Ω — the wells
+#: 15/16 regime-A film — and every sweep of ch21/ch22 classifies A with a told
+#: route-A value (measured: 24/24 sweeps on the Quick grid, and 24/24 on the
+#: fallback grid). **Neither the floor nor the classifier is loosened to suit a
+#: fixture**; it is the fixture that is made a resolvable film.
+FILM_APEX_HZ = 15_000.0
 
 
 def _context(*, budget_uL=None, target=6.0) -> FormulationContext:
@@ -127,11 +129,11 @@ def catalog() -> TaskCatalog:
 async def connected():
     mgr = create_mock_manager(config={})
     # The grid-aware rig `tests/test_rung3_fake_cast.py` installs, for the reason
-    # `LOSSY_APEX_HZ` gives. Swapped HERE rather than in `mock_espico.py`, whose
+    # `FILM_APEX_HZ` gives. Swapped HERE rather than in `mock_espico.py`, whose
     # `_synthetic_eis` backs ~71 test files. BEFORE `connect_all`: these picos are
     # brand new and disconnected, and a connected manager will not connect them
     # again.
-    install_mock_picos(mgr, MockRig(default_apex_hz=LOSSY_APEX_HZ))
+    install_mock_picos(mgr, MockRig(default_apex_hz=FILM_APEX_HZ))
     await mgr.connect_all()
     yield mgr
     await mgr.disconnect_all()

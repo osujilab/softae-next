@@ -33,6 +33,7 @@ from softae.core.autonomous_wiring import (
     resolve_direction,
     resolve_objective,
 )
+from softae.drivers.mock_espico import MOCK_R0_OHM
 from softae.errors import CampaignError
 from tests.eis_synthetic import log_frequencies, pure_series_rc, reference_spectrum
 from tests.test_autonomous_composition import SPACE as COMPOSITION_SPACE
@@ -55,56 +56,44 @@ _QUICK_GRID = log_frequencies(f_lo=6.475, f_hi=200_000, npts=27)
 
 
 def _measurable_spectrum(**over) -> tuple[np.ndarray, np.ndarray]:
-    """One spectrum both engines can actually report a σ *value* for.
+    """One spectrum both engines can actually report a σ *value* for, and the objective
+    tells.
 
-    Every test below that wants a real conductivity needs the objective to clear two
+    Every test below that wants a real conductivity needs the objective to clear three
     conditions ``_sigma_from_eis_raw`` applies and ``report_sigma`` does not:
-    ``report.ok`` (the gates) and ``report.sigma.is_value`` (a value, not a bound).
-    Under the **gated** engine T11.46 makes the second one bite: an arc that does not
-    close in band yields a ceiling on σ, and the objective declines a bound.
+    ``report.ok`` (the gates), ``report.sigma.is_value`` (a value, not a bound), and —
+    with ``[eis] regime_aware`` on, as shipped — a regime whose value is admitted. Since
+    the operator ruling of 2026-10-02 a value from a regime-B or unrecognised-shape-U
+    spectrum is recorded but never told, so this must be a **regime-A film**.
 
-    **Two independent bounds have to be cleared, and they pull opposite ways.**
+    It is the wells-15/16 positive control (``regime_b_two_feature_analysis.md``): the
+    board's series term (``MOCK_R0_OHM``), one film arc ``R_f = 1e5 Ω ∥ 3.4e-10 F`` (the
+    cell capacitance, apex ~4.7 kHz) and an electrode CPE (``Q = 1e-7``, ``n = 0.8``)
+    that takes over about a decade above the sweep floor. The fixture it replaces
+    (``R_bulk`` 5e5 ∥ 6.4 pF, ``Q`` 1e-6) had no electrode spur in band and classified U
+    ``floor_phase_ambiguous``, so the ruling left every test here with nothing told.
 
-    *Arc closure.* ``arc_closure`` reads ``argmax(−Z″)`` and calls the arc open when the
-    maximum sits at the lowest frequency — on a blocking cell that is decided by how far
-    the CPE tail has risen there, so ``C_par`` alone moves nothing and ``Q`` is the
-    lever. ``engine_support`` then gates on *severity* (``phase_low_deg ≤ −60°``), not on
-    the state itself. This wants the corner frequency **inside** the band.
-
-    *Loss-tangent floor* (the bound added with the sigma loss-ceiling work). σ is
-    reported as a ceiling when tan δ falls below the extrapolated phase floor. For this
-    topology tan δ at the top of the band is ≈ ``f_c / f``, so this wants the corner
-    frequency **high**. ``f_c = 50 kHz`` is the window where both hold.
-
-    Measured on this fixture (not computed), seeds 0-7, all three call shapes the tests
-    below use — the shipped config unpatched, and ``_use_engine``-patched either way:
+    Measured on this fixture (not computed), seeds 0-7 × ``C_par`` 0.9-1.2x, all three
+    call shapes the tests below use — the shipped config unpatched, and
+    ``_use_engine``-patched either way:
 
     ==========================  =====================================================
-    arc state                   ``closed``, apex interior at ~61 kHz
-    ``phase_low_deg``           −5.4°, i.e. **54.6° clear** of the −60° gate
-    σ, shipped config           ~1.33e-4 S/cm, a value in every seed
-    σ, forced ``gated``         ~1.33e-4 S/cm, a value in every seed
-    σ, forced ``legacy``        ~1.53e-4 S/cm, a value in every seed
-    legacy/gated                1.1458-1.1505 — ~150x the ``rel=1e-3`` pin below
-    ``C_par`` tolerance         contiguous pass over 0.9-1.2x this value
+    regime                      A ``arc_then_cpe`` in all 32 cells; route A answers
+    σ, shipped config           ~6.66e-4 S/cm (route A), a told value in every cell
+    σ, forced ``gated``         the same number as the shipped config
+    σ, forced ``legacy``        6.6-7.7e-4 S/cm (no classifier: ``""``), every cell
+    legacy/gated, seed 3        1.0331 — 33x the ``rel=1e-3`` pin below
+    legacy/gated, seeds 0-7     0.9920-1.0861 at this ``C_par``; never within 4.7e-3
     ==========================  =====================================================
 
-    ``R_bulk`` is 5.0e5 rather than the 2.0e3 these tests used before T11.46. That is not
-    a free choice: measured across ``Q`` from 1e-7 to 1e-4 at two corner frequencies, a
-    2 kΩ bulk gives the **legacy** engine no working point at all on this grid — every
-    cell either fails to converge or blows the 15 % RMS-residual gate — so the two
-    engines cannot both report on it, and
-    ``test_flipping_the_engine_moves_the_number_so_the_agreement_is_not_vacuous`` needs
-    both. Legacy's acceptance really is patchy in this space, which is why the ``C_par``
-    tolerance above is stated: this point was chosen for sitting in a contiguous basin
-    rather than on the spikes its neighbours sit on.
+    Legacy's acceptance is patchy in this space (``Q`` 3e-7 or ``n`` 0.7 at this film
+    each lose it on some seeds), which is why the ``C_par`` tolerance is stated.
 
     The spectra still cast with ``reference_spectrum()``'s defaults elsewhere in this
     file all assert ``None``, so none of this reaches them.
     """
-    params = dict(freq=_QUICK_GRID, R_bulk=5.0e5,
-                  # f_c = 1/(2*pi*R_bulk*C_par) = 50 kHz.
-                  C_par=6.3662e-12, Q=1.0e-6, noise_pct=1.0, seed=3)
+    params = dict(freq=_QUICK_GRID, R_series=MOCK_R0_OHM, R_bulk=1.0e5, C_par=3.4e-10,
+                  Q=1.0e-7, n=0.8, noise_pct=1.0, seed=3)
     params.update(over)
     return reference_spectrum(**params)
 
@@ -378,14 +367,11 @@ class TestOneSigmaEverywhere:
             self, monkeypatch):
         # The positive control. Both engines agreeing across the two surfaces is only
         # meaningful if the config reaches the objective at all — and it does: the
-        # legacy fitter and the gated one land ~14.8 % apart on this spectrum
-        # (measured, 1.1458-1.1505 over seeds 0-7), which is ~150x the `rel=1e-3` pin
-        # below. That gap IS the divergence the user ruled out; it was previously
-        # invisible because the objective always took one side of it.
-        #
-        # The margin used to be stated as "more than a factor of two". That was true of
-        # the pre-T11.46 fixture, whose gated arm returns no value at all now, so the
-        # claim was unverifiable rather than merely large; this one is measured.
+        # legacy fitter and the gated one (route A, flag on) land 3.3 % apart on this
+        # spectrum (measured, seed 3), which is 33x the `rel=1e-3` pin below. That gap
+        # IS the divergence the user ruled out; it was previously invisible because the
+        # objective always took one side of it. See `_measurable_spectrum` for the
+        # spread over seeds.
         f, Z = _measurable_spectrum()
 
         self._use_engine(monkeypatch, "legacy")
