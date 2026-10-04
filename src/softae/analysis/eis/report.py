@@ -97,6 +97,13 @@ DEFAULT_ABOVE_CEILING_FRAC = 0.5
 REGIME_A_FIT_RB = "regime_a_fit_rb"
 REGIME_A_PASSIVE = "regime_a_passive"
 REGIME_A_FOOT_LOWER = "regime_a_foot_lower"
+#: Regime-B bases (slice 2, ``analysis/eis/regime_b.py``; spec §3.1). The film arc's R_f
+#: identified at the cell capacitance; the lower bound ``σ ≥ K/max(R_fit, R_mf)`` when a
+#: closed in-band arc fails a value gate; and the model-conditional ceiling
+#: ``σ ≤ K/(Re Z_lo − R_x)`` when no film arc is in band. None is ever derived from R_x.
+REGIME_B_FILM_ARC = "regime_b_film_arc"
+REGIME_B_ARC_LOWER = "regime_b_arc_lower"
+REGIME_B_NO_ARC = "regime_b_no_arc"
 
 BASIS_TEXT = {
     "split_bulk": "R_bulk",
@@ -105,6 +112,10 @@ BASIS_TEXT = {
     REGIME_A_FIT_RB: "R_b (regime-A fit, series excluded)",
     REGIME_A_PASSIVE: "R_b,min (regime-A passive bound)",
     REGIME_A_FOOT_LOWER: "R_foot (regime-A lower bound, series included)",
+    REGIME_B_FILM_ARC: "R_f (regime-B film arc at C_cell, series excluded)",
+    REGIME_B_ARC_LOWER: ("R_arc (regime-B lower bound: all film R between series element "
+                         "and electrode)"),
+    REGIME_B_NO_ARC: "Re Z_lo − R_x (regime-B upper bound, no film arc in band)",
 }
 
 
@@ -187,7 +198,9 @@ class SigmaReport:
     #: (legacy engine, an early return, or a classifier failure), never ``U``.
     #: ``regime_mode`` / ``regime_sigma`` are what the regime-A route says (value, or the
     #: bound it states) and ``regime_sigma_lower`` is ``K/R_foot`` when it can state
-    #: neither. ``regime_active`` is whether that answer is the one reported above.
+    #: neither. ``regime_active`` is whether a regime route's answer — A's, or B's under
+    #: ``[eis] regime_b`` (which then fills these slice-1 fields in their own vocabulary)
+    #: — is the one reported above.
     #: ``regime_reason`` is always the **classifier's** reason; why the A route chose its
     #: outcome (``pair_disagrees``, ``no_cell_constant``, …) is ``regime_route_detail``.
     #: ``regime_R_foot_ohm`` is the resistance behind ``regime_sigma_lower``.
@@ -206,6 +219,25 @@ class SigmaReport:
     #: report that never passed the stamp (legacy engine, early returns, hand-built or
     #: older reports) — means the pre-regime campaign rule (``observation.py``).
     regime_aware: bool = False
+    #: Regime-B route, slice 2 — **additive**, filled in shadow on every B (or routed U)
+    #: spectrum whatever the flags, and reported (``regime_active``) only when
+    #: ``[eis] regime_aware`` and ``[eis] regime_b`` are both on. ``regime_b_mode`` is the
+    #: route's own outcome (``value`` / ``lower_bound`` / ``upper_bound`` /
+    #: ``unavailable``; ``""`` = the route did not run) and ``regime_b_detail`` its
+    #: ``regime_b`` detail token; ``regime_b_sigma`` the σ it states (the value, or the
+    #: bound in the outcome's direction). ``regime_cx_source`` says whether the series
+    #: element's C_x was measured or unresolved.
+    regime_b_mode: str = ""
+    regime_b_detail: str = ""
+    regime_b_sigma: float = float("nan")
+    regime_cx_source: str = ""
+    #: The film's own resistance, independent of K — the settle observable (spec §4):
+    #: route A's ``R_fit`` on an A value or bound, regime B's ``R_f`` on a B value or
+    #: lower bound. ``regime_film_basis`` is ``equilibration``'s token for it —
+    #: ``film_rb`` / ``film_arc``, ``film_unidentified`` when a film route ran and
+    #: identified nothing, ``""`` when no film route applies (C, bad-data U, unclassified).
+    regime_film_R_ohm: float = float("nan")
+    regime_film_basis: str = ""
 
     @property
     def is_bound(self) -> bool:
@@ -870,7 +902,8 @@ class SigmaCeiling:
     #: The ε that went in, recorded even when no ceiling came out.
     eps_rad: float = float("nan")
     #: ``"loss_at_numerator"`` | ``"magnitude_ceiling"`` | :data:`ARC_OPEN_CEILING`
-    #: | :data:`REGIME_A_PASSIVE` | ``"unavailable"``. ``magnitude_ceiling`` is reachable **only** when ε is
+    #: | :data:`REGIME_A_PASSIVE` | :data:`REGIME_B_NO_ARC` | ``"unavailable"``.
+    #: ``magnitude_ceiling`` is reachable **only** when ε is
     #: unmeasured and :data:`ARC_OPEN_CEILING` **only** from ``engine.py``'s refusal
     #: (a) — this function never produces the latter; every other way of failing to
     #: produce a number is ``unavailable`` with a :attr:`reason`.

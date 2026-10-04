@@ -2498,16 +2498,25 @@ def _announce_basis(
     every round is a line nobody reads.
     """
     from softae.analysis.equilibration import (
-        BASIS_FITTED,
+        BASIS_FILM_UNIDENTIFIED,
         EXCLUDED_RAILED,
         EXCLUDED_SIGMA_NULL,
     )
 
     named: set[int] = announced.setdefault("basis", set())
+    modelled = _modelled_bases()
     for fit in fits:
-        if fit.basis in ("", BASIS_FITTED) or int(fit.channel) in named:
+        if fit.basis in ("", *modelled) or int(fit.channel) in named:
             continue
         named.add(int(fit.channel))
+        if fit.basis == BASIS_FILM_UNIDENTIFIED:
+            # Slice 2: the film route ran and identified no film arc. Not a failed
+            # fit, and deliberately not 1/R1 either -- on regime B, R1 is the series
+            # element, which is flat, and would certify a film still moving.
+            print(f"[settle] ch{int(fit.channel)} NO FILM ARC: no film resistance was "
+                  f"identified this round, so it carries no sigma and the channel "
+                  f"drops out of the window (never replaced by 1/R1)", flush=True)
+            continue
         raw = ("and the sweep carried no readable Z' either"
                if fit.r_raw_ohms is None else
                f"its raw low-frequency Z' was {fit.r_raw_ohms:.4g} ohm, recorded "
@@ -2535,10 +2544,16 @@ def _announce_basis(
           f"and refuse.", flush=True)
 
 
-def _n_modelled(fits: Any) -> int:
-    from softae.analysis.equilibration import BASIS_FITTED
+def _modelled_bases() -> tuple[str, ...]:
+    """The σ bases a model stands behind: ``fitted`` 1/R1 and slice 2's two film R's."""
+    from softae.analysis.equilibration import BASIS_FILM_ARC, BASIS_FILM_RB, BASIS_FITTED
 
-    return sum(1 for fit in fits if fit.basis == BASIS_FITTED)
+    return (BASIS_FITTED, BASIS_FILM_ARC, BASIS_FILM_RB)
+
+
+def _n_modelled(fits: Any) -> int:
+    modelled = _modelled_bases()
+    return sum(1 for fit in fits if fit.basis in modelled)
 
 
 def _narrated_exclusions(check: Any) -> dict[str, str]:

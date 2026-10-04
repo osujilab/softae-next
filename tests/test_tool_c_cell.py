@@ -185,6 +185,48 @@ def test_c_cell_write_typed_yes_round_trips_through_contract(project, capsys):
     assert store.cell_capacitance(5, 3) is None and store.cell_capacitance(4, 10) is None
 
 
+# ── The store refuses a row ([e158] L4 note) ─────────────────────────────────
+
+class RefusingStore(FakeStore):
+    """The store's own validation contract: ``ValueError`` before anything is written."""
+
+    def record_cell_capacitance(self, **kw):
+        raise ValueError("source_measurement_ids must be a non-empty sequence of ints")
+
+
+def test_c_cell_write_store_value_error_reported_cleanly_exit_failed(project, capsys):
+    code, asked = _run(project, "--write", "--accepted-by", "CO", store_cls=RefusingStore)
+    err = capsys.readouterr().err
+    assert code == tool.EXIT_FAILED and asked
+    assert "The store refused group 9-16: source_measurement_ids" in err
+    assert "Recorded before the refusal: nothing." in err
+    assert "Traceback" not in err and FakeStore.rows == []
+
+
+def _group(group, ids, c=2.5e-10):
+    return cc.CellCapacitance(board_id=5, group=group, c_cell_F=c, spread_dec=0.0,
+                              source_measurement_ids=tuple(ids),
+                              channel_values=((group[0], c),))
+
+
+def test_c_cell_write_groups_real_store_refusal_names_group_and_prior_rows(tmp_path):
+    """Against the REAL store: a group with no measurement ids is refused by the store's
+    own validation, and the group written before it is reported, not lost."""
+    from softae.core.data_store import DataStore
+
+    store = DataStore(tmp_path)
+    try:
+        groups = {(1, 8): _group((1, 8), [11]), (9, 16): _group((9, 16), [])}
+        with pytest.raises(tool.GroupRefused) as err:
+            tool.write_groups(store, groups, accepted_by="CO")
+        assert err.value.group == (9, 16) and len(err.value.written) == 1
+        assert isinstance(err.value, ValueError) and "non-empty" in str(err.value)
+        assert store.cell_capacitance(5, 3)["id"] == err.value.written[0]
+        assert store.cell_capacitance(5, 12) is None
+    finally:
+        store.close()
+
+
 # ── Selection and occupancy ──────────────────────────────────────────────────
 
 def test_select_measurements_latest_per_channel_all_reads_and_role(project):

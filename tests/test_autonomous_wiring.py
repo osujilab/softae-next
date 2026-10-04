@@ -3691,6 +3691,155 @@ async def test_campaign_regime_mid_run_config_edit_every_analysis_receives_campa
     assert [e["regime_aware"] for e in events if e["type"] == "regime_settings"] == [False]
 
 
+# ── C_cell per board (slice 2 wave 2) ───────────────────────────────────────
+
+_C_HI = 3.08e-10          # board-2 group 17-24 (spec §2.2)
+_C_LO = 2.66e-10          # board-2 group 1-8
+
+
+def _record_c_cell(store: DataStore, board: int, group: tuple[int, int], c: float) -> int:
+    return store.record_cell_capacitance(
+        board_id=board, group=group, c_cell_F=c, spread=0.01,
+        method="apparent_c_100_1000Hz_v1", source_measurement_ids=[101, 102],
+        accepted_by="CO")
+
+
+def test_cell_capacitance_lookup_group_rows_and_one_event_per_board(tmp_path: Path):
+    from softae.core.autonomous_wiring import CellCapacitanceLookup
+
+    store = DataStore(tmp_path / "proj_ccell")
+    try:
+        board = store.current_board_id()
+        row = _record_c_cell(store, board, (17, 24), _C_HI)
+        events: list[tuple[str, dict]] = []
+        lookup = CellCapacitanceLookup(store, [21, 9], emit=lambda t, **kw: events.append((t, kw)))
+
+        assert lookup.resolve() == board
+        assert (lookup(21), lookup(9), lookup(21)) == (_C_HI, None, _C_HI)
+        assert lookup(3) is None                        # off the campaign set: asked, not announced
+        assert len(events) == 1
+        kind, payload = events[0]
+        assert (kind, payload["board_id"]) == ("cell_capacitance", board)
+        assert payload["channels"]["21"] == {
+            "status": "recorded", "c_cell_F": _C_HI, "row_id": row, "channel_row": False,
+            "group": [17, 24], "source_measurement_ids": [101, 102]}
+        assert payload["channels"]["9"] == {"status": "unmeasured", "c_cell_F": None}
+    finally:
+        store.close()
+
+
+def test_cell_capacitance_lookup_board_exchange_resolves_new_board(tmp_path: Path):
+    """A spare-board exchange moves the pointer: board 2's C_cell must not reach board 3."""
+    from softae.core.autonomous_wiring import CellCapacitanceLookup
+
+    store = DataStore(tmp_path / "proj_ccell_swap")
+    try:
+        _record_c_cell(store, 2, (17, 24), _C_HI)
+        _record_c_cell(store, 3, (17, 24), _C_LO)
+        store.set_active_board(2)
+        events: list[dict] = []
+        lookup = CellCapacitanceLookup(store, [21], emit=lambda t, **kw: events.append(kw))
+
+        assert lookup(21) == _C_HI
+        store.set_active_board(3)
+        assert (lookup(21), lookup(21)) == (_C_LO, _C_LO)
+        assert [e["board_id"] for e in events] == [2, 3]
+    finally:
+        store.close()
+
+
+def test_cell_capacitance_lookup_mid_run_append_does_not_move_value(tmp_path: Path):
+    """Resolved once per board (R6's posture): a row appended mid-run waits for the next run."""
+    from softae.core.autonomous_wiring import CellCapacitanceLookup
+
+    store = DataStore(tmp_path / "proj_ccell_frozen")
+    try:
+        board = store.current_board_id()
+        lookup = CellCapacitanceLookup(store, [21])
+        assert lookup(21) is None
+        _record_c_cell(store, board, (17, 24), _C_HI)
+        assert lookup(21) is None
+        assert CellCapacitanceLookup(store, [21])(21) == _C_HI
+    finally:
+        store.close()
+
+
+class _NoTableStore:
+    def current_board_id(self):
+        return 4
+
+
+class _RaisingStore(_NoTableStore):
+    def cell_capacitance(self, board_id, channel):
+        raise RuntimeError("locked")
+
+
+class _NoBoardStore:
+    def current_board_id(self):
+        raise RuntimeError("no board_state")
+
+
+@pytest.mark.parametrize("store, status", [
+    (_NoTableStore(), "no_table"), (_RaisingStore(), "lookup_failed")])
+def test_cell_capacitance_lookup_unreadable_store_none_with_cause(store, status):
+    """Every cause reaches the engine as None (unmeasured), and the event names which."""
+    from softae.core.autonomous_wiring import CellCapacitanceLookup
+
+    events: list[dict] = []
+    lookup = CellCapacitanceLookup(store, [21], emit=lambda t, **kw: events.append(kw))
+    assert lookup(21) is None
+    assert events == [{"board_id": 4, "channels": {
+        "21": {"status": status, "c_cell_F": None}}}]
+
+
+def test_cell_capacitance_lookup_board_unreadable_none_no_event():
+    from softae.core.autonomous_wiring import CellCapacitanceLookup
+
+    events: list = []
+    lookup = CellCapacitanceLookup(_NoBoardStore(), [21], emit=lambda *a, **k: events.append(a))
+    assert (lookup.resolve(), lookup(21), events) == (None, None, [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recorded", [True, False], ids=["recorded", "unmeasured"])
+async def test_campaign_c_cell_every_analysis_receives_board_value(
+        connected, tmp_path: Path, monkeypatch, recorded: bool):
+    """Every campaign-path ``analyze_spectrum`` — the scored objective AND each settle
+    round — receives ``cell_capacitance=`` as the board's recorded value, explicitly
+    ``None`` when unmeasured, never absent; one ``cell_capacitance`` event at launch."""
+    import softae.analysis.eis.engine as engine
+
+    calls: list[dict] = []
+    real = engine.analyze_spectrum
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "analyze_spectrum", spy)
+    store = DataStore(tmp_path / "proj_ccell_campaign")
+    if recorded:
+        _record_c_cell(store, store.current_board_id(), (17, 24), _C_HI)
+    events: list[dict] = []
+    try:
+        await run_autonomous_campaign(
+            _settle_spec(max_hold_s=0.05), manager=connected, data_store=store,
+            on_event=events.append)
+    finally:
+        store.close()
+
+    want = _C_HI if recorded else None
+    engines = {kw.get("engine") for kw in calls}
+    assert {None, "legacy"} <= engines, f"objective and settle not both observed: {engines}"
+    absent = object()
+    assert [kw.get("cell_capacitance", absent) for kw in calls] == [want] * len(calls)
+    announced = [e for e in events if e["type"] == "cell_capacitance"]
+    assert len(announced) == 1
+    assert announced[0]["channels"]["21"]["c_cell_F"] == want
+    status = announced[0]["channels"]["21"]["status"]
+    assert status == ("recorded" if recorded else "unmeasured")
+
+
 @pytest.mark.asyncio
 async def test_campaign_regime_b_bounds_alert_record_and_never_park(
         connected, tmp_path: Path):

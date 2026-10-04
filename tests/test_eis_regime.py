@@ -295,6 +295,40 @@ def test_regime_settings_true_arms():
     assert rr.regime_settings({"regime_aware": False}).enabled is False
 
 
+@pytest.mark.parametrize("raw", ["true", "True", 1, "yes", None])
+def test_regime_settings_regime_b_non_boolean_off(raw):
+    """``[eis] regime_b`` parses like ``regime_aware``: only a literal ``True`` arms."""
+    s = rr.regime_settings({"regime_aware": True, "regime_b": raw})
+    assert (s.enabled, s.regime_b, s.b_route) == (True, False, False)
+
+
+@pytest.mark.parametrize("aware, b, live", [(False, False, False), (False, True, False),
+                                            (True, False, False), (True, True, True)])
+def test_regime_settings_b_route_live_only_when_both_flags_true(aware, b, live):
+    s = rr.regime_settings({"regime_aware": aware, "regime_b": b})
+    assert (s.enabled, s.regime_b, s.b_route) == (aware, b, live)
+
+
+def test_regime_settings_regime_b_is_a_dataclass_field_for_the_resume_guard():
+    """The campaign resume guard compares the settings' FIELDS (lane B, [a418]): a property
+    would be invisible to it, and a pre-slice-2 checkpoint would resume unchecked."""
+    import dataclasses
+
+    assert [f.name for f in dataclasses.fields(rr.RegimeSettings)] == ["enabled", "regime_b"]
+    assert rr.RegimeSettings().regime_b is False
+
+
+@pytest.mark.parametrize("label, reason, routed", [
+    ("B", "valley_then_rise", True), ("U", "no_cpe_drop", True),
+    ("U", "non_monotone", True), ("U", "floor_phase_ambiguous", False),
+    ("U", "incoherent", False), ("A", "arc_then_cpe", False), ("C", "no_plateau", False)])
+def test_b_routed_b_and_validated_u_shapes_only(label, reason, routed):
+    """Spec §1.1: B, U/no_cpe_drop and U/non_monotone; never floor_phase_ambiguous (Q7)."""
+    verdict = rg.RegimeVerdict(label=label, reason=reason, screen=rg.screen_points(F, F))
+    assert rr.b_routed(verdict) is routed
+    assert rr.b_routed(None) is False
+
+
 # ── Engine: shadow, flag, and the real fixtures ─────────────────────────────────
 
 
@@ -577,3 +611,15 @@ def test_regime_settings_repo_config_armed_as_boolean():
                         .read_text(encoding="utf-8"))
     assert cfg["eis"]["regime_aware"] is True
     assert rr.regime_settings(cfg["eis"]).enabled is True
+
+
+def test_regime_settings_repo_config_regime_b_not_armed():
+    """Slice 2 wave 2 lands in shadow (spec §5.3): ``[eis] regime_b`` stays off in the repo
+    config until the arming review, so landing the route moves no reported number."""
+    import tomllib
+    from pathlib import Path
+
+    cfg = tomllib.loads((Path(__file__).resolve().parents[1] / "softae_config.toml")
+                        .read_text(encoding="utf-8"))
+    assert cfg["eis"].get("regime_b", False) is not True
+    assert rr.regime_settings(cfg["eis"]).b_route is False

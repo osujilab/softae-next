@@ -2233,3 +2233,28 @@ def test_analyze_spectrum_regime_flag_off_matches_head_goldens(monkeypatch):
     for name, eis, ch in corpus:
         report = golden.run_one(eis, ch, regime=RegimeSettings(enabled=False))
         assert golden.record(report, list(rows[name]["sigma"])) == rows[name], name
+
+
+def test_analyze_spectrum_regime_b_armed_flag_off_matches_head_goldens(monkeypatch):
+    """Slice 2's rollback, on the same golden: ``regime_aware`` off disarms the regime-B
+    route even with ``regime_b`` on and a C_cell passed — every HEAD field byte-identical.
+    The B shadow still runs (on the B fixtures), so the route was reached, not skipped."""
+    import json
+
+    from softae.config import loader
+    from tests import eis_regime_golden as golden
+
+    if not golden.OUT.exists():
+        pytest.skip(f"HEAD goldens absent: {golden.OUT} (tests/data/ is gitignored)")
+    rows = json.loads(golden.OUT.read_text(encoding="utf-8"))["rows"]
+    monkeypatch.setattr(loader, "load", lambda *a, **k: {})
+    from softae.analysis.eis.regime_route import RegimeSettings
+
+    shadowed = 0
+    for name, eis, ch in golden.corpus():
+        report = golden.run_one(eis, ch, regime=RegimeSettings(enabled=False, regime_b=True),
+                                cell_capacitance=2.5e-10)
+        assert golden.record(report, list(rows[name]["sigma"])) == rows[name], name
+        assert report.sigma.regime_active is False, name
+        shadowed += report.sigma.regime_b_mode not in ("", "unavailable")
+    assert shadowed >= 2          # synth_B_0 and rung3b ch1/ch3 run the fit in shadow

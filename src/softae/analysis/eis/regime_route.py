@@ -37,7 +37,7 @@ from typing import Any
 import numpy as np
 import structlog
 
-from softae.analysis.eis.regime import RegimeVerdict
+from softae.analysis.eis.regime import B, RegimeVerdict, U
 from softae.analysis.eis.report import (
     REGIME_A_FIT_RB,
     REGIME_A_FOOT_LOWER,
@@ -60,24 +60,48 @@ SERIES_NOT_SEPARABLE = "series_not_separable"
 NO_CELL_CONSTANT = "no_cell_constant"
 #: ``regime_route_detail`` when the pair could not be compared (``R_mf`` or ``R_fit`` absent).
 PAIR_UNAVAILABLE = "pair_unavailable"
+#: ``regime_b_detail`` when the B route raised. The shadow never costs a spectrum, and an
+#: exception is spelled apart from every outcome the route can decide (§3.1(a)).
+B_ROUTE_ERROR = "route_error"
+#: U reasons routed to regime B (slice 2 spec §1.1): the shapes the two-feature analysis
+#: validated. ``floor_phase_ambiguous`` is unanalysed (and the mock rig's shape, Q7).
+B_ROUTED_U_REASONS = ("no_cpe_drop", "non_monotone")
 
 VALUE, BOUND, UNAVAILABLE = "value", "bound", "unavailable"
 
 __all__ = ["REGIME_A_FIT_RB", "REGIME_A_FOOT_LOWER", "REGIME_A_PASSIVE",
-           "SERIES_NOT_SEPARABLE", "NO_CELL_CONSTANT", "PAIR_UNAVAILABLE", "RegimeSettings",
-           "RegimeAEstimates", "plateau_decision", "regime_a_estimates", "regime_a_kind",
-           "regime_settings", "log_shadow", "route_basis"]
+           "SERIES_NOT_SEPARABLE", "NO_CELL_CONSTANT", "PAIR_UNAVAILABLE", "B_ROUTE_ERROR",
+           "B_ROUTED_U_REASONS", "RegimeSettings", "RegimeAEstimates", "b_routed",
+           "plateau_decision", "regime_a_estimates", "regime_a_kind", "regime_settings",
+           "log_shadow", "route_basis"]
 
 
 @dataclass(frozen=True)
 class RegimeSettings:
-    """``[eis] regime_aware``. Off unless the key is the boolean ``true``."""
+    """``[eis] regime_aware`` and ``[eis] regime_b``. Each off unless its key is ``true``.
+
+    The regime-B route is live only when **both** are on (:attr:`b_route`): ``regime_b``
+    is slice 2's own rollback, so arming it cannot happen by arming slice 1.
+    """
 
     enabled: bool = False
+    regime_b: bool = False
+
+    @property
+    def b_route(self) -> bool:
+        return self.enabled is True and self.regime_b is True
+
+
+def _raw_flag(config: dict[str, Any], key: str) -> bool:
+    raw = config.get(key)
+    if raw is not None and not isinstance(raw, bool):
+        logger.warning(f"eis_{key}_unparseable", value=repr(raw),
+                       msg=f"[eis] {key} must be a boolean; the route stays off")
+    return raw is True
 
 
 def regime_settings(config: dict[str, Any] | None = None) -> RegimeSettings:
-    """Read ``[eis] regime_aware`` raw. Absent, malformed or anything but ``True`` is off.
+    """Read ``[eis] regime_aware`` and ``[eis] regime_b`` raw. Anything but ``True`` is off.
 
     Read raw like ``pregate_settings`` — no loader or toml edit, so ``config_hash`` does not
     move. **Arms only on** ``value is True``: the string ``"false"`` is truthy, and a typo
@@ -90,11 +114,15 @@ def regime_settings(config: dict[str, Any] | None = None) -> RegimeSettings:
             config = loader.load().get("eis", {}) or {}
         except Exception:      # noqa: BLE001 - an unreadable config must not stop a fit
             config = {}
-    raw = config.get("regime_aware")
-    if raw is not None and not isinstance(raw, bool):
-        logger.warning("eis_regime_aware_unparseable", value=repr(raw),
-                       msg="[eis] regime_aware must be a boolean; the route stays off")
-    return RegimeSettings(enabled=raw is True)
+    return RegimeSettings(enabled=_raw_flag(config, "regime_aware"),
+                          regime_b=_raw_flag(config, "regime_b"))
+
+
+def b_routed(verdict: RegimeVerdict | None) -> bool:
+    """Whether the regime-B route applies to this verdict: B, or a routed-shape U."""
+    if verdict is None:
+        return False
+    return verdict.label == B or (verdict.label == U and verdict.reason in B_ROUTED_U_REASONS)
 
 
 @dataclass(frozen=True)
@@ -248,14 +276,21 @@ def log_shadow(channel: Any, verdict: RegimeVerdict, chosen: Any, today: Any, *,
                today_arc_gate: bool, estimates: RegimeAEstimates | None = None,
                plateau_mode: str = "", route_detail: str = "",
                sigma_value: float = float("nan"), sigma_sum: float = float("nan"),
-               sigma_lower: float = float("nan")) -> None:
+               sigma_lower: float = float("nan"),
+               b_fields: dict[str, Any] | None = None) -> None:
     """One ``sigma_regime_shadow`` line per classified spectrum, in both flag states.
 
     ``today_*`` is the flag-off report; ``regime_*`` is what the regime-A route says
     (empty for B/C/U, where today's route is the route). ``sigma_sum = K/(R_s+R_b)`` rides
     beside ``sigma_value`` because the in-band R_s may be partly film (spec §3).
+    ``b_fields`` is the regime-B route's shadow (slice 2 spec §3.2), logged under a ``b_``
+    prefix so its R_fit / R_mf never collide with route A's; no ``sigma_sum`` for B, which
+    is meaningless when R_x ~ R_f.
     """
     est = estimates or RegimeAEstimates()
+    b_log = {f"b_{k}": v for k, v in (b_fields or {}).items()}
+    # A taken B route states its basis on the report itself; route_basis is A's table.
+    b_active = bool(chosen.regime_active) and not verdict.is_a
     logger.info(
         "sigma_regime_shadow", channel=channel, regime=verdict.label,
         reason=verdict.reason, route_active=bool(chosen.regime_active),
@@ -268,8 +303,16 @@ def log_shadow(channel: Any, verdict: RegimeVerdict, chosen: Any, today: Any, *,
         today_basis=(today.upper_bound_basis if today.mode != VALUE else today.R_basis),
         today_arc_gate=bool(today_arc_gate),
         regime_mode=chosen.regime_mode, regime_sigma=chosen.regime_sigma,
-        regime_basis=route_basis(chosen.regime_mode, chosen.regime_sigma_lower),
+        regime_basis=(_stated_basis(chosen) if b_active
+                      else route_basis(chosen.regime_mode, chosen.regime_sigma_lower)),
+        **b_log,
     )
+
+
+def _stated_basis(report: Any) -> str:
+    """The basis of the number a report states: the ceiling's for a bound, else ``R_basis``."""
+    bound = report.mode in ("bound", "bound_unqualified")
+    return report.upper_bound_basis if bound else report.R_basis
 
 
 def route_basis(kind: str, sigma_lower: float = float("nan")) -> str:

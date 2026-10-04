@@ -55,6 +55,9 @@ from softae.analysis.eis.policy import build_context, reduce_gates
 from softae.analysis.eis.regime_route import regime_settings
 from softae.analysis.eis.report import (
     ARC_OPEN_CEILING,
+    REGIME_B_ARC_LOWER,
+    REGIME_B_FILM_ARC,
+    REGIME_B_NO_ARC,
     SigmaCeiling,
     SigmaReport,
     SpectrumReport,
@@ -62,6 +65,11 @@ from softae.analysis.eis.report import (
     sigma_loss_ceiling,
 )
 from softae.analysis.eis.settings import eis_settings
+from softae.analysis.equilibration import (
+    BASIS_FILM_ARC,
+    BASIS_FILM_RB,
+    BASIS_FILM_UNIDENTIFIED,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -682,6 +690,96 @@ def _classify_quietly(eis_result: Any, freq: np.ndarray, Z_work: np.ndarray) -> 
         return None
 
 
+def _sigma_or_nan(cell: CellConstant | None, R: float) -> float:
+    """``K/R`` for a positive finite R and a cell; NaN otherwise (both regime routes)."""
+    return cell.sigma(R) if (cell is not None and R == R and R > 0) else float("nan")
+
+
+#: The regime-B outcomes in slice 1's ``regime_mode`` vocabulary (spec §3.2, §3.4). A
+#: lower bound is spelled as route A's foot lower bound — *unavailable* with
+#: ``regime_sigma_lower`` — because that is the shape ``observation.py`` already admits
+#: as a censored ``lower_bound``; an upper bound is a ``bound``.
+_B_MODE = {"value": "value", "upper_bound": "bound", "lower_bound": "unavailable",
+           "unavailable": "unavailable"}
+
+
+def _regime_b_sigma(verdict: Any, today: SigmaReport, *, cell: CellConstant | None,
+                    c_cell: float | None, R_engine: float
+                    ) -> tuple[SigmaReport | None, SigmaCeiling | None, dict[str, Any],
+                               dict[str, Any]]:
+    """The regime-B route (slice 2 spec §3.2): ``(report, ceiling, shadow, log)``.
+
+    *shadow* holds the additive ``SigmaReport`` fields and *log* the route's
+    ``sigma_regime_shadow`` fields; both are always returned. *report*
+    is today's rebuilt around the route's answer, or ``None`` when the route is
+    *unavailable* — then today's report stands, flagged only by the shadow fields. σ
+    arithmetic stays here (``regime_b`` returns resistances only). A raising route is
+    caught here, not by ``_regime_report``, so it cannot cost route A's shadow.
+    """
+    from dataclasses import replace
+
+    from softae.analysis.eis import regime_b as rb
+    from softae.analysis.eis import regime_route as rr
+
+    nan = float("nan")
+    try:
+        out = rb.regime_b_route(verdict.screen.f, verdict.screen.Z, c_cell=c_cell,
+                                has_cell=cell is not None)
+        # Identification needs no K (the settle observable is 1/R_f), so without a cell
+        # the film is judged as ``film_arc_resistance`` judges it.
+        ident = (out.kind if cell is not None
+                 else rb.regime_b_kind(out.estimates, has_cell=True)[0])
+    except Exception as exc:  # noqa: BLE001 - the shadow must never cost a spectrum
+        logger.warning("eis_regime_b_route_failed", error=str(exc), regime=verdict.label,
+                       msg="regime-B route not computed; today's report stands")
+        shadow = dict(regime_b_mode=rb.UNAVAILABLE, regime_b_detail=rr.B_ROUTE_ERROR,
+                      regime_film_basis=BASIS_FILM_UNIDENTIFIED)
+        return None, None, shadow, dict(kind=rb.UNAVAILABLE, detail=rr.B_ROUTE_ERROR)
+    est = out.estimates
+    stated = _sigma_or_nan(cell, out.R_ohm)
+    film = ident in (rb.VALUE, rb.LOWER_BOUND)
+    shadow = dict(
+        regime_b_mode=out.kind, regime_b_detail=out.detail, regime_b_sigma=stated,
+        regime_cx_source=est.fit.cx_source if est.fit is not None else "",
+        regime_film_R_ohm=est.R_fit if film else nan,
+        regime_film_basis=BASIS_FILM_ARC if film else BASIS_FILM_UNIDENTIFIED,
+    )
+    log = dict(kind=out.kind, detail=out.detail, sigma=stated, **est.shadow_fields())
+    if out.kind == rb.UNAVAILABLE:
+        return None, None, shadow, log
+    common = dict(
+        shadow, value=nan, upper_bound=nan, upper_bound_f_hz=nan,
+        upper_bound_basis="unavailable", rel_uncertainty=nan, R_reported_se_ohm=nan,
+        rho=nan, cross_check_pct=nan, fit_implied_sigma=_sigma_or_nan(cell, R_engine),
+        regime=verdict.label, regime_reason=verdict.reason, regime_mode=_B_MODE[out.kind],
+        regime_sigma=nan, regime_sigma_lower=nan, regime_R_foot_ohm=nan,
+        regime_route_detail=out.detail, regime_active=True,
+    )
+    if out.kind == rb.VALUE:
+        # Cross-checked against the route's own model-free partner, as route A's value is;
+        # a value implies the pair agreed, so R_mf is finite here.
+        pair_rel = abs(est.R_fit - est.R_mf) / est.R_fit
+        common.update(mode="value", value=stated, regime_sigma=stated,
+                      rel_uncertainty=cell.sigma_rel_uncertainty(pair_rel),
+                      R_reported_ohm=out.R_ohm, R_basis=REGIME_B_FILM_ARC,
+                      cross_check_pct=pair_rel * 100.0)
+        ceiling = SigmaCeiling(reason="regime_b_value")
+    elif out.kind == rb.UPPER_BOUND:
+        # Model-conditional (spec §3.2: the rigorous passive correction is vacuous at
+        # f_lo), so provisional, like route A's passive bound. No frequency: Re Z_lo is
+        # the median of the three lowest points, not a reading at one.
+        common.update(mode="bound", upper_bound=stated, upper_bound_basis=REGIME_B_NO_ARC,
+                      provisional=True, R_reported_ohm=out.R_ohm, R_basis=REGIME_B_NO_ARC,
+                      regime_sigma=stated)
+        ceiling = SigmaCeiling(value=stated, basis=REGIME_B_NO_ARC)
+    else:
+        common.update(mode="unavailable", provisional=False, regime_sigma_lower=stated,
+                      regime_R_foot_ohm=out.R_ohm, R_reported_ohm=out.R_ohm,
+                      R_basis=REGIME_B_ARC_LOWER)
+        ceiling = SigmaCeiling(reason=f"regime_b_{out.detail}")
+    return replace(today, **common), ceiling, shadow, log
+
+
 def _regime_a_sigma(verdict: Any, today: SigmaReport, *, cell: CellConstant | None,
                     envelope: Any, tand_headroom_mult: float,
                     R_engine: float) -> tuple[SigmaReport, SigmaCeiling, dict[str, Any]]:
@@ -701,11 +799,16 @@ def _regime_a_sigma(verdict: Any, today: SigmaReport, *, cell: CellConstant | No
     nan = float("nan")
 
     def sig(R: float) -> float:
-        return cell.sigma(R) if (cell is not None and R == R and R > 0) else nan
+        return _sigma_or_nan(cell, R)
 
     log = dict(estimates=est, plateau_mode=plateau.mode, route_detail=detail,
                sigma_value=sig(est.R_fit), sigma_sum=sig(est.R_fit + est.R_fit_s),
                sigma_lower=sig(est.R_foot))
+    # The settle observable is 1/R_fit and needs no K, so it is judged on the kind
+    # BEFORE the no-cell override below (spec §4; ``regime_b.film_arc_resistance`` alike).
+    film = kind in (rr.VALUE, rr.BOUND) and est.R_fit == est.R_fit and est.R_fit > 0
+    film_fields = dict(regime_film_R_ohm=est.R_fit if film else nan,
+                       regime_film_basis=BASIS_FILM_RB if film else BASIS_FILM_UNIDENTIFIED)
     if cell is None:
         kind, log["route_detail"] = rr.UNAVAILABLE, rr.NO_CELL_CONSTANT
     common = dict(
@@ -718,7 +821,7 @@ def _regime_a_sigma(verdict: Any, today: SigmaReport, *, cell: CellConstant | No
         headroom_window=plateau.window,
         regime=verdict.label, regime_reason=verdict.reason, regime_mode=kind,
         regime_sigma_lower=log["sigma_lower"], regime_R_foot_ohm=est.R_foot,
-        regime_route_detail=log["route_detail"],
+        regime_route_detail=log["route_detail"], **film_fields,
     )
     if kind == rr.VALUE:
         # The cross-check is against the route's own model-free partner R_mf, never
@@ -754,16 +857,19 @@ def _regime_a_sigma(verdict: Any, today: SigmaReport, *, cell: CellConstant | No
 
 def _regime_report(eis_result: Any, verdict: Any, route_a: bool, today: SigmaReport,
                    ceiling: SigmaCeiling, mode: str, *, arc_open: bool,
+                   route_b: bool = False, c_cell: float | None = None,
                    **a_kwargs: Any) -> tuple[SigmaReport, SigmaCeiling, str]:
-    """Shadow always; the A route's answer replaces today's only when ``route_a``.
+    """Shadow always; a route's answer replaces today's only when that route is live.
 
-    Returns ``(sigma, ceiling, mode)``. With the flag off, ``sigma`` is *today* with the
-    additive regime fields set, so every pre-slice field is today's exactly. Any failure
-    returns *today* untouched — on the A route too, which is then the flag-off answer.
+    Returns ``(sigma, ceiling, mode)``. With the flags off, ``sigma`` is *today* with the
+    additive regime fields set, so every pre-slice field is today's exactly — and with
+    ``route_b`` off, every pre-slice-2 field is too: the B route then writes only its own
+    additive fields. Any failure returns *today* untouched — on the A route too, which is
+    then the flag-off answer. A B route that is *unavailable* leaves today's report.
     """
     from dataclasses import replace
 
-    from softae.analysis.eis.regime_route import log_shadow
+    from softae.analysis.eis.regime_route import b_routed, log_shadow
 
     if verdict is None:
         return today, ceiling, mode
@@ -771,22 +877,32 @@ def _regime_report(eis_result: Any, verdict: Any, route_a: bool, today: SigmaRep
         a_sigma, a_ceiling, log = None, ceiling, {}
         if verdict.is_a:
             a_sigma, a_ceiling, log = _regime_a_sigma(verdict, today, **a_kwargs)
-        shadow = dict(regime=verdict.label, regime_reason=verdict.reason)
+        b_sigma, b_ceiling, b_shadow, b_log = None, None, {}, None
+        if b_routed(verdict):
+            b_sigma, b_ceiling, b_shadow, b_log = _regime_b_sigma(
+                verdict, today, cell=a_kwargs.get("cell"), c_cell=c_cell,
+                R_engine=a_kwargs.get("R_engine", float("nan")))
+        shadow = dict(regime=verdict.label, regime_reason=verdict.reason, **b_shadow)
         if a_sigma is not None:
             shadow.update({k: getattr(a_sigma, k) for k in (
                 "regime_reason", "regime_mode", "regime_sigma", "regime_sigma_lower",
-                "regime_R_foot_ohm", "regime_route_detail")})
-        chosen = (replace(a_sigma, regime_active=True) if route_a and a_sigma is not None
-                  else replace(today, **shadow))
+                "regime_R_foot_ohm", "regime_route_detail", "regime_film_R_ohm",
+                "regime_film_basis")})
+        if route_a and a_sigma is not None:
+            chosen, taken_ceiling = replace(a_sigma, regime_active=True), a_ceiling
+        elif route_b and b_sigma is not None:
+            chosen, taken_ceiling = b_sigma, b_ceiling
+        else:
+            chosen, taken_ceiling = replace(today, **shadow), ceiling
         log_shadow(getattr(eis_result, "channel", None), verdict, chosen, today,
-                   today_arc_gate=arc_open, **log)
+                   today_arc_gate=arc_open, b_fields=b_log, **log)
     except Exception as exc:  # noqa: BLE001 - the shadow must never cost a spectrum
         logger.warning("eis_regime_shadow_failed", error=str(exc),
                        channel=getattr(eis_result, "channel", None), route_a=route_a,
                        msg="regime shadow not computed; today's report stands")
         return today, ceiling, mode
     if chosen.regime_active:
-        return chosen, a_ceiling, chosen.mode
+        return chosen, taken_ceiling, chosen.mode
     return chosen, ceiling, mode
 
 
@@ -806,6 +922,7 @@ def analyze_spectrum(
     pregate: Any = None,
     role: str = "sample",
     regime: Any = None,
+    cell_capacitance: float | None = None,
 ) -> SpectrumReport:
     """Analyse one spectrum through whichever engine is selected.
 
@@ -840,7 +957,14 @@ def analyze_spectrum(
         A :class:`~softae.analysis.eis.regime_route.RegimeSettings`. ``None`` reads
         ``[eis] regime_aware`` raw (absent = off). The classification and the regime-A
         shadow run either way on the gated post-fit path; the flag decides only whether
-        a regime-A answer replaces today's report.
+        a regime-A answer replaces today's report. ``[eis] regime_b`` (its ``regime_b``
+        field) does the same for the regime-B route, and only together with
+        ``regime_aware``.
+    cell_capacitance
+        This spectrum's channel's measured C_cell (F) — the caller looks it up
+        (``DataStore.cell_capacitance``); this function does no DB reads. ``None`` means
+        unmeasured: the regime-B route then answers *unavailable*
+        (``c_cell_unmeasured``) and fits nothing — never a default band.
     """
     cfg = settings if settings is not None else eis_settings()
     chosen = (engine or cfg.engine or "legacy").strip().lower()
@@ -1149,6 +1273,7 @@ def analyze_spectrum(
     reg_cfg = regime if regime is not None else regime_settings()
     verdict = _classify_quietly(eis_result, freq, Z_work)
     route_a = bool(reg_cfg.enabled and verdict is not None and verdict.is_a)
+    route_b = getattr(reg_cfg, "b_route", False) is True
 
     # ── Two arithmetic refusals (T11.46), and NEITHER reads ``gate_cfg.enabled`` ──
     #
@@ -1180,19 +1305,6 @@ def analyze_spectrum(
         # the pin for exactly that claim.
         if mode not in ("bound", "bound_unqualified"):
             mode = "bound"
-    # Refusal (a) is BYPASSED on the regime-A route (spec §4): an A foot is the arc's end
-    # and the CPE spike below it is the electrode, so "open at the floor" is not evidence
-    # of an extrapolated R. Today's answer is still computed — it is the shadow's
-    # ``today_*`` and the fallback should the route fail — but not announced.
-    if arc_open and not route_a:
-        logger.info("eis_arc_open_bound",
-                    channel=getattr(eis_result, "channel", None),
-                    phase_low_deg=float(getattr(arc, "phase_low_deg", float("nan"))),
-                    f_peak_hz=float(getattr(arc, "f_peak_hz", float("nan"))),
-                    ceiling_S_per_cm=ceiling.value, basis=ceiling.basis,
-                    model_free_R_ohm=float(model_free_R),
-                    msg="arc did not close in band — R1 is an extrapolation, so the "
-                        "row reports a ceiling on sigma and never a fitted value")
     # (b) runs after (a) and the order is free: (a) reads the arc and the admittance
     # and never the fit, (b) rewrites the fit and never the ceiling. That is what
     # lets them compose — (b) removes the value, (a) supplies the bound that stands
@@ -1222,9 +1334,23 @@ def analyze_spectrum(
     )
     sigma, ceiling, mode = _regime_report(
         eis_result, verdict, route_a, sigma, ceiling, mode, arc_open=arc_open,
+        route_b=route_b, c_cell=cell_capacitance,
         cell=cell, envelope=env, tand_headroom_mult=gate_cfg.tand_headroom_mult,
         R_engine=R if fit.success else float("nan"),
     )
+    # Refusal (a) is BYPASSED on a taken regime route (A: spec §4; B: slice 2 §3.2): an
+    # A foot is the arc's end and the CPE spike below it is the electrode, and on B
+    # today's admittance ceiling *is* K/R_x. Today's answer is still computed — it is the
+    # shadow's ``today_*`` and the fallback should the route fail — but not announced.
+    if arc_open and not sigma.regime_active:
+        logger.info("eis_arc_open_bound",
+                    channel=getattr(eis_result, "channel", None),
+                    phase_low_deg=float(getattr(arc, "phase_low_deg", float("nan"))),
+                    f_peak_hz=float(getattr(arc, "f_peak_hz", float("nan"))),
+                    ceiling_S_per_cm=ceiling.value, basis=ceiling.basis,
+                    model_free_R_ohm=float(model_free_R),
+                    msg="arc did not close in band — R1 is an extrapolation, so the "
+                        "row reports a ceiling on sigma and never a fitted value")
     # The flag state this report was analysed under, for observation.py: with it off
     # the campaign decision must be the pre-regime rule, and only this field can say so.
     sigma = _replace(sigma, regime_aware=bool(reg_cfg.enabled))

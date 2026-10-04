@@ -168,13 +168,36 @@ def render(checks: Sequence[cc.InsulatorCheck], groups: dict, *, board_id: int) 
     return "\n".join(lines)
 
 
+class GroupRefused(ValueError):
+    """The store refused one group's row. Carries what was already written before it.
+
+    Each ``record_cell_capacitance`` is its own transaction, so a refusal of the second
+    group leaves the first recorded; the operator is owed both facts, not a traceback.
+    """
+
+    def __init__(self, group: tuple[int, int], written: list[Any], cause: ValueError):
+        super().__init__(str(cause))
+        self.group, self.written = group, list(written)
+
+
 def write_groups(store: Any, groups: dict, *, accepted_by: str) -> list[Any]:
-    """Append one row per group through eis-acq's contract. Nothing else is written."""
-    return [store.record_cell_capacitance(
-        board_id=rec.board_id, group=rec.group, c_cell_F=rec.c_cell_F,
-        spread=rec.spread_dec, method=rec.method,
-        source_measurement_ids=list(rec.source_measurement_ids), accepted_by=accepted_by)
-        for _, rec in sorted(groups.items())]
+    """Append one row per group through eis-acq's contract. Nothing else is written.
+
+    The store validates each row and raises ``ValueError`` before writing it (e.g. a
+    group with no measurement ids: a C_cell with no support is not a measurement);
+    that is re-raised as :class:`GroupRefused` naming the group and the rows before it.
+    """
+    written: list[Any] = []
+    for group, rec in sorted(groups.items()):
+        try:
+            written.append(store.record_cell_capacitance(
+                board_id=rec.board_id, group=rec.group, c_cell_F=rec.c_cell_F,
+                spread=rec.spread_dec, method=rec.method,
+                source_measurement_ids=list(rec.source_measurement_ids),
+                accepted_by=accepted_by))
+        except ValueError as exc:
+            raise GroupRefused(group, written, exc) from exc
+    return written
 
 
 def _default_store_cls() -> type:
@@ -256,6 +279,13 @@ def main(argv: Sequence[str] | None = None, *, input_fn: Callable[[str], str] = 
     store = store_cls(project, db_filename=db_filename)
     try:
         ids = write_groups(store, groups, accepted_by=args.accepted_by.strip())
+    except GroupRefused as exc:
+        lo, hi = exc.group
+        print(f"The store refused group {lo}-{hi}: {exc}\n"
+              f"Recorded before the refusal: {exc.written or 'nothing'}.", file=sys.stderr)
+        logger.warning("c_cell_group_refused", board_id=args.board, group=[lo, hi],
+                       error=str(exc), rows=exc.written)
+        return EXIT_FAILED
     finally:
         getattr(store, "close", lambda: None)()
     logger.info("c_cell_recorded", board_id=args.board, rows=ids)

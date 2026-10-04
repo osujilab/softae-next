@@ -51,9 +51,9 @@ async def connected():
     await mgr.disconnect_all()
 
 
-def _flag(monkeypatch, enabled: bool) -> None:
-    monkeypatch.setattr(rr, "regime_settings",
-                        lambda config=None: rr.RegimeSettings(enabled=enabled))
+def _flag(monkeypatch, enabled: bool, regime_b: bool = False) -> None:
+    monkeypatch.setattr(rr, "regime_settings", lambda config=None: rr.RegimeSettings(
+        enabled=enabled, regime_b=regime_b))
 
 
 async def _park_a_run(connected, store: DataStore, monkeypatch, *, enabled: bool) -> None:
@@ -79,7 +79,7 @@ async def test_resume_regime_flag_changed_refuses_naming_both_values(
     store = DataStore(tmp_path / "proj")
     await _park_a_run(connected, store, monkeypatch, enabled=launched)
     recorded = json.loads(store.campaign_checkpoint("regime_resume")["spec_json"])
-    assert recorded["regime"] == {"enabled": launched}
+    assert recorded["regime"] == {"enabled": launched, "regime_b": False}
 
     _flag(monkeypatch, now)
     events: list[dict] = []
@@ -175,4 +175,62 @@ def test_check_resume_regime_recorded_key_no_longer_a_field_refuses(value):
     spec_json = _checkpoint({"enabled": True, "retired_flag": value})
     with pytest.raises(ResumeMismatchError,
                        match=f"retired_flag = {json.dumps(value)} at launch, absent now"):
+        check_resume_regime(spec_json, rr.RegimeSettings(enabled=True), campaign="c")
+
+
+# ── [eis] regime_b (slice 2): a field of RegimeSettings, so the guard covers it ──
+
+
+def _strip_regime_b(store: DataStore) -> None:
+    """Rewrite the parked checkpoint as one written before ``regime_b`` existed."""
+    cp = store.campaign_checkpoint("regime_resume")
+    spec = json.loads(cp["spec_json"])
+    spec["regime"].pop("regime_b")
+    store.save_campaign_checkpoint(
+        "regime_resume", iteration=cp["iteration"], run_id=cp["run_id"],
+        loop_state=cp["loop_state"], board_id=cp["board_id"],
+        spec_json=json.dumps(spec, sort_keys=True),
+        optimizer_json=cp["optimizer_json"])
+
+
+@pytest.mark.asyncio
+async def test_resume_pre_regime_b_checkpoint_regime_b_off_proceeds(
+        connected, tmp_path: Path, monkeypatch):
+    store = DataStore(tmp_path / "proj")
+    await _park_a_run(connected, store, monkeypatch, enabled=True)
+    _strip_regime_b(store)
+
+    _flag(monkeypatch, True, regime_b=False)
+    events: list[dict] = []
+    result = await _resume(connected, store, events)
+
+    assert any(e["type"] == "resumed" for e in events)
+    assert not any(e["type"] in ("resume_refused", "resume_regime_unrecorded")
+                   for e in events)
+    assert result.n_trials == 3
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_pre_regime_b_checkpoint_regime_b_on_refuses_naming_it(
+        connected, tmp_path: Path, monkeypatch):
+    store = DataStore(tmp_path / "proj")
+    await _park_a_run(connected, store, monkeypatch, enabled=True)
+    _strip_regime_b(store)
+
+    _flag(monkeypatch, True, regime_b=True)
+    events: list[dict] = []
+    with pytest.raises(ResumeMismatchError,
+                       match="regime_b = false at launch, true now"):
+        await _resume(connected, store, events)
+
+    assert [e["type"] for e in events if e["type"] == "resume_refused"]
+    assert not any(e["type"] == "resumed" for e in events)
+    assert store.campaign_checkpoint("regime_resume") is not None
+    store.close()
+
+
+def test_check_resume_regime_real_settings_regime_b_changed_refuses():
+    spec_json = _checkpoint({"enabled": True, "regime_b": True})
+    with pytest.raises(ResumeMismatchError, match="regime_b = true at launch, false now"):
         check_resume_regime(spec_json, rr.RegimeSettings(enabled=True), campaign="c")

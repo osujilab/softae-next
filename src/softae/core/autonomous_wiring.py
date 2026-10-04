@@ -1048,6 +1048,7 @@ def serialize_campaign_spec(spec: "CampaignSpec", *, regime: Any = None) -> str:
 
 
 #: ``RegimeSettings`` field -> the ``[eis]`` key an operator edits to change it.
+#: A field not named here is spelled as its own key (``regime_b`` is both).
 _REGIME_CONFIG_KEYS = {"enabled": "regime_aware"}
 
 
@@ -1068,7 +1069,9 @@ def check_resume_regime(spec_json: str | None, current: Any, *, campaign: str) -
     if not isinstance(recorded, dict):
         return (f"Checkpoint for '{campaign}' predates recorded EIS regime settings; "
                 f"resuming under the current [eis] regime_aware = "
-                f"{json.dumps(bool(current.enabled))}, which cannot be checked "
+                f"{json.dumps(bool(current.enabled))}, regime_b = "
+                f"{json.dumps(getattr(current, 'regime_b', False) is True)}, "
+                f"which cannot be checked "
                 f"against the estimator its earlier values were told under.")
     now = asdict(current)
     # A field added since launch did not exist then, so the launch ran at its
@@ -1989,12 +1992,18 @@ def settle_round_fits(
     *,
     thickness_for: Callable[[int], Any] | None = None,
     regime: Any = None,
+    cell_capacitance_for: Callable[[int], float | None] | None = None,
 ) -> list["RoundFit"]:
     """The criterion's tracked quantity per channel, one round — **always one
     entry per channel**.
 
     *regime* is the campaign's one ``RegimeSettings`` (R6), so a settle round and
-    the scored read of the same film are analysed under the same flag read.
+    the scored read of the same film are analysed under the same flag read, and
+    *cell_capacitance_for* is the campaign's C_cell lookup, likewise.
+
+    **Under** ``regime_aware`` **and** ``regime_b`` (operator ruling Q8, spec §4)
+    the tracked quantity is the *film* resistance — see :func:`_film_round_fit`.
+    With either flag off this function is exactly what it was before slice 2.
 
     A channel whose step did not complete comes back as an all-``None``
     :class:`~softae.analysis.equilibration.RoundFit` rather than being dropped,
@@ -2020,9 +2029,18 @@ def settle_round_fits(
     )
 
     out: list[RoundFit] = []
+    film_route = regime_b_live(regime)
     for channel in channels:
         raw = raws.get(int(channel))
         thickness = thickness_for(int(channel)) if thickness_for is not None else None
+        c_cell = _c_cell(cell_capacitance_for, channel)
+        if film_route and raw is not None:
+            film = _film_round_fit(int(channel), _spectrum_report_from_raw(
+                raw, channel=int(channel), thickness_um=thickness, engine="gated",
+                regime=regime, cell_capacitance=c_cell))
+            if film is not None:
+                out.append(film)
+                continue
         # `engine="legacy"` — USER RULING [a265] item 2 (T11.15), on rung 3a's bench
         # evidence ([a276]/[a277]/[a280]): the settle gate fits R₁ through the direct
         # fitter, regardless of what `[eis] engine` is set to. That ruling STANDS, but
@@ -2042,7 +2060,8 @@ def settle_round_fits(
         report = (None if raw is None else
                   _spectrum_report_from_raw(raw, channel=int(channel),
                                             thickness_um=thickness,
-                                            engine="legacy", regime=regime))
+                                            engine="legacy", regime=regime,
+                                            cell_capacitance=c_cell))
         sigma = _report_sigma(report)
         # The tool path's own three-way split (`eis_validate_hold._round_fit`), reused
         # rather than re-spelled: a sweep that never happened and a fit that did not
@@ -2060,6 +2079,99 @@ def settle_round_fits(
                             sigma_mode=_report_sigma_mode(report),
                             quality_verdict=_report_quality_verdict(report)))
     return out
+
+
+class SettleBasisWatch:
+    """Say, on the round it happens, that a well's tracked observable changed.
+
+    ``rate_check`` is pure, so the restart eis-acq's ``EXCLUDED_MIXED_BASIS`` rule
+    makes at a basis change (``fitted`` → ``film_arc`` on a film whose label flipped
+    across the hold) is announced here, by the wiring that feeds it — once per
+    change, per channel. Only a round that **carries a σ** has a basis, the
+    criterion's own rule (``_recorded_basis``): a σ-less round is not a change.
+    With ``regime_b`` off every σ round is ``fitted``, so this never fires.
+
+    Returns the fits unchanged, so it wraps ``fits_from`` without touching what the
+    tracker sees.
+    """
+
+    def __init__(self, emit: Callable[..., None]) -> None:
+        self._emit = emit
+        self._last: dict[int, str] = {}
+
+    def __call__(self, fits: Sequence["RoundFit"]) -> Sequence["RoundFit"]:
+        for fit in fits:
+            basis = str(fit.basis) if fit.basis and fit.sigma is not None else ""
+            if not basis:
+                continue
+            channel = int(fit.channel)
+            previous = self._last.get(channel)
+            self._last[channel] = basis
+            if previous is not None and previous != basis:
+                self._emit(channel=channel, previous=previous, basis=basis)
+        return fits
+
+
+def regime_b_live(regime: Any) -> bool:
+    """Is the regime-B route live for this campaign: ``regime_aware`` AND ``regime_b``?
+
+    Read off the campaign's one ``RegimeSettings`` (R6), never off config, by delegating
+    to its ``b_route`` — the one spelling of the rule. ``None`` (a direct caller with no
+    campaign settings) is off: the settle gate then stays on [a265]'s legacy 1/R₁, which
+    is what it was before slice 2.
+    """
+    return bool(getattr(regime, "b_route", False))
+
+
+def _film_round_fit(channel: int, report: Any) -> "RoundFit | None":
+    """One settle round under ``regime_b``: the film resistance, or ``None`` for 1/R₁.
+
+    Operator ruling Q8 (``regime_b_slice2_spec.md`` §4), read off the *gated* report's
+    ``regime_film_basis`` / ``regime_film_R_ohm`` — the engine's route already decided
+    which R the film's is, and a second classification here could disagree with it:
+
+    * ``film_arc`` / ``film_rb`` with a finite positive R → σ = 1/R, ``r1_ohms`` None
+      (the R₁ rail check is a ``simpleSalt`` fact and does not apply to a film R).
+    * ``film_unidentified``, or a film basis with no usable R → **unjudgeable**: σ
+      None. **Never 1/R₁**: on B, R₁ follows the series element, which is flat, and
+      the hold would certify by round two while the film still moves. ``r1_ohms`` is
+      NaN, not None, so the round drops as ``sigma_null`` and not as *absent* (the
+      tool path's ``_round_fit`` precedent): the sweep happened.
+    * no gated report at all → unjudgeable, ``fit_failed``, for the same reason: the
+      round's label is unknown, and falling back would track R_x on exactly the films
+      this route exists for.
+    * ``""`` → not a film route (C, bad-data U, unclassified): ``None``, and the caller
+      takes today's legacy 1/R₁ round.
+    """
+    from softae.analysis.equilibration import (
+        BASIS_FILM_ARC,
+        BASIS_FILM_RB,
+        BASIS_FILM_UNIDENTIFIED,
+        BASIS_FIT_FAILED,
+        RoundFit,
+    )
+
+    if report is None:
+        return RoundFit(channel=channel, sigma=None, r1_ohms=float("nan"),
+                        basis=BASIS_FIT_FAILED)
+    sigma_report = getattr(report, "sigma", None)
+    basis = str(getattr(sigma_report, "regime_film_basis", "") or "")
+    if not basis:
+        return None
+    try:
+        film_r = float(getattr(sigma_report, "regime_film_R_ohm"))
+    except (AttributeError, TypeError, ValueError):
+        film_r = float("nan")
+    told = (basis in (BASIS_FILM_ARC, BASIS_FILM_RB)
+            and math.isfinite(film_r) and film_r > 0)
+    return RoundFit(channel=channel,
+                    sigma=1.0 / film_r if told else None,
+                    r1_ohms=None if told else float("nan"),
+                    basis=basis if told else BASIS_FILM_UNIDENTIFIED,
+                    arc_state=_report_arc_state(report),
+                    n_points_dropped=_report_n_points_dropped(report),
+                    sigma_mode=_report_sigma_mode(report),
+                    quality_verdict=_report_quality_verdict(report))
 
 
 def _report_sigma(report: Any) -> float | None:
@@ -2835,6 +2947,110 @@ def make_thickness_lookup(
     return _lookup
 
 
+#: Why a channel has no C_cell. Three words, because *nobody measured this board*,
+#: *the store could not be asked* and *the asking raised* send an operator to three
+#: different places (``SUBAGENT_RULES.md`` §3.1(a)); every one of them still reaches
+#: the engine as ``None``, which the B route reports as ``c_cell_unmeasured``.
+C_CELL_RECORDED = "recorded"
+C_CELL_UNMEASURED = "unmeasured"
+C_CELL_NO_TABLE = "no_table"
+C_CELL_LOOKUP_FAILED = "lookup_failed"
+
+
+class CellCapacitanceLookup:
+    """``channel -> C_cell (F)`` on the board the channel is on **now**, or ``None``.
+
+    Slice 2 (``regime_b_slice2_spec.md`` §2.3): the campaign resolves each campaign
+    channel's C_cell once per board through ``DataStore.cell_capacitance(board_id,
+    channel)`` -- eis-acq's one preference order (own channel row, else the covering
+    group row) -- and hands the number to every analysis beside the campaign's one
+    ``RegimeSettings``.
+
+    **The board is ``data_store.current_board_id()`` at the call**, which is the
+    allocator's board after the board check (a FRESH or full board has already moved
+    the pointer) and follows the loop's ``set_active_board`` on a spare-board
+    exchange. C_cell is per board -- not in the hardware hash, so a swapped plate
+    keeps the hash -- and a value resolved at launch would silently apply board 2's
+    capacitance to board 3. Each board is resolved **once**, on first use, and
+    cached, so a row appended mid-run cannot move the estimator under values already
+    told (R6's posture), and each resolution is one ``cell_capacitance`` event.
+
+    ``None`` is *unmeasured* and is never replaced by a default: ``[eis.instrument]
+    c_cell_F`` is 3-6x the measured value, which is why the table exists.
+    """
+
+    def __init__(self, data_store: Any, channels: Sequence[int], *,
+                 emit: Callable[..., None] | None = None) -> None:
+        self._store = data_store
+        self._channels = sorted({int(ch) for ch in channels})
+        self._emit = emit or (lambda *_a, **_k: None)
+        self._by_board: dict[int, dict[int, tuple[dict[str, Any] | None, str]]] = {}
+
+    def __call__(self, channel: int) -> float | None:
+        record, _status = self._entry(int(channel))
+        return None if record is None else float(record["c_cell_F"])
+
+    def resolve(self) -> int | None:
+        """Resolve every campaign channel on the current board now; the board id."""
+        board = self._board()
+        if board is not None and board not in self._by_board:
+            self._resolve(board)
+        return board
+
+    def _entry(self, channel: int) -> tuple[dict[str, Any] | None, str]:
+        board = self._board()
+        if board is None:
+            return None, C_CELL_LOOKUP_FAILED
+        rows = self._by_board.get(board)
+        if rows is None:
+            rows = self._resolve(board)
+        if channel not in rows:                    # off the campaign's channel set
+            rows[channel] = self._lookup(board, channel)
+        return rows[channel]
+
+    def _board(self) -> int | None:
+        try:
+            return int(self._store.current_board_id())
+        except Exception:
+            logger.warning("cell_capacitance_board_unavailable", exc_info=True)
+            return None
+
+    def _lookup(self, board: int, channel: int) -> tuple[dict[str, Any] | None, str]:
+        getter = getattr(self._store, "cell_capacitance", None)
+        if not callable(getter):
+            return None, C_CELL_NO_TABLE
+        try:
+            record = getter(board, channel)
+        except Exception:
+            logger.warning("cell_capacitance_lookup_failed", board_id=board,
+                           channel=channel, exc_info=True)
+            return None, C_CELL_LOOKUP_FAILED
+        return (record, C_CELL_RECORDED) if record else (None, C_CELL_UNMEASURED)
+
+    def _resolve(self, board: int) -> dict[int, tuple[dict[str, Any] | None, str]]:
+        rows = {ch: self._lookup(board, ch) for ch in self._channels}
+        self._by_board[board] = rows
+        summary = {str(ch): _c_cell_summary(*entry) for ch, entry in rows.items()}
+        logger.info("cell_capacitance", board_id=board, channels=summary)
+        self._emit("cell_capacitance", board_id=board, channels=summary)
+        return rows
+
+
+def _c_cell_summary(record: dict[str, Any] | None, status: str) -> dict[str, Any]:
+    """One channel's line in the ``cell_capacitance`` event: the value and its support."""
+    if record is None:
+        return {"status": status, "c_cell_F": None}
+    return {"status": status, "c_cell_F": float(record["c_cell_F"]),
+            "row_id": record.get("id"), "channel_row": record.get("channel") is not None,
+            "group": [record.get("group_lo"), record.get("group_hi")],
+            "source_measurement_ids": list(record.get("source_measurement_ids") or [])}
+
+
+def _c_cell(lookup: Callable[[int], float | None] | None, channel: int) -> float | None:
+    """*lookup*'s C_cell for *channel*, or ``None`` (unmeasured) when none was wired."""
+    return None if lookup is None else lookup(int(channel))
+
+
 def resolve_direction(spec: CampaignSpec, *, settings: Any = None) -> tuple[str, str]:
     """The optimisation direction this campaign must use. Returns ``(direction, kind)``.
 
@@ -2894,12 +3110,14 @@ def _trial_objective_kind(kind: str | None, *, has_thickness: bool) -> str:
 def _scalar_from_eis_raw(raw: Any, *, channel: int = 0,
                          thickness_um: float | None = None,
                          kind: str | None = None,
-                         regime: Any = None) -> Any:
+                         regime: Any = None,
+                         cell_capacitance: float | None = None) -> Any:
     """The trial metric for one EIS step result, or None if unusable.
 
     mean |Z| (a float) under a volume campaign; under a σ campaign, whatever
     :func:`_sigma_from_eis_raw` returns — a float, a ``SigmaObservation`` or None.
-    *regime* is the campaign's one ``RegimeSettings`` (R6), passed through.
+    *regime* is the campaign's one ``RegimeSettings`` (R6), passed through, and
+    *cell_capacitance* is this channel's C_cell on its board (slice 2), likewise.
 
     Rejects non-finite results explicitly.  ``np.asarray(None, dtype=float)``
     yields ``array(nan)`` *without raising*, so a missing step result used to
@@ -2958,7 +3176,7 @@ def _scalar_from_eis_raw(raw: Any, *, channel: int = 0,
     # *would* have returned, so the two can be compared over a real campaign before
     # anything is flipped — the same observe-before-acting posture as [purge] actuate.
     sigma = _sigma_from_eis_raw(raw, channel=channel, thickness_um=thickness_um,
-                                regime=regime)
+                                regime=regime, cell_capacitance=cell_capacitance)
     if _trial_objective_kind(kind, has_thickness=thickness_um is not None) == "sigma":
         # No thickness under a σ campaign means *unmeasured*, never mean |Z|: handing
         # a maximiser an impedance for one channel would score the worst conductor in
@@ -2974,7 +3192,8 @@ def _scalar_from_eis_raw(raw: Any, *, channel: int = 0,
 
 def _sigma_from_eis_raw(raw: Any, *, channel: int = 0,
                         thickness_um: float | None = None,
-                        regime: Any = None) -> Any:
+                        regime: Any = None,
+                        cell_capacitance: float | None = None) -> Any:
     """σ for one EIS step result: a float, a ``SigmaObservation``, or ``None``.
 
     Three answers, read off :func:`~softae.analysis.eis.observation.sigma_observation`
@@ -3001,7 +3220,7 @@ def _sigma_from_eis_raw(raw: Any, *, channel: int = 0,
     Never raises: a broken analysis path must not discard a measurement.
     """
     report = _spectrum_report_from_raw(raw, channel=channel, thickness_um=thickness_um,
-                                       regime=regime)
+                                       regime=regime, cell_capacitance=cell_capacitance)
     if report is None:
         return None
     from softae.analysis.eis.observation import VALUE, sigma_observation
@@ -3028,7 +3247,8 @@ def _sigma_from_eis_raw(raw: Any, *, channel: int = 0,
 def _spectrum_report_from_raw(raw: Any, *, channel: int = 0,
                               thickness_um: float | None = None,
                               engine: str | None = None,
-                              regime: Any = None) -> Any | None:
+                              regime: Any = None,
+                              cell_capacitance: float | None = None) -> Any | None:
     """One EIS step result → a ``SpectrumReport``, or ``None`` if it cannot be built.
 
     **The single raw → physics hop on the campaign path.** σ and R₁ come out of
@@ -3046,6 +3266,11 @@ def _spectrum_report_from_raw(raw: Any, *, channel: int = 0,
     ``[eis] regime_aware`` **once** at build and hands the same ``RegimeSettings``
     to every call, so a mid-run config edit cannot change the estimator under
     values already told; ``None`` lets the engine read the key itself.
+
+    ``cell_capacitance`` is the channel's C_cell on its board, from
+    :class:`CellCapacitanceLookup` (slice 2), passed straight through on every
+    call. ``None`` is *unmeasured*: the B route then reports ``c_cell_unmeasured``,
+    never a value against a default band. The engine does no DB I/O for it.
 
     Never raises: a broken analysis path must not discard a measurement.
     """
@@ -3108,7 +3333,7 @@ def _spectrum_report_from_raw(raw: Any, *, channel: int = 0,
         # silently start fitting different circuits the day either default moves.
         return analyze_spectrum(eis, cell=cell, re_connection="bridged_by_sample",
                                 model_name=SETTLE_CIRCUIT_MODEL, engine=engine,
-                                regime=regime)
+                                regime=regime, cell_capacitance=cell_capacitance)
     except Exception:
         logger.warning("sigma_objective_unavailable", exc_info=True)
         return None
@@ -3165,6 +3390,7 @@ def eis_impedance_objective(
     kind: str | None = None,
     step_tags: Mapping[str, Mapping[str, Any]] | None = None,
     regime: Any = None,
+    cell_capacitance_for: Callable[[int], float | None] | None = None,
 ) -> Any:
     """Default real objective, aggregated over the trial's EIS measurements.
 
@@ -3183,6 +3409,10 @@ def eis_impedance_objective(
     *thickness_for* maps a channel to its cast thickness in µm — see
     :func:`make_thickness_lookup`. Without it the σ path has no geometry and reports
     every trial unmeasured, so a campaign wanting σ must supply one.
+
+    *cell_capacitance_for* maps a channel to its C_cell on its board — see
+    :class:`CellCapacitanceLookup`. Without it every channel is *unmeasured*, which
+    the regime-B route reports as ``c_cell_unmeasured`` rather than a value.
 
     Returns ``None`` when nothing usable is present. **``None`` means "not measured"
     and must never be coerced to a number** — this function once returned ``0.0``,
@@ -3234,7 +3464,7 @@ def eis_impedance_objective(
     for name, channel, raw in measured:
         value = _scalar_from_eis_raw(
             raw, channel=channel, thickness_um=thickness[name], kind=settled,
-            regime=regime)
+            regime=regime, cell_capacitance=_c_cell(cell_capacitance_for, channel))
         if value is None:
             continue
         if hasattr(value, "counts_as_measured"):
@@ -3270,6 +3500,7 @@ def eis_impedance_objective_for_channel(
     kind: str | None = None,
     step_tags: Mapping[str, Mapping[str, Any]] | None = None,
     regime: Any = None,
+    cell_capacitance_for: Callable[[int], float | None] | None = None,
 ) -> Any:
     """Per-channel EIS objective — the batched (q-BO) analog of the aggregate.
 
@@ -3305,7 +3536,8 @@ def eis_impedance_objective_for_channel(
         return None
     thickness = thickness_for(channel) if thickness_for is not None else None
     scalar = _scalar_from_eis_raw(raw, channel=channel, thickness_um=thickness,
-                                  kind=kind, regime=regime)
+                                  kind=kind, regime=regime,
+                                  cell_capacitance=_c_cell(cell_capacitance_for, channel))
     if scalar is None or hasattr(scalar, "counts_as_measured"):
         return scalar
     return float(scalar)
@@ -3800,8 +4032,9 @@ async def run_autonomous_campaign(
 
         _regime = regime_settings()
         logger.info("campaign_regime_settings", campaign=spec.name,
-                    regime_aware=_regime.enabled)
-        emit("regime_settings", regime_aware=_regime.enabled)
+                    regime_aware=_regime.enabled, regime_b=_regime.regime_b)
+        emit("regime_settings", regime_aware=_regime.enabled,
+             regime_b=_regime.regime_b)
 
         # Resume (P3.3): rebuild the optimizer from the checkpoint rather than
         # starting a fresh search. Seed observations are NOT re-applied — they
@@ -4017,6 +4250,10 @@ async def run_autonomous_campaign(
         # was previously resolved, or omitted, per extractor: the placement path
         # passed no thickness at all and so could never produce a σ.)
         _thickness_for = make_thickness_lookup(data_store, run_id)
+        # Slice 2: C_cell per (board, channel), beside `_regime` in every analysis.
+        # Lazy per board -- it is first resolved after the board check below, which
+        # may move the board pointer -- see `CellCapacitanceLookup`.
+        _c_cell_for = CellCapacitanceLookup(data_store, measure_channels, emit=emit)
         # `_regime` (R6) was resolved once, above the resume block.
         _objective_kind: str | None = None
         _objective: ObjectiveSpec | None = None
@@ -4045,7 +4282,8 @@ async def run_autonomous_campaign(
             return _objective.channel_extractor(
                 step_results, channels[index],
                 thickness_for=_thickness_for, kind=_objective_kind,
-                step_tags=trial_step_tags, regime=_regime)
+                step_tags=trial_step_tags, regime=_regime,
+                cell_capacitance_for=_c_cell_for)
 
         if spec.batch and batch_size > 1:
             emit("batch_mode", q=batch_size, channels=channels)
@@ -4105,6 +4343,10 @@ async def run_autonomous_campaign(
             emit("electrode_mode", capacity=spec.electrode_capacity,
                  start=allocator.start, board_id=allocator.board_index,
                  batch_size=batch_size)
+        # The board is settled now (a FRESH or full board has moved the pointer), so
+        # this is the launch's one `cell_capacitance` event; an exchange later
+        # resolves the new board on its first analysis and announces it the same way.
+        _c_cell_for.resolve()
 
         def placement_builder(
             batch: list[dict[str, Any]], place_channels: list[int]
@@ -4125,7 +4367,8 @@ async def run_autonomous_campaign(
             return _objective.channel_extractor(
                 step_results, channel,
                 thickness_for=_thickness_for, kind=_objective_kind,
-                step_tags=trial_step_tags, regime=_regime)
+                step_tags=trial_step_tags, regime=_regime,
+                cell_capacitance_for=_c_cell_for)
 
         def equilibration_builder() -> Workflow:
             return build_equilibration_workflow(spec)
@@ -4220,7 +4463,8 @@ async def run_autonomous_campaign(
                 return _objective.extractor(
                     step_results, params,
                     thickness_for=_thickness_for, kind=_objective_kind,
-                    step_tags=trial_step_tags, regime=_regime)
+                    step_tags=trial_step_tags, regime=_regime,
+                    cell_capacitance_for=_c_cell_for)
         last_params: dict[str, Any] = {}
 
         def loop_extractor(step_results: dict[str, Any]) -> float:
@@ -4504,6 +4748,8 @@ async def run_autonomous_campaign(
             if not targets:
                 return step_results
             round_channels = sorted(targets)
+            watch_basis = SettleBasisWatch(lambda **kw: emit(
+                "settle_basis_changed", iteration=loop.iteration, **kw))
 
             def _on_settle_round(round_index: int, check: Any) -> None:
                 """Narrate each round *while* the hold is still happening.
@@ -4529,9 +4775,9 @@ async def run_autonomous_campaign(
                 settle_plan,
                 channels=round_channels,
                 measure_round=lambda i: _settle_round(round_channels, i),
-                fits_from=lambda raws: settle_round_fits(
+                fits_from=lambda raws: watch_basis(settle_round_fits(
                     raws, round_channels, thickness_for=_thickness_for,
-                    regime=_regime),
+                    regime=_regime, cell_capacitance_for=_c_cell_for)),
                 r1_bound_ohms=settle_r1_bound_ohms(),
                 rh_for_round=_settle_round_rh,
                 on_round=_on_settle_round,

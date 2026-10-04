@@ -333,7 +333,9 @@ class TestTheReportedBasisIsRenderedForTheOperator:
         assert report.BASIS_SUM_UNQUALIFIED is BASIS_SUM_UNQUALIFIED
         assert set(BASIS_TEXT) == {"split_bulk", "sum", BASIS_SUM_UNQUALIFIED,
                                    report.REGIME_A_FIT_RB, report.REGIME_A_PASSIVE,
-                                   report.REGIME_A_FOOT_LOWER}
+                                   report.REGIME_A_FOOT_LOWER, report.REGIME_B_FILM_ARC,
+                                   report.REGIME_B_ARC_LOWER,
+                                   report.REGIME_B_NO_ARC}
 
     def test_a_production_no_covariance_fit_reaches_the_operator_as_a_sum(self):
         """``SUBAGENT_RULES`` §3.2 — the branch composed end to end on the shape real

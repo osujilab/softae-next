@@ -19,6 +19,9 @@ from softae.analysis.eis.report import (
     REGIME_A_FIT_RB,
     REGIME_A_FOOT_LOWER,
     REGIME_A_PASSIVE,
+    REGIME_B_ARC_LOWER,
+    REGIME_B_FILM_ARC,
+    REGIME_B_NO_ARC,
     SigmaReport,
     SpectrumReport,
 )
@@ -203,6 +206,84 @@ def test_sigma_observation_flag_off_lower_bound_never_appears():
 def test_sigma_observation_unavailable_without_lower_is_unmeasured():
     o = ob.sigma_observation(_report(**{**A_LOWER, "regime_sigma_lower": NAN}))
     assert o == ob.unmeasured("A", regime_aware=True)
+
+
+# ── Regime-B route outcomes (slice 2 §3.4), as ``engine._regime_b_sigma`` builds them ──
+
+B_ROUTE_VALUE = dict(mode="value", value=4.9e-5, R_reported_ohm=1.26e6,
+                     R_basis=REGIME_B_FILM_ARC, regime="B", regime_reason="valley_then_rise",
+                     regime_mode="value", regime_sigma=4.9e-5, regime_active=True,
+                     regime_b_mode="value", regime_b_sigma=4.9e-5)
+B_ROUTE_LOWER = dict(mode="unavailable", R_reported_ohm=3.7e5, R_basis=REGIME_B_ARC_LOWER,
+                     regime="U", regime_reason="no_cpe_drop", regime_mode="unavailable",
+                     regime_sigma_lower=1.7e-4, regime_R_foot_ohm=3.7e5,
+                     regime_active=True, regime_b_mode="lower_bound")
+B_ROUTE_UPPER = dict(mode="bound", upper_bound=2.0e-7, upper_bound_basis=REGIME_B_NO_ARC,
+                     R_reported_ohm=3.1e8, R_basis=REGIME_B_NO_ARC, provisional=True,
+                     regime="B", regime_reason="valley_then_rise", regime_mode="bound",
+                     regime_sigma=2.0e-7, regime_active=True, regime_b_mode="upper_bound")
+#: Unavailable route: today's B value stands, flagged only by the shadow fields.
+B_ROUTE_UNAVAILABLE = {**U_VALUE, "regime": "B", "regime_reason": "valley_then_rise",
+                       "R_basis": "sum", "regime_b_mode": "unavailable",
+                       "regime_b_detail": "electrode_not_negligible"}
+
+
+@pytest.mark.parametrize("state, kind, basis, admitted", [
+    (B_ROUTE_VALUE, ob.VALUE, REGIME_B_FILM_ARC, True),
+    (B_ROUTE_LOWER, ob.LOWER_BOUND, REGIME_B_ARC_LOWER, True),
+    (B_ROUTE_UPPER, ob.UPPER_BOUND, REGIME_B_NO_ARC, False),
+    (B_ROUTE_UNAVAILABLE, ob.VALUE, "sum", False),
+], ids=["value", "lower", "upper", "unavailable"])
+def test_sigma_observation_b_route_admission_matrix(state, kind, basis, admitted):
+    """Value told; lower bound admitted censored; no-arc ceiling recorded only (Q5); an
+    unavailable route leaves today's B value withheld (f8b08b7). All measured (no park)."""
+    o = ob.sigma_observation(_report(**state))
+    assert (o.kind, o.basis, o.admitted) == (kind, basis, admitted)
+    assert o.classified and o.counts_as_measured
+
+
+def test_sigma_observation_b_lower_bound_basis_not_regime_a():
+    """§3.3: a B lower bound must not reach the store spelled as route A's foot."""
+    o = ob.sigma_observation(_report(**B_ROUTE_LOWER))
+    assert (o.reported, o.R_film_ohm, o.lower) == (1.7e-4, 3.7e5, None)
+    assert o.basis == o.R_film_basis == REGIME_B_ARC_LOWER
+    assert REGIME_A_FOOT_LOWER not in (o.basis, o.R_film_basis)
+
+
+def test_sigma_observation_lower_bound_unknown_basis_is_unmeasured_not_regime_a():
+    """An active non-A lower bound with no lower-bound token reads ``""`` (§3.1(a)): an
+    unknown never borrows route A's checked token. On A the foot is the only one there is."""
+    unknown = ob.sigma_observation(_report(**{**B_ROUTE_LOWER, "R_basis": "split_bulk"}))
+    assert unknown.kind == ob.LOWER_BOUND and unknown.basis == unknown.R_film_basis == ""
+    a = ob.sigma_observation(_report(**{**A_LOWER, "R_basis": REGIME_A_FIT_RB}))
+    assert a.basis == a.R_film_basis == REGIME_A_FOOT_LOWER
+
+
+@pytest.mark.parametrize("change", [{"regime_active": False}, {"R_basis": "sum"}],
+                         ids=["not_active", "other_basis"])
+def test_sigma_observation_b_value_carve_out_needs_basis_and_active(change):
+    """The carve-out keys on the film-arc basis **and** a taken route, never on the label."""
+    o = ob.sigma_observation(_report(**{**B_ROUTE_VALUE, **change}))
+    assert o.kind == ob.VALUE and not o.admitted and o.classified
+
+
+def test_sigma_observation_b_route_upper_bound_never_admitted_even_as_route_a_basis_set():
+    """The upper bound's refusal is the basis list, not the regime: positive control that
+    the same report with route A's ceiling basis WOULD be admitted."""
+    assert REGIME_B_NO_ARC not in ob.ROUTE_A_BOUND_BASES
+    a_basis = {**B_ROUTE_UPPER, "upper_bound_basis": REGIME_A_PASSIVE}
+    assert ob.sigma_observation(_report(**a_basis)).admitted is True
+    assert ob.sigma_observation(_report(**B_ROUTE_UPPER)).admitted is False
+
+
+@pytest.mark.parametrize("state", [B_ROUTE_VALUE, B_ROUTE_LOWER, B_ROUTE_UPPER,
+                                   B_ROUTE_UNAVAILABLE],
+                         ids=["value", "lower", "upper", "unavailable"])
+def test_sigma_observation_b_route_flag_off_pre_regime_rule(state):
+    """Flag off is the rollback: no bound admitted, nothing classified; a value told."""
+    o = ob.sigma_observation(_unstamped_report(**state))
+    assert not o.classified
+    assert o.admitted is (o.kind == ob.VALUE)
 
 
 def test_sigma_observation_not_ok_recorded_not_admitted():

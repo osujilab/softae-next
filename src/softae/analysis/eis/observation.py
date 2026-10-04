@@ -9,15 +9,16 @@ from ``SigmaReport`` to *value / lower bound / upper bound* exists exactly once
 =================================  ===============  ========================  ====================
 Engine state                       ``kind``         ``reported``              admitted
 =================================  ===============  ========================  ====================
-``value``                          ``value``        ``value``                 unless B or U
+``value``                          ``value``        ``value``                 unless B or U (†)
 ``bound`` / ``bound_unqualified``  ``upper_bound``  ``upper_bound``           route A only
 ``unavailable``, active route,     ``lower_bound``  ``regime_sigma_lower``    yes
 finite ``regime_sigma_lower``
 anything else                      ``None``         ``None``                  no
 =================================  ===============  ========================  ====================
 
-Every row is also gated on ``report.ok``: a gate-rejected number is recorded, never
-admitted, and its *classified* status is unaffected.
+(†) except a taken regime-B route's film-arc value (below). Every row is also gated on
+``report.ok``: a gate-rejected number is recorded, never admitted, and its *classified*
+status is unaffected.
 
 **Admitted** means the number may become the campaign objective. An old-route upper bound
 is recorded but never admitted: on regime-A films the legacy loss ceiling sits 0.5–3.5
@@ -30,15 +31,25 @@ agree within 0.08 dec were told σ 0.74 dec apart. Its value, and an unrecognise
 U's, is recorded but not told until a two-feature analysis exists; the spectrum still
 counts as measured, so it never parks a run (:data:`VALUE_WITHHELD_REGIMES`).
 
+**The regime-B route (slice 2, ``[eis] regime_b``) is that two-feature analysis**, and its
+outcomes map onto the rows above without a new row (spec §3.4): a film-arc *value*
+(``R_basis`` ``regime_b_film_arc`` on a taken route) is admitted — the one B value that
+is; a *lower bound* (``regime_b_arc_lower``) is an admitted censored ``lower_bound`` like
+route A's foot; a *no-arc upper bound* (``regime_b_no_arc``) is recorded and never
+admitted (Q5, :data:`ROUTE_A_BOUND_BASES`); *unavailable* leaves today's report, whose B
+value stays withheld. With ``regime_b`` off the engine produces none of these, so nothing
+here moves.
+
 **Flag off is a clean rollback** (operator ruling 2026-10-01). Everything in the tables
 here applies only when the report's ``sigma.regime_aware`` is ``True`` — the flag state
 ``analyze_spectrum`` stamped. With it ``False`` (flag off, or any report that never
 passed the stamp) the campaign decision is the pre-``5234d37`` rule exactly: a value is
 admitted when ``report.ok`` and it is finite and > 0, whatever the regime; nothing is
 classified; no bound is admitted; so ``counts_as_measured``
-is "an admitted value". ``regime_active`` cannot gate this: it marks only a taken A
-route, and a B/C/U report is otherwise identical in both flag states. The stored kind,
-number and basis are unchanged by the flag — only admission and classification are.
+is "an admitted value". ``regime_active`` cannot gate this: it marks only a taken
+regime route, and an untaken one's report is otherwise identical in both flag states.
+The stored kind, number and basis are unchanged by the flag — only admission and
+classification are.
 
 **Regime U splits by its reason** (operator ruling 2026-10-01, narrowing arming review F3):
 
@@ -78,7 +89,12 @@ from typing import Any
 import structlog
 
 from softae.analysis.eis.regime import A, B, C, U
-from softae.analysis.eis.report import REGIME_A_FOOT_LOWER, REGIME_A_PASSIVE
+from softae.analysis.eis.report import (
+    REGIME_A_FOOT_LOWER,
+    REGIME_A_PASSIVE,
+    REGIME_B_ARC_LOWER,
+    REGIME_B_FILM_ARC,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -102,8 +118,14 @@ U_SHAPE_REASONS = ("non_monotone", "floor_phase_ambiguous", "no_cpe_drop")
 #: unfiled reason must cost a park, never tell a number from an unscreened spectrum.
 U_BAD_DATA_REASONS = ("incoherent", "too_many_nonphysical", "too_few_points",
                       "a_too_many_nonphysical", "phase_incoherent")
-#: Upper-bound bases the regime-A route produces. Only these may be admitted.
+#: Upper-bound bases the regime-A route produces. Only these may be admitted. Regime B's
+#: no-arc ceiling (``regime_b_no_arc``) is deliberately absent: it is model-conditional,
+#: recorded and never admitted until the shadow review rules (slice 2 Q5).
 ROUTE_A_BOUND_BASES = (REGIME_A_PASSIVE,)
+#: Lower-bound bases a taken regime route states, each in its own spelling. A lower bound
+#: carrying none of them reads ``""`` (unmeasured), never borrows route A's (§3.1(a)) —
+#: except on an A spectrum, where route A's foot is the only lower bound there is.
+LOWER_BOUND_BASES = (REGIME_A_FOOT_LOWER, REGIME_B_ARC_LOWER)
 #: Regimes whose ``value`` is recorded but never admitted under the regime rules
 #: (ruling 2026-10-02). U covers both families: bad data was already refused (F3), and
 #: an unrecognised shape now is too. A, C and ``""`` keep the value admitted.
@@ -203,21 +225,32 @@ def sigma_observation(report: Any) -> SigmaObservation:
         return replace(unmeasured(regime, reason, regime_aware=aware), classified=False)
 
 
+def _lower_basis(s: Any, regime: str) -> str:
+    """The basis a lower bound states: its route's own token, never another route's."""
+    stated = s.R_basis if isinstance(s.R_basis, str) else ""
+    if stated in LOWER_BOUND_BASES:
+        return stated
+    return REGIME_A_FOOT_LOWER if regime == A else ""
+
+
 def _observe(s: Any, ok: bool, regime: str, reason: str, aware: bool) -> SigmaObservation:
     active = bool(s.regime_active)    # what is STATED; the flag gates only admission
     classified = aware and is_classified(regime, reason)
     R_film = _positive(s.R_reported_ohm)
     if s.mode == "value":
         kind, reported, lower, basis = VALUE, _positive(s.value), None, s.R_basis
-        # B and U never tell (F3; ruling 2026-10-02) — under the regime rules only.
-        admitted = not aware or regime not in VALUE_WITHHELD_REGIMES
+        # B and U never tell (F3; ruling 2026-10-02) — under the regime rules only —
+        # except a taken regime-B route's film-arc value (slice 2 §3.4), keyed on the
+        # basis token plus active, never on the label.
+        admitted = (not aware or regime not in VALUE_WITHHELD_REGIMES
+                    or (active and s.R_basis == REGIME_B_FILM_ARC))
     elif s.mode in ("bound", "bound_unqualified"):
         kind, reported, basis = UPPER_BOUND, _positive(s.upper_bound), s.upper_bound_basis
         lower = _positive(s.regime_sigma_lower) if active else None
         admitted = aware and active and basis in ROUTE_A_BOUND_BASES
     elif s.mode == "unavailable" and active and _positive(s.regime_sigma_lower) is not None:
         kind, reported, lower = LOWER_BOUND, _positive(s.regime_sigma_lower), None
-        basis, R_film = REGIME_A_FOOT_LOWER, _positive(s.regime_R_foot_ohm)
+        basis, R_film = _lower_basis(s, regime), _positive(s.regime_R_foot_ohm)
         admitted = aware
     else:
         return unmeasured(regime, reason, regime_aware=aware)
@@ -226,6 +259,6 @@ def _observe(s: Any, ok: bool, regime: str, reason: str, aware: bool) -> SigmaOb
     return SigmaObservation(
         kind=kind, reported=reported, lower=lower, regime=regime, basis=str(basis),
         R_film_ohm=R_film, admitted=admitted and ok, classified=classified,
-        R_film_basis=(REGIME_A_FOOT_LOWER if kind == LOWER_BOUND else str(s.R_basis)),
+        R_film_basis=(basis if kind == LOWER_BOUND else str(s.R_basis)),
         regime_reason=reason, regime_aware=aware,
     )
