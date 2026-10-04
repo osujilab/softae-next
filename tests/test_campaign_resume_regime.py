@@ -10,6 +10,7 @@ entry point actually applies it.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ import pytest
 import softae.analysis.eis.regime_route as rr
 from softae.core.autonomous_wiring import (
     CampaignSpec,
+    check_resume_regime,
     composition_target_objective,
     run_autonomous_campaign,
 )
@@ -136,3 +138,41 @@ async def test_resume_regime_unchanged_proceeds_silently(
                    for e in events)
     assert result.n_trials == 3
     store.close()
+
+
+# ── Union of recorded and current keys ([a414] §3) ──────────────────────────
+# A field added to RegimeSettings after a run was checkpointed must still be
+# guarded: these drive check_resume_regime directly with a widened settings type.
+
+
+@dataclass(frozen=True)
+class _WidenedSettings:
+    enabled: bool = False
+    regime_b: bool = False
+
+
+def _checkpoint(regime: dict) -> str:
+    return json.dumps({"regime": regime})
+
+
+def test_check_resume_regime_new_field_at_default_proceeds():
+    spec_json = _checkpoint({"enabled": True})
+    assert check_resume_regime(spec_json, _WidenedSettings(enabled=True),
+                               campaign="c") is None
+
+
+def test_check_resume_regime_new_field_non_default_refuses_naming_it():
+    spec_json = _checkpoint({"enabled": True})
+    with pytest.raises(ResumeMismatchError,
+                       match="regime_b = false at launch, true now"):
+        check_resume_regime(spec_json, _WidenedSettings(enabled=True, regime_b=True),
+                            campaign="c")
+
+
+# None matters: a removed field read back as None must not equal a recorded null.
+@pytest.mark.parametrize("value", [False, None])
+def test_check_resume_regime_recorded_key_no_longer_a_field_refuses(value):
+    spec_json = _checkpoint({"enabled": True, "retired_flag": value})
+    with pytest.raises(ResumeMismatchError,
+                       match=f"retired_flag = {json.dumps(value)} at launch, absent now"):
+        check_resume_regime(spec_json, rr.RegimeSettings(enabled=True), campaign="c")

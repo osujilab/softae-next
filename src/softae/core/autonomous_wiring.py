@@ -32,7 +32,8 @@ import os
 import tempfile
 import uuid
 from contextlib import ExitStack
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import MISSING, asdict, dataclass, field, replace
+from dataclasses import fields as dataclass_fields
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Sequence
 
 import structlog
@@ -1070,9 +1071,20 @@ def check_resume_regime(spec_json: str | None, current: Any, *, campaign: str) -
                 f"{json.dumps(bool(current.enabled))}, which cannot be checked "
                 f"against the estimator its earlier values were told under.")
     now = asdict(current)
-    diffs = [f"{_REGIME_CONFIG_KEYS.get(k, k)} = {json.dumps(v)} at launch, "
-             f"{json.dumps(now.get(k))} now"
-             for k, v in sorted(recorded.items()) if now.get(k) != v]
+    # A field added since launch did not exist then, so the launch ran at its
+    # default; a recorded field that no longer exists has nothing to compare to.
+    launch = {f.name: f.default for f in dataclass_fields(current)
+              if f.default is not MISSING}
+    launch.update(recorded)
+    absent = object()
+
+    def show(value: Any) -> str:
+        return "absent" if value is absent else json.dumps(value)
+
+    diffs = [f"{_REGIME_CONFIG_KEYS.get(k, k)} = {show(launch.get(k, absent))} at launch, "
+             f"{show(now.get(k, absent))} now"
+             for k in sorted(launch.keys() | now.keys())
+             if launch.get(k, absent) != now.get(k, absent)]
     if diffs:
         raise ResumeMismatchError(
             f"Checkpoint for '{campaign}' was told under different EIS estimator "
