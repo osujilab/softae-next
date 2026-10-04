@@ -3660,3 +3660,142 @@ class TestDoeObservationJson:
         assert stored["kind"] == "value"
         assert stored["reported"] is None               # NaN never stored as a number
         assert stored["regime"] is None                 # absent field: written, null
+
+
+# ---------------------------------------------------------------------------
+# cell_capacitance (slice 2, L3): append-only C_cell, supersede never overwrite
+# ---------------------------------------------------------------------------
+
+def _ccell(store: DataStore, **overrides) -> int:
+    """One valid group record, as ``tools/c_cell.py``'s ``write_groups`` calls it."""
+    kwargs = dict(board_id=5, group=(9, 16), c_cell_F=2.5e-10, spread=0.176,
+                  method="apparent_c_100_1000Hz_v1",
+                  source_measurement_ids=[11, 12], accepted_by="CO")
+    kwargs.update(overrides)
+    return store.record_cell_capacitance(**kwargs)
+
+
+def _ccell_rows(store: DataStore) -> list[dict]:
+    return [dict(r) for r in store._conn.execute(
+        "SELECT * FROM cell_capacitance ORDER BY id").fetchall()]
+
+
+class TestCellCapacitance:
+    """The table ``tools/c_cell.py --write`` lands in, and its one reader."""
+
+    def test_migration_old_db_gains_table_and_fresh_declarations_match(
+        self, tmp_path: Path
+    ) -> None:
+        project = tmp_path / "legacy_ccell"
+        with DataStore(project) as store:
+            run_id = store.start_run("wf")
+            store._conn.execute("DROP TABLE cell_capacitance")
+            store._conn.commit()
+        with DataStore(project) as store:
+            decls = _declarations(store, "cell_capacitance")
+            indexes = {r[1] for r in store._conn.execute(
+                "PRAGMA index_list(cell_capacitance)").fetchall()}
+            assert store._conn.execute(                  # existing rows untouched
+                "SELECT COUNT(*) FROM experiments WHERE run_id = ?",
+                (run_id,)).fetchone()[0] == 1
+        assert decls == {
+            "id": ("INTEGER", 0, None), "created_at": ("TEXT", 1, None),
+            "superseded_at": ("TEXT", 0, None), "board_id": ("INTEGER", 1, None),
+            "channel": ("INTEGER", 0, None), "group_lo": ("INTEGER", 0, None),
+            "group_hi": ("INTEGER", 0, None), "c_cell_F": ("REAL", 1, None),
+            "n_spectra": ("INTEGER", 1, None), "spread_dec": ("REAL", 0, None),
+            "method": ("TEXT", 1, None), "source_measurement_ids": ("TEXT", 1, None),
+            "accepted_by": ("TEXT", 1, None)}
+        assert "idx_cell_capacitance_board" in indexes
+
+    def test_cell_capacitance_group_row_round_trips_and_misses_are_none(
+        self, store: DataStore
+    ) -> None:
+        row_id = _ccell(store, source_measurement_ids=[11, 12, 13])
+
+        got = store.cell_capacitance(5, 12)
+        assert got["id"] == row_id
+        assert got["channel"] is None and (got["group_lo"], got["group_hi"]) == (9, 16)
+        assert got["c_cell_F"] == pytest.approx(2.5e-10)
+        assert got["spread_dec"] == pytest.approx(0.176)
+        assert got["n_spectra"] == 3
+        assert got["source_measurement_ids"] == [11, 12, 13]
+        assert got["superseded_at"] is None and got["accepted_by"] == "CO"
+        # Unmeasured is None -- never a default: other group, other board.
+        assert store.cell_capacitance(5, 3) is None
+        assert store.cell_capacitance(4, 12) is None
+
+    def test_record_cell_capacitance_supersedes_same_group_only(
+        self, store: DataStore
+    ) -> None:
+        first = _ccell(store)
+        other_group = _ccell(store, group=(1, 8), c_cell_F=2.7e-10)
+        second = _ccell(store, c_cell_F=1.7e-10)
+
+        rows = {r["id"]: r for r in _ccell_rows(store)}
+        assert len(rows) == 3                            # history is kept
+        assert rows[first]["superseded_at"] is not None
+        assert rows[second]["superseded_at"] is None
+        assert rows[other_group]["superseded_at"] is None
+        assert store.cell_capacitance(5, 12)["id"] == second
+        assert store.cell_capacitance(5, 3)["id"] == other_group
+
+    def test_cell_capacitance_channel_row_wins_over_newer_group_row(
+        self, store: DataStore
+    ) -> None:
+        """The reader hands the current rows to ``preferred_record``: the
+        channel's own row wins although the group row is NEWER, which "newest
+        current row covering the channel" would not do."""
+        store._conn.execute(
+            "INSERT INTO cell_capacitance (created_at, board_id, channel, group_lo, "
+            "group_hi, c_cell_F, n_spectra, spread_dec, method, "
+            "source_measurement_ids, accepted_by) VALUES "
+            "('2026-10-01', 5, 12, 9, 16, 3.3e-10, 1, NULL, 'm', '[7]', 'CO')")
+        store._conn.commit()
+        group_id = _ccell(store)
+
+        own = store.cell_capacitance(5, 12)
+        assert own["channel"] == 12 and own["c_cell_F"] == pytest.approx(3.3e-10)
+        assert own["source_measurement_ids"] == [7]
+        assert store.cell_capacitance(5, 13)["id"] == group_id
+        # The group write superseded group rows only, never the channel row.
+        assert own["superseded_at"] is None
+
+    @pytest.mark.parametrize("override", [
+        {"c_cell_F": 0.0}, {"c_cell_F": -1e-10}, {"c_cell_F": float("nan")},
+        {"c_cell_F": float("inf")}, {"c_cell_F": None}, {"c_cell_F": "big"},
+        {"group": (16, 9)}, {"group": (9,)}, {"group": (9, 16, 24)},
+        {"group": (9.0, 16)}, {"group": ("9", "16")}, {"group": (True, 16)},
+        {"group": 9}, {"group": None},
+        {"method": ""}, {"method": "   "}, {"method": None},
+        {"accepted_by": ""}, {"accepted_by": " \t"}, {"accepted_by": None},
+        {"source_measurement_ids": []}, {"source_measurement_ids": None},
+        {"source_measurement_ids": "12"}, {"source_measurement_ids": [1.5]},
+        {"source_measurement_ids": [True]}, {"source_measurement_ids": [1, None]},
+        {"spread": -0.1}, {"spread": float("inf")}, {"spread": "wide"},
+    ])
+    def test_record_cell_capacitance_invalid_raises_and_writes_nothing(
+        self, store: DataStore, override: dict
+    ) -> None:
+        """Refused before the transaction: the current row is not superseded."""
+        kept = _ccell(store)
+        with pytest.raises(ValueError):
+            _ccell(store, **override)
+        rows = _ccell_rows(store)
+        assert [r["id"] for r in rows] == [kept]
+        assert rows[0]["superseded_at"] is None
+
+    @pytest.mark.parametrize("spread", [None, float("nan")])
+    def test_record_cell_capacitance_absent_spread_is_null(
+        self, store: DataStore, spread
+    ) -> None:
+        _ccell(store, spread=spread)
+        assert store.cell_capacitance(5, 12)["spread_dec"] is None
+
+    def test_migration_adds_no_schema_epoch_row(self, store: DataStore) -> None:
+        """A new table: no stored number changes meaning."""
+        from softae.core.data_store import SCHEMA_EPOCHS
+
+        assert not any("cell_capacitance" in note or "c_cell" in note
+                       for _, _, note in SCHEMA_EPOCHS)
+        assert store.current_schema_version() == max(v for v, _, _ in SCHEMA_EPOCHS)

@@ -62,7 +62,7 @@ stand in for a missing σ.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Sequence
 
 import numpy as np
@@ -1127,6 +1127,22 @@ RATE_SPAN_TOO_SHORT = "rate_span_too_short"
 #: :data:`RATE_SPAN_TOO_SHORT` — and spelled apart from it rather than reusing
 #: it, because reusing a word spells one finding with another finding's token.
 RATE_ARC_CLASS_CHANGED = "rate_arc_class_changed"
+#: The σ **basis** was not the same on every round of this window
+#: (:func:`_bases_observed`): ``1/R₁`` from a full fit on some rounds,
+#: ``1/R_arc`` from a closed film arc on others. Every basis is `1/R` for *some*
+#: R, so the numbers are indistinguishable once they are in the window, and a
+#: slope across the change measures the change of observable, not the cell.
+#: Slice 2 makes this routine: a label flips across a hold (B → C on a drying
+#: insulator, A ↔ U on 15/16 across RH).
+#:
+#: A statement about the *observation* and not about the sample, like
+#: :data:`RATE_ARC_CLASS_CHANGED` -- and spelled apart from it because the two
+#: are different findings: that one is one observable whose regime moved, this
+#: is two observables. :func:`rate_check` **restarts** the well's regression at
+#: the change and speaks this word only while the restarted run is too short to
+#: judge; :func:`settle_check`, which has no regression to restart, excludes the
+#: channel with it.
+EXCLUDED_MIXED_BASIS = "mixed_basis"
 #: This channel's **own** noise floor exceeds the relative tolerance, so no hold
 #: length can ever certify it. :func:`window_noise_floor` takes the MEDIAN across
 #: participants — deliberately — while the criterion aggregates with MAX, so the
@@ -1275,7 +1291,8 @@ def rate_tol_ln_per_hour(dec_per_hour: float) -> float:
 #: because every candidate is `1/R` for *some* R and the numbers are therefore
 #: indistinguishable once they are in the window — which is precisely how a gate
 #: comes to be decided by a quantity nobody chose. A window that mixes bases
-#: mixes two different observables and must be refused, never averaged.
+#: mixes two different observables and must be refused, never averaged: see
+#: :data:`EXCLUDED_MIXED_BASIS`, which is what now reads this field.
 BASIS_FITTED = "fitted"
 BASIS_RAW = "raw"
 #: The fit ran and produced nothing usable. Spelled apart from
@@ -1284,6 +1301,16 @@ BASIS_RAW = "raw"
 #: happened send an operator to different places.
 BASIS_FIT_FAILED = "fit_failed"
 BASIS_ABSENT = "absent"
+#: Slice 2's three (``regime_b_slice2_spec.md`` §4). ``film_arc`` is `1/R_arc`
+#: from a closed in-band arc -- regime B, or a U routed to the arc;
+#: ``film_rb`` is `1/R_fit` from route A's small fit. Neither is ``fitted``:
+#: each is `1/R` of a *different* R, which is the whole reason the field exists.
+BASIS_FILM_ARC = "film_arc"
+BASIS_FILM_RB = "film_rb"
+#: B or routed U with no arc, or no C_cell to identify it against. σ is
+#: ``None``, so the round drops as ``sigma_null`` like any σ-less round and is
+#: never a basis (:func:`_bases_observed`) -- the word is provenance only.
+BASIS_FILM_UNIDENTIFIED = "film_unidentified"
 
 
 @dataclass(frozen=True)
@@ -1496,6 +1523,7 @@ class WellVerdict:
     :data:`RATE_UNDETECTABLE`           still resolving              **yes**
     :data:`RATE_SPAN_TOO_SHORT`         still resolving              **yes**
     :data:`RATE_ARC_CLASS_CHANGED`      still resolving              **yes**
+    :data:`EXCLUDED_MIXED_BASIS`        still resolving              **yes**
     :data:`RATE_TOO_FEW_POINTS`         still resolving              conditional
     :data:`EXCLUDED_UNSETTLEABLE`       no hold can certify it       no
     :data:`WELL_FIT_FAILED`             no information               no
@@ -1681,12 +1709,20 @@ def _window_series(window: Sequence[Sequence[RoundFit]]) -> dict[int, list[Round
     return out
 
 
-def _exclusion(fits: Sequence[RoundFit], bound_ohms: float | None) -> str:
+def _exclusion(fits: Sequence[RoundFit], bound_ohms: float | None, *,
+               mixed_ok: bool = False) -> str:
     """Why this channel cannot carry the window, or ``""`` if it can.
 
     Order matters: a channel absent from a round is reported as absent rather
     than as a NULL σ, because those send an operator to different places (a step
     that never completed vs. a fit that failed).
+
+    A window mixing σ bases is :data:`EXCLUDED_MIXED_BASIS` -- after the three
+    per-round tests, so a channel that is also absent or σ-less is named for
+    that first, and before the zero-mean test, whose mean would itself average
+    two observables. *mixed_ok* is :func:`rate_check`'s, via
+    :func:`_rate_exclusion`: that criterion has a regression to **restart** at
+    the change rather than a whole channel to drop.
     """
     for fit in fits:
         if fit.sigma is None and fit.r1_ohms is None:
@@ -1695,6 +1731,8 @@ def _exclusion(fits: Sequence[RoundFit], bound_ohms: float | None) -> str:
             return EXCLUDED_SIGMA_NULL
         if is_railed(fit.r1_ohms, bound_ohms):
             return EXCLUDED_RAILED
+    if not mixed_ok and len(_bases_observed(fits)) > 1:
+        return EXCLUDED_MIXED_BASIS
     mean = float(np.mean([float(fit.sigma) for fit in fits]))  # type: ignore[arg-type]
     if not np.isfinite(mean) or mean == 0.0:
         return EXCLUDED_ZERO_MEAN
@@ -1712,8 +1750,11 @@ def _rate_exclusion(fits: Sequence[RoundFit], bound_ohms: float | None) -> str:
     twice per channel in the worst case — once on the raw window, once on what
     survives a consensus exclusion — and two copies of a participation rule is
     how the two answers drift apart.
+
+    Never :data:`EXCLUDED_MIXED_BASIS`: the rate criterion restarts the well's
+    regression at a basis change instead (see :func:`_restart_at_basis_change`).
     """
-    if (why := _exclusion(fits, bound_ohms)):
+    if (why := _exclusion(fits, bound_ohms, mixed_ok=True)):
         return why
     if any(fit.sigma is None or float(fit.sigma) <= 0.0 for fit in fits):
         return EXCLUDED_SIGMA_NULL
@@ -1779,6 +1820,52 @@ def _arc_classes_observed(fits: Sequence[RoundFit]) -> tuple[str, ...]:
     """
     return tuple(dict.fromkeys(
         str(fit.arc_state) for fit in fits if fit.arc_state))
+
+
+def _recorded_basis(fit: RoundFit) -> str:
+    """This round's σ basis, or ``""`` when it carries none.
+
+    Only a round that **carries a σ** has a basis: a σ-less round
+    (:data:`BASIS_FIT_FAILED`, :data:`BASIS_FILM_UNIDENTIFIED`, …) is already
+    dealt with by the participation rule, and letting its word count here would
+    turn one failed round into a "change of observable" no number ever made.
+    ``""`` is *never asked*, on :func:`_arc_classes_observed`' precedent.
+    """
+    return str(fit.basis) if fit.basis and fit.sigma is not None else ""
+
+
+def _bases_observed(fits: Sequence[RoundFit]) -> tuple[str, ...]:
+    """The distinct σ bases these rounds recorded, first-seen first.
+
+    More than one is :data:`EXCLUDED_MIXED_BASIS`' trigger. Compared, never
+    validated against the ``BASIS_*`` list, for :func:`_arc_classes_observed`'
+    reason: a word this module has never heard of is a basis that disagrees,
+    not one it silently forgives.
+    """
+    return tuple(dict.fromkeys(b for fit in fits if (b := _recorded_basis(fit))))
+
+
+def _restart_at_basis_change(
+    rows: Sequence[tuple[float, RoundFit]],
+) -> tuple[list[tuple[float, RoundFit]], tuple[str, ...], int]:
+    """``(trailing run, basis sequence, rounds dropped)`` for one well's window.
+
+    The regression restarts **after the last round whose recorded basis differs
+    from the final one** -- σ and time point leave together, as for a
+    consensus-forgiven round. Rounds recording no basis (``""``) inside the run
+    stay in it, exactly as they do on a one-basis window today: "never asked" is
+    not a change. The sequence collapses consecutive repeats and keeps order, so
+    a reason can say *fitted then film_arc then fitted* rather than the
+    first-seen pair. One basis or none: the rows come back whole, dropped 0.
+    """
+    bases = [b for _t, fit in rows if (b := _recorded_basis(fit))]
+    sequence = tuple(b for i, b in enumerate(bases) if i == 0 or b != bases[i - 1])
+    if len(set(sequence)) <= 1:
+        return list(rows), sequence, 0
+    final = sequence[-1]
+    start = next(i + 1 for i in range(len(rows) - 1, -1, -1)
+                 if _recorded_basis(rows[i][1]) not in ("", final))
+    return list(rows[start:]), sequence, start
 
 
 def _has_absent_round(fits: Sequence[RoundFit]) -> bool:
@@ -1896,6 +1983,11 @@ def settle_check(
     Those three are all the same failure wearing different clothes — a series
     that is constant because nothing measured it — and the whole reason this
     function exists is that a constant passes a stability test perfectly.
+
+    A channel whose window mixes σ bases is excluded too, as
+    :data:`EXCLUDED_MIXED_BASIS`: a deviation about a mean of two observables
+    measures the change of observable. This criterion has no time regression to
+    restart, so the whole channel goes, where :func:`rate_check` restarts.
 
     Fewer than *min_channels* participants is **not** a "no": it is
     ``evaluable=False``, and the caller must run to its ceiling rather than treat
@@ -2111,6 +2203,38 @@ def _arc_class_refusal(channel: int, times_s: Sequence[float],
         **_rate_fields(channel, times_s, sigmas))
 
 
+def _mixed_basis_refusal(channel: int, times_s: Sequence[float],
+                         sigmas: Sequence[float], sequence: Sequence[str],
+                         dropped: int, needed: int) -> ChannelRate:
+    """The σ basis changed and the restarted window is too short to judge yet.
+
+    Built like :func:`_arc_class_refusal` and for its reason: the restart was
+    asked **before** any rate, so a well here has no regression for
+    :func:`_channel_rate` to rank. *times_s* / *sigmas* are the restarted run,
+    so the audit numbers describe what would be judged, not what was set aside.
+
+    Never :data:`RATE_TOO_FEW_POINTS`, though "too few points" is literally
+    true: that word's split in :func:`_resolving` would read the well as short
+    of *its own* rounds and let it stop holding the board on an artefact of the
+    observable changing under it.
+    """
+    return ChannelRate(
+        evaluable=False, settled=False, refusal=EXCLUDED_MIXED_BASIS,
+        reason=(f"the sigma basis changed inside this window "
+                f"({' then '.join(sequence)}); the regression restarts at the "
+                f"change and the restarted window holds {len(sigmas)} round(s) "
+                f"of the {needed} it needs ({dropped} earlier round(s) not "
+                f"used), so the well goes on being watched rather than judged"),
+        **_rate_fields(channel, times_s, sigmas))
+
+
+def _restart_note(sequence: Sequence[str], dropped: int) -> str:
+    """The suffix a judged-after-restart verdict carries, so its short point
+    count says why rather than reading as missing rounds."""
+    return (f" (window restarted at the basis change {sequence[-2]} → "
+            f"{sequence[-1]}; {dropped} earlier round(s) not used)")
+
+
 def _channel_rate(
     channel: int,
     times_s: Sequence[float],
@@ -2287,6 +2411,9 @@ def _resolving(rate: ChannelRate, window_len: int) -> bool:
     :data:`RATE_SPAN_TOO_SHORT` does and never the way
     :data:`RATE_TOO_FEW_POINTS` conditionally does: a well in the middle of the
     transition still has its rounds, it is the *window* that cannot speak.
+    :data:`EXCLUDED_MIXED_BASIS` is the fourth, for the same reason one level
+    down: its restarted run is short because the observable changed, not
+    because rounds went missing, and each further round lengthens it.
 
     :data:`RATE_TOO_FEW_POINTS` splits, and the split is the refinement: a well
     short of points because the **window** has not filled yet is still
@@ -2306,7 +2433,7 @@ def _resolving(rate: ChannelRate, window_len: int) -> bool:
     short; fewer means this well is.
     """
     if rate.refusal in (RATE_UNDETECTABLE, RATE_SPAN_TOO_SHORT,
-                        RATE_ARC_CLASS_CHANGED):
+                        RATE_ARC_CLASS_CHANGED, EXCLUDED_MIXED_BASIS):
         return True
     return (rate.refusal == RATE_TOO_FEW_POINTS
             and rate.n_points >= int(window_len))
@@ -2442,6 +2569,17 @@ def rate_check(
     compose in that order, so a single off-class round is forgiven and only what
     survives is asked to agree.
 
+    **And a fourth, asked before the class check: one σ basis.** Where a
+    channel's surviving rounds carry more than one (:func:`_bases_observed`),
+    its regression **restarts** at the last change -- only the trailing run on
+    the final basis is regressed, σ and time together, and the earlier rounds
+    are never averaged in. A run shorter than the fit needs is
+    :data:`EXCLUDED_MIXED_BASIS`, which holds the board like
+    :data:`RATE_ARC_CLASS_CHANGED`; a run long enough is judged as any other,
+    with the restart named in its reason. A restart is a fact about the
+    observable, never a channel exclusion, so :func:`_rate_exclusion` does not
+    whole-channel-exclude on mixing the way :func:`settle_check` does.
+
     **Nothing calls this yet, by design.** It ships as a pure unit so that the
     criterion can be measured against real windows before it is given any
     routing power; the selector that would call it is a later stage.
@@ -2528,6 +2666,18 @@ def rate_check(
                   if index != dropped_index.get(channel)]
         for channel in participating
     }
+    # THE BASIS PRECONDITION, asked on the same surviving rounds and BEFORE the
+    # class check below: a different observable is prior to a different regime
+    # of one observable. A well whose σ basis changed has its regression
+    # RESTARTED at the change -- `kept` is cut to the trailing run, so `paired`,
+    # `fitted` and the class check all read only that run and nothing from
+    # before the change is ever averaged in.
+    restarts: dict[int, tuple[tuple[str, ...], int]] = {}
+    for channel in participating:
+        kept[channel], sequence, dropped = _restart_at_basis_change(kept[channel])
+        if dropped:
+            restarts[channel] = (sequence, dropped)
+    needed_points = max(SETTLE_MIN_FIT_POINTS, int(min_fit_points))
     paired = {
         channel: tuple(zip(*[(t, float(fit.sigma))  # type: ignore[arg-type]
                              for t, fit in rows]))
@@ -2550,19 +2700,27 @@ def rate_check(
     by_rate: dict[int, ChannelRate] = {}
     for channel, sigmas in series.items():
         times = list(paired[channel][0])
+        restart = restarts.get(channel)
+        if restart is not None and len(sigmas) < needed_points:
+            by_rate[channel] = _mixed_basis_refusal(
+                channel, times, sigmas, *restart, needed_points)
+            continue
         classes = _arc_classes_observed([fit for _t, fit in kept[channel]])
-        by_rate[channel] = (
+        rate = (
             _arc_class_refusal(channel, times, sigmas, classes)
             if len(classes) > 1 else
             _channel_rate(
                 channel, times, sigmas, fitted[channel],
                 tol_per_hour=tol_per_hour, tol_rel=tol_rel,
                 min_fit_points=min_fit_points, reference_half_width=reference))
+        by_rate[channel] = (rate if restart is None else
+                            replace(rate, reason=rate.reason + _restart_note(*restart)))
     grouped = {name: sorted(ch for ch, rate in by_rate.items()
                             if rate.refusal == name)
                for name in (RATE_MOVING, RATE_UNDETECTABLE,
                             EXCLUDED_UNSETTLEABLE, RATE_SPAN_TOO_SHORT,
-                            RATE_ARC_CLASS_CHANGED, RATE_TOO_FEW_POINTS)}
+                            RATE_ARC_CLASS_CHANGED, EXCLUDED_MIXED_BASIS,
+                            RATE_TOO_FEW_POINTS)}
     quiet = sorted(ch for ch, rate in by_rate.items() if rate.settled)
     bounds = [rate.upper_bound_per_hour for rate in by_rate.values()
               if rate.upper_bound_per_hour is not None]
@@ -2623,7 +2781,8 @@ def rate_check(
     tally = ", ".join(
         f"{len(grouped[name])} {name}" for name in
         (RATE_UNDETECTABLE, EXCLUDED_UNSETTLEABLE, RATE_SPAN_TOO_SHORT,
-         RATE_ARC_CLASS_CHANGED, RATE_TOO_FEW_POINTS) if grouped[name])
+         RATE_ARC_CLASS_CHANGED, EXCLUDED_MIXED_BASIS, RATE_TOO_FEW_POINTS)
+        if grouped[name])
     if needed is None:
         # `evaluable` under this policy is "did ANY well produce a rate
         # estimate", certified or not — the input to the board word, where

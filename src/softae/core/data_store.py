@@ -40,6 +40,13 @@ from softae.analysis.eis.calibration import (
     TWO_TERMINAL_ROLES,
     electrode_mode_ok,
 )
+
+# C_cell's preference order (own channel row, else the covering group row) is
+# IMPORTED, not re-spelled: `tools/c_cell.py`'s fake store and this reader must
+# answer "which row speaks for channel N?" identically, and a second copy is free
+# to disagree. Same dependency shape as `observation` below -- its imports are
+# `observation` and `regime`, both already loaded by this module.
+from softae.analysis.eis.cell_capacitance import preferred_record
 from softae.analysis.eis.geometry import THICKNESS_METHODS, CellConstant
 from softae.analysis.eis.observation import KINDS as OBSERVATION_KINDS
 from softae.analysis.eis.observation import VALUE, SigmaObservation, sigma_observation
@@ -737,6 +744,65 @@ def _f_or_none(value: Any) -> float | None:
     return f if f == f else None
 
 
+def _is_int(value: Any) -> bool:
+    """An integer that is not a ``bool`` -- ``True`` is not channel 1."""
+    return isinstance(value, (int, np.integer)) and not isinstance(value, bool)
+
+
+def _spread_or_none(spread: Any) -> float | None:
+    """``CellCapacitance.spread_dec``: ``None``/NaN -> NULL, else finite and >= 0.
+
+    The one field allowed to be absent -- *not stated* -- because a one-channel
+    group has no spread to report, and a 0.0 there would claim agreement.
+    """
+    if spread is None:
+        return None
+    try:
+        value = float(spread)
+    except (TypeError, ValueError):
+        raise ValueError(f"spread must be a number or None, got {spread!r}") from None
+    if np.isnan(value):
+        return None
+    if not (np.isfinite(value) and value >= 0.0):
+        raise ValueError(f"spread must be finite and >= 0, got {spread!r}")
+    return value
+
+
+def _cell_capacitance_values(
+    group: Any, c_cell_F: Any, spread: Any, method: Any,
+    source_measurement_ids: Any, accepted_by: Any,
+) -> tuple[int, int, float, float | None, str, list[int], str]:
+    """Validate one C_cell row, or raise ``ValueError`` before anything is written.
+
+    Every refusal is a row that would read as a measurement and is not one: a
+    C_cell with no supporting spectrum, an inverted group, a spread that is not a
+    spread, an acceptance nobody signed.
+    """
+    try:
+        c = float(c_cell_F)
+    except (TypeError, ValueError):
+        raise ValueError(f"c_cell_F must be a number, got {c_cell_F!r}") from None
+    if not (np.isfinite(c) and c > 0.0):
+        raise ValueError(f"c_cell_F must be finite and > 0, got {c_cell_F!r}")
+    pair = tuple(group) if isinstance(group, (tuple, list)) else ()
+    if len(pair) != 2 or not all(_is_int(v) for v in pair) or pair[0] > pair[1]:
+        raise ValueError(f"group must be two ints (lo, hi) with lo <= hi, got {group!r}")
+    if not (isinstance(method, str) and method.strip()):
+        raise ValueError("method must be a non-empty string")
+    if not (isinstance(accepted_by, str) and accepted_by.strip()):
+        raise ValueError("accepted_by must be a non-empty string")
+    ids = (list(source_measurement_ids)
+           if isinstance(source_measurement_ids, Sequence)
+           and not isinstance(source_measurement_ids, (str, bytes)) else [])
+    if not ids or not all(_is_int(i) for i in ids):
+        raise ValueError("source_measurement_ids must be a non-empty sequence of "
+                         "ints; a C_cell with no support is not a measurement, "
+                         f"got {source_measurement_ids!r}")
+    spread_dec = _spread_or_none(spread)
+    return (int(pair[0]), int(pair[1]), c, spread_dec, method.strip(),
+            [int(i) for i in ids], accepted_by.strip())
+
+
 def _finite_or_none(value: Any) -> float | None:
     """:func:`_f_or_none`, also refusing ±inf — for a number that must be a measurement."""
     f = _f_or_none(value)
@@ -1163,6 +1229,8 @@ class DataStore:
         self._migrate_fit_provenance_columns()
         # D2 (rung 3c): every well's stated observation, admitted or not.
         self._migrate_doe_observation_column()
+        # Slice 2 (L3): the empty-electrode capacitance a regime-B arc is read against.
+        self._migrate_cell_capacitance()
         # LAST, always: the ledger records the epochs every migration above has
         # just finished establishing, so it must not claim them before they hold.
         self._migrate_schema_version()
@@ -3527,6 +3595,99 @@ class DataStore:
                 "superseded_at": row[5], "calibration": payload,
             })
         return out
+
+    def _migrate_cell_capacitance(self) -> None:
+        """Append-only C_cell history (slice 2, L3; ``regime_b_slice2_spec.md`` §2.3).
+
+        A new table, created on open, so an existing project gains it with no
+        change to any row it already holds. It follows :meth:`_migrate_eis_calibrations`
+        for the same reason that table appends: successive accepted values for one
+        (board, group) are a drift record, and an overwrite would erase it.
+
+        ``channel`` is NULL on a **group** row -- the only kind
+        ``tools/c_cell.py`` writes today -- and a channel row, when one exists,
+        is preferred over its group by :func:`preferred_record`. **No new**
+        :data:`SCHEMA_EPOCHS` **row**: a new table, and no stored number changes
+        meaning.
+        """
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS cell_capacitance (
+                   id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+                   created_at             TEXT    NOT NULL,
+                   superseded_at          TEXT,
+                   board_id               INTEGER NOT NULL,
+                   channel                INTEGER,
+                   group_lo               INTEGER,
+                   group_hi               INTEGER,
+                   c_cell_F               REAL    NOT NULL,
+                   n_spectra              INTEGER NOT NULL,
+                   spread_dec             REAL,
+                   method                 TEXT    NOT NULL,
+                   source_measurement_ids TEXT    NOT NULL,
+                   accepted_by            TEXT    NOT NULL
+               )"""
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cell_capacitance_board "
+            "ON cell_capacitance(board_id, superseded_at)"
+        )
+        self._conn.commit()
+
+    def record_cell_capacitance(
+        self, board_id: int, group: tuple[int, int], c_cell_F: float,
+        spread: float | None, method: str, source_measurement_ids: Sequence[int],
+        accepted_by: str,
+    ) -> int:
+        """Append one accepted group C_cell; supersede, never overwrite. Returns its id.
+
+        The contract ``tools/c_cell.py``'s ``write_groups`` calls by keyword.
+        *spread* is ``CellCapacitance.spread_dec`` and lands in ``spread_dec``;
+        ``n_spectra`` is ``len(source_measurement_ids)`` because the contract does
+        not pass it and a second count would be free to disagree with the list.
+
+        Validated first (:func:`_cell_capacitance_values`), so a refusal writes
+        nothing. The supersede and the insert share one transaction: a crash
+        between them must not leave a group with no current row, which a reader
+        would report as *unmeasured*.
+        """
+        lo, hi, c, spread_dec, method_, ids, who = _cell_capacitance_values(
+            group, c_cell_F, spread, method, source_measurement_ids, accepted_by)
+        board = int(board_id)
+        now = _now_iso()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE cell_capacitance SET superseded_at = ? "
+                "WHERE board_id = ? AND channel IS NULL AND group_lo = ? "
+                "AND group_hi = ? AND superseded_at IS NULL",
+                (now, board, lo, hi))
+            cur = self._conn.execute(
+                "INSERT INTO cell_capacitance (created_at, board_id, channel, "
+                "group_lo, group_hi, c_cell_F, n_spectra, spread_dec, method, "
+                "source_measurement_ids, accepted_by) "
+                "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (now, board, lo, hi, c, len(ids), spread_dec, method_,
+                 json.dumps(ids), who))
+        return int(cur.lastrowid)
+
+    def cell_capacitance(self, board_id: int, channel: int) -> dict[str, Any] | None:
+        """The C_cell row that speaks for *channel* on *board_id*, or ``None``.
+
+        The board's **current** rows, oldest first, handed to
+        :func:`preferred_record` -- the one preference order (own channel row,
+        else the covering group row, newest last). ``None`` means *unmeasured*
+        and is never replaced by a default: ``[eis.instrument] c_cell_F`` is
+        3-6x the measured value, which is why this table exists.
+        """
+        rows = []
+        for row in self._conn.execute(
+            "SELECT * FROM cell_capacitance WHERE board_id = ? "
+            "AND superseded_at IS NULL ORDER BY id", (int(board_id),)
+        ).fetchall():
+            record = dict(row)
+            record["source_measurement_ids"] = json.loads(
+                record["source_measurement_ids"])
+            rows.append(record)
+        return preferred_record(int(channel), rows)
 
     def _migrate_thickness(self) -> None:
         """Planned and measured film thickness (E5 harness).

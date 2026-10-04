@@ -31,9 +31,14 @@ import numpy as np
 import pytest
 
 from softae.analysis.equilibration import (
+    BASIS_FILM_ARC,
+    BASIS_FILM_RB,
+    BASIS_FILM_UNIDENTIFIED,
+    BASIS_FITTED,
     ChannelRate,
     DEFAULT_SETTLE_MIN_FIT_POINTS,
     EXCLUDED_ABSENT,
+    EXCLUDED_MIXED_BASIS,
     EXCLUDED_RAILED,
     EXCLUDED_SIGMA_NULL,
     EXCLUDED_UNSETTLEABLE,
@@ -51,6 +56,7 @@ from softae.analysis.equilibration import (
     RoundFit,
     SettleTracker,
     _arc_classes_observed,
+    _bases_observed,
     _resolving,
     channel_noise_floors,
     log_rate,
@@ -1941,3 +1947,209 @@ class TestArcClassStability:
         # Still EVALUABLE: three wells produced rate estimates. The board word is
         # `ceiling` if the hold runs out, never `not_evaluable`.
         assert check.evaluable is True
+
+
+# ── One sigma basis per regression (slice 2, L3) ─────────────────────────────
+#
+# Every basis is 1/R for SOME R -- 1/R1 from the full fit, 1/R_arc from a closed
+# film arc, 1/R_fit from route A -- so once the numbers are in the window they
+# are indistinguishable, and a slope across a change of basis measures the change
+# of observable. Slice 2 makes the change routine (a label flipping across a
+# hold), so the rate criterion restarts at it and the deviation criterion, which
+# has nothing to restart, excludes the channel.
+
+
+def _based(series: dict[int, list[float]],
+           bases: dict[int, list[str]] | None = None, default: str = ""):
+    """``{channel: [R1]}`` plus the sigma basis each round recorded.
+
+    *default* is every round's basis unless *bases* says otherwise for a
+    channel; ``""`` is the feeders' "never asked", which is every window built
+    before the field existed.
+    """
+    rounds = max(len(values) for values in series.values())
+    return [
+        [RoundFit(channel=ch, sigma=1.0 / values[i], r1_ohms=values[i],
+                  basis=(bases or {}).get(ch, [default] * rounds)[i])
+         for ch, values in sorted(series.items())]
+        for i in range(rounds)]
+
+
+def _flat_r1(n: int) -> list[float]:
+    """Flatter than :func:`_quiet_r1` (0.5 % swing), so a FOUR-point restarted
+    run certifies with margin rather than on the tolerance's edge."""
+    cycle = [1.0, -1.0, 0.6, -0.6]
+    return [float(1.0 / (2.0e-4 * (1.0 + 0.005 * cycle[i % len(cycle)])))
+            for i in range(n)]
+
+
+class TestMixedBasis:
+    """A window mixing sigma bases is restarted (rate) or excluded (deviation)."""
+
+    def _short_restart(self, bases_18: list[str]):
+        """Six rounds; ch18's basis per *bases_18*, two quiet `fitted` wells."""
+        quiet = _quiet_r1(6)
+        return _based({18: list(quiet), 19: list(quiet), 20: list(quiet)},
+                      {18: bases_18}, default=BASIS_FITTED)
+
+    def test_rate_check_basis_change_short_restart_refuses_and_holds_board(self):
+        """fitted x4 -> film_arc x2 at min_fit_points 3: the restarted run is two
+        rounds of the four the fit needs, so the well is withheld -- and it must
+        HOLD the board, never fall to `rate_too_few_points`, whose split would
+        let a well short of its own rounds stop holding it.
+
+        The control is the identical sigma series on one basis: it certifies, so
+        the refusal is about the basis and nothing else.
+        """
+        mixed = [BASIS_FITTED] * 4 + [BASIS_FILM_ARC] * 2
+        check = rate_check(self._short_restart(mixed), _times(6),
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_fit_points=3,
+                           board_minimum=None)
+        control = rate_check(self._short_restart([BASIS_FITTED] * 6), _times(6),
+                             tol_per_hour=RATE_TOL_LN_PER_H, min_fit_points=3,
+                             board_minimum=None)
+
+        assert control.by_channel[18].settled is True and control.settled is True
+        rate = check.by_channel[18]
+        assert rate.refusal == EXCLUDED_MIXED_BASIS
+        assert rate.evaluable is False and rate.settled is False
+        assert rate.n_points == 2                     # the restarted run only
+        assert "fitted then film_arc" in rate.reason
+        assert "2 round(s) of the 4" in rate.reason
+        assert _resolving(rate, 6) is True
+        # Restarted, never whole-channel excluded: the well still has a word.
+        assert 18 not in check.excluded
+        assert check.by_well[18].word == EXCLUDED_MIXED_BASIS
+        assert check.settled is False and check.quiet == [19, 20]
+        assert "ch18 " + EXCLUDED_MIXED_BASIS in check.reason
+
+    def test_rate_check_basis_change_long_restart_judges_trailing_run_only(self):
+        """fitted x3 -> film_arc x4: judged on the four trailing rounds, sigma
+        AND time together. The three earlier rounds sit at 5x the conductance, so
+        a regression that averaged them in would read a film falling fast; the
+        control on one basis says exactly that.
+        """
+        r18 = [1.0e3] * 3 + _flat_r1(4)
+        flat = _flat_r1(ARMED_WINDOW)
+        series = {18: r18, 19: list(flat), 20: list(flat)}
+        mixed = {18: [BASIS_FITTED] * 3 + [BASIS_FILM_ARC] * 4}
+        times = _times(ARMED_WINDOW)
+
+        check = rate_check(_based(series, mixed, default=BASIS_FITTED), times,
+                           tol_per_hour=RATE_TOL_LN_PER_H, min_fit_points=4,
+                           min_channels=3)
+        averaged = rate_check(_based(series, default=BASIS_FITTED), times,
+                              tol_per_hour=RATE_TOL_LN_PER_H, min_fit_points=4,
+                              min_channels=3)
+
+        assert averaged.by_channel[18].refusal == RATE_MOVING
+        rate = check.by_channel[18]
+        slope, _se, _resid = log_rate(times[3:], [1.0 / r for r in r18[3:]])
+        assert rate.n_points == 4
+        assert rate.span_s == pytest.approx(times[-1] - times[3])
+        assert rate.rate_per_hour == pytest.approx(slope * 3600.0)
+        assert rate.refusal == "" and rate.settled is True
+        assert ("window restarted at the basis change fitted → film_arc; "
+                "3 earlier round(s) not used") in rate.reason
+        assert check.settled is True and check.moving == []
+
+    def test_rate_check_restart_is_at_the_last_change_and_keeps_unasked_rounds(self):
+        """A basis that flips back restarts at the LAST change, and the reason
+        names the whole order; a `""` round inside the trailing run stays in it,
+        as it does on a one-basis window -- "never asked" is not a change."""
+        flat = _flat_r1(ARMED_WINDOW)
+        bases = [BASIS_FITTED, BASIS_FILM_ARC, BASIS_FILM_ARC, "",
+                 BASIS_FITTED, BASIS_FITTED, BASIS_FITTED]
+        window = _based({18: list(flat), 19: list(flat), 20: list(flat)},
+                        {18: bases}, default=BASIS_FITTED)
+        rate = rate_check(window, _times(ARMED_WINDOW),
+                          tol_per_hour=RATE_TOL_LN_PER_H, min_fit_points=4,
+                          min_channels=3).by_channel[18]
+
+        assert rate.n_points == 4
+        assert rate.refusal == "" and rate.settled is True
+        assert ("basis change film_arc → fitted; 3 earlier round(s) not used"
+                in rate.reason)
+
+    def test_rate_check_one_basis_or_never_asked_is_byte_identical(self):
+        """The reach of the restart is a CHANGE of basis and nothing else. A
+        board exercising every branch -- moving, too noisy, quiet -- returns the
+        identical RateCheck whether every round says `""`, `fitted` or
+        `film_arc`, and with `""` sprinkled among one channel's `fitted` rounds:
+        "never asked" is not a basis and cannot disagree with one.
+        """
+        quiet = _quiet_r1(ARMED_WINDOW)
+        series = {18: _decaying_transient_r1(ARMED_WINDOW),
+                  19: _flat_and_noisy_r1(ARMED_WINDOW),
+                  20: list(quiet), 21: list(quiet)}
+        sprinkled = {20: ["", BASIS_FITTED, "", BASIS_FITTED, BASIS_FITTED,
+                          BASIS_FITTED, ""]}
+        times = _times(ARMED_WINDOW)
+
+        def check(window, **kw):
+            return rate_check(window, times, tol_per_hour=RATE_TOL_LN_PER_H,
+                              tol_rel=0.5, **kw)
+
+        for kw in ({"min_channels": 2}, {"board_minimum": None}):
+            baseline = check(_based(series), **kw)
+            assert baseline.moving == [18]            # the board is not trivial
+            for window in (_based(series, default=BASIS_FITTED),
+                           _based(series, default=BASIS_FILM_ARC),
+                           _based(series, sprinkled, default=BASIS_FITTED)):
+                assert check(window, **kw) == baseline
+
+    def test_bases_observed_sigma_less_rounds_are_not_a_basis(self):
+        """`film_unidentified` carries no sigma, so it drops as `sigma_null` like
+        any sigma-less round -- it must not also count as a change of basis.
+
+        Unit-level on purpose: on both criteria a sigma-less round leaves the
+        window (participation rule, or the consensus rule's one round) before the
+        basis is asked, so no end-to-end window can reach this filter today. The
+        end-to-end half below pins that ordering instead.
+        """
+        fits = [RoundFit(channel=1, sigma=2e-4, r1_ohms=5e3, basis=BASIS_FITTED),
+                RoundFit(channel=1, sigma=None, r1_ohms=float("nan"),
+                         basis=BASIS_FILM_UNIDENTIFIED),
+                RoundFit(channel=1, sigma=2e-4, r1_ohms=5e3, basis=""),
+                RoundFit(channel=1, sigma=2e-4, r1_ohms=5e3, basis=BASIS_FITTED)]
+        assert _bases_observed(fits) == (BASIS_FITTED,)
+        assert _bases_observed(fits[1:3]) == ()
+        assert _bases_observed(
+            fits + [RoundFit(channel=1, sigma=1e-4, basis=BASIS_FILM_RB)]) \
+            == (BASIS_FITTED, BASIS_FILM_RB)
+
+        quiet = _quiet_r1(3)
+        window = _based({18: quiet, 19: list(quiet)}, default=BASIS_FITTED)
+        window[1][0] = RoundFit(channel=18, sigma=None, r1_ohms=float("nan"),
+                                basis=BASIS_FILM_UNIDENTIFIED)
+        window[2][0] = RoundFit(channel=18, sigma=1.0 / quiet[2],
+                                r1_ohms=quiet[2], basis=BASIS_FILM_ARC)
+        assert settle_check(window, min_channels=1).excluded == {
+            18: EXCLUDED_SIGMA_NULL}
+
+    def test_settle_check_mixed_basis_channel_is_excluded(self):
+        """The deviation criterion has no regression to restart, so the whole
+        channel goes -- and only the mixing one; one basis is unchanged."""
+        quiet = _quiet_r1(3)
+        series = {18: list(quiet), 19: list(quiet), 20: list(quiet)}
+        mixed = _based(series, {18: [BASIS_FITTED, BASIS_FITTED, BASIS_FILM_ARC]},
+                       default=BASIS_FITTED)
+
+        check = settle_check(mixed, min_channels=2)
+        assert check.excluded == {18: EXCLUDED_MIXED_BASIS}
+        assert check.participating == [19, 20]
+        assert check.evaluable is True and check.settled is True
+
+        baseline = settle_check(_based(series), min_channels=2)
+        assert baseline.excluded == {}
+        for default in (BASIS_FITTED, BASIS_FILM_ARC):
+            assert settle_check(_based(series, default=default),
+                                min_channels=2) == baseline
+
+    def test_basis_tokens_values_pinned(self):
+        """Stored and joined by value (WellVerdict.word, run artifacts), and
+        afl's L4 feeder writes the three bases: a respelling is a contract
+        change."""
+        assert (BASIS_FILM_ARC, BASIS_FILM_RB, BASIS_FILM_UNIDENTIFIED) == (
+            "film_arc", "film_rb", "film_unidentified")
+        assert EXCLUDED_MIXED_BASIS == "mixed_basis"
